@@ -152,6 +152,7 @@ bool FUniReferenceParityTest::RunTest(const FString&)
 	FCpuGenBackend Be(G, 2097152u);
 	FUniStreamer S(G, Be);
 	S.bVelocityLod = false;
+	S.Update(UniScenes::SolarCamera());   // AllReady() is trivially true before the first update
 	for (int32 I = 0; I < 60 && !S.AllReady(); ++I) { S.Update(UniScenes::SolarCamera()); }
 	size_t StreamObjects = 0;
 	S.ForEachReady([&](const FCellKey&, uint32 Start, uint32 Count, float)

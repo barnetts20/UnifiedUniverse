@@ -19,7 +19,11 @@ public class UnifiedUniverseRender : ModuleRules
 
 		// The engine-agnostic UniCore headers were built offline with g++ and clang only. Shadowed
 		// names there must not fail an MSVC build tonight; tighten once UE-1 is green.
+#if UE_5_5_OR_LATER
+		CppCompileWarningSettings.ShadowVariableWarningLevel = WarningLevel.Warning;
+#else
 		ShadowVariableWarningLevel = WarningLevel.Warning;
+#endif
 
 		PublicDependencyModuleNames.AddRange(new string[]
 		{
@@ -34,6 +38,7 @@ public class UnifiedUniverseRender : ModuleRules
 		{
 			"Renderer",
 			"Projects",
+			"RHICore",   // Renderer-private headers (SceneRendering.h) reach into RHICore
 		});
 
 		PublicIncludePaths.Add(Path.Combine(ModuleDirectory, "..", "UniCore"));

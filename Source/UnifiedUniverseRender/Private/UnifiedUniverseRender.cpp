@@ -1,6 +1,10 @@
 #include "UnifiedUniverseRender.h"
 
+#include "UniRenderer.h"
+
 #include "Interfaces/IPluginManager.h"
+#include "Misc/CoreDelegates.h"
+#include "RenderingThread.h"
 #include "Misc/Paths.h"
 #include "ShaderCore.h"
 
@@ -25,10 +29,22 @@ void FUnifiedUniverseRenderModule::StartupModule()
 	{
 		AddShaderSourceDirectoryMapping(ShaderVirtualPath, ShaderDir);
 	}
+
+	// R4: the renderer is a function-local static, destroyed after the RHI is gone. Drop its
+	// pooled buffers and readbacks while the render thread still runs.
+	PreExitHandle = FCoreDelegates::OnEnginePreExit.AddLambda([]()
+	{
+		ENQUEUE_RENDER_COMMAND(UniReleaseRenderer)([](FRHICommandListImmediate&)
+		{
+			FUniRenderer::Get().Release_RenderThread();
+		});
+		FlushRenderingCommands();
+	});
 }
 
 void FUnifiedUniverseRenderModule::ShutdownModule()
 {
+	FCoreDelegates::OnEnginePreExit.Remove(PreExitHandle);
 	// The engine owns the mapping table and clears it at shutdown. Removing the entry here
 	// would break a live-coding reload, which re-runs StartupModule against the same table.
 }

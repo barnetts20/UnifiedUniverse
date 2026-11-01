@@ -4,10 +4,10 @@
 
 | | |
 | --- | --- |
-| Commit | `a046b28` + uncommitted changes (branch `uu/prototype-day1`) |
-| Run | 2026-11-01 12:01 EST, 230 s |
+| Commit | `b1222b9` + uncommitted changes (branch `uu/prototype-day1`) |
+| Run | 2026-11-01 12:22 EST, 229 s |
 | Environment tier reached | Tier 3 offline (Tier 4 static only: no Unreal, no DXC here — see ENVIRONMENT.md) |
-| Checks | 39 run, 39 pass, **0 fail** |
+| Checks | 42 run, 42 pass, **0 fail** |
 
 ## Tier 1 — core correctness
 
@@ -30,7 +30,7 @@
 | `T1.window.velocity_lod` | PASS | Velocity LOD suspends above 1 cell per K = 4 frames, resumes below 0.8 of that | transitions as specified |
 | `T1.level.coverage` | PASS | L = ceil(log2(R/N_eff)), N_eff = N - 1/K: for random camera offsets in the centre cell, every object with distance <= R is inside its level's window | 240000 trials over N = 1..6 and R = 4 cm..2^123 cm, 0 violations; min N_eff*2^L / R = 1.000002 |
 | `T1.clang.coord_seed` | PASS | clang++ build passes every Tier 1 group (coord, seed, window, level, photometry; quick fuzz 10^5) | 12 checks, failing: none |
-| `T1.coord.oracle` | PASS | Coordinate fuzz vs Python big-int oracle: Sub, ToDouble, ToHiLo, CellOf, Neighbour, AddDisplacement, object-relative (shader core) | 1000000 cases x 3 axes vs Python big-int oracle, 0 mismatches (25 s) |
+| `T1.coord.oracle` | PASS | Coordinate fuzz vs Python big-int oracle: Sub, ToDouble, ToHiLo, CellOf, Neighbour, AddDisplacement, object-relative (shader core) | 1000000 cases x 3 axes vs Python big-int oracle, 0 mismatches (24 s) |
 | `T1.seed.oracle` | PASS | UniSeed vs Python oracle: Avalanche, HashCombine, MixSeed, FRandomStream, CellSeed, ObjectSeed, draws, ChannelId | 2007 cases vs Python oracle (fast HashCombine), 0 mismatches |
 
 ## Tier 2 — generation behaviour
@@ -47,6 +47,8 @@
 | `T2.gen.baked` | PASS | Baked UniVol path: file round trip, mips are exact means, mip-descent placement follows texels, counts follow mip integrals, 48 tile symmetries | R32 round trip exact, R16 max rel err 4.9e-04; mip mean err 6.0e-08; descent vs texel r = 0.9987 (400k draws); count z = -1.19; 48/48 symmetries used, integral change 0.0e+00; periodic yes |
 | `T2.gen.slice_draws` | PASS | Magnitude draws stay inside their slice (as stored, half precision) and match the slice's conditional mean | 24 slices x 20,000 draws: 0 outside their slice, 0 with a biased mean; worst Star L71 mean -3.1607 vs -3.1516 (3.2 sigma) |
 | `T2.stream.parity` | PASS | Runtime streamer (probe -> allocate -> place, readback contributors) with the CPU backend reproduces the reference pipeline cell for cell | 5375 cells / 719687 objects compared, 0 differ; galaxy_to_star: 2375 ready cells; flythrough: 3000 ready cells; 43 batches, worst entering-to-ready latency 37 frames, pool peak 361697, 0 alloc failures required (0) |
+| `T2.stream.sensitivity_resize` | PASS | Sensitivity resize keeps resident cells (no interior regeneration) and settles to the reference at the new dm | ready cells 2375 before, 3935 on the resize frame (kept), settled objects 1625782 vs reference 1625782; batches 19 -> 36 |
+| `T2.stream.fail_closed` | PASS | Backend timeouts fail closed: affected cells are not drawn and release their ranges; no unwritten slot is ever drawn | 6 batches failed on purpose, 749 cells failed closed, 257418 slots drawn, 0 of them unwritten |
 
 ## Tier 3 — rendering behaviour
 
@@ -57,6 +59,7 @@
 | `T3.occlusion` | PASS | Synthetic promoted occluder: backdrop objects behind it are culled, objects in front kept, for all test placements | 20000 placements (3386 behind, 550 in front on the disc, 16064 beside), 0 wrong |
 | `T3.frames` | PASS | Reference stills written for visual inspection (galaxy interior x2, cosmic web) | still_galaxy_towards_centre: 9904 visible of 367374 resident; still_galaxy_out_of_plane: 1967 visible of 367374 resident; web dm+5: 65 visible of 63829 resident |
 | `T3.flythrough` | PASS | Scripted path 10^28 cm to 1 m from an object: 48-frame contact sheet; objects entering above the fade threshold = 0 (frames 1..N; frame 0 is the initial fill) | 2400 frames, 545902 objects entered residency, 0 above threshold (1% of a just-visible star), 0 with any non-zero intensity; target M = -4.38. [00 3.24 Gpc: 7 vis] [08 123 kpc: 9 vis] [16 14.8 ly: 2553 vis] [24 35.4 AU: 2549 vis] [32 2.004e+05 km: 0 vis] [40 7.4 km: 0 vis] [47 1 m: 0 vis]  |
+| `T3.sensitivity` | PASS | Global sensitivity sweep dm 0 -> +2.5 -> 0: no pops, no level blinks, visible count grows with dm | 120 frames: 3745207 entering objects, 0 pops, 0 level blinks; visible 9918 at dm 0, 259980 at dm +2.5, 9918 back at 0 |
 | `T3.images` | PASS | Reference frames and flythrough contact sheet converted to PNG with HUD (D-018) | 4 PNGs in Verification/images |
 
 ## Tier 4 — Unreal integration (static only in this environment)
@@ -83,7 +86,7 @@ Written by the session after looking at the images: [OBSERVATIONS.md](OBSERVATIO
 
 - Regressed (PASS → FAIL): none
 - Fixed (FAIL → PASS): none
-- New checks: `T1.build.strict.gpp`, `T1.build.strict.clangpp`
+- New checks: `T2.stream.fail_closed`
 
 ## Not verified here
 

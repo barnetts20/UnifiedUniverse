@@ -32,3 +32,6 @@ Append only. One entry per step start, finish, block, or commit. Times in the ow
 | 11:48 | P5 | note | CPU reference refactored onto the GPU's probe → allocate → place phases; Tier 2 unchanged. T2.stream.parity: streamer + CPU backend = reference, 5,375 cells / 719,687 objects (caught anchor-only cells skipping allocation) |
 | 11:51 | P5 | commit | Checkpoint (37 checks green); UE shaders and renderer written, unbuilt |
 | 12:01 | P5 | commit | UE game module, render hooks, Automation tests, strict C++20 header check; handover drafted. 39 checks green. Independent review of UE code running |
+| 12:09 | P6 | done (stretch 1) | Global sensitivity: new checks T3.sensitivity, T2.stream.sensitivity_resize caught blink/regenerate-on-resize; fixed (D-126). Ping shell not started |
+| 12:19 | P5 | decision D-127 | UE review fixes applied: B1, B2, B4, B5, R1, R2/W5, R3, R4, W1, W2, W3, W4, W6, S1. New check T2.stream.fail_closed. Uncompiled (UE-1/3/5) |
+| 12:24 | END | done (gate green) | Final verify_all: 42 checks, 0 failed (new: T2.stream.fail_closed). Committed; zip and patches packaged for D:\Projects\vxl |

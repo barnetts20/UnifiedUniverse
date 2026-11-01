@@ -33,11 +33,11 @@ Item IDs match `Tools/UniVerify/unverified.json` (the report checks they are all
 
 3. **Shaders (UE-3).** Start the editor. Global shaders compile at startup.
    - Expect: no shader errors in the Output Log for `FUniGenProbeCS`, `FUniGenPlaceCS`, `FUniScatterCS`, `FUniProjectCS`, `FUniSpriteVS` or `FUniSpritePS`.
-   - Failure looks like: "Failed to compile global shader …". Set `r.ShaderDevelopmentMode=1` in ConsoleVariables.ini to get the error text. Likeliest causes: relative `#include "Core/…"` resolution, and `StructuredBuffer` passed as a function parameter in `UniPlacement.ush` / `UniGenTask.ush`.
+   - Failure looks like: "Failed to compile global shader …". Set `r.ShaderDevelopmentMode=1` in ConsoleVariables.ini to get the error text. Likeliest causes: relative `#include "Core/…"` resolution, and `StructuredBuffer` passed as a function parameter in `UniPlacement.ush` / `UniGenTask.ush`. If `FUniGenPlaceCS` fails with X4026 ("thread sync operation must be in non-varying flow control", FXC/SM5 only), delete the marked `if (GsBase >= Capacity) { break; }` line in `UniGen.usf`; results do not change.
 
 4. **See it (UE-5).** Create a new Empty Level with no sky or atmosphere, so stars are not drowned, and press Play. In the console run `uu.Enable galaxy`.
    - Expect: within about a second (levels fill coarse to fine, about 37 frames), a band of stars across the sky, as in `Verification/images/still_galaxy_towards_centre.png`. Look along −X for the galactic centre. Then run `uu.Stats`: cells ready > 2,000, `gpu done` > 0, `failed` 0, and "cells drawn" > 0.
-   - Failure looks like: black. Read `uu.Stats`. If cells are ready but nothing is drawn, it's the sprite pass or the hook; capture a frame in RenderDoc and look for the "UnifiedUniverse" event scope. If batches failed (timeouts), the generation passes are not running. Brightness is uncalibrated (lesson #36): try `uu.Exposure -3` (brighter) or `+3`, and disable auto-exposure if the empty level blows it out.
+   - Failure looks like: black. Read `uu.Stats`. If cells are ready but nothing is drawn, it's the sprite pass or the hook; capture a frame in RenderDoc and look for the "UnifiedUniverse" event scope. If batches failed (timeouts), the generation passes are not running. Brightness is uncalibrated (lesson #36), although the sprites now follow the view's pre-exposure: try `uu.Exposure -3` (brighter) or `+3`, and disable auto-exposure if the empty level blows it out.
 
 5. **Occlusion (UE-5).** Place a large sphere mesh in front of the camera.
    - Expect: stars behind it are hidden, and stars around its silhouette are crisp.
@@ -89,7 +89,26 @@ Item IDs match `Tools/UniVerify/unverified.json` (the report checks they are all
 - D-125 Anchors uploaded by a scatter pass.
 
 ## 6. Known issues and blocked items
-- **Nothing UE-facing has been compiled**: there was no engine and no engine headers here. An independent review of that code ran this afternoon; its findings and the fixes made are listed below (filled in when it finished).
+- **Nothing UE-facing has been compiled**: there was no engine and no engine headers here. An independent reviewer, who had not seen the code being written, read all of it against UE 5.3–5.6 conventions. Its list of the five likeliest failures tonight was B1, W1, R1, S1 and B2/R4. All of them are now fixed in code, but none of the fixes has been compiled. Recorded as D-127.
+
+  | ID | Finding | Fix |
+  | --- | --- | --- |
+  | B1 | `UniSubsystem.h` forward-declared types held in `TUniquePtr`; the UHT-generated destructor cannot delete them | Includes `UniStreamer.h` before `.generated.h` |
+  | B2 | `FRHIGPUBufferReadback` and friends need `RHICore` | Added to the Render module's dependencies |
+  | B4 | `ShadowVariableWarningLevel` moved to `CppCompileWarningSettings` in 5.5 | All four Build.cs files guarded with `#if UE_5_5_OR_LATER` |
+  | B5 | `TStaticBlendState` used without `RHIStaticStates.h` | Included |
+  | R1 | Sprites were drawn straight into the post-process input, which need not be render-targetable | Copy into `OverrideOutput` or a new target, then draw into that |
+  | R2/W5 | A failed batch could leave pool slots unwritten but drawn; the read offset was shared across cells | `bFailed` handled in both phases, per-cell read offset; new check `T2.stream.fail_closed` (749 cells failed closed, 0 unwritten slots drawn) |
+  | R3 | Probe and place shared one set of request flags, so a late probe command could mark the place phase submitted | Separate per-phase flags; the timeout starts when the render thread runs the command; timeouts fail closed |
+  | R4 | The renderer's pooled buffers outlived the RHI at exit | Released on `OnEnginePreExit` with a render-thread flush |
+  | W1 | Cleared sky (reverse-Z depth 0) produced a NaN or negative distance, which would hide every star | Depth 0 is treated as infinitely far |
+  | W2 | The jittered projection was used after TSR, so stars would wobble by the TAA jitter | Unjittered (`ComputeProjectionNoAAMatrix`) projection and field of view |
+  | W3 | Scene colour is pre-exposed at this point; the sprites were not | Sprite radiance is multiplied by `PreExposure` |
+  | W4 | Local-mode anchor re-entry and teleport ignored the pawn's view location; the flythrough left a velocity behind | Anchor = camera − view location; velocity zeroed at the end |
+  | W6 | Scene captures and editor views also got the backdrop | Game views only, with `OverrideOutput` still honoured |
+  | S1 | `UniGen.usf` returned early before group barriers and had an unbounded loop | No early return (padding groups do zero work and mask their writes); the place loop is bounded by the candidate budget |
+
+  **Remaining risks from that review:** S1's early-out `break` may still trip FXC on SM5 (fallback in §3 step 3). `FViewInfo` (used for the internal view rect and `PreExposure`) needs the Renderer's private include path, which may change between engine versions. Reviewer item R5 (the promotion readback ring is never drained on teleport) is harmless for now, because promotion has no consumer yet. W7 (a cosmetic log-spam item) was not changed.
 - **DXC was not runnable** (session policy refused executing the downloaded binary; not worked around). Shader syntax is unverified (UE-3). The shader *logic* is verified by running the same cores on the CPU.
 - **UltraLargeScale reference** is the GitHub snapshot `cb2ccc5` (2026-08-30). Your laptop copy may be newer. `ULSScaleLadder.h` is not in that snapshot, so `UniScaleLadder.h` is a fresh implementation.
 - **Coarse cells miscount** by 3–18% where a contributor spans ≤ 8 cells per axis (the bright end of the star luminosity function). The fix is adaptive probing (D-103).

@@ -13,8 +13,10 @@
 // Engine-version notes (D-106), all guarded below:
 //   - UE 5.5+ passes the view to SubscribeToPostProcessingPass; earlier versions do not.
 //   - UE 5.3+ hands post-process inputs as FScreenPassTextureSlice.
-//   - FViewInfo (for the internal view rect) needs the Renderer's private include path
-//     (UnifiedUniverseRender.Build.cs adds it).
+//   - FViewInfo (for the internal view rect and PreExposure) needs the Renderer's private
+//     include path (UnifiedUniverseRender.Build.cs adds it).
+//   - The draw goes into a copy of scene colour (or OverrideOutput), never into the input
+//     (UE review R1), and uses the unjittered projection (W2, in UniRenderer.cpp).
 
 #include "UniRenderHooks.h"
 
@@ -69,20 +71,38 @@ namespace
 #else
 			FScreenPassTexture SceneColor = Inputs.GetInput(EPostProcessMaterialInput::SceneColor);
 #endif
+			const FViewInfo& ViewInfo = static_cast<const FViewInfo&>(View);
+
+			// Only game views get the backdrop (W6): scene captures, reflection captures and
+			// editor-only views pass through. OverrideOutput must still be honoured when set.
+			if (View.bIsSceneCapture || View.bIsReflectionCapture || !View.bIsGameView)
+			{
+				if (Inputs.OverrideOutput.IsValid())
+				{
+					AddDrawTexturePass(GraphBuilder, ViewInfo, SceneColor, Inputs.OverrideOutput);
+					return Inputs.OverrideOutput;
+				}
+				return SceneColor;
+			}
+
+			// R1: the post-process input is not guaranteed render-targetable (and must not be
+			// written in place), so the sprites draw into a copy: the override output when the
+			// chain hands one, otherwise a new target shaped like scene colour.
+			FScreenPassRenderTarget Output = Inputs.OverrideOutput.IsValid()
+				? Inputs.OverrideOutput
+				: FScreenPassRenderTarget::CreateFromInput(GraphBuilder, SceneColor, ERenderTargetLoadAction::ENoAction, TEXT("UniSceneColor"));
+			AddDrawTexturePass(GraphBuilder, ViewInfo, SceneColor, Output);
+
 			FRDGTextureRef SceneDepth = nullptr;
 			if (Inputs.SceneTextures.SceneTextures)
 			{
 				SceneDepth = Inputs.SceneTextures.SceneTextures->GetParameters()->SceneDepthTexture;
 			}
-			const FIntRect DepthRect = static_cast<const FViewInfo&>(View).ViewRect;   // internal (pre-upscale) rect
-			FUniRenderer::Get().RenderBackdrop_RenderThread(GraphBuilder, View, SceneColor, SceneDepth, DepthRect);
-
-			if (Inputs.OverrideOutput.IsValid())
-			{
-				AddDrawTexturePass(GraphBuilder, View, SceneColor, Inputs.OverrideOutput);
-				return Inputs.OverrideOutput;
-			}
-			return SceneColor;
+			const FIntRect DepthRect = ViewInfo.ViewRect;   // internal (pre-upscale) rect
+			// W3: scene colour is pre-exposed at this point; the sprite radiance must be too.
+			const float PreExposure = ViewInfo.PreExposure > 0.0f ? ViewInfo.PreExposure : 1.0f;
+			FUniRenderer::Get().RenderBackdrop_RenderThread(GraphBuilder, View, Output, SceneDepth, DepthRect, PreExposure);
+			return MoveTemp(Output);
 		}
 	};
 

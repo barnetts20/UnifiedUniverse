@@ -13,6 +13,10 @@
 //   UNI_GEN_PASS 2  SCATTER: authored records (anchors) written at CPU-chosen pool indices.
 //
 // Dispatch is wrapped into 2D (lesson #23): task = GroupId.y * DispatchGroupsX + GroupId.x.
+// Padding groups (TaskIndex >= NumTasks) do NOT return early: every thread of every group
+// reaches every barrier, with the work counts forced to zero and the writes masked (UE review
+// S1: FXC rejects barriers after a return, and some drivers hang on them). Loops that contain
+// barriers have a trip count read from the task, which is group-uniform, and are bounded.
 // Parity note (D-105): the probe sum is a tree reduction here and a sequential sum on the CPU,
 // so mean and lambda differ in the last bits and a Poisson count can differ in rare boundary
 // cases. Integer parts (seeds, offsets, ranks) are bit-identical.
@@ -40,12 +44,13 @@ groupshared float GsMax[UNI_GEN_THREADS];
 void MainCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
 {
 	const uint TaskIndex = GroupId.y * DispatchGroupsX + GroupId.x;
-	if (TaskIndex >= NumTasks) { return; }   // whole group exits together
-	const FUniGenTask T = InTasks[TaskIndex];
+	const bool bValid = TaskIndex < NumTasks;   // group-uniform
+	const FUniGenTask T = InTasks[min(TaskIndex, NumTasks - 1)];
+	const uint NumProbes = bValid ? UNI_PROBES_PER_CELL : 0u;
 
 	float Sum = 0.0f;
 	float Max = 0.0f;
-	for (uint K = GroupIndex; K < UNI_PROBES_PER_CELL; K += UNI_GEN_THREADS)
+	for (uint K = GroupIndex; K < NumProbes; K += UNI_GEN_THREADS)
 	{
 		const float V = Uni_TaskProbe(T, K);
 		Sum += V;
@@ -63,7 +68,7 @@ void MainCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
 		}
 		GroupMemoryBarrierWithGroupSync();
 	}
-	if (GroupIndex == 0)
+	if (bValid && GroupIndex == 0)
 	{
 		OutCounts[TaskIndex] = Uni_TaskCount(T, GsSum[0], GsMax[0]);
 	}
@@ -84,57 +89,63 @@ groupshared uint GsBase;
 void MainCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
 {
 	const uint TaskIndex = GroupId.y * DispatchGroupsX + GroupId.x;
-	if (TaskIndex >= NumTasks) { return; }
-	const FUniGenTask T = InTasks[TaskIndex];
-	const FUniTaskCount C = InCounts[TaskIndex];
+	const bool bValid = TaskIndex < NumTasks;   // group-uniform
+	const uint TaskRead = min(TaskIndex, NumTasks - 1);
+	const FUniGenTask T = InTasks[TaskRead];
+	const FUniTaskCount C = InCounts[TaskRead];
 	const FUniSlice S = InSlices[T.SliceIndex];
+	const uint Capacity = bValid ? T.PoolCapacity : 0u;
+	// At least one chunk whenever there is capacity, as the CPU loop's first iteration.
+	const uint MaxChunks = (Capacity > 0u) ? max(1u, (C.CandidateBudget + UNI_GEN_THREADS - 1u) / UNI_GEN_THREADS) : 0u;
 
 	if (GroupIndex == 0) { GsBase = 0; }
 	GroupMemoryBarrierWithGroupSync();
 
-	if (T.PoolCapacity > 0)
+	[loop]
+	for (uint Chunk = 0; Chunk < MaxChunks; ++Chunk)
 	{
-		for (uint Chunk = 0; ; ++Chunk)
+		const uint J = Chunk * UNI_GEN_THREADS + GroupIndex;
+		uint3 Offset = uint3(0, 0, 0);
+		float Density = 0.0f;
+		bool bAccepted = false;
+		if (J < C.CandidateBudget)
 		{
-			const uint J = Chunk * UNI_GEN_THREADS + GroupIndex;
-			uint3 Offset = uint3(0, 0, 0);
-			float Density = 0.0f;
-			bool bAccepted = false;
-			if (J < C.CandidateBudget)
-			{
-				bAccepted = Uni_TaskCandidate(T, C.Envelope, J, Offset, Density);
-			}
-			// Inclusive scan of accept flags (Hillis-Steele): rank = acceptance order.
-			GsScan[GroupIndex] = bAccepted ? 1u : 0u;
-			GroupMemoryBarrierWithGroupSync();
-			for (uint Off = 1; Off < UNI_GEN_THREADS; Off <<= 1)
-			{
-				const uint Add = (GroupIndex >= Off) ? GsScan[GroupIndex - Off] : 0u;
-				GroupMemoryBarrierWithGroupSync();
-				GsScan[GroupIndex] += Add;
-				GroupMemoryBarrierWithGroupSync();
-			}
-			const uint Base = GsBase;
-			const uint Rank = Base + GsScan[GroupIndex] - (bAccepted ? 1u : 0u);
-			if (bAccepted && Rank < T.PoolCapacity)
-			{
-				OutPool[T.PoolBase + Rank] = Uni_TaskSuppressed(T, Offset) ? Uni_BlankObject() : Uni_TaskMakeObject(T, S, InLut, Rank, Offset);
-			}
-			const uint ChunkTotal = GsScan[UNI_GEN_THREADS - 1];
-			GroupMemoryBarrierWithGroupSync();
-			if (GroupIndex == 0) { GsBase = Base + ChunkTotal; }
-			GroupMemoryBarrierWithGroupSync();
-			// Group-uniform exit: every thread reads the same GsBase after the barrier.
-			if (GsBase >= T.PoolCapacity || (Chunk + 1) * UNI_GEN_THREADS >= C.CandidateBudget) { break; }
+			bAccepted = Uni_TaskCandidate(T, C.Envelope, J, Offset, Density);
 		}
+		// Inclusive scan of accept flags (Hillis-Steele): rank = acceptance order.
+		GsScan[GroupIndex] = bAccepted ? 1u : 0u;
+		GroupMemoryBarrierWithGroupSync();
+		[unroll]
+		for (uint Off = 1; Off < UNI_GEN_THREADS; Off <<= 1)
+		{
+			const uint Add = (GroupIndex >= Off) ? GsScan[GroupIndex - Off] : 0u;
+			GroupMemoryBarrierWithGroupSync();
+			GsScan[GroupIndex] += Add;
+			GroupMemoryBarrierWithGroupSync();
+		}
+		const uint Base = GsBase;
+		const uint Rank = Base + GsScan[GroupIndex] - (bAccepted ? 1u : 0u);
+		if (bAccepted && Rank < Capacity)
+		{
+			OutPool[T.PoolBase + Rank] = Uni_TaskSuppressed(T, Offset) ? Uni_BlankObject() : Uni_TaskMakeObject(T, S, InLut, Rank, Offset);
+		}
+		const uint ChunkTotal = GsScan[UNI_GEN_THREADS - 1];
+		GroupMemoryBarrierWithGroupSync();
+		if (GroupIndex == 0) { GsBase = Base + ChunkTotal; }
+		GroupMemoryBarrierWithGroupSync();
+		// Early out once the range is full. Every thread reads the same GsBase after the
+		// barrier, so the break is group-uniform; if a compiler still rejects it (X4026 on FXC),
+		// delete this line: the rank test above already stops the writes, at the cost of
+		// evaluating the rest of the budget.
+		if (GsBase >= Capacity) { break; }
 	}
 
-	const uint Filled = min(GsBase, T.PoolCapacity);
-	for (uint I = Filled + GroupIndex; I < T.PoolCapacity; I += UNI_GEN_THREADS)
+	const uint Filled = min(GsBase, Capacity);
+	for (uint I = Filled + GroupIndex; I < Capacity; I += UNI_GEN_THREADS)
 	{
 		OutPool[T.PoolBase + I] = Uni_BlankObject();
 	}
-	if (GroupIndex == 0) { OutAccepted[TaskIndex] = Filled; }
+	if (bValid && GroupIndex == 0) { OutAccepted[TaskIndex] = Filled; }
 }
 
 #else // UNI_GEN_PASS == 2: scatter authored records (anchors) into the pool

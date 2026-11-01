@@ -105,7 +105,12 @@ void UUniSubsystem::SetCamera(const FUniCoord& Coord)
 void UUniSubsystem::Teleport(const FUniCoord& Coord)
 {
 	SetCamera(Coord);
-	LocalAnchor = Coord;
+	// Keep Local mode consistent: the camera lands at Coord with the pawn where it is.
+	UniCore::FCoord A = Coord.ToCore();
+	UniCore::FVec3f F{};
+	const FVector ViewLoc = GetViewLocation();
+	UniCore::AddDisplacement(A, F, UniCore::FVec3d{ -ViewLoc.X, -ViewLoc.Y, -ViewLoc.Z });
+	LocalAnchor = FUniCoord::Make(A);
 }
 
 void UUniSubsystem::SetVelocity(const FVector& CmPerSecond)
@@ -186,14 +191,23 @@ void UUniSubsystem::Tick(float DeltaTime)
 		C = FlyTarget.ToCore();
 		Frac = UniCore::FVec3f{};
 		UniCore::AddDisplacement(C, Frac, UniCore::FVec3d{ D.X, D.Y, D.Z });
-		if (T >= 1.0) { bFlying = false; }
+		if (T >= 1.0) { bFlying = false; Velocity = FVector::ZeroVector; }   // ends in Cruise, parked 1 m above the star
 	}
 	else
 	{
 		// D-008 motion modes with hysteresis.
 		const double Speed = Velocity.Size();
-		if (MotionMode == EUniMotionMode::Local && Speed > kCruiseOn) { MotionMode = EUniMotionMode::Cruise; LocalAnchor = Camera; }
-		else if (MotionMode == EUniMotionMode::Cruise && Speed < kCruiseOff) { MotionMode = EUniMotionMode::Local; LocalAnchor = Camera; }
+		// Local mode computes camera = anchor + view location, so on entering Local the anchor is
+		// the camera MINUS the view location (else the camera jumps by the pawn offset).
+		auto AnchorFor = [&ViewLoc](const FUniCoord& Cam)
+		{
+			UniCore::FCoord A = Cam.ToCore();
+			UniCore::FVec3f F{};
+			UniCore::AddDisplacement(A, F, UniCore::FVec3d{ -ViewLoc.X, -ViewLoc.Y, -ViewLoc.Z });
+			return FUniCoord::Make(A);
+		};
+		if (MotionMode == EUniMotionMode::Local && Speed > kCruiseOn) { MotionMode = EUniMotionMode::Cruise; }
+		else if (MotionMode == EUniMotionMode::Cruise && Speed < kCruiseOff) { MotionMode = EUniMotionMode::Local; LocalAnchor = AnchorFor(Camera); }
 		if (MotionMode == EUniMotionMode::Cruise)
 		{
 			const FVector Step = Velocity * double(DeltaTime);

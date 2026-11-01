@@ -12,6 +12,7 @@
 #include "SceneView.h"
 #include "ScreenPass.h"
 #include "CommonRenderResources.h"
+#include "RHIStaticStates.h"
 #include "HAL/IConsoleManager.h"
 
 static TAutoConsoleVariable<float> CVarUniSpriteExtent(TEXT("uu.SpriteExtent"), 3.0f, TEXT("Sprite quad half size in Gaussian sigmas."), ECVF_RenderThreadSafe);
@@ -120,8 +121,19 @@ FRDGBufferRef FUniRenderer::RegisterLut_RenderThread(FRDGBuilder& GraphBuilder)
 	return GraphBuilder.RegisterExternalBuffer(LutBuffer, TEXT("UniLut"));
 }
 
-void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& View, const FScreenPassTexture& SceneColor,
-	FRDGTextureRef SceneDepth, const FIntRect& DepthViewRect)
+void FUniRenderer::Release_RenderThread()
+{
+	check(IsInRenderingThread());
+	Pool.SafeRelease();
+	SlicesBuffer.SafeRelease();
+	LutBuffer.SafeRelease();
+	PromoteRing.Empty();
+	RenderFrame = FUniFrameData();
+	bTablesDirty = true;
+}
+
+void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& View, const FScreenPassRenderTarget& SceneColor,
+	FRDGTextureRef SceneDepth, const FIntRect& DepthViewRect, float PreExposure)
 {
 	check(IsInRenderingThread());
 	const FUniFrameData& F = RenderFrame;
@@ -148,7 +160,8 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 	const FVector3f Forward(View.GetViewDirection());
 	const FVector3f Right(View.GetViewRight());
 	const FVector3f Up(View.GetViewUp());
-	const FMatrix& Proj = View.ViewMatrices.GetProjectionMatrix();
+	// The pass runs after TSR: use the UNJITTERED projection, or stars wobble by the TAA jitter.
+	const FMatrix Proj = View.ViewMatrices.ComputeProjectionNoAAMatrix();
 	const float TanX = 1.0f / float(Proj.M[0][0]);
 	const float TanY = 1.0f / float(Proj.M[1][1]);
 	const FIntRect OutRect = SceneColor.ViewRect;
@@ -209,7 +222,7 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 		FUniSpritePassParameters* P = GraphBuilder.AllocParameters<FUniSpritePassParameters>();
 		P->Sprite.InSprites = GraphBuilder.CreateSRV(SpriteBuf);
 		P->Sprite.MaxSprites = UniGpuLayout::MaxSprites;
-		P->Sprite.TranslatedWorldToClip = FMatrix44f(View.ViewMatrices.GetTranslatedViewProjectionMatrix());
+		P->Sprite.TranslatedWorldToClip = FMatrix44f(View.ViewMatrices.GetTranslatedViewMatrix() * Proj);
 		P->Sprite.ViewForward = Forward; P->Sprite.ViewRight = Right; P->Sprite.ViewUp = Up;
 		P->Sprite.SpriteExtent = CVarUniSpriteExtent.GetValueOnRenderThread();
 		P->Sprite.InvDeviceZToWorldZTransform = FVector4f(View.InvDeviceZToWorldZTransform);
@@ -221,12 +234,12 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 		const FVector2f Bias(float(DepthViewRect.Min.X) / float(DepthExtent.X) - float(OutRect.Min.X) * Scale.X,
 			float(DepthViewRect.Min.Y) / float(DepthExtent.Y) - float(OutRect.Min.Y) * Scale.Y);
 		P->Sprite.DepthUVScaleBias = FVector4f(Scale.X, Scale.Y, Bias.X, Bias.Y);
-		P->Sprite.SceneColourScale = FVector3f(F.SceneColourScale);
+		P->Sprite.SceneColourScale = FVector3f(F.SceneColourScale * PreExposure);   // scene colour is pre-exposed here
 		P->Sprite.PixelsPerRadian = PixelsPerRadian;
 		P->Sprite.SceneDepthTexture = SceneDepth;
 		P->Sprite.SceneDepthSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
 		P->DrawArgs = ArgsBuf;
-		P->RenderTargets[0] = FRenderTargetBinding(SceneColor.Texture, ERenderTargetLoadAction::ELoad);
+		P->RenderTargets[0] = FRenderTargetBinding(SceneColor.Texture, ERenderTargetLoadAction::ELoad);   // a render-targetable copy (R1)
 
 		TShaderMapRef<FUniSpriteVS> VS(GetGlobalShaderMap(View.GetFeatureLevel()));
 		TShaderMapRef<FUniSpritePS> PS(GetGlobalShaderMap(View.GetFeatureLevel()));
@@ -258,16 +271,21 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 
 struct FUniGpuGenBackend::FRequest
 {
+	/** One phase's progress. Separate per phase: a stale probe command must never mark the
+	 *  place phase submitted (R3 in the UE review). */
+	struct FPhase
+	{
+		std::atomic<bool> bSubmitted{ false };     // render thread: graph executed, copies enqueued
+		std::atomic<bool> bCopied{ false };        // render thread: results copied into the batch
+		std::atomic<bool> bCopyEnqueued{ false };  // game thread: copy command sent
+		std::atomic<double> StartTime{ 0.0 };      // enqueue time, then the render thread's execution time
+	};
 	std::shared_ptr<UniCore::FGenBatch> Batch;
 	TUniquePtr<FRHIGPUBufferReadback> CountReadback;      // probe: FTaskCountGPU per task
 	TUniquePtr<FRHIGPUBufferReadback> AcceptedReadback;   // place: uint per task
 	TUniquePtr<FRHIGPUBufferReadback> ObjectReadback;     // place: the read ranges, concatenated
-	std::atomic<bool> bSubmitted{ false };
-	std::atomic<bool> bCopied{ false };
-	std::atomic<bool> bCopyEnqueued{ false };
-	std::atomic<bool> bFailed{ false };
-	double SubmitTime = 0.0;
-	bool bPlace = false;
+	FPhase Probe;
+	FPhase Place;
 };
 
 FUniGpuGenBackend::FUniGpuGenBackend() {}
@@ -284,7 +302,7 @@ void FUniGpuGenBackend::SubmitProbe(std::shared_ptr<UniCore::FGenBatch> Batch)
 	check(IsInGameThread());
 	TSharedPtr<FRequest, ESPMode::ThreadSafe> Req = MakeShared<FRequest, ESPMode::ThreadSafe>();
 	Req->Batch = Batch;
-	Req->SubmitTime = FPlatformTime::Seconds();
+	Req->Probe.StartTime = FPlatformTime::Seconds();
 	// Allocated HERE, on the calling thread, not in the render command (lesson #24).
 	Req->CountReadback = MakeUnique<FRHIGPUBufferReadback>(TEXT("UniGenCountReadback"));
 	Requests.Add(Batch->Ticket, Req);
@@ -294,8 +312,9 @@ void FUniGpuGenBackend::SubmitProbe(std::shared_ptr<UniCore::FGenBatch> Batch)
 	TSharedRef<TArray<UniCore::FGenTaskGPU>, ESPMode::ThreadSafe> Payload = MakeShared<TArray<UniCore::FGenTaskGPU>, ESPMode::ThreadSafe>(MoveTemp(Tasks));
 	ENQUEUE_RENDER_COMMAND(UniGenProbe)([Req, Payload](FRHICommandListImmediate& RHICmdList)
 	{
+		Req->Probe.StartTime = FPlatformTime::Seconds();   // the timeout runs from execution, not from enqueue
 		const uint32 NumTasks = uint32(Payload->Num());
-		if (NumTasks == 0) { Req->bSubmitted = true; return; }
+		if (NumTasks == 0) { Req->Probe.bSubmitted = true; return; }
 		FRDGBuilder GraphBuilder(RHICmdList);
 		FRDGBufferRef TaskBuf = UploadStructured(GraphBuilder, TEXT("UniGenTasks"), *Payload);
 		FRDGBufferDesc CountDesc = FRDGBufferDesc::CreateStructuredDesc(UniGpuLayout::TaskCountBytes, NumTasks);
@@ -312,7 +331,7 @@ void FUniGpuGenBackend::SubmitProbe(std::shared_ptr<UniCore::FGenBatch> Batch)
 		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Gen.Probe %u tasks", NumTasks), CS, P, Groups);
 		AddEnqueueCopyPass(GraphBuilder, Req->CountReadback.Get(), CountBuf, NumTasks * UniGpuLayout::TaskCountBytes);
 		GraphBuilder.Execute();
-		Req->bSubmitted = true;
+		Req->Probe.bSubmitted = true;
 	});
 }
 
@@ -322,9 +341,7 @@ void FUniGpuGenBackend::SubmitPlace(std::shared_ptr<UniCore::FGenBatch> Batch)
 	TSharedPtr<FRequest, ESPMode::ThreadSafe>* Found = Requests.Find(Batch->Ticket);
 	if (!Found) { return; }
 	TSharedPtr<FRequest, ESPMode::ThreadSafe> Req = *Found;
-	Req->bPlace = true;
-	Req->bSubmitted = false; Req->bCopied = false; Req->bCopyEnqueued = false;
-	Req->SubmitTime = FPlatformTime::Seconds();
+	Req->Place.StartTime = FPlatformTime::Seconds();
 	Req->AcceptedReadback = MakeUnique<FRHIGPUBufferReadback>(TEXT("UniGenAcceptedReadback"));
 	Req->ObjectReadback = MakeUnique<FRHIGPUBufferReadback>(TEXT("UniGenObjectReadback"));
 
@@ -344,6 +361,7 @@ void FUniGpuGenBackend::SubmitPlace(std::shared_ptr<UniCore::FGenBatch> Batch)
 
 	ENQUEUE_RENDER_COMMAND(UniGenPlace)([Req, Payload](FRHICommandListImmediate& RHICmdList)
 	{
+		Req->Place.StartTime = FPlatformTime::Seconds();
 		const uint32 NumTasks = uint32(Payload->Tasks.Num());
 		FRDGBuilder GraphBuilder(RHICmdList);
 		FUniRenderer& R = FUniRenderer::Get();
@@ -399,7 +417,7 @@ void FUniGpuGenBackend::SubmitPlace(std::shared_ptr<UniCore::FGenBatch> Batch)
 		AddEnqueueCopyPass(GraphBuilder, Req->AcceptedReadback.Get(), AccBuf, FMath::Max(NumTasks, 1u) * sizeof(uint32));
 		AddEnqueueCopyPass(GraphBuilder, Req->ObjectReadback.Get(), Stage, FMath::Max(TotalObjects, 1u) * UniGpuLayout::ObjectBytes);
 		GraphBuilder.Execute();
-		Req->bSubmitted = true;
+		Req->Place.bSubmitted = true;
 	});
 }
 
@@ -409,31 +427,36 @@ bool FUniGpuGenBackend::Poll(const UniCore::FGenBatch& Batch, bool bPlace)
 	TSharedPtr<FRequest, ESPMode::ThreadSafe>* Found = Requests.Find(Batch.Ticket);
 	if (!Found) { return true; }
 	TSharedPtr<FRequest, ESPMode::ThreadSafe> Req = *Found;
-	if (Req->bCopied)
+	FRequest::FPhase& Ph = bPlace ? Req->Place : Req->Probe;
+	if (Ph.bCopied)
 	{
-		if (bPlace) { Requests.Remove(Batch.Ticket); FUniRenderer::Get().Stats.GenBatchesCompleted++; }
+		if (bPlace || Req->Batch->bFailed)
+		{
+			Requests.Remove(Batch.Ticket);
+			if (!Req->Batch->bFailed) { FUniRenderer::Get().Stats.GenBatchesCompleted++; }
+		}
 		return true;
 	}
-	const bool bTimedOut = FPlatformTime::Seconds() - Req->SubmitTime > UniGpuLayout::ReadbackTimeoutSeconds;
-	if (bTimedOut && !Req->bCopyEnqueued)
+	// Fail closed on timeout (lessons #1, #24, #27): the batch is marked failed and its cells are
+	// not drawn; never a CPU substitute. The clock starts when the render thread executes the
+	// command, so render-thread latency does not count, with a long cap before that.
+	const double Now = FPlatformTime::Seconds();
+	const double Limit = Ph.bSubmitted ? UniGpuLayout::ReadbackTimeoutSeconds : 5.0 * UniGpuLayout::ReadbackTimeoutSeconds;
+	if (Now - Ph.StartTime.load() > Limit && !Ph.bCopyEnqueued)
 	{
-		// Fail closed (lesson #1, #27): an empty result, never a CPU substitute.
-		UE_LOG(LogUniRender, Warning, TEXT("UnifiedUniverse: generation batch %llu timed out in the %s phase; its cells stay empty."), Batch.Ticket, bPlace ? TEXT("place") : TEXT("probe"));
-		std::shared_ptr<UniCore::FGenBatch> B = Req->Batch;
-		if (!bPlace) { B->Counts.assign(B->Tasks.size(), UniCore::FTaskCountGPU{}); }
-		else { B->Accepted.assign(B->Tasks.size(), 0u); B->ReadObjects.clear(); }
-		Req->bFailed = true;
-		Req->bCopied = true;
+		UE_LOG(LogUniRender, Warning, TEXT("UnifiedUniverse: generation batch %llu timed out in the %s phase; its cells fail closed."), Batch.Ticket, bPlace ? TEXT("place") : TEXT("probe"));
+		Req->Batch->bFailed = true;
+		Ph.bCopied = true;
 		FUniRenderer::Get().Stats.GenBatchesFailed++;
 		return Poll(Batch, bPlace);
 	}
-	if (!Req->bSubmitted || Req->bCopyEnqueued) { return false; }
+	if (!Ph.bSubmitted || Ph.bCopyEnqueued) { return false; }
+	if (!bPlace && Req->Batch->Tasks.empty()) { Req->Batch->Counts.clear(); Ph.bCopied = true; return true; }
 	FRHIGPUBufferReadback* RbA = bPlace ? Req->AcceptedReadback.Get() : Req->CountReadback.Get();
 	FRHIGPUBufferReadback* RbB = bPlace ? Req->ObjectReadback.Get() : nullptr;
-	if (Req->Batch->Tasks.empty() && !bPlace) { Req->Batch->Counts.clear(); Req->bCopied = true; return true; }
 	if (!RbA->IsReady() || (RbB && !RbB->IsReady())) { return false; }
 	// Lock() is render-thread only (lesson #24): marshal the copy there.
-	Req->bCopyEnqueued = true;
+	Ph.bCopyEnqueued = true;
 	ENQUEUE_RENDER_COMMAND(UniGenCopy)([Req, bPlace](FRHICommandListImmediate&)
 	{
 		std::shared_ptr<UniCore::FGenBatch> B = Req->Batch;
@@ -447,6 +470,7 @@ bool FUniGpuGenBackend::Poll(const UniCore::FGenBatch& Batch, bool bPlace)
 				FMemory::Memcpy(B->Counts.data(), Src, N * sizeof(UniCore::FTaskCountGPU));
 				Req->CountReadback->Unlock();
 			}
+			Req->Probe.bCopied = true;
 		}
 		else
 		{
@@ -466,8 +490,8 @@ bool FUniGpuGenBackend::Poll(const UniCore::FGenBatch& Batch, bool bPlace)
 				FMemory::Memcpy(B->ReadObjects.data(), Src, Total * sizeof(UniCore::FObjectGPU));
 				Req->ObjectReadback->Unlock();
 			}
+			Req->Place.bCopied = true;
 		}
-		Req->bCopied = true;
 	});
 	return false;
 }

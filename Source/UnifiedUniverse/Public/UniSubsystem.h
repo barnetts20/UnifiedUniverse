@@ -24,9 +24,10 @@
 #include "Subsystems/WorldSubsystem.h"
 #include "Tickable.h"
 #include "UniCoordTypes.h"
+// Complete types, not forward declarations: UHT generates this class's destructor in
+// UniSubsystem.gen.cpp, which sees only this header, and TUniquePtr must be able to delete them.
+#include "UniStreamer.h"
 #include "UniSubsystem.generated.h"
-
-namespace UniCore { class FUniverseModel; class FRefGenerator; class FUniStreamer; class IGenBackend; }
 
 UENUM(BlueprintType)
 enum class EUniMotionMode : uint8

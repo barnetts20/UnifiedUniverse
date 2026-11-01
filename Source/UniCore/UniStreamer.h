@@ -33,6 +33,7 @@ namespace UniCore
 		std::vector<std::pair<u32, u32>> ReadRanges;    // pool ranges to read back after placing (start, count)
 		std::vector<FObjectGPU> ReadObjects;            // their records, concatenated
 		std::vector<std::pair<u32, FObjectGPU>> Writes; // authored records (anchors) uploaded into the pool with the place phase
+		bool bFailed = false;                           // set by a backend that timed out: cells of this batch fail closed
 	};
 
 	/** Generation backend. Submit* never block; Poll* return true once results are in. */
@@ -142,6 +143,7 @@ namespace UniCore
 			std::vector<u32> OwnedContributors;     // registered from this cell's objects
 			FCellContent Readback;                   // emitter objects with indices (for contributors)
 			FCellContent Anchors;                    // authored objects of this cell (anchors), CPU-known
+			size_t ReadOffset = 0;                   // where this cell's read-back objects start in its batch's ReadObjects
 			u32 Frames = 0;                          // frames since entering (latency stats)
 		};
 
@@ -194,20 +196,31 @@ namespace UniCore
 				Lv.Fade = bSusp ? std::max(0.0f, Lv.Fade - 0.125f) : std::min(1.0f, Lv.Fade + 0.125f);
 				if (bSusp && Lv.Win.IsValid()) { bCoarserReady = bCoarserReady && LevelReady(Lv); continue; }
 
-				if (Lv.Win.Geometry().N != N) { EvictAll(Lv); Lv.Win = FLevelWindow(L, N); }
+				// D-126: a sensitivity resize keeps every cell still in the window, Ready ones
+				// included; only the new outer shell is generated. Fade is not reset.
+				bool bResized = false;
+				std::unordered_map<FCellKey, FCell, FCellKeyHasher> Kept;
+				if (Lv.Win.Geometry().N != N) { Kept = std::move(Lv.Cells); Lv.Cells.clear(); Lv.Win = FLevelWindow(L, N); bResized = true; }
 				FWindowGeometry Next = Lv.Win.Geometry();
 				Next.Centre = CellOf(Camera, L);
 				const std::vector<const FContributor*> Gathered = Gather(Next);
 				MaxGather = std::max(MaxGather, Gathered.size());
 				if (Gathered.empty() && !AnchorInWindow(Next))
 				{
+					for (auto& KV : Kept) { Release(KV.second); }
 					if (Lv.Win.IsValid()) { EvictAll(Lv); Lv.Win = FLevelWindow(L, N); }
 					continue;
 				}
 				const FWindowDiff Diff = Lv.Win.Recentre(Next.Centre);
-				if ((Diff.bRebuilt || bJump) && !bFirstFrame) { Lv.Fade = 0.0f; }
+				if (((Diff.bRebuilt && !bResized) || bJump) && !bFirstFrame) { Lv.Fade = 0.0f; }
 				for (const FCellKey& K : Diff.Exiting) { Evict(Lv, K); }
-				for (const FWindowCell& C : Diff.Entering) { Lv.Cells[C.Key] = FCell(); Lv.Cells[C.Key].Key = C.Key; }
+				for (const FWindowCell& C : Diff.Entering)
+				{
+					auto K = Kept.find(C.Key);
+					if (K != Kept.end()) { Lv.Cells[C.Key] = std::move(K->second); Kept.erase(K); continue; }
+					Lv.Cells[C.Key] = FCell(); Lv.Cells[C.Key].Key = C.Key;
+				}
+				for (auto& KV : Kept) { Release(KV.second); }   // shrank out of the window
 
 				if (bCoarserReady)
 				{
@@ -256,6 +269,7 @@ namespace UniCore
 			return Out;
 		}
 
+		/** AllocFailures counts cells that failed closed: pool exhausted or a backend timeout. */
 		struct FStats { size_t CellsReady = 0, CellsPending = 0, PoolUsed = 0, Batches = 0, Regenerations = 0, MaxGather = 0, AllocFailures = 0, MaxLatencyFrames = 0; };
 		FStats Stats() const
 		{
@@ -419,6 +433,12 @@ namespace UniCore
 				if (bProbing)
 				{
 					if (!Backend.PollProbe(*B)) { ++It; continue; }
+					if (B->bFailed)
+					{
+						for (FCell* C : Mine) { C->State = ECellState::Failed; C->Batch.reset(); ++AllocFailures; }
+						It = Inflight.erase(It);
+						continue;
+					}
 					// Allocation: per cell, IndexBase = prefix sum of n (truncated at 2^15), one
 					// contiguous pool range per cell, task sub-ranges in order.
 					B->ReadRanges.clear();
@@ -440,6 +460,10 @@ namespace UniCore
 						if (!Pool.Alloc(Index + NumAnchors, C->PoolStart)) { ++AllocFailures; C->State = ECellState::Failed; C->PoolCount = 0; continue; }   // fail closed: not drawn
 						C->PoolCount = Index + NumAnchors;
 						for (u32 A = 0; A < NumAnchors; ++A) { B->Writes.push_back({ C->PoolStart + Index + A, C->Anchors.Objects[A] }); }
+						// Stored per cell: the cells of a batch are found again by map iteration later,
+						// and that order is not stable across inserts (W5 in the UE review).
+						C->ReadOffset = 0;
+						for (const auto& Rg : B->ReadRanges) { C->ReadOffset += Rg.second; }
 						u32 Base = C->PoolStart;
 						for (size_t T = 0; T < C->Tasks.size(); ++T)
 						{
@@ -458,11 +482,19 @@ namespace UniCore
 					continue;
 				}
 				if (!Backend.PollPlace(*B)) { ++It; continue; }
+				if (B->bFailed)
+				{
+					// The backend gave up (timeout): fail closed. Nothing of these cells is drawn,
+					// and their ranges are released; they retry if they re-enter (lesson #27).
+					for (FCell* C : Mine) { if (C->State == ECellState::Placing) { Release(*C); C->State = ECellState::Failed; C->Batch.reset(); ++AllocFailures; } }
+					It = Inflight.erase(It);
+					continue;
+				}
 				// Ready: register contributors from the read-back emitter objects.
-				size_t Cursor = 0;
 				for (FCell* C : Mine)
 				{
 					if (C->State != ECellState::Placing) { continue; }
+					size_t Cursor = C->ReadOffset;
 					C->Readback = FCellContent();
 					C->Readback.Key = C->Key;
 					for (size_t T = 0; T < C->Tasks.size(); ++T)

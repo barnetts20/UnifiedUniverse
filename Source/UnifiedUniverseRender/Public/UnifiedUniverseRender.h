@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Delegates/IDelegateInstance.h"
 #include "Modules/ModuleManager.h"
 
 DECLARE_LOG_CATEGORY_EXTERN(LogUniRender, Log, All);
@@ -14,4 +15,7 @@ public:
 
 	/** Virtual shader path, D-001. Shaders live at /Plugin/UnifiedUniverse/Private/... */
 	static constexpr const TCHAR* ShaderVirtualPath = TEXT("/Plugin/UnifiedUniverse");
+
+private:
+	FDelegateHandle PreExitHandle;
 };

@@ -561,7 +561,11 @@ namespace UniCore
 				Lv.Fade = bSusp ? std::max(0.0f, Lv.Fade - 0.125f) : std::min(1.0f, Lv.Fade + 0.125f);
 				if (bSusp && Lv.Win.IsValid()) { continue; }   // keeps contents; render fades it
 
-				if (Lv.Win.Geometry().N != N) { Lv.Win = FLevelWindow(L, N); Lv.InWindow.clear(); }
+				// D-126: a sensitivity resize keeps every cell still in the window (content and
+				// fade); only the new outer shell enters, and it lies beyond relevance.
+				bool bResized = false;
+				auto OldInWindow = Lv.InWindow;
+				if (Lv.Win.Geometry().N != N) { Lv.Win = FLevelWindow(L, N); Lv.InWindow.clear(); bResized = true; }
 
 				// Gather first, against the window the camera is about to have: contributors
 				// emitting at L that overlap it (D-004 list). With none, the level is inactive and
@@ -587,14 +591,16 @@ namespace UniCore
 				const FWindowDiff Diff = Lv.Win.Recentre(Next.Centre);
 				// A rebuilt level, or a window that jumped more than one cell (resume after velocity
 				// LOD, teleport), can hold cells inside relevance: it fades in from zero (D-116).
-				if ((Diff.bRebuilt || bJump) && !bFirstFrame) { Lv.Fade = 0.0f; }
+				if (((Diff.bRebuilt && !bResized) || bJump) && !bFirstFrame) { Lv.Fade = 0.0f; }
 
 				for (const FCellKey& K : Diff.Exiting) { Lv.InWindow.erase(K); if (bEvictOnExit) { Evict(K); } }
 				for (const FWindowCell& WC : Diff.Entering)
 				{
-					EnsureCell(Lv, WC.Key, Gathered, true);
+					const bool bWasResident = bResized && OldInWindow.count(WC.Key) != 0;
+					EnsureCell(Lv, WC.Key, Gathered, !bWasResident);   // kept cells do not "enter"
 					Lv.InWindow.insert(WC.Key);
 				}
+				if (bResized && bEvictOnExit) { for (const FCellKey& K : OldInWindow) { if (!Lv.InWindow.count(K)) { Evict(K); } } }
 				// D-113: cells whose contributor set grew are regenerated.
 				for (const FCellKey& K : Lv.InWindow) { EnsureCell(Lv, K, Gathered, false); }
 

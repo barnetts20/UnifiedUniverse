@@ -411,3 +411,60 @@ UNI_TEST(render, flythrough)
 			Uni::Fmt("%d frames, %lld objects entered residency, %lld above threshold (1%% of a just-visible star), %lld with any non-zero intensity; target M = %.2f. %s",
 				Frames, EnteringObjects, Pops, StrictPops, BestMag, Notes.c_str()));
 }
+
+UNI_TEST(render, sensitivity)
+{
+	// Global sensitivity sweep at the solar camera: dm ramps 0 -> +2.5 -> 0 over 120 frames
+	// (a scanner pulse). Windows grow and shrink; the limiting magnitude follows. Pass: no
+	// entering object is visible above threshold (pops), no level's fade is reset while it is
+	// drawing (blinks), and the visible count rises with dm as the luminosity function predicts.
+	FUniverseModel M(UniScenes::GalaxyToStar());
+	FRefGenerator G(M);
+	FRefPipeline P(G);
+	P.bVelocityLod = false;
+	FCamera Cam; Cam.Coord = UniScenes::SolarCamera(); Cam.LookAlong({ -1, -0.12, -0.02 }); Cam.Width = 480; Cam.Height = 270;
+	H::FUniView View;
+	long long Pops = 0, Entering = 0;
+	bool bCounting = false;
+	const float VisibleRef = std::pow(10.0f, -0.4f * 0.5f);
+	P.OnEnterWindow = [&](const FCellContent& C, float Fade)
+	{
+		if (!bCounting) { return; }
+		for (const FObjectGPU& O : C.Objects)
+		{
+			++Entering;
+			H::uint4 D[3];
+			CellDelta(C.Key, Cam.Coord, D);
+			const H::FUniSprite S = H::Uni_ProjectObject(D[0], D[1], D[2], u32(C.Key.Level), Fade, UniCore::ToHlsl(O), View, false);
+			if ((S.Flags & H::UNI_SPRITE_VISIBLE) && std::max(S.Radiance.x, std::max(S.Radiance.y, S.Radiance.z)) > 0.01f * VisibleRef) { ++Pops; }
+		}
+	};
+	long long Blinks = 0;
+	size_t Vis0 = 0, VisPeak = 0, VisEnd = 0;
+	std::map<int, float> PrevFade;
+	for (int F = 0; F < 120; ++F)
+	{
+		const double Dm = 2.5 * std::sin(3.14159265358979 * double(F) / 119.0);
+		P.DeltaMag = Dm; Cam.DeltaMag = Dm;
+		View = Cam.View();
+		bCounting = F > 0;
+		P.Update(Cam.Coord, FVec3f{});
+		for (int L : P.LevelList())
+		{
+			const float Fd = P.LevelFade(L);
+			if (F > 0 && PrevFade.count(L) && PrevFade[L] > 0.5f && Fd < PrevFade[L] - 0.3f) { ++Blinks; }
+			PrevFade[L] = Fd;
+		}
+		if (F == 0 || F == 60 || F == 119)
+		{
+			FImage Img(Cam.Width, Cam.Height);
+			const FFrameStats St = RenderFrame(P, Cam, Img);
+			(F == 0 ? Vis0 : (F == 60 ? VisPeak : VisEnd)) = St.Visible;
+		}
+	}
+	Uni::Check(3, "T3.sensitivity", "Global sensitivity sweep dm 0 -> +2.5 -> 0: no pops, no level blinks, visible count grows with dm")
+		.Metric("pops", double(Pops)).Metric("blinks", double(Blinks)).Metric("entering", double(Entering))
+		.Metric("visible_dm0", double(Vis0)).Metric("visible_peak", double(VisPeak)).Metric("visible_end", double(VisEnd))
+		.Pass(Pops == 0 && Blinks == 0 && VisPeak > 2 * Vis0 && VisEnd < VisPeak,
+			Uni::Fmt("120 frames: %lld entering objects, %lld pops, %lld level blinks; visible %zu at dm 0, %zu at dm +2.5, %zu back at 0", Entering, Pops, Blinks, Vis0, VisPeak, VisEnd));
+}

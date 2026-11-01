@@ -76,3 +76,90 @@ UNI_TEST(stream, parity)
 			Uni::Fmt("%lld cells / %lld objects compared, %lld differ; %s; %zu batches, worst entering-to-ready latency %zu frames, pool peak %zu, 0 alloc failures required (%zu)",
 				Cells, Objects, Mismatch, Detail.c_str(), Batches, MaxLatency, PoolUsed, Failures));
 }
+
+UNI_TEST(stream, sensitivity_resize)
+{
+	// A sensitivity change resizes windows. The streamer must keep the cells still inside
+	// (no regeneration of the interior), and after it settles it must match the reference
+	// pipeline at the new sensitivity.
+	FUniverseModel M(UniScenes::GalaxyToStar());
+	FRefGenerator G(M);
+	FCpuGenBackend Be(G, 2097152u);
+	FUniStreamer S(G, Be);
+	S.bVelocityLod = false;
+	const FCoord C = UniScenes::SolarCamera();
+	S.Update(C);   // AllReady() is trivially true before the first update
+	for (int I = 0; I < 60 && !S.AllReady(); ++I) { S.Update(C); }
+	const size_t Batches0 = S.Stats().Batches;
+	size_t ReadyBefore = S.Stats().CellsReady;
+	S.DeltaMag = 1.0;     // N 2 -> 4
+	S.Update(C);
+	const size_t ReadyRightAfter = S.Stats().CellsReady;
+	for (int I = 0; I < 80 && !S.AllReady(); ++I) { S.Update(C); }
+	size_t StreamObjects = 0;
+	S.ForEachReady([&](const FCellKey&, u32 Start, u32 Count, float) { for (u32 I = 0; I < Count; ++I) { StreamObjects += ((Be.PoolData()[Start + I].A[3] >> 16) & UniHlsl::UNI_OBJ_FLAG_DELTA_HIDDEN) ? 0 : 1; } });
+	FRefPipeline P(G);
+	P.bVelocityLod = false;
+	P.DeltaMag = 1.0;
+	P.Update(C, FVec3f{});
+	const bool bMatch = StreamObjects == P.TotalResident();
+	Uni::Check(2, "T2.stream.sensitivity_resize", "Sensitivity resize keeps resident cells (no interior regeneration) and settles to the reference at the new dm")
+		.Metric("ready_before", double(ReadyBefore)).Metric("ready_right_after", double(ReadyRightAfter)).Metric("objects", double(StreamObjects)).Metric("reference", double(P.TotalResident()))
+		.Pass(ReadyBefore > 1000 && ReadyRightAfter >= ReadyBefore && bMatch,
+			Uni::Fmt("ready cells %zu before, %zu on the resize frame (kept), settled objects %zu vs reference %zu; batches %zu -> %zu",
+				ReadyBefore, ReadyRightAfter, StreamObjects, P.TotalResident(), Batches0, S.Stats().Batches));
+}
+
+namespace
+{
+	/** Wraps the CPU backend and fails every Nth batch in the place phase, as a GPU timeout would. */
+	class FFlakyBackend : public IGenBackend
+	{
+	public:
+		FFlakyBackend(FCpuGenBackend& In, u64 InEvery) : Inner(In), Every(InEvery) {}
+		void SubmitProbe(std::shared_ptr<FGenBatch> B) override { Inner.SubmitProbe(B); }
+		bool PollProbe(const FGenBatch& B) override { return Inner.PollProbe(B); }
+		void SubmitPlace(std::shared_ptr<FGenBatch> B) override
+		{
+			if (B->Ticket % Every == 0) { B->bFailed = true; B->Accepted.assign(B->Tasks.size(), 0u); B->ReadObjects.clear(); ++Failed; return; }
+			Inner.SubmitPlace(B);
+		}
+		bool PollPlace(const FGenBatch& B) override { return Inner.PollPlace(B); }
+		u32 PoolCapacity() const override { return Inner.PoolCapacity(); }
+		int Failed = 0;
+	private:
+		FCpuGenBackend& Inner;
+		u64 Every;
+	};
+}
+
+UNI_TEST(stream, fail_closed)
+{
+	// Backend timeouts: the affected cells fail closed (not drawn, ranges released), the
+	// streamer neither crashes nor reads past the readback, and the rest still matches.
+	FUniverseModel M(UniScenes::GalaxyToStar());
+	FRefGenerator G(M);
+	FCpuGenBackend Cpu(G, 2097152u);
+	FFlakyBackend Be(Cpu, 3);
+	FUniStreamer S(G, Be);
+	S.bVelocityLod = false;
+	const FCoord C = UniScenes::SolarCamera();
+	S.Update(C);
+	for (int I = 0; I < 80 && !S.AllReady(); ++I) { S.Update(C); }
+	size_t DrawnHidden = 0, Drawn = 0;
+	for (const FCellGPU& Cell : S.CellTable())
+	{
+		for (u32 I = 0; I < Cell.PoolCount; ++I)
+		{
+			const FObjectGPU& O = Cpu.PoolData()[Cell.PoolStart + I];
+			Drawn++;
+			// A slot drawn from a failed batch would still hold a stale or zero record; a zero record has archetype 0.
+			if ((O.A[3] & 0xFFFFu) == 0u && !((O.A[3] >> 16) & UniHlsl::UNI_OBJ_FLAG_DELTA_HIDDEN)) { ++DrawnHidden; }
+		}
+	}
+	const auto St = S.Stats();
+	Uni::Check(2, "T2.stream.fail_closed", "Backend timeouts fail closed: affected cells are not drawn and release their ranges; no unwritten slot is ever drawn")
+		.Metric("failed_batches", Be.Failed).Metric("failed_cells", double(St.AllocFailures)).Metric("unwritten_drawn", double(DrawnHidden))
+		.Pass(Be.Failed > 0 && St.AllocFailures > 0 && DrawnHidden == 0 && Drawn > 0,
+			Uni::Fmt("%d batches failed on purpose, %zu cells failed closed, %zu slots drawn, %zu of them unwritten", Be.Failed, St.AllocFailures, Drawn, DrawnHidden));
+}

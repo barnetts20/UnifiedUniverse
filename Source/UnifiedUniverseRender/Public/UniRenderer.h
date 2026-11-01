@@ -25,6 +25,7 @@
 class FRDGBuilder;
 class FSceneView;
 struct FScreenPassTexture;
+struct FScreenPassRenderTarget;
 
 /** What the game thread hands the renderer each frame (one by-value payload, lesson #25). */
 struct FUniFrameData
@@ -58,9 +59,13 @@ public:
 	/** Game thread. Slice table and LUTs, once per universe definition. */
 	void SetTables_GameThread(TArray<UniCore::FSliceGPU> Slices, TArray<float> Lut);
 
-	/** Render thread: draws the backdrop into SceneColor. Called from the view extension. */
-	void RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& View, const FScreenPassTexture& SceneColor,
-		FRDGTextureRef SceneDepth, const FIntRect& DepthViewRect);
+	/** Render thread: draws the backdrop additively into Output (a render-targetable copy of
+	 *  scene colour, made by the view extension). Called from the view extension. */
+	void RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& View, const FScreenPassRenderTarget& Output,
+		FRDGTextureRef SceneDepth, const FIntRect& DepthViewRect, float PreExposure);
+
+	/** Render thread: drop every GPU resource (engine pre-exit, before RHI shutdown). */
+	void Release_RenderThread();
 
 	/** Render thread: the persistent pool, registered into a graph (created on first use). */
 	FRDGBufferRef RegisterPool_RenderThread(FRDGBuilder& GraphBuilder);
