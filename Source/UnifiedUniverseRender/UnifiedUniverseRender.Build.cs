@@ -15,6 +15,11 @@ public class UnifiedUniverseRender : ModuleRules
 	public UnifiedUniverseRender(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
+		CppStandard = CppStandardVersion.Cpp20;
+
+		// The engine-agnostic UniCore headers were built offline with g++ and clang only. Shadowed
+		// names there must not fail an MSVC build tonight; tighten once UE-1 is green.
+		ShadowVariableWarningLevel = WarningLevel.Warning;
 
 		PublicDependencyModuleNames.AddRange(new string[]
 		{
@@ -33,5 +38,10 @@ public class UnifiedUniverseRender : ModuleRules
 
 		PublicIncludePaths.Add(Path.Combine(ModuleDirectory, "..", "UniCore"));
 		PublicIncludePaths.Add(Path.Combine(ModuleDirectory, "..", "..", "Shaders", "Private", "Core"));
+
+		// FViewInfo (internal view rect, UniRenderHooks.cpp) lives in the Renderer's private
+		// headers. A common plugin pattern; it is the most version-fragile line in the plugin.
+		PrivateIncludePaths.Add(Path.Combine(GetModuleDirectory("Renderer"), "Private"));
+		PrivateIncludePaths.Add(Path.Combine(GetModuleDirectory("Renderer"), "Internal"));
 	}
 }

@@ -4,18 +4,18 @@
 
 | | |
 | --- | --- |
-| Commit | `6a292b8` + uncommitted changes (branch `uu/prototype-day1`) |
-| Run | 2026-11-01 11:39 EST, 229 s |
+| Commit | `6c5493b` + uncommitted changes (branch `uu/prototype-day1`) |
+| Run | 2026-11-01 11:50 EST, 237 s |
 | Environment tier reached | Tier 3 offline (Tier 4 static only: no Unreal, no DXC here — see ENVIRONMENT.md) |
-| Checks | 36 run, 36 pass, **0 fail** |
+| Checks | 37 run, 37 pass, **0 fail** |
 
 ## Tier 1 — core correctness
 
 | Check | Result | Criterion | Measured |
 | --- | --- | --- | --- |
-| `T1.build.gcc` | PASS | Harness and UniCore build with g++, -Wall -Wextra -Werror, C++17 | built in 10 s |
-| `T1.build.clang` | PASS | Harness and UniCore build with clang++, -Wall -Wextra -Werror, C++17 | built in 8 s |
-| `T1.coord.fuzz` | PASS | Coordinate fuzz: UniCoord.h vs UniCoord.ush (via shim) vs __int128, all ops | 1000000 cases x 3 axes, 0 mismatches (2.2 s) |
+| `T1.build.gcc` | PASS | Harness and UniCore build with g++, -Wall -Wextra -Werror, C++17 | built in 14 s |
+| `T1.build.clang` | PASS | Harness and UniCore build with clang++, -Wall -Wextra -Werror, C++17 | built in 11 s |
+| `T1.coord.fuzz` | PASS | Coordinate fuzz: UniCoord.h vs UniCoord.ush (via shim) vs __int128, all ops | 1000000 cases x 3 axes, 0 mismatches (2.1 s) |
 | `T1.coord.edges` | PASS | Targeted edges: borrow chains, root wrap, max magnitude, zero, level shifts, extreme AddDisplacement, hex | 1079 targeted expectations, 0 failed |
 | `T1.coord.hilo` | PASS | ToHiLo relative error <= 2^-46 over the fuzz set | worst relative error 2^-49.00 over 1000000 cases x 3 axes (limit 2^-46), 0 over |
 | `T1.fr` | PASS | f(r) monotonic over 1..2^128 cm in log steps, C1 at r0, inverse exists (within float conditioning) | 12800 samples, 0 non-monotonic; continuous yes, C1 yes; inverse worst rel error 1.11e-05 = 0.67 of its float bound; 2^128 cm maps to 69.0 r0 |
@@ -28,7 +28,7 @@
 | `T1.window.velocity_lod` | PASS | Velocity LOD suspends above 1 cell per K = 4 frames, resumes below 0.8 of that | transitions as specified |
 | `T1.level.coverage` | PASS | L = ceil(log2(R/N_eff)), N_eff = N - 1/K: for random camera offsets in the centre cell, every object with distance <= R is inside its level's window | 240000 trials over N = 1..6 and R = 4 cm..2^123 cm, 0 violations; min N_eff*2^L / R = 1.000002 |
 | `T1.clang.coord_seed` | PASS | clang++ build passes every Tier 1 group (coord, seed, window, level, photometry; quick fuzz 10^5) | 12 checks, failing: none |
-| `T1.coord.oracle` | PASS | Coordinate fuzz vs Python big-int oracle: Sub, ToDouble, ToHiLo, CellOf, Neighbour, AddDisplacement, object-relative (shader core) | 1000000 cases x 3 axes vs Python big-int oracle, 0 mismatches (25 s) |
+| `T1.coord.oracle` | PASS | Coordinate fuzz vs Python big-int oracle: Sub, ToDouble, ToHiLo, CellOf, Neighbour, AddDisplacement, object-relative (shader core) | 1000000 cases x 3 axes vs Python big-int oracle, 0 mismatches (24 s) |
 | `T1.seed.oracle` | PASS | UniSeed vs Python oracle: Avalanche, HashCombine, MixSeed, FRandomStream, CellSeed, ObjectSeed, draws, ChannelId | 2007 cases vs Python oracle (fast HashCombine), 0 mismatches |
 
 ## Tier 2 — generation behaviour
@@ -44,6 +44,7 @@
 | `T2.gen.gather` | PASS | Max contributor list length per level logged (D-004 trigger: 256) | max 1 contributors gathered (L82); D-004 trigger 256 not reached |
 | `T2.gen.baked` | PASS | Baked UniVol path: file round trip, mips are exact means, mip-descent placement follows texels, counts follow mip integrals, 48 tile symmetries | R32 round trip exact, R16 max rel err 4.9e-04; mip mean err 6.0e-08; descent vs texel r = 0.9987 (400k draws); count z = -1.19; 48/48 symmetries used, integral change 0.0e+00; periodic yes |
 | `T2.gen.slice_draws` | PASS | Magnitude draws stay inside their slice (as stored, half precision) and match the slice's conditional mean | 24 slices x 20,000 draws: 0 outside their slice, 0 with a biased mean; worst Star L71 mean -3.1607 vs -3.1516 (3.2 sigma) |
+| `T2.stream.parity` | PASS | Runtime streamer (probe -> allocate -> place, readback contributors) with the CPU backend reproduces the reference pipeline cell for cell | 5375 cells / 719687 objects compared, 0 differ; galaxy_to_star: 2375 ready cells; flythrough: 3000 ready cells; 43 batches, worst entering-to-ready latency 37 frames, pool peak 361697, 0 alloc failures required (0) |
 
 ## Tier 3 — rendering behaviour
 
@@ -60,8 +61,8 @@
 
 | Check | Result | Criterion | Measured |
 | --- | --- | --- | --- |
-| `T4.static.core_subset` | PASS | Shader cores stay in the shared C++/HLSL subset (no swizzles, UNI_FN, f-suffixed literals, no textures) | 7 cores, 0 problems |
-| `T4.static.gpu_structs` | PASS | GPU-mirrored structs (marked // GPU-MIRROR) have a static_assert, size a multiple of 16 (lesson #20) | 6 GPU structs; missing assert: none; not 16-multiple: none |
+| `T4.static.core_subset` | PASS | Shader cores stay in the shared C++/HLSL subset (no swizzles, UNI_FN, f-suffixed literals, no textures) | 8 cores, 0 problems |
+| `T4.static.gpu_structs` | PASS | GPU-mirrored structs (marked // GPU-MIRROR) have a static_assert, size a multiple of 16 (lesson #20) | 7 GPU structs; missing assert: none; not 16-multiple: none |
 | `T4.static.ue_rules` | PASS | UE-facing rules: no UE includes in UniCore, render hooks only in UniRenderHooks.cpp, no absolute FVector | no problems |
 | `T0.report.unverified_listed` | PASS | Every unverified item is listed in REVIEW_TONIGHT.md | 6 unverified items; missing from REVIEW_TONIGHT: none |
 
@@ -80,7 +81,7 @@ Written by the session after looking at the images: [OBSERVATIONS.md](OBSERVATIO
 
 - Regressed (PASS → FAIL): none
 - Fixed (FAIL → PASS): none
-- New checks: none
+- New checks: `T2.stream.parity`
 
 ## Not verified here
 

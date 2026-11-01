@@ -255,6 +255,15 @@ def main():
     results = []
 
     gcc = build(results, "g++", "gcc")
+    for cxx in ("g++", "clang++"):
+        if not shutil.which(cxx):
+            continue
+        code, out, secs = run([cxx, "-std=c++20", "-fsyntax-only", "-Wall", "-Wextra", "-Wshadow", "-Werror",
+                               "-I" + os.path.join(PLUGIN, "Source", "UniCore"), "-I" + os.path.join(PLUGIN, "Shaders", "Private", "Core"),
+                               os.path.join(HERE, "strict", "strict_headers.cpp")])
+        errs = [l for l in out.splitlines() if "error" in l or "warning" in l][:4]
+        add(results, 1, "T1.build.strict." + cxx.replace("+", "p"), f"Every UniCore header as C++20 with -Wall -Wextra -Wshadow -Werror ({cxx}), as the UE modules compile them",
+            code == 0, "clean" if code == 0 else " | ".join(errs), {"seconds": secs})
     clang = build(results, "clang++", "clang") if shutil.which("clang++") else None
 
     jsonl = os.path.join(WORK, "results.jsonl")

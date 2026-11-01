@@ -48,7 +48,8 @@ namespace UniCore
 	};
 
 	/** CPU backend: runs the task phases synchronously into a CPU pool, through the same cores
-	 *  as the GPU. For offline verification, and for UE's debug cvar uu.CpuGeneration (D-123). */
+	 *  as the GPU. For offline verification (T2.stream.parity) and the UE Automation parity test;
+	 *  never a runtime fallback (lesson #1). */
 	class FCpuGenBackend : public IGenBackend
 	{
 	public:

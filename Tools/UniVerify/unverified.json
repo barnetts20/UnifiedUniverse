@@ -1,8 +1,34 @@
 [
-  {"id": "UE-1", "what": "The plugin compiles in the vxl project: all four modules, with UHT on the USTRUCTs (FUniCoord, FUniCellKey, FUniObjectId) and the UFUNCTION library."},
-  {"id": "UE-2", "what": "UE Automation tests (UnifiedUniverse.*) pass headless with -nullrhi, including engine-parity checks of the UniSeed port against ProcSeed / HashCombine / FRandomStream."},
-  {"id": "UE-3", "what": "Every .usf entry point compiles under the engine shader compiler (DXC was not runnable here)."},
-  {"id": "UE-4", "what": "GPU execution parity: the shared cores give the same results on the GPU as their CPU runs through UniHlslShim.h (integer cores bitwise, float cores statistically, D-105)."},
-  {"id": "UE-5", "what": "Render hooks: the scene view extension subscribes at the intended points on the project's engine version (D-006), and sprites appear with scene-depth occlusion."},
-  {"id": "UE-6", "what": "Flythrough in the editor: `uu.Flythrough` console command on an empty level shows the backdrop, with no jitter and no pops."}
+  {
+    "id": "UE-1",
+    "what": "The plugin compiles in the vxl project: all four modules, with UHT on the USTRUCTs (FUniCoord, FUniCellKey, FUniObjectId) and the UFUNCTION library."
+  },
+  {
+    "id": "UE-2",
+    "what": "UE Automation tests (UnifiedUniverse.*) pass headless with -nullrhi, including engine-parity checks of the UniSeed port against ProcSeed / HashCombine / FRandomStream."
+  },
+  {
+    "id": "UE-3",
+    "what": "Every .usf entry point compiles under the engine shader compiler (DXC was not runnable here)."
+  },
+  {
+    "id": "UE-4",
+    "what": "GPU execution parity: the shared cores give the same results on the GPU as their CPU runs through UniHlslShim.h (integer cores bitwise, float cores statistically, D-105)."
+  },
+  {
+    "id": "UE-5",
+    "what": "Render hooks: the scene view extension subscribes at the intended points on the project's engine version (D-006), and sprites appear with scene-depth occlusion."
+  },
+  {
+    "id": "UE-6",
+    "what": "Flythrough in the editor: `uu.Flythrough` console command on an empty level shows the backdrop, with no jitter and no pops."
+  },
+  {
+    "id": "UE-7",
+    "what": "Promotion handoff appearance: the reference renderer showed the sprite's glare far larger than the promoted body (OBSERVATIONS.md). In UE there is no promotion actor pool yet, so promoted stars stay sprites; check how the glare reads with real bloom."
+  },
+  {
+    "id": "UE-8",
+    "what": "Runtime cost: GPU time of the generate / project / sprite passes, the one-time game-thread hitch of the normalising integral when entering a galaxy (D-123), and teleport fill latency (about 37 frames, D-122)."
+  }
 ]
