@@ -14,6 +14,8 @@
 #include "CommonRenderResources.h"
 #include "RHIStaticStates.h"
 #include "HAL/IConsoleManager.h"
+#include "Misc/EngineVersionComparison.h"
+#include "HAL/PlatformProcess.h"
 
 static TAutoConsoleVariable<float> CVarUniSpriteExtent(TEXT("uu.SpriteExtent"), 3.0f, TEXT("Sprite quad half size in Gaussian sigmas."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<float> CVarUniGlare(TEXT("uu.GlareGain"), 0.35f, TEXT("Sprite footprint growth with flux."), ECVF_RenderThreadSafe);
@@ -23,7 +25,11 @@ namespace
 	FIntVector WrappedGroups(uint32 Count, uint32& OutGroupsX)
 	{
 		// Lesson #23: at most 65,535 groups per dimension; wrap into 2D.
+#if UE_VERSION_OLDER_THAN(5, 3, 0)
+		const int32 MaxX = FMath::Max(int32(GRHIMaxDispatchThreadGroupsPerDimension.X), 1);
+#else
 		const int32 MaxX = FMath::Max(GRHIGlobals.MaxDispatchThreadGroupsPerDimension.X, 1);
+#endif
 		const int32 X = FMath::Clamp(int32(Count), 1, MaxX);
 		const int32 Y = FMath::DivideAndRoundUp(FMath::Max(int32(Count), 1), X);
 		OutGroupsX = uint32(X);
@@ -55,6 +61,47 @@ FUniRenderer& FUniRenderer::Get()
 {
 	static FUniRenderer Instance;
 	return Instance;
+}
+
+bool FUniRenderer::ShadersEnabled()
+{
+	return UniShadersEnabled();
+}
+
+bool FUniRenderer::ReadbackPoolBlocking_GameThread(TArray<UniCore::FObjectGPU>& Out, uint32 Num, double TimeoutSeconds)
+{
+	check(IsInGameThread());
+	Out.Reset();
+	if (!UniShadersEnabled() || Num == 0) { return Num == 0; }
+	Num = FMath::Min(Num, UniGpuLayout::PoolCapacity);
+	// Allocated on the calling thread (lesson #24); shared so the render commands keep it alive.
+	TSharedRef<FRHIGPUBufferReadback, ESPMode::ThreadSafe> Rb = MakeShared<FRHIGPUBufferReadback, ESPMode::ThreadSafe>(TEXT("UniPoolParityReadback"));
+	ENQUEUE_RENDER_COMMAND(UniPoolReadback)([Rb, Num](FRHICommandListImmediate& RHICmdList)
+	{
+		FRDGBuilder GraphBuilder(RHICmdList);
+		FRDGBufferRef PoolBuf = FUniRenderer::Get().RegisterPool_RenderThread(GraphBuilder);
+		AddEnqueueCopyPass(GraphBuilder, &Rb.Get(), PoolBuf, Num * UniGpuLayout::ObjectBytes);
+		GraphBuilder.Execute();
+	});
+	const double Start = FPlatformTime::Seconds();
+	std::atomic<bool> bReady{ false };
+	while (!bReady.load() && FPlatformTime::Seconds() - Start < TimeoutSeconds)
+	{
+		ENQUEUE_RENDER_COMMAND(UniPoolReadbackPoll)([Rb, &bReady](FRHICommandListImmediate&) { bReady = Rb->IsReady(); });
+		FlushRenderingCommands();
+		if (!bReady.load()) { FPlatformProcess::Sleep(0.01f); }
+	}
+	if (!bReady.load()) { return false; }
+	Out.SetNumUninitialized(int32(Num));
+	UniCore::FObjectGPU* Dst = Out.GetData();
+	ENQUEUE_RENDER_COMMAND(UniPoolReadbackCopy)([Rb, Dst, Num](FRHICommandListImmediate&)
+	{
+		const void* Src = Rb->Lock(Num * UniGpuLayout::ObjectBytes);   // render thread only (lesson #24)
+		FMemory::Memcpy(Dst, Src, Num * UniGpuLayout::ObjectBytes);
+		Rb->Unlock();
+	});
+	FlushRenderingCommands();
+	return true;
 }
 
 void FUniRenderer::SetFrame_GameThread(FUniFrameData&& Data)
@@ -137,7 +184,7 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 {
 	check(IsInRenderingThread());
 	const FUniFrameData& F = RenderFrame;
-	if (!F.bEnabled || F.Cells.Num() == 0 || !SceneColor.IsValid() || !SceneDepth) { return; }
+	if (!UniShadersEnabled() || !F.bEnabled || F.Cells.Num() == 0 || !SceneColor.IsValid() || !SceneDepth) { return; }
 	RDG_EVENT_SCOPE(GraphBuilder, "UnifiedUniverse");
 
 	FRDGBufferRef PoolBuf = RegisterPool_RenderThread(GraphBuilder);
@@ -303,6 +350,14 @@ void FUniGpuGenBackend::SubmitProbe(std::shared_ptr<UniCore::FGenBatch> Batch)
 	TSharedPtr<FRequest, ESPMode::ThreadSafe> Req = MakeShared<FRequest, ESPMode::ThreadSafe>();
 	Req->Batch = Batch;
 	Req->Probe.StartTime = FPlatformTime::Seconds();
+	if (!UniShadersEnabled())
+	{
+		// uu.Shaders=0: nothing to dispatch. The batch fails closed on its first poll.
+		Batch->bFailed = true;
+		Req->Probe.bCopied = true;
+		Requests.Add(Batch->Ticket, Req);
+		return;
+	}
 	// Allocated HERE, on the calling thread, not in the render command (lesson #24).
 	Req->CountReadback = MakeUnique<FRHIGPUBufferReadback>(TEXT("UniGenCountReadback"));
 	Requests.Add(Batch->Ticket, Req);

@@ -12,6 +12,12 @@
 #include "RenderGraphResources.h"
 #include "UniGpuTypes.h"
 
+/** Escape hatch (uu.Shaders, read-only, set at startup; Docs/BUILD_TRIAGE.md). A global
+ *  shader that fails to compile can stop the editor from starting. With uu.Shaders=0 none of
+ *  this plugin's shaders is compiled, every pass and generation batch is skipped (batches fail
+ *  closed), and the editor opens so the errors can be read and fixed. */
+bool UniShadersEnabled();
+
 namespace UniGpuLayout
 {
 	inline constexpr uint32 ObjectBytes = sizeof(UniCore::FObjectGPU);          // 32
@@ -55,7 +61,7 @@ public:
 		SHADER_PARAMETER(uint32, DispatchGroupsX)
 	END_SHADER_PARAMETER_STRUCT()
 
-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
 	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& P, FShaderCompilerEnvironment& Env)
 	{
 		FGlobalShader::ModifyCompilationEnvironment(P, Env);
@@ -80,7 +86,7 @@ public:
 		SHADER_PARAMETER(uint32, DispatchGroupsX)
 	END_SHADER_PARAMETER_STRUCT()
 
-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
 	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& P, FShaderCompilerEnvironment& Env)
 	{
 		FGlobalShader::ModifyCompilationEnvironment(P, Env);
@@ -102,7 +108,7 @@ public:
 		SHADER_PARAMETER(uint32, NumWrites)
 	END_SHADER_PARAMETER_STRUCT()
 
-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
 	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& P, FShaderCompilerEnvironment& Env)
 	{
 		FGlobalShader::ModifyCompilationEnvironment(P, Env);
@@ -140,7 +146,7 @@ public:
 		SHADER_PARAMETER(float, GlareGain)
 	END_SHADER_PARAMETER_STRUCT()
 
-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
 };
 
 BEGIN_SHADER_PARAMETER_STRUCT(FUniSpriteParameters, )
@@ -165,7 +171,7 @@ public:
 	DECLARE_GLOBAL_SHADER(FUniSpriteVS);
 	SHADER_USE_PARAMETER_STRUCT(FUniSpriteVS, FGlobalShader);
 	using FParameters = FUniSpriteParameters;
-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
 };
 
 class FUniSpritePS : public FGlobalShader
@@ -174,7 +180,7 @@ public:
 	DECLARE_GLOBAL_SHADER(FUniSpritePS);
 	SHADER_USE_PARAMETER_STRUCT(FUniSpritePS, FGlobalShader);
 	using FParameters = FUniSpriteParameters;
-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
 };
 
 BEGIN_SHADER_PARAMETER_STRUCT(FUniSpritePassParameters, )

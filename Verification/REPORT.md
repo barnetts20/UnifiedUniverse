@@ -4,8 +4,8 @@
 
 | | |
 | --- | --- |
-| Commit | `b1222b9` + uncommitted changes (branch `uu/prototype-day1`) |
-| Run | 2026-11-01 12:22 EST, 229 s |
+| Commit | `79eee9c` + uncommitted changes (branch `uu/prototype-day1`) |
+| Run | 2026-11-01 17:50 EST, 260 s |
 | Environment tier reached | Tier 3 offline (Tier 4 static only: no Unreal, no DXC here — see ENVIRONMENT.md) |
 | Checks | 42 run, 42 pass, **0 fail** |
 
@@ -13,11 +13,11 @@
 
 | Check | Result | Criterion | Measured |
 | --- | --- | --- | --- |
-| `T1.build.gcc` | PASS | Harness and UniCore build with g++, -Wall -Wextra -Werror, C++17 | built in 5 s |
+| `T1.build.gcc` | PASS | Harness and UniCore build with g++, -Wall -Wextra -Werror, C++17 | built in 14 s |
 | `T1.build.strict.gpp` | PASS | Every UniCore header as C++20 with -Wall -Wextra -Wshadow -Werror (g++), as the UE modules compile them | clean |
 | `T1.build.strict.clangpp` | PASS | Every UniCore header as C++20 with -Wall -Wextra -Wshadow -Werror (clang++), as the UE modules compile them | clean |
-| `T1.build.clang` | PASS | Harness and UniCore build with clang++, -Wall -Wextra -Werror, C++17 | built in 4 s |
-| `T1.coord.fuzz` | PASS | Coordinate fuzz: UniCoord.h vs UniCoord.ush (via shim) vs __int128, all ops | 1000000 cases x 3 axes, 0 mismatches (2.2 s) |
+| `T1.build.clang` | PASS | Harness and UniCore build with clang++, -Wall -Wextra -Werror, C++17 | built in 11 s |
+| `T1.coord.fuzz` | PASS | Coordinate fuzz: UniCoord.h vs UniCoord.ush (via shim) vs __int128, all ops | 1000000 cases x 3 axes, 0 mismatches (2.1 s) |
 | `T1.coord.edges` | PASS | Targeted edges: borrow chains, root wrap, max magnitude, zero, level shifts, extreme AddDisplacement, hex | 1079 targeted expectations, 0 failed |
 | `T1.coord.hilo` | PASS | ToHiLo relative error <= 2^-46 over the fuzz set | worst relative error 2^-49.00 over 1000000 cases x 3 axes (limit 2^-46), 0 over |
 | `T1.fr` | PASS | f(r) monotonic over 1..2^128 cm in log steps, C1 at r0, inverse exists (within float conditioning) | 12800 samples, 0 non-monotonic; continuous yes, C1 yes; inverse worst rel error 1.11e-05 = 0.67 of its float bound; 2^128 cm maps to 69.0 r0 |
@@ -30,7 +30,7 @@
 | `T1.window.velocity_lod` | PASS | Velocity LOD suspends above 1 cell per K = 4 frames, resumes below 0.8 of that | transitions as specified |
 | `T1.level.coverage` | PASS | L = ceil(log2(R/N_eff)), N_eff = N - 1/K: for random camera offsets in the centre cell, every object with distance <= R is inside its level's window | 240000 trials over N = 1..6 and R = 4 cm..2^123 cm, 0 violations; min N_eff*2^L / R = 1.000002 |
 | `T1.clang.coord_seed` | PASS | clang++ build passes every Tier 1 group (coord, seed, window, level, photometry; quick fuzz 10^5) | 12 checks, failing: none |
-| `T1.coord.oracle` | PASS | Coordinate fuzz vs Python big-int oracle: Sub, ToDouble, ToHiLo, CellOf, Neighbour, AddDisplacement, object-relative (shader core) | 1000000 cases x 3 axes vs Python big-int oracle, 0 mismatches (24 s) |
+| `T1.coord.oracle` | PASS | Coordinate fuzz vs Python big-int oracle: Sub, ToDouble, ToHiLo, CellOf, Neighbour, AddDisplacement, object-relative (shader core) | 1000000 cases x 3 axes vs Python big-int oracle, 0 mismatches (25 s) |
 | `T1.seed.oracle` | PASS | UniSeed vs Python oracle: Avalanche, HashCombine, MixSeed, FRandomStream, CellSeed, ObjectSeed, draws, ChannelId | 2007 cases vs Python oracle (fast HashCombine), 0 mismatches |
 
 ## Tier 2 — generation behaviour
@@ -60,7 +60,7 @@
 | `T3.frames` | PASS | Reference stills written for visual inspection (galaxy interior x2, cosmic web) | still_galaxy_towards_centre: 9904 visible of 367374 resident; still_galaxy_out_of_plane: 1967 visible of 367374 resident; web dm+5: 65 visible of 63829 resident |
 | `T3.flythrough` | PASS | Scripted path 10^28 cm to 1 m from an object: 48-frame contact sheet; objects entering above the fade threshold = 0 (frames 1..N; frame 0 is the initial fill) | 2400 frames, 545902 objects entered residency, 0 above threshold (1% of a just-visible star), 0 with any non-zero intensity; target M = -4.38. [00 3.24 Gpc: 7 vis] [08 123 kpc: 9 vis] [16 14.8 ly: 2553 vis] [24 35.4 AU: 2549 vis] [32 2.004e+05 km: 0 vis] [40 7.4 km: 0 vis] [47 1 m: 0 vis]  |
 | `T3.sensitivity` | PASS | Global sensitivity sweep dm 0 -> +2.5 -> 0: no pops, no level blinks, visible count grows with dm | 120 frames: 3745207 entering objects, 0 pops, 0 level blinks; visible 9918 at dm 0, 259980 at dm +2.5, 9918 back at 0 |
-| `T3.images` | PASS | Reference frames and flythrough contact sheet converted to PNG with HUD (D-018) | 4 PNGs in Verification/images |
+| `T3.images` | PASS | Reference frames and flythrough contact sheet converted to PNG with HUD (D-018) | 8 PNGs in Verification/images |
 
 ## Tier 4 — Unreal integration (static only in this environment)
 
@@ -76,6 +76,10 @@
 - [flythrough_contact_sheet.png](images/flythrough_contact_sheet.png)
 - [still_galaxy_out_of_plane.png](images/still_galaxy_out_of_plane.png)
 - [still_galaxy_towards_centre.png](images/still_galaxy_towards_centre.png)
+- [still_vol_galaxy_edgeon_30kpc.png](images/still_vol_galaxy_edgeon_30kpc.png)
+- [still_vol_galaxy_faceon_60kpc.png](images/still_vol_galaxy_faceon_60kpc.png)
+- [still_vol_interior_out_of_plane.png](images/still_vol_interior_out_of_plane.png)
+- [still_vol_interior_towards_centre.png](images/still_vol_interior_towards_centre.png)
 - [still_web_sensitive_dm5.png](images/still_web_sensitive_dm5.png)
 
 ## Visual inspection
@@ -86,7 +90,7 @@ Written by the session after looking at the images: [OBSERVATIONS.md](OBSERVATIO
 
 - Regressed (PASS → FAIL): none
 - Fixed (FAIL → PASS): none
-- New checks: `T2.stream.fail_closed`
+- New checks: none
 
 ## Not verified here
 

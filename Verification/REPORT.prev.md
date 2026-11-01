@@ -5,19 +5,19 @@
 | | |
 | --- | --- |
 | Commit | `b1222b9` + uncommitted changes (branch `uu/prototype-day1`) |
-| Run | 2026-11-01 12:13 EST, 247 s |
+| Run | 2026-11-01 12:22 EST, 229 s |
 | Environment tier reached | Tier 3 offline (Tier 4 static only: no Unreal, no DXC here — see ENVIRONMENT.md) |
-| Checks | 41 run, 41 pass, **0 fail** |
+| Checks | 42 run, 42 pass, **0 fail** |
 
 ## Tier 1 — core correctness
 
 | Check | Result | Criterion | Measured |
 | --- | --- | --- | --- |
-| `T1.build.gcc` | PASS | Harness and UniCore build with g++, -Wall -Wextra -Werror, C++17 | built in 10 s |
+| `T1.build.gcc` | PASS | Harness and UniCore build with g++, -Wall -Wextra -Werror, C++17 | built in 5 s |
 | `T1.build.strict.gpp` | PASS | Every UniCore header as C++20 with -Wall -Wextra -Wshadow -Werror (g++), as the UE modules compile them | clean |
 | `T1.build.strict.clangpp` | PASS | Every UniCore header as C++20 with -Wall -Wextra -Wshadow -Werror (clang++), as the UE modules compile them | clean |
-| `T1.build.clang` | PASS | Harness and UniCore build with clang++, -Wall -Wextra -Werror, C++17 | built in 8 s |
-| `T1.coord.fuzz` | PASS | Coordinate fuzz: UniCoord.h vs UniCoord.ush (via shim) vs __int128, all ops | 1000000 cases x 3 axes, 0 mismatches (2.1 s) |
+| `T1.build.clang` | PASS | Harness and UniCore build with clang++, -Wall -Wextra -Werror, C++17 | built in 4 s |
+| `T1.coord.fuzz` | PASS | Coordinate fuzz: UniCoord.h vs UniCoord.ush (via shim) vs __int128, all ops | 1000000 cases x 3 axes, 0 mismatches (2.2 s) |
 | `T1.coord.edges` | PASS | Targeted edges: borrow chains, root wrap, max magnitude, zero, level shifts, extreme AddDisplacement, hex | 1079 targeted expectations, 0 failed |
 | `T1.coord.hilo` | PASS | ToHiLo relative error <= 2^-46 over the fuzz set | worst relative error 2^-49.00 over 1000000 cases x 3 axes (limit 2^-46), 0 over |
 | `T1.fr` | PASS | f(r) monotonic over 1..2^128 cm in log steps, C1 at r0, inverse exists (within float conditioning) | 12800 samples, 0 non-monotonic; continuous yes, C1 yes; inverse worst rel error 1.11e-05 = 0.67 of its float bound; 2^128 cm maps to 69.0 r0 |
@@ -30,7 +30,7 @@
 | `T1.window.velocity_lod` | PASS | Velocity LOD suspends above 1 cell per K = 4 frames, resumes below 0.8 of that | transitions as specified |
 | `T1.level.coverage` | PASS | L = ceil(log2(R/N_eff)), N_eff = N - 1/K: for random camera offsets in the centre cell, every object with distance <= R is inside its level's window | 240000 trials over N = 1..6 and R = 4 cm..2^123 cm, 0 violations; min N_eff*2^L / R = 1.000002 |
 | `T1.clang.coord_seed` | PASS | clang++ build passes every Tier 1 group (coord, seed, window, level, photometry; quick fuzz 10^5) | 12 checks, failing: none |
-| `T1.coord.oracle` | PASS | Coordinate fuzz vs Python big-int oracle: Sub, ToDouble, ToHiLo, CellOf, Neighbour, AddDisplacement, object-relative (shader core) | 1000000 cases x 3 axes vs Python big-int oracle, 0 mismatches (25 s) |
+| `T1.coord.oracle` | PASS | Coordinate fuzz vs Python big-int oracle: Sub, ToDouble, ToHiLo, CellOf, Neighbour, AddDisplacement, object-relative (shader core) | 1000000 cases x 3 axes vs Python big-int oracle, 0 mismatches (24 s) |
 | `T1.seed.oracle` | PASS | UniSeed vs Python oracle: Avalanche, HashCombine, MixSeed, FRandomStream, CellSeed, ObjectSeed, draws, ChannelId | 2007 cases vs Python oracle (fast HashCombine), 0 mismatches |
 
 ## Tier 2 — generation behaviour
@@ -48,6 +48,7 @@
 | `T2.gen.slice_draws` | PASS | Magnitude draws stay inside their slice (as stored, half precision) and match the slice's conditional mean | 24 slices x 20,000 draws: 0 outside their slice, 0 with a biased mean; worst Star L71 mean -3.1607 vs -3.1516 (3.2 sigma) |
 | `T2.stream.parity` | PASS | Runtime streamer (probe -> allocate -> place, readback contributors) with the CPU backend reproduces the reference pipeline cell for cell | 5375 cells / 719687 objects compared, 0 differ; galaxy_to_star: 2375 ready cells; flythrough: 3000 ready cells; 43 batches, worst entering-to-ready latency 37 frames, pool peak 361697, 0 alloc failures required (0) |
 | `T2.stream.sensitivity_resize` | PASS | Sensitivity resize keeps resident cells (no interior regeneration) and settles to the reference at the new dm | ready cells 2375 before, 3935 on the resize frame (kept), settled objects 1625782 vs reference 1625782; batches 19 -> 36 |
+| `T2.stream.fail_closed` | PASS | Backend timeouts fail closed: affected cells are not drawn and release their ranges; no unwritten slot is ever drawn | 6 batches failed on purpose, 749 cells failed closed, 257418 slots drawn, 0 of them unwritten |
 
 ## Tier 3 — rendering behaviour
 
@@ -85,7 +86,7 @@ Written by the session after looking at the images: [OBSERVATIONS.md](OBSERVATIO
 
 - Regressed (PASS → FAIL): none
 - Fixed (FAIL → PASS): none
-- New checks: `T3.sensitivity`, `T2.stream.sensitivity_resize`
+- New checks: `T2.stream.fail_closed`
 
 ## Not verified here
 
