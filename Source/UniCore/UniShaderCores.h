@@ -20,6 +20,7 @@ namespace UniHlsl
 #include "UniPhotometry.ush"
 #include "UniFields.ush"
 #include "UniPlacement.ush"
+#include "UniProject.ush"
 }
 
 #include "UniCoord.h"

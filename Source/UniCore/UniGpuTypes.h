@@ -89,8 +89,9 @@ namespace UniCore
 		float RadiusModel[4];            // log10 R = x + y (M - z) + w (2u - 1)
 		float ColourModel[4];            // log10 T = x + y (M - z) + w (2u - 1)
 		uint32_t ChildFlags;             // UNI_OBJ_FLAG_* set on every child (extended, has-contributor)
-		float SurfaceBrightnessOffset;   // SB = M + offset (extended sources)
-		uint32_t Pad[2];
+		uint32_t Pad;
+		float BrightM;                   // slice magnitude interval: draws are clamped to it (D-117)
+		float FaintM;
 	};
 	static_assert(sizeof(FSliceGPU) == 64, "FSliceGPU must match FUniSlice (UniGen.usf)");
 }

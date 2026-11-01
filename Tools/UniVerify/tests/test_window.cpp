@@ -163,7 +163,7 @@ UNI_TEST(level, coverage)
 		{
 			const double LogR = 2.0 + R.Unit() * 120.0;            // R from 4 cm to 2^122 cm
 			const double Rel = std::ldexp(1.0, int(LogR)) * (1.0 + R.Unit());
-			const int L = LevelForRelevance(Rel, N);
+			const int L = LevelForRelevance(Rel, double(N) - 1.0 / UniHlsl::UNI_VELOCITY_LOD_K);
 			// Camera: random point; object: random direction at distance in [0, R].
 			FCoord Cam = FCoord::FromOriginOffset(i64(R.U32()) << 20, -(i64(R.U32()) << 10), i64(R.U32()));
 			FVec3f Fr;
@@ -181,11 +181,11 @@ UNI_TEST(level, coverage)
 			const bool Inside = InWindow(G, CellOf(Obj, L));
 			++Trials;
 			if (!Inside) { ++Violations; }
-			MinSlack = std::min(MinSlack, std::ldexp(double(N), L) / Rel);
+			MinSlack = std::min(MinSlack, std::ldexp(double(N) - 1.0 / UniHlsl::UNI_VELOCITY_LOD_K, L) / Rel);
 		}
 	}
-	Uni::Check(1, "T1.level.coverage", "L = ceil(log2(R/N)): for random camera offsets in the centre cell, every object with distance <= R is inside its level's window")
+	Uni::Check(1, "T1.level.coverage", "L = ceil(log2(R/N_eff)), N_eff = N - 1/K: for random camera offsets in the centre cell, every object with distance <= R is inside its level's window")
 		.Metric("trials", double(Trials)).Metric("violations", double(Violations)).Metric("min_coverage_over_R", MinSlack)
 		.Pass(Violations == 0 && MinSlack >= 1.0,
-			Uni::Fmt("%lld trials over N = 1..6 and R = 4 cm..2^123 cm, %lld violations; min N*2^L / R = %.6f", Trials, Violations, MinSlack));
+			Uni::Fmt("%lld trials over N = 1..6 and R = 4 cm..2^123 cm, %lld violations; min N_eff*2^L / R = %.6f", Trials, Violations, MinSlack));
 }

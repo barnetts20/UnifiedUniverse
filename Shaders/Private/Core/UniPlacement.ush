@@ -205,11 +205,18 @@ UNI_FN float Uni_LutSample(StructuredBuffer<float> InLut, uint InBase, uint InCo
 }
 
 /** Absolute magnitude for an object of a luminosity slice: the inverse CDF evaluated at a
- *  uniform draw restricted to the slice's CDF interval [InCdfLo, InCdfHi). */
-UNI_FN float Uni_DrawAbsMag(uint InObjectSeed, float InCdfLo, float InCdfHi, StructuredBuffer<float> InInvCdf, uint InBase, uint InCount)
+ *  uniform draw restricted to the slice's CDF interval [InCdfLo, InCdfHi), then CLAMPED to the
+ *  slice's magnitude interval (D-117). The clamp is what guarantees level coverage: a LUT
+ *  interpolates, and an interpolated magnitude brighter than the slice's bright bound would be
+ *  visible beyond its level's window, which is a pop. The bright bound carries a margin of one
+ *  half-float step (the record stores M as half; rounding to nearest moves it by at most half a
+ *  step, 0.008 mag for |M| < 32). */
+UNI_FN float Uni_DrawAbsMag(uint InObjectSeed, float InCdfLo, float InCdfHi, float InBrightM, float InFaintM,
+	StructuredBuffer<float> InInvCdf, uint InBase, uint InCount)
 {
 	const float U = Uni_DrawUnit(InObjectSeed, UNI_CH_MAG, 0u);
-	return Uni_LutSample(InInvCdf, InBase, InCount, InCdfLo + U * (InCdfHi - InCdfLo));
+	const float M = Uni_LutSample(InInvCdf, InBase, InCount, InCdfLo + U * (InCdfHi - InCdfLo));
+	return clamp(M, InBrightM + 0.016f, max(InFaintM, InBrightM + 0.016f));
 }
 
 /** log2 of physical radius in cm: log10 R = A + B (M - M0) + S (2u - 1). */
@@ -226,6 +233,14 @@ UNI_FN float3 Uni_DrawColour(uint InObjectSeed, float InAbsMag, float4 InColourM
 	const float U = Uni_DrawUnit(InObjectSeed, UNI_CH_COLOUR, 0u);
 	const float Log10T = InColourModel.x + InColourModel.y * (InAbsMag - InColourModel.z) + InColourModel.w * (2.0f * U - 1.0f);
 	return Uni_TemperatureColour(pow(10.0f, Log10T));
+}
+
+/** Surface brightness of an extended source, mag / arcsec^2 (distance independent):
+ *  mu = M + 2.5 log10(pi theta^2), theta = angular radius at 10 pc in arcsec. */
+UNI_FN float Uni_SurfaceBrightness(float InAbsMag, float InRadiusLog2)
+{
+	// 5 log10(theta) = 5 (log2(R) log10(2) - log10(10 pc) + log10(206264.8)); 2.5 log10(pi) = 1.2429.
+	return InAbsMag + 5.0f * (InRadiusLog2 * 0.30103f - 19.48935f + 5.31443f) + 1.24287f;
 }
 
 UNI_FN FUniObject Uni_MakeObject(uint3 InOffset, uint InArchetypeId, uint InFlags, uint InSeed, float InRadiusLog2,

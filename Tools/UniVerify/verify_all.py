@@ -314,6 +314,17 @@ def main():
         except OSError:
             pass
 
+    render_dir = os.path.join(WORK, "render")
+    if os.path.isdir(render_dir):
+        for f in os.listdir(IMAGES):
+            if f.endswith(".png"):
+                os.remove(os.path.join(IMAGES, f))
+        code, out, _ = run([sys.executable, "-I", os.path.join(HERE, "scripts", "make_images.py"), render_dir, IMAGES])
+        open(os.path.join(WORK, "images.log"), "w").write(out)
+        n = len([f for f in os.listdir(IMAGES) if f.endswith(".png")])
+        add(results, 3, "T3.images", "Reference frames and flythrough contact sheet converted to PNG with HUD (D-018)", code == 0 and n >= 4,
+            f"{n} PNGs in Verification/images" if code == 0 else out[-300:], {"pngs": n})
+
     lint_cores(results)
     lint_gpu_structs(results)
     lint_ue_rules(results)

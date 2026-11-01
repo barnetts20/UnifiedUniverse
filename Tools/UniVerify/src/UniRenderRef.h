@@ -1,0 +1,226 @@
+#pragma once
+
+// UniRenderRef.h
+// CPU reference renderer for Tier 3. Projects every resident object through the shared
+// project-and-cull core (UniProject.ush) exactly as the GPU pass will, splats sprites, draws
+// promoted bodies as true-scale spheres into a "main pass" colour + distance buffer, and
+// applies the sprite pixel shader's scene-depth test (Uni_SceneDepthKeep). Verification only.
+
+#include "UniGenRef.h"
+#include "UniScaleLadder.h"
+#include "UniShaderCores.h"
+
+#include <cmath>
+#include <cstdio>
+#include <limits>
+#include <map>
+#include <string>
+#include <vector>
+
+namespace UniRender
+{
+	using namespace UniCore;
+	namespace H = UniHlsl;
+
+	struct FV3 { double X = 0, Y = 0, Z = 0; };
+	inline FV3 operator+(FV3 A, FV3 B) { return { A.X + B.X, A.Y + B.Y, A.Z + B.Z }; }
+	inline FV3 operator-(FV3 A, FV3 B) { return { A.X - B.X, A.Y - B.Y, A.Z - B.Z }; }
+	inline FV3 operator*(FV3 A, double S) { return { A.X * S, A.Y * S, A.Z * S }; }
+	inline double Dot(FV3 A, FV3 B) { return A.X * B.X + A.Y * B.Y + A.Z * B.Z; }
+	inline FV3 Cross(FV3 A, FV3 B) { return { A.Y * B.Z - A.Z * B.Y, A.Z * B.X - A.X * B.Z, A.X * B.Y - A.Y * B.X }; }
+	inline FV3 Norm(FV3 A) { const double L = std::sqrt(Dot(A, A)); return A * (1.0 / L); }
+
+	struct FCamera
+	{
+		FCoord Coord;
+		FVec3f Frac;
+		FV3 Forward{ 1, 0, 0 }, Right{ 0, 1, 0 }, Up{ 0, 0, 1 };
+		double FovX = 1.5707963267948966;   // 90 degrees
+		int Width = 960, Height = 540;
+		double DeltaMag = 0.0;
+
+		void LookAlong(FV3 F, FV3 WorldUp = { 0, 0, 1 })
+		{
+			Forward = Norm(F);
+			if (std::fabs(Dot(Forward, WorldUp)) > 0.99) { WorldUp = { 0, 1, 0 }; }
+			Right = Norm(Cross(Forward, WorldUp));
+			Up = Cross(Right, Forward);
+		}
+		double TanX() const { return std::tan(FovX * 0.5); }
+		double TanY() const { return TanX() * double(Height) / double(Width); }
+		double FocalPx() const { return double(Width) * 0.5 / TanX(); }
+
+		H::FUniView View() const
+		{
+			H::FUniView V;
+			V.Forward = H::float3(float(Forward.X), float(Forward.Y), float(Forward.Z));
+			V.Right = H::float3(float(Right.X), float(Right.Y), float(Right.Z));
+			V.Up = H::float3(float(Up.X), float(Up.Y), float(Up.Z));
+			V.TanHalfFovX = float(TanX());
+			V.TanHalfFovY = float(TanY());
+			V.LimitingMag = H::Uni_LimitingMag(float(DeltaMag));
+			V.SurfaceLimit = H::UNI_MU_REF + float(DeltaMag);
+			V.CameraFraction = H::float3(Frac.X, Frac.Y, Frac.Z);
+			V.ExposureMag = V.LimitingMag - 1.0f;
+			V.ThetaPixel = float(1.0 / FocalPx());
+			V.GlareGain = 0.35f;
+			V.Pad = 0.0f;
+			return V;
+		}
+	};
+
+	/** Exact two's-complement cell delta CellOrigin - Camera, as the CPU uploads it (D-104). */
+	inline void CellDelta(const FCellKey& K, const FCoord& Cam, H::uint4 Out[3])
+	{
+		const FDelta D = Sub(CellOrigin(K), Cam);
+		for (int A = 0; A < 3; ++A) { Out[A] = ToUint4(D.TwosComplement(A)); }
+	}
+
+	struct FImage
+	{
+		int W = 0, H = 0;
+		std::vector<float> Rgb;          // HDR, exposure units
+		std::vector<double> SceneDist;   // main-pass true distance per pixel (inf = sky)
+		FImage(int InW, int InH) : W(InW), H(InH), Rgb(size_t(InW) * InH * 3, 0.0f), SceneDist(size_t(InW) * InH, std::numeric_limits<double>::infinity()) {}
+
+		void Add(int X, int Y, float R, float G, float B)
+		{
+			if (X < 0 || Y < 0 || X >= W || Y >= H) { return; }
+			float* P = &Rgb[(size_t(Y) * W + X) * 3];
+			P[0] += R; P[1] += G; P[2] += B;
+		}
+
+		/** Tonemapped PPM: 1 - exp(-I), sRGB-ish gamma. */
+		bool WritePpm(const std::string& Path) const
+		{
+			FILE* F = std::fopen(Path.c_str(), "wb");
+			if (!F) { return false; }
+			std::fprintf(F, "P6\n%d %d\n255\n", W, H);
+			std::vector<unsigned char> Row(size_t(W) * 3);
+			for (int Y = 0; Y < H; ++Y)
+			{
+				for (int X = 0; X < W * 3; ++X)
+				{
+					const double V = 1.0 - std::exp(-double(Rgb[size_t(Y) * W * 3 + X]));
+					Row[size_t(X)] = (unsigned char)std::lround(255.0 * std::pow(std::max(0.0, std::min(1.0, V)), 1.0 / 2.2));
+				}
+				std::fwrite(Row.data(), 1, Row.size(), F);
+			}
+			std::fclose(F);
+			return true;
+		}
+	};
+
+	struct FFrameStats
+	{
+		size_t Resident = 0, Visible = 0, Promoted = 0, Occluded = 0;
+		std::map<int, size_t> VisibleByLevel;
+		double BrightestMag = 99.0;
+	};
+
+	/** Sprite splat: a normalised Gaussian whose sigma is the sprite's angular radius in pixels
+	 *  (at least ~0.6 px), so the total deposited equals the sprite's radiance. */
+	inline bool Splat(FImage& Img, const FCamera& Cam, const H::FUniSprite& S)
+	{
+		const double Px = (double(S.NdcX) * 0.5 + 0.5) * Img.W;
+		const double Py = (0.5 - double(S.NdcY) * 0.5) * Img.H;
+		const double Sigma = std::max(0.6, double(S.AngularRadius) * Cam.FocalPx() * 0.5);
+		// Kernel radius: out to where the Gaussian tail falls below 1e-3 exposure units, so a
+		// saturated bright star is not truncated into a square. Capped at 160 px.
+		const double Peak = double(std::max(S.Radiance.x, std::max(S.Radiance.y, S.Radiance.z))) / (6.283185307179586 * Sigma * Sigma);
+		const double Reach = Sigma * std::sqrt(2.0 * std::log(std::max(Peak / 1.0e-3, 2.0)));
+		const int Rad = int(std::min(160.0, std::ceil(std::max(3.0 * Sigma, Reach))));
+		const int Cx = int(std::floor(Px)), Cy = int(std::floor(Py));
+		// Scene-depth test at the sprite centre pixel, as the pixel shader does per pixel.
+		bool bAnyKept = false;
+		double Norm = 0.0;
+		for (int Dy = -Rad; Dy <= Rad; ++Dy) for (int Dx = -Rad; Dx <= Rad; ++Dx)
+		{
+			const double Ex = (Cx + Dx + 0.5) - Px, Ey = (Cy + Dy + 0.5) - Py;
+			Norm += std::exp(-(Ex * Ex + Ey * Ey) / (2 * Sigma * Sigma));
+		}
+		for (int Dy = -Rad; Dy <= Rad; ++Dy) for (int Dx = -Rad; Dx <= Rad; ++Dx)
+		{
+			const int X = Cx + Dx, Y = Cy + Dy;
+			if (X < 0 || Y < 0 || X >= Img.W || Y >= Img.H) { continue; }
+			if (!H::Uni_SceneDepthKeep(S.TrueDistance, float(std::min(Img.SceneDist[size_t(Y) * Img.W + X], 3.0e38)))) { continue; }
+			const double Ex = (X + 0.5) - Px, Ey = (Y + 0.5) - Py;
+			const double Wt = std::exp(-(Ex * Ex + Ey * Ey) / (2 * Sigma * Sigma)) / Norm;
+			Img.Add(X, Y, float(S.Radiance.x * Wt), float(S.Radiance.y * Wt), float(S.Radiance.z * Wt));
+			bAnyKept = true;
+		}
+		return bAnyKept;
+	}
+
+	/** True-scale sphere into the main pass (colour + distance), by ray casting in double from
+	 *  the exact camera-relative centre. */
+	inline void DrawPromotedSphere(FImage& Img, const FCamera& Cam, FV3 Centre, double Radius, H::float3 Rgb)
+	{
+		const double Dist = std::sqrt(Dot(Centre, Centre));
+		if (Dist <= Radius) { return; }
+		const double Ang = std::asin(Radius / Dist);
+		const FV3 Dir = Centre * (1.0 / Dist);
+		const double Fz = Dot(Dir, Cam.Forward);
+		if (Fz <= std::cos(Cam.FovX)) { return; }
+		const double Nx = Dot(Dir, Cam.Right) / (Fz * Cam.TanX()), Ny = Dot(Dir, Cam.Up) / (Fz * Cam.TanY());
+		const double Px = (Nx * 0.5 + 0.5) * Img.W, Py = (0.5 - Ny * 0.5) * Img.H;
+		const double RadPx = std::tan(Ang) * Cam.FocalPx() / std::max(Fz, 1e-3) + 2.0;
+		const int X0 = std::max(0, int(Px - RadPx)), X1 = std::min(Img.W - 1, int(Px + RadPx));
+		const int Y0 = std::max(0, int(Py - RadPx)), Y1 = std::min(Img.H - 1, int(Py + RadPx));
+		for (int Y = Y0; Y <= Y1; ++Y) for (int X = X0; X <= X1; ++X)
+		{
+			const double Ndx = ((X + 0.5) / Img.W - 0.5) * 2.0 * Cam.TanX(), Ndy = (0.5 - (Y + 0.5) / Img.H) * 2.0 * Cam.TanY();
+			const FV3 Ray = Norm(Cam.Forward + Cam.Right * Ndx + Cam.Up * Ndy);
+			const double B = Dot(Ray, Centre);
+			const double C = Dot(Centre, Centre) - Radius * Radius;
+			const double Disc = B * B - C;
+			if (Disc < 0.0 || B <= 0.0) { continue; }
+			const double T = B - std::sqrt(Disc);
+			double& Sd = Img.SceneDist[size_t(Y) * Img.W + X];
+			if (T < Sd)
+			{
+				Sd = T;
+				float* P = &Img.Rgb[(size_t(Y) * Img.W + X) * 3];
+				P[0] = Rgb.x * 4.0f; P[1] = Rgb.y * 4.0f; P[2] = Rgb.z * 4.0f;   // emissive body, overwrites
+			}
+		}
+	}
+
+	/** Render every resident object of a pipeline. Promotion is immediate in the reference (the
+	 *  GPU path has 1-2 frames of readback latency, covered by the deferred handoff, UE-5). */
+	inline FFrameStats RenderFrame(const FRefPipeline& P, const FCamera& Cam, FImage& Img)
+	{
+		FFrameStats St;
+		const H::FUniView V = Cam.View();
+		struct FPending { H::FUniSprite S; int Level; };
+		std::vector<FPending> Sprites;
+		P.ForEachResident([&](const FCellKey& K, const FObjectGPU& O, float Fade, u64)
+		{
+			++St.Resident;
+			H::uint4 D[3];
+			CellDelta(K, Cam.Coord, D);
+			const H::FUniSprite S = H::Uni_ProjectObject(D[0], D[1], D[2], u32(K.Level), Fade, UniCore::ToHlsl(O), V, false);
+			if (S.Flags & H::UNI_SPRITE_PROMOTE_CANDIDATE)
+			{
+				// Main pass: point-like bodies as true-scale spheres; extended objects hand off to
+				// volumetrics (not in the prototype), so they draw nothing here.
+				if (!((O.A[3] >> 16) & H::UNI_OBJ_FLAG_EXTENDED))
+				{
+					const u32 Off[3] = { O.A[0], O.A[1], O.A[2] };
+					const FVec3d Rel = ToDouble(Sub(ObjectCoord(K, Off), Cam.Coord));
+					const FV3 C{ Rel.X - Cam.Frac.X, Rel.Y - Cam.Frac.Y, Rel.Z - Cam.Frac.Z };
+					DrawPromotedSphere(Img, Cam, C, std::exp2(double(H::Uni_ObjectRadiusLog2(UniCore::ToHlsl(O)))), H::Uni_UnpackColour(O.B[3]));
+				}
+				++St.Promoted;
+				return;
+			}
+			if (S.Flags & H::UNI_SPRITE_VISIBLE) { Sprites.push_back({ S, K.Level }); }
+		});
+		for (const FPending& Sp : Sprites)
+		{
+			if (Splat(Img, Cam, Sp.S)) { ++St.Visible; ++St.VisibleByLevel[Sp.Level]; }
+			else { ++St.Occluded; }
+		}
+		return St;
+	}
+}

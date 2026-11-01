@@ -66,7 +66,7 @@ namespace UniCore
 		std::vector<double> Pdf;          // relative density at uniformly spaced M, MMin..MMax
 		std::vector<double> Cdf;          // derived, same grid
 		std::vector<float> InvCdf;        // derived, kInvCdfSize entries uniform in u
-		static constexpr int kInvCdfSize = 512;
+		static constexpr int kInvCdfSize = 4096;
 
 		/** From (M, log10 phi) control points, piecewise linear in log phi, sampled finely. */
 		static FMagnitudeLut FromLogControlPoints(const std::vector<std::pair<double, double>>& Points, int Samples = 2049)
@@ -209,6 +209,13 @@ namespace UniCore
 		int Level = 0;
 		double P = 0.0;         // fraction of children whose relevance maps to this level
 		double CdfLo = 0.0, CdfHi = 0.0;
+		double BrightM = 0.0, FaintM = 0.0;   // magnitude interval of the slice (D-117)
+		/** The slice's OWN inverse CDF, kSliceLut entries uniform in u over [0, 1] (D-117). A
+		 *  global table cannot resolve bright slices: L69's CDF interval is narrower than one
+		 *  step of a 512-entry global table, which drew its stars up to 5 mag too bright. */
+		std::vector<float> InvCdf;
+		double MeanM = 0.0;                   // analytic conditional mean, for tests
+		static constexpr int kSliceLut = 64;
 	};
 
 	struct FSliceTable
@@ -338,14 +345,55 @@ namespace UniCore
 				PrevLevel = L;
 				FSlice& S = ByLevel[L];
 				const double C0 = A.AbsMag.Cdf[I], C1 = A.AbsMag.Cdf[I + 1];
-				if (S.P == 0.0) { S.Level = L; S.CdfLo = C0; }
+				if (S.P == 0.0) { S.Level = L; S.CdfLo = C0; S.BrightM = M0; }
 				S.CdfHi = C1;
+				S.FaintM = M1;
 				S.P += C1 - C0;
 			}
-			for (auto It = ByLevel.rbegin(); It != ByLevel.rend(); ++It) { T.Slices.push_back(It->second); T.PSum += It->second.P; }
+			for (auto It = ByLevel.rbegin(); It != ByLevel.rend(); ++It)
+			{
+				FSlice S = It->second;
+				BuildSliceLut(A.AbsMag, S);
+				T.Slices.push_back(S);
+				T.PSum += S.P;
+			}
 			T.LMin = ByLevel.begin()->first;
 			T.LMax = ByLevel.rbegin()->first;
 			Slices[Id] = T;
+		}
+
+		/** Per-slice inverse CDF over [BrightM, FaintM], from the fine PDF grid. */
+		static void BuildSliceLut(const FMagnitudeLut& Lut, FSlice& S)
+		{
+			// Fine local CDF over the slice: 1024 sub-steps with linearly interpolated PDF.
+			const int Sub = 1024;
+			std::vector<double> Ms(Sub + 1), Cs(Sub + 1, 0.0);
+			auto PdfAt = [&](double M)
+			{
+				const double T = std::clamp((M - Lut.MMin) / (Lut.MMax - Lut.MMin), 0.0, 1.0) * double(Lut.Pdf.size() - 1);
+				const size_t I = std::min(size_t(T), Lut.Pdf.size() - 2);
+				return Lut.Pdf[I] + (T - double(I)) * (Lut.Pdf[I + 1] - Lut.Pdf[I]);
+			};
+			double MeanAcc = 0.0;
+			for (int I = 0; I <= Sub; ++I) { Ms[size_t(I)] = S.BrightM + (S.FaintM - S.BrightM) * double(I) / Sub; }
+			for (int I = 1; I <= Sub; ++I)
+			{
+				const double Pm = PdfAt(0.5 * (Ms[size_t(I)] + Ms[size_t(I) - 1]));
+				Cs[size_t(I)] = Cs[size_t(I) - 1] + Pm;
+				MeanAcc += Pm * 0.5 * (Ms[size_t(I)] + Ms[size_t(I) - 1]);
+			}
+			const double Total = Cs[size_t(Sub)];
+			S.MeanM = MeanAcc / Total;
+			S.InvCdf.resize(FSlice::kSliceLut);
+			size_t K = 0;
+			for (int I = 0; I < FSlice::kSliceLut; ++I)
+			{
+				const double U = double(I) / double(FSlice::kSliceLut - 1) * Total;
+				while (K + 1 < size_t(Sub) && Cs[K + 1] < U) { ++K; }
+				const double Span = Cs[K + 1] - Cs[K];
+				const double T = Span > 0.0 ? std::clamp((U - Cs[K]) / Span, 0.0, 1.0) : 0.0;
+				S.InvCdf[size_t(I)] = float(Ms[K] + T * (Ms[K + 1] - Ms[K]));
+			}
 		}
 
 		double RelevanceNoCache(const FArchetype& A, double M) const

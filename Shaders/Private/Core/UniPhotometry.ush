@@ -68,11 +68,20 @@ UNI_FN float Uni_LimitingMag(float InDeltaMag)
 	return UNI_M_REF + clamp(InDeltaMag, UNI_DM_MIN, UNI_DM_MAX);
 }
 
-/** N_L = min(ceil(N * k), N_max). */
+/** Effective half-width used for level assignment: N - 1/K (D-118). A window lags the camera
+ *  by one frame of motion, and velocity LOD bounds that motion to w / K for any active level,
+ *  so an entering cell can be up to w / K closer than N cells. Assigning levels with N - 1/K
+ *  makes entering objects lie beyond their relevance radius anyway: they stream in where they
+ *  are already invisible, which is the design's no-pop claim, now actually true. */
+static const float UNI_WINDOW_N_EFF = 1.75f;   // UNI_WINDOW_N - 1 / UNI_VELOCITY_LOD_K
+
+/** N_L = min(ceil(N_eff * k + 1/K), N_max): equals N at dm = 0 and keeps the same motion slack
+ *  when sensitivity scales every relevance radius by k. */
 UNI_FN int Uni_WindowHalfWidth(float InDeltaMag)
 {
 	const float K = Uni_SensitivityScale(InDeltaMag);
-	return min((int)ceil((float)UNI_WINDOW_N * K - 1.0e-5f), UNI_WINDOW_N_MAX);
+	const float Need = UNI_WINDOW_N_EFF * K + 1.0f / (float)UNI_VELOCITY_LOD_K;
+	return min((int)ceil(Need - 1.0e-5f), UNI_WINDOW_N_MAX);
 }
 
 /** Render-only visibility fade: 1 at m <= m_lim - band, 0 at m >= m_lim (lesson #12). */

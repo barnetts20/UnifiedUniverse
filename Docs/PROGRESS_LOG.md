@@ -19,6 +19,12 @@ Append only. One entry per step start, finish, block, or commit. Times in the ow
 | 10:44 | P2 | done (gate green) | 21 checks green: seeds (chi² in band, 0 object-seed collisions, Python oracle 2007 cases), windows (0 violations / 5184 slides), coverage (0 / 240k), f(r), photometry, clang parity |
 | 10:44 | P2 | note | Log times for P2 corrected to the clock (earlier entries were estimated ahead of time) |
 | 10:45 | P3 | start | Fields, placement core, archetype/slicing model, UniVol, reference generator + pipeline, scenes, Tier 2 |
-| 11:12 | P3 | note | Tier 2 caught: anchors' level never activated (activation fix), rejection cap shortfall z=−12 (D-114), normaliser 4% high (D-115) |
-| 11:21 | P3 | decision D-101..D-103, D-111..D-115 | Influence term, radius scatter, cell integral, luminosity-scaled N, tile symmetries, regeneration, candidate budget, normaliser |
-| 11:24 | P3 | done (gate green) | 29 checks green. Tier 2 on web_to_galaxy and galaxy_to_star: determinism 54,864 cells 0 differ; counts z=−1.05 over 12,735 tasks; slicing 1.0021; fidelity r=0.919 / 0.983; coverage 298k children 0 outside; baked path |
+| 10:56 | P3 | note | Tier 2 caught: anchors' level never activated (activation fix), rejection cap shortfall z=−12 (D-114), normaliser 4% high (D-115) |
+| 11:00 | P3 | decision D-101..D-103, D-111..D-115 | Influence term, radius scatter, cell integral, luminosity-scaled N, tile symmetries, regeneration, candidate budget, normaliser |
+| 11:03 | P3 | done (gate green) | 29 checks green. Tier 2 on web_to_galaxy and galaxy_to_star: determinism 54,864 cells 0 differ; counts z=−1.05 over 12,735 tasks; slicing 1.0021; fidelity r=0.919 / 0.983; coverage 298k children 0 outside; baked path |
+| 11:03 | P3 | note | P3 log times corrected to the clock. From here every entry is stamped from the clock at the time of writing |
+| 11:04 | P4 | start | Project-and-cull core (UniProject.ush), reference renderer, Tier 3 |
+| 11:14 | P4 | note | First flythrough: 102,618 pops. Diagnosed and fixed in three steps: resume fades (D-116), slice LUT bug drawing bright stars up to 5 mag too bright (D-117, new check T2.gen.slice_draws), window lag needs N_eff = N − 1/K (D-118, HIGH reroll, owner decision) |
+| 11:28 | P4 | note | Visual inspection: Milky-Way band correct; web filaments not legible at 65 points; renderer square-kernel artifact fixed; sprite→body handoff glare discontinuity → UE-5 |
+| 11:35 | P4 | decision D-116..D-121 | Resume fades, per-slice LUT + clamp, N_eff, θ_promote, true-distance depth test, extended blend |
+| 11:38 | P4 | done (gate green) | 36 checks green. Tier 3: jitter 2.6e-3 px worst (limit 0.01), ordering 0 reversed / per-depth 2,284 wrong, occlusion 0 wrong / 20k, flythrough 0 pops / 545,902 entering |

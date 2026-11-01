@@ -85,7 +85,7 @@ UNI_TEST(photometry, magnitudes)
 		if (Ref >= MLim && IGot != 0.0) { ++FadeBad; }                  // invisible at and past m_lim
 		if (Ref <= MLim - 0.5 && H::Uni_MagFade(float(Ref), float(MLim)) != 1.0f) { ++FadeBad; }
 	}
-	// Window growth: N_L = min(ceil(N k), N_max): exactly N at dm = 0, N_max at dm = +5.
+	// Window growth: N_L = min(ceil(N_eff k + 1/K), N_max): exactly N at dm = 0, N_max at dm = +5.
 	const bool Win = H::Uni_WindowHalfWidth(0.0f) == 2 && H::Uni_WindowHalfWidth(5.0f) == 6 && H::Uni_WindowHalfWidth(1.0f) == 4
 		&& H::Uni_WindowHalfWidth(-5.0f) == 1;
 	// Relevance and level inverse: AbsMagForRelevance(RelevanceFlux(M)) == M.

@@ -4,36 +4,83 @@
 
 | | |
 | --- | --- |
-| Commit | `0f60608` + uncommitted changes (branch `uu/prototype-day1`) |
-| Run | 2026-11-01 11:01 EST, 5 s |
-| Environment tier reached | Tier 0 offline (Tier 4 static only: no Unreal, no DXC here — see ENVIRONMENT.md) |
-| Checks | 6 run, 4 pass, **2 fail** |
+| Commit | `6a292b8` + uncommitted changes (branch `uu/prototype-day1`) |
+| Run | 2026-11-01 11:34 EST, 220 s |
+| Environment tier reached | Tier 3 offline (Tier 4 static only: no Unreal, no DXC here — see ENVIRONMENT.md) |
+| Checks | 36 run, 36 pass, **0 fail** |
 
 ## Tier 1 — core correctness
 
 | Check | Result | Criterion | Measured |
 | --- | --- | --- | --- |
-| `T1.build.gcc` | FAIL | Harness and UniCore build with g++, -Wall -Wextra -Werror, C++17 | BUILD FAILED: /home/claude/uu/Plugins/UnifiedUniverse/Tools/UniVerify/tests/test_gen.cpp:227:37: error: unused variable ‘PUsed’ [-Werror=unused-variable] | cc1plus: all warnings being treated as errors | gmake[2]: *** [CMakeFiles/univerify.dir/build.make:146: CMakeFiles/univerify.dir/tests/test_gen.cpp.o] Error 1 | gmake[1]: *** [CMakeFiles/Makefile2:83: CMakeFiles/univerify.dir/all] Error 2 | gmake: *** [Makefile:91: all] Error 2 |
-| `T1.build.clang` | FAIL | Harness and UniCore build with clang++, -Wall -Wextra -Werror, C++17 | BUILD FAILED: /home/claude/uu/Plugins/UnifiedUniverse/Tools/UniVerify/tests/test_gen.cpp:227:30: error: unused variable 'PUsed' [-Werror,-Wunused-variable] | 1 error generated. | gmake[2]: *** [CMakeFiles/univerify.dir/build.make:146: CMakeFiles/univerify.dir/tests/test_gen.cpp.o] Error 1 | gmake[1]: *** [CMakeFiles/Makefile2:83: CMakeFiles/univerify.dir/all] Error 2 | gmake: *** [Makefile:91: all] Error 2 |
+| `T1.build.gcc` | PASS | Harness and UniCore build with g++, -Wall -Wextra -Werror, C++17 | built in 10 s |
+| `T1.build.clang` | PASS | Harness and UniCore build with clang++, -Wall -Wextra -Werror, C++17 | built in 8 s |
+| `T1.coord.fuzz` | PASS | Coordinate fuzz: UniCoord.h vs UniCoord.ush (via shim) vs __int128, all ops | 1000000 cases x 3 axes, 0 mismatches (2.2 s) |
+| `T1.coord.edges` | PASS | Targeted edges: borrow chains, root wrap, max magnitude, zero, level shifts, extreme AddDisplacement, hex | 1079 targeted expectations, 0 failed |
+| `T1.coord.hilo` | PASS | ToHiLo relative error <= 2^-46 over the fuzz set | worst relative error 2^-49.00 over 1000000 cases x 3 axes (limit 2^-46), 0 over |
+| `T1.fr` | PASS | f(r) monotonic over 1..2^128 cm in log steps, C1 at r0, inverse exists (within float conditioning) | 12800 samples, 0 non-monotonic; continuous yes, C1 yes; inverse worst rel error 1.11e-05 = 0.67 of its float bound; 2^128 cm maps to 69.0 r0 |
+| `T1.photometry` | PASS | Apparent magnitude, fade band and sensitivity k = 10^(dm/5) match closed form (1e-6, condition-aware) | 200k samples: worst m err 3.72e-07 of term size, k rel err 2.47e-07, intensity rel err 6.65e-05, fade violations 0; window N(dm) ok; relevance inverse err 3.6e-15 |
+| `T1.seed.channels` | PASS | Shader channel constants equal ChannelId(name), all distinct, runtime form case-insensitive | 14 channels, 0 problems |
+| `T1.seed.quality` | PASS | Chi-squared over 64 bins within the 99% band for sequential inputs (Avalanche/MixSeed/CellSeed/ObjectSeed/draws) | band [37.8, 95.7], 200k sequential inputs: MixSeed(root, PLACE)=72.5, MixSeedIdx(7, PLACE, i)=81.1, FRandomStream(MixSeed(root)).FRand=81.7, CellSeed(sequential x cells)=55.9, ObjectSeed(cell, i)=54.0, DrawUnit(root, PLACE, 0)=54.9, DrawUnit(seed, PLACE, k)=45.2. (Without Avalanche: 1.26e+07, ProcSeed lesson reproduced) |
+| `T1.seed.injective` | PASS | Object seeds injective in index (0 collisions over 300 cells x 2^15); cell seeds near birthday bound | object-seed collisions 0 (must be 0); cell-seed collisions over 64^3 cells 10 (birthday ~8) |
+| `T1.seed.stream_port` | PASS | FRandomStream port: FRand sequence, RandRange bounds, RollRange quantize/clamp | 16,000 FRand draws, 0 mismatches; RandRange(2,6) out of range 0, ends hit 1931/2020; quantized roll 5.0 |
+| `T1.window.bijection` | PASS | Toroidal slot bijection; residents keep their slot while sliding; correct entering/exiting diff (N = 1..6) | 648 windows, 5184 slides (393 seam rebuilds), 0 bijection / 0 stability / 0 diff violations; unit slide 25 in / 25 out: yes |
+| `T1.window.velocity_lod` | PASS | Velocity LOD suspends above 1 cell per K = 4 frames, resumes below 0.8 of that | transitions as specified |
+| `T1.level.coverage` | PASS | L = ceil(log2(R/N_eff)), N_eff = N - 1/K: for random camera offsets in the centre cell, every object with distance <= R is inside its level's window | 240000 trials over N = 1..6 and R = 4 cm..2^123 cm, 0 violations; min N_eff*2^L / R = 1.000002 |
+| `T1.clang.coord_seed` | PASS | clang++ build passes every Tier 1 group (coord, seed, window, level, photometry; quick fuzz 10^5) | 12 checks, failing: none |
+| `T1.coord.oracle` | PASS | Coordinate fuzz vs Python big-int oracle: Sub, ToDouble, ToHiLo, CellOf, Neighbour, AddDisplacement, object-relative (shader core) | 1000000 cases x 3 axes vs Python big-int oracle, 0 mismatches (25 s) |
+| `T1.seed.oracle` | PASS | UniSeed vs Python oracle: Avalanche, HashCombine, MixSeed, FRandomStream, CellSeed, ObjectSeed, draws, ChannelId | 2007 cases vs Python oracle (fast HashCombine), 0 mismatches |
+
+## Tier 2 — generation behaviour
+
+| Check | Result | Criterion | Measured |
+| --- | --- | --- | --- |
+| `T2.gen.determinism` | PASS | Per-cell content hashes identical across batch orders, window histories, and revisits after 10 slides (evicted, regenerated) | web_to_galaxy: 8474 compared, 0 differ; galaxy_to_star: 46390 compared, 0 differ (contributor-growth regenerations on path A: 0) |
+| `T2.gen.counts` | PASS | Aggregate z-score of placed count vs lambda within +-3 over >= 10^4 cells | 12735 tasks, sum lambda 8.441e+05, z = -0.88; rejection-cap shortfall 0; candidates over envelope 0.109% |
+| `T2.gen.slicing` | PASS | Luminosity slicing conserves totals: sum over levels of expected children = N_total within 1% | sum P(L): stars 1.000000000 over L58..L75, galaxies 1.000000000 over L82..L87; tiling sum / integral: 4 cells/axis: 1.1798, 8 cells/axis: 0.9725, 16 cells/axis: 0.9975, 32 cells/axis: 1.0029, 64 cells/axis: 1.0021; expected total / N_total = 1.0021 |
+| `T2.gen.fidelity` | PASS | Objects sit on structure: per-voxel placed density vs field correlation > 0.9 | galaxy disc cell: r = 0.9194 (199983 objects, 4096 voxels); cosmic web cell: r = 0.9832 (200492 objects, 4096 voxels) |
+| `T2.gen.coverage` | PASS | No child placed outside its contributor's influence | 416053 children checked against their contributor sphere, 0 outside |
+| `T2.gen.budget` | PASS | Residency under D-005 caps (131,072 per level, 2,097,152 total); peaks logged | peak per level 82644 (L69), peak total 367375. web_to_galaxy resident by level: L83:30 L84:197 L85:935 L86:2098 L87:426; galaxy_to_star resident by level: L61:1 L62:7 L63:41 L64:211 L65:1225 L66:5586 L67:20569 L68:52251 L69:78404 L70:53544 L71:44989 L72:51111 L73:38194 L74:9889 L75:1997 L86:1 |
+| `T2.gen.gather` | PASS | Max contributor list length per level logged (D-004 trigger: 256) | max 1 contributors gathered (L82); D-004 trigger 256 not reached |
+| `T2.gen.baked` | PASS | Baked UniVol path: file round trip, mips are exact means, mip-descent placement follows texels, counts follow mip integrals, 48 tile symmetries | R32 round trip exact, R16 max rel err 4.9e-04; mip mean err 6.0e-08; descent vs texel r = 0.9987 (400k draws); count z = -1.19; 48/48 symmetries used, integral change 0.0e+00; periodic yes |
+| `T2.gen.slice_draws` | PASS | Magnitude draws stay inside their slice (as stored, half precision) and match the slice's conditional mean | 24 slices x 20,000 draws: 0 outside their slice, 0 with a biased mean; worst Star L71 mean -3.1607 vs -3.1516 (3.2 sigma) |
+
+## Tier 3 — rendering behaviour
+
+| Check | Result | Criterion | Measured |
+| --- | --- | --- | --- |
+| `T3.jitter` | PASS | Camera parked at 1e30 / 1e35 / 2^127 cm, 0.001 cm per frame for 100 frames: max screen error of static objects vs long-double reference < 0.01 px | 51300 samples (objects 10 cm .. 10^27 cm away, plus objects 10^9..10^14 cm away stored in L60/68/75 cells; 1920 px over 90 deg): worst error 2.63e-03 px, worst frame-to-frame jitter 1.11e-04 px. For the record, the design's hi/lo + float-offset form: 6.89e-05 px when cells match distance, 1.62e+04 px for near objects in coarse cells (D-104) |
+| `T3.ordering` | PASS | Compressed render depth order equals true distance order for 10^5 random pairs; per-depth compression shown to fail on the same set | 100000 pairs: radial f(r) reverses 0 (float ties 0); per-depth z compression misorders 2284; fixed layer compositing misorders 7 |
+| `T3.occlusion` | PASS | Synthetic promoted occluder: backdrop objects behind it are culled, objects in front kept, for all test placements | 20000 placements (3386 behind, 550 in front on the disc, 16064 beside), 0 wrong |
+| `T3.frames` | PASS | Reference stills written for visual inspection (galaxy interior x2, cosmic web) | still_galaxy_towards_centre: 9904 visible of 367374 resident; still_galaxy_out_of_plane: 1967 visible of 367374 resident; web dm+5: 65 visible of 63829 resident |
+| `T3.flythrough` | PASS | Scripted path 10^28 cm to 1 m from an object: 48-frame contact sheet; objects entering above the fade threshold = 0 (frames 1..N; frame 0 is the initial fill) | 2400 frames, 545902 objects entered residency, 0 above threshold (1% of a just-visible star), 0 with any non-zero intensity; target M = -4.38. [00 3.24 Gpc: 7 vis] [08 123 kpc: 9 vis] [16 14.8 ly: 2553 vis] [24 35.4 AU: 2549 vis] [32 2.004e+05 km: 0 vis] [40 7.4 km: 0 vis] [47 1 m: 0 vis]  |
+| `T3.images` | PASS | Reference frames and flythrough contact sheet converted to PNG with HUD (D-018) | 4 PNGs in Verification/images |
 
 ## Tier 4 — Unreal integration (static only in this environment)
 
 | Check | Result | Criterion | Measured |
 | --- | --- | --- | --- |
-| `T4.static.core_subset` | PASS | Shader cores stay in the shared C++/HLSL subset (no swizzles, UNI_FN, f-suffixed literals, no textures) | 6 cores, 0 problems |
+| `T4.static.core_subset` | PASS | Shader cores stay in the shared C++/HLSL subset (no swizzles, UNI_FN, f-suffixed literals, no textures) | 7 cores, 0 problems |
 | `T4.static.gpu_structs` | PASS | GPU-mirrored structs (marked // GPU-MIRROR) have a static_assert, size a multiple of 16 (lesson #20) | 6 GPU structs; missing assert: none; not 16-multiple: none |
 | `T4.static.ue_rules` | PASS | UE-facing rules: no UE includes in UniCore, render hooks only in UniRenderHooks.cpp, no absolute FVector | no problems |
 | `T0.report.unverified_listed` | PASS | Every unverified item is listed in REVIEW_TONIGHT.md | 6 unverified items; missing from REVIEW_TONIGHT: none |
 
 ## Images
 
-None generated in this run.
+- [flythrough_contact_sheet.png](images/flythrough_contact_sheet.png)
+- [still_galaxy_out_of_plane.png](images/still_galaxy_out_of_plane.png)
+- [still_galaxy_towards_centre.png](images/still_galaxy_towards_centre.png)
+- [still_web_sensitive_dm5.png](images/still_web_sensitive_dm5.png)
+
+## Visual inspection
+
+Written by the session after looking at the images: [OBSERVATIONS.md](OBSERVATIONS.md).
 
 ## Regressions since the previous run
 
-- Regressed (PASS → FAIL): `T1.build.gcc`
+- Regressed (PASS → FAIL): none
 - Fixed (FAIL → PASS): none
-- New checks: none
+- New checks: `T2.gen.slice_draws`, `T3.jitter`, `T3.ordering`, `T3.occlusion`, `T3.frames`, `T3.flythrough`, `T3.images`
 
 ## Not verified here
 

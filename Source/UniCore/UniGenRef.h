@@ -119,14 +119,8 @@ namespace UniCore
 		return H;
 	}
 
-	/** Surface brightness of an extended source in mag/arcsec^2 (distance independent):
-	 *  mu = M + 2.5 log10(pi theta^2) with theta the angular radius at 10 pc in arcsec. */
-	inline float SurfaceBrightness(float AbsMag, float RadiusLog2)
-	{
-		const double R = std::exp2(double(RadiusLog2));
-		const double ThetaArcsec = R / kTenPcCm * 206264.806;
-		return float(double(AbsMag) + 2.5 * std::log10(3.141592653589793 * ThetaArcsec * ThetaArcsec));
-	}
+	/** Surface brightness: the shared core (UniPlacement.ush), so GPU and CPU agree. */
+	inline float SurfaceBrightness(float AbsMag, float RadiusLog2) { return UniHlsl::Uni_SurfaceBrightness(AbsMag, RadiusLog2); }
 
 	// ======================================================================================
 	// Reference generator
@@ -318,7 +312,7 @@ namespace UniCore
 				const double Accept = St.Envelope > 0.0 ? std::max(St.Mean / St.Envelope, 1.0e-4) : 1.0;
 				const u32 Cap = u32(std::min(256.0 + 4.0 * double(N) / Accept, 4.0e9));
 				const FSlice& Sl = *S;
-				H::StructuredBuffer<float> Lut(CA.AbsMag.InvCdf.data(), u32(CA.AbsMag.InvCdf.size()));
+				H::StructuredBuffer<float> Lut(Sl.InvCdf.data(), u32(Sl.InvCdf.size()));   // the slice's own LUT (D-117)
 				const H::float4 RadM(CA.RadiusModel[0], CA.RadiusModel[1], CA.RadiusModel[2], CA.RadiusModel[3]);
 				const H::float4 ColM(CA.ColourModel[0], CA.ColourModel[1], CA.ColourModel[2], CA.ColourModel[3]);
 				u32 Flags = (CA.Visibility == EVisibility::Extended ? H::UNI_OBJ_FLAG_EXTENDED : 0u) | (CA.Emitters.empty() ? 0u : H::UNI_OBJ_FLAG_HAS_CONTRIBUTOR);
@@ -333,7 +327,7 @@ namespace UniCore
 					const u32 OffA[3] = { Off.x, Off.y, Off.z };
 					if (Suppressed(Child, K, OffA)) { continue; }   // masked, not relocated
 					const u32 ObjSeed = H::Uni_ObjectSeed(Seed, Local);
-					const float M = H::Uni_DrawAbsMag(ObjSeed, float(Sl.CdfLo), float(Sl.CdfHi), Lut, 0u, Lut.Count);
+					const float M = H::Uni_DrawAbsMag(ObjSeed, 0.0f, 1.0f, float(Sl.BrightM), float(Sl.FaintM), Lut, 0u, Lut.Count);
 					const float RL2 = H::Uni_DrawRadiusLog2(ObjSeed, M, RadM);
 					const H::float3 Rgb = H::Uni_DrawColour(ObjSeed, M, ColM);
 					const float SB = CA.Visibility == EVisibility::Extended ? SurfaceBrightness(M, RL2) : 0.0f;
@@ -491,6 +485,9 @@ namespace UniCore
 		int VelocityK = UniHlsl::UNI_VELOCITY_LOD_K;
 		bool bVelocityLod = true;
 		std::function<void(const FCellContent&)> OnGenerated;   // test hook
+		/** Test hook: a cell entered a window (generated, restored or regenerated) this frame,
+		 *  with its level's render fade at that moment. Pop analysis listens here. */
+		std::function<void(const FCellContent&, float)> OnEnterWindow;
 
 		/** Advance one frame with the camera at Coord + Frac. Generates every entering cell of
 		 *  every non-suspended level, coarse to fine, so a cell's parent window is always
@@ -508,7 +505,13 @@ namespace UniCore
 				FLevel& Lv = It->second;
 				const int L = It->first;
 				const double CellsPerFrame = Moved / CellWidthCm(L);
-				const bool bSusp = bVelocityLod && Lv.Lod.Update(CellsPerFrame, VelocityK);
+				bool bSusp = bVelocityLod && Lv.Lod.Update(CellsPerFrame, VelocityK);
+				// D-116: a level that resumes before it has fully faded out, and whose window would
+				// jump, keeps fading out first. Content then never blinks from partial brightness.
+				const bool bJump = Lv.Win.IsValid() && CentreJump(Lv.Win.Geometry(), CellOf(Camera, L)) > 1;
+				if (bSusp) { Lv.bHeld = true; }
+				else if (Lv.bHeld && bJump && Lv.Fade > 0.0f) { bSusp = true; }
+				else { Lv.bHeld = false; }
 				Lv.Fade = bSusp ? std::max(0.0f, Lv.Fade - 0.125f) : std::min(1.0f, Lv.Fade + 0.125f);
 				if (bSusp && Lv.Win.IsValid()) { continue; }   // keeps contents; render fades it
 
@@ -536,7 +539,9 @@ namespace UniCore
 				Lv.bActive = true;
 
 				const FWindowDiff Diff = Lv.Win.Recentre(Next.Centre);
-				if (Diff.bRebuilt && !bFirstFrame) { Lv.Fade = 0.0f; }   // a rebuilt level fades in
+				// A rebuilt level, or a window that jumped more than one cell (resume after velocity
+				// LOD, teleport), can hold cells inside relevance: it fades in from zero (D-116).
+				if ((Diff.bRebuilt || bJump) && !bFirstFrame) { Lv.Fade = 0.0f; }
 
 				for (const FCellKey& K : Diff.Exiting) { Lv.InWindow.erase(K); if (bEvictOnExit) { Evict(K); } }
 				for (const FWindowCell& WC : Diff.Entering)
@@ -595,6 +600,7 @@ namespace UniCore
 			FVelocityLod Lod;
 			float Fade = 1.0f;
 			bool bActive = false;
+			bool bHeld = false;   // suspended, or still fading out before a resume jump
 			std::set<FCellKey, bool (*)(const FCellKey&, const FCellKey&)> InWindow{ &KeyLess };
 			FLevelStats Stats;
 		};
@@ -618,6 +624,23 @@ namespace UniCore
 				for (int L = C.LMin; L <= C.LMax; ++L) { Ls.insert(L); }
 				AddRange(Ls, E.ChildArchetypeId, Depth + 1);
 			}
+		}
+
+		/** Chebyshev distance in cells between a window's centre and a new centre (toroidal),
+		 *  saturating at 2^30. */
+		static int64_t CentreJump(const FWindowGeometry& G, const FCellKey& NewCentre)
+		{
+			int64_t J = 0;
+			const int Bits = G.AxisBits();
+			for (int A = 0; A < 3; ++A)
+			{
+				const FU128 D = MaskLow(Sub(NewCentre.C[A], G.Centre.C[A]), Bits);
+				const FU128 N = MaskLow(Sub(G.Centre.C[A], NewCentre.C[A]), Bits);
+				const FU128 M = FU128::Compare(D, N) < 0 ? D : N;
+				const int64_t V = (M.L[0] | M.L[1] | M.L[2]) != 0u || M.L[3] > (1u << 30) ? (int64_t(1) << 30) : int64_t(M.L[3]);
+				J = std::max(J, V);
+			}
+			return J;
 		}
 
 		/** Authored anchors make their own level active: nothing emits them. */
@@ -679,7 +702,11 @@ namespace UniCore
 			auto It = Cache.find(K);
 			if (It != Cache.end())
 			{
-				if (It->second.ContributorSet == Ids) { if (bEntering) { ++Lv.Stats.Restored; } return; }
+				if (It->second.ContributorSet == Ids)
+				{
+					if (bEntering) { ++Lv.Stats.Restored; if (OnEnterWindow) { OnEnterWindow(It->second, Lv.Fade); } }
+					return;
+				}
 				if (!bEntering && Ids.size() <= It->second.ContributorSet.size() && std::includes(It->second.ContributorSet.begin(), It->second.ContributorSet.end(), Ids.begin(), Ids.end()))
 				{
 					return;   // a contributor left the window list but still exists: content unchanged
@@ -693,6 +720,7 @@ namespace UniCore
 			++Lv.Stats.Generated;
 			for (FContributor& Ct : Gen.MakeContributors(C)) { Registered[Ct.Id] = Ct; }
 			if (OnGenerated) { OnGenerated(C); }
+			if (OnEnterWindow) { OnEnterWindow(C, Lv.Fade); }
 			Cache[K] = std::move(C);
 		}
 

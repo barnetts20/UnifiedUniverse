@@ -1,0 +1,136 @@
+// UniProject.ush
+// Project and cull: one resident object -> one sprite (or nothing). Shared by the GPU pass
+// (UniProject.usf, every frame, every resident object) and the CPU reference renderer.
+//
+//   1. Exact camera-relative vector: per-cell 128-bit delta + offset in integer, one float
+//      conversion (D-104). r and direction from it, overflow-safe.
+//   2. Apparent magnitude; surface brightness for resolved extended sources. Cull past the
+//      limit, outside the frustum, promoted, or delta-hidden.
+//   3. Render position p = d * f(r) and angular radius (unchanged by compression: scaling
+//      about the eye preserves projection, so parallax is exact by construction).
+//   4. Intensity in exposure-calibrated units (lesson #36), faded across the band and by the
+//      level fade. Fades are render-only (lesson #12).
+//   5. Promotion candidate test, with hysteresis: promote at r - R < r0 or R / r > theta_p,
+//      demote at 1.25x both.
+
+#ifndef UNI_PROJECT_USH
+#define UNI_PROJECT_USH
+
+#include "UniCoreDefs.ush"
+#include "UniCoord.ush"
+#include "UniPhotometry.ush"
+#include "UniPlacement.ush"
+
+static const float UNI_THETA_PROMOTE = 0.02f;     // rad: angular size that promotes to an actor (D-119)
+static const float UNI_PROMOTE_HYSTERESIS = 1.25f;
+
+static const uint UNI_SPRITE_VISIBLE = 1u;
+static const uint UNI_SPRITE_PROMOTE_CANDIDATE = 2u;
+static const uint UNI_SPRITE_EXTENDED = 4u;
+
+struct FUniView
+{
+	float3 Forward;
+	float TanHalfFovX;
+	float3 Right;
+	float TanHalfFovY;
+	float3 Up;
+	float LimitingMag;        // m_lim = m_ref + dm
+	float3 CameraFraction;    // sub-cm part of the camera position, [0, 1) cm
+	float ExposureMag;        // magnitude that maps to intensity 1
+	float SurfaceLimit;       // mu_lim = mu_ref + dm
+	float ThetaPixel;         // angular radius of one pixel: minimum sprite footprint
+	float GlareGain;          // footprint growth with flux
+	float Pad;
+};
+
+struct FUniSprite
+{
+	float3 RenderPos;         // camera-relative, compressed: dir * f(r)
+	float AngularRadius;      // rad, for the sprite quad (render size = AngularRadius * f(r))
+	float3 Radiance;          // colour * intensity, exposure-calibrated
+	float TrueDistance;       // cm, for the scene-depth test
+	float NdcX;               // [-1, 1] across the view
+	float NdcY;
+	uint Flags;
+	float PhysAngularRadius;  // R / r, rad (promotion, volumetric hand-off)
+};
+
+/** Promotion test with hysteresis. */
+UNI_FN bool Uni_PromoteTest(float InDistance, float InRadius, bool InWasPromoted)
+{
+	const float H = InWasPromoted ? UNI_PROMOTE_HYSTERESIS : 1.0f;
+	return (InDistance - InRadius < UNI_R0_CM * H) || (InRadius / InDistance > UNI_THETA_PROMOTE / H);
+}
+
+/** Pixel-shader scene-depth test: keep the sprite only if the scene surface along this ray is
+ *  farther than the object's true distance. Both are true-scale distances (D-120). */
+UNI_FN bool Uni_SceneDepthKeep(float InTrueDistance, float InSceneDistance)
+{
+	return InTrueDistance < InSceneDistance;
+}
+
+/** Project one object. Returns the sprite; Flags says whether it is visible and whether it is
+ *  a promotion candidate (candidates are reported even when culled for being promoted). */
+UNI_FN FUniSprite Uni_ProjectObject(uint4 InCellDeltaX, uint4 InCellDeltaY, uint4 InCellDeltaZ, uint InLevel,
+	float InLevelFade, FUniObject InObj, FUniView InView, bool InWasPromoted)
+{
+	FUniSprite S;
+	S.RenderPos = float3(0.0f, 0.0f, 0.0f);
+	S.AngularRadius = 0.0f;
+	S.Radiance = float3(0.0f, 0.0f, 0.0f);
+	S.TrueDistance = 0.0f;
+	S.NdcX = 0.0f;
+	S.NdcY = 0.0f;
+	S.Flags = 0u;
+	S.PhysAngularRadius = 0.0f;
+
+	const uint3 Off = uint3(InObj.A.x, InObj.A.y, InObj.A.z);
+	const float3 Rel = Uni_ObjectRelative(InCellDeltaX, InCellDeltaY, InCellDeltaZ, Off, InLevel, InView.CameraFraction);
+	const float R = max(Uni_SafeLength(Rel), 1.0e-3f);
+	const float3 Dir = Rel * (1.0f / R);
+	S.TrueDistance = R;
+
+	const float Radius = exp2(Uni_ObjectRadiusLog2(InObj));
+	S.PhysAngularRadius = Radius / R;
+	const uint ObjFlags = Uni_ObjectFlags(InObj);
+	if (Uni_PromoteTest(R, Radius, InWasPromoted)) { S.Flags = S.Flags | UNI_SPRITE_PROMOTE_CANDIDATE; }
+	if ((ObjFlags & (UNI_OBJ_FLAG_PROMOTED | UNI_OBJ_FLAG_DELTA_HIDDEN)) != 0u) { return S; }
+
+	// Photometry. Every source has a point-source visibility from its apparent magnitude. An
+	// extended source also has a resolved visibility from its surface brightness, which ramps
+	// in from 0 at theta_min to full at 2 theta_min, so the switch to surface-brightness
+	// photometry is continuous (no pop when a galaxy grows past theta_min, D-121).
+	const float AbsMag = Uni_ObjectAbsMag(InObj);
+	const float AppMag = Uni_ApparentMag(AbsMag, R);
+	const float PointFade = Uni_MagFade(AppMag, InView.LimitingMag);
+	float Fade = PointFade;
+	bool bExtended = false;
+	if ((ObjFlags & UNI_OBJ_FLAG_EXTENDED) != 0u)
+	{
+		const float Resolve = saturate(S.PhysAngularRadius / UNI_THETA_MIN - 1.0f);
+		const float ExtFade = Uni_MagFade(Uni_ObjectSurfaceBrightness(InObj), InView.SurfaceLimit) * Resolve;
+		Fade = max(PointFade, ExtFade);
+		bExtended = Resolve > 0.0f;
+	}
+	const float Intensity = pow(10.0f, -0.4f * (AppMag - InView.ExposureMag)) * Fade * saturate(InLevelFade);
+	if (!(Intensity > 0.0f)) { return S; }
+
+	// Frustum.
+	const float Fz = dot(Dir, InView.Forward);
+	if (Fz <= 0.0f) { return S; }
+	const float Nx = dot(Dir, InView.Right) / (Fz * InView.TanHalfFovX);
+	const float Ny = dot(Dir, InView.Up) / (Fz * InView.TanHalfFovY);
+	const float Margin = 1.0f + (S.PhysAngularRadius + InView.ThetaPixel) / InView.TanHalfFovX;
+	if (abs(Nx) > Margin || abs(Ny) > Margin) { return S; }
+
+	S.NdcX = Nx;
+	S.NdcY = Ny;
+	S.RenderPos = Dir * Uni_Compress(R);
+	S.AngularRadius = max(S.PhysAngularRadius, InView.ThetaPixel * (1.0f + InView.GlareGain * log2(1.0f + Intensity)));
+	S.Radiance = Uni_UnpackColour(InObj.B.w) * Intensity;
+	S.Flags = S.Flags | UNI_SPRITE_VISIBLE | (bExtended ? UNI_SPRITE_EXTENDED : 0u);
+	return S;
+}
+
+#endif // UNI_PROJECT_USH

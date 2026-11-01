@@ -424,3 +424,41 @@ UNI_TEST(gen, baked)
 			Uni::Fmt("R32 round trip %s, R16 max rel err %.1e; mip mean err %.1e; descent vs texel r = %.4f (400k draws); count z = %+.2f; %zu/48 symmetries used, integral change %.1e; periodic %s",
 				bSame ? "exact" : "FAILED", HalfErr, MipErr, Corr, Z, Used.size(), SymErr, bPeriodic ? "yes" : "NO"));
 }
+
+UNI_TEST(gen, slice_draws)
+{
+	// Every slice's magnitude draws stay inside the slice and follow the luminosity function
+	// within it: the mean of 20,000 draws matches the analytic conditional mean. This is the
+	// check that was missing when bright slices drew from a global LUT too coarse to resolve
+	// them (D-117).
+	int Slices = 0, Bad = 0;
+	double WorstMeanSigma = 0.0;
+	long long Outside = 0;
+	std::string Worst;
+	for (u32 A : { UniScenes::kStar, UniScenes::kGalaxy })
+	{
+		for (const FSlice& S : Gal().Model.SlicesOf(A).Slices)
+		{
+			++Slices;
+			H::StructuredBuffer<float> Lut(S.InvCdf.data(), u32(S.InvCdf.size()));
+			const int N = 20000;
+			double Sum = 0.0, Sum2 = 0.0;
+			for (int I = 0; I < N; ++I)
+			{
+				const float M = H::Uni_DrawAbsMag(H::Uni_ObjectSeed(0xD4A3u + u32(S.Level), u32(I)), 0.0f, 1.0f, float(S.BrightM), float(S.FaintM), Lut, 0u, Lut.Count);
+				const float Stored = H::Uni_F16ToF32(H::Uni_F32ToF16(M));   // what the record keeps
+				if (Stored < float(S.BrightM) || M > float(S.FaintM) + 1e-4f) { ++Outside; }
+				Sum += M; Sum2 += double(M) * M;
+			}
+			const double Mean = Sum / N, Sd = std::sqrt(std::max(1e-12, Sum2 / N - Mean * Mean));
+			const double Sigma = std::fabs(Mean - S.MeanM) / (Sd / std::sqrt(double(N)));
+			// LUT resolution floor: 64 entries over the slice.
+			const double Ok = std::fabs(Mean - S.MeanM) < std::max(4.0 * Sd / std::sqrt(double(N)), 0.002 * (S.FaintM - S.BrightM));
+			if (!Ok) { ++Bad; }
+			if (Sigma > WorstMeanSigma) { WorstMeanSigma = Sigma; Worst = Uni::Fmt("%s L%d mean %.4f vs %.4f", Gal().Model.Definition().Arch(A).Name.c_str(), S.Level, Mean, S.MeanM); }
+		}
+	}
+	Uni::Check(2, "T2.gen.slice_draws", "Magnitude draws stay inside their slice (as stored, half precision) and match the slice's conditional mean")
+		.Metric("slices", Slices).Metric("bad", Bad).Metric("outside", double(Outside)).Metric("worst_mean_sigma", WorstMeanSigma)
+		.Pass(Bad == 0 && Outside == 0, Uni::Fmt("%d slices x 20,000 draws: %lld outside their slice, %d with a biased mean; worst %s (%.1f sigma)", Slices, Outside, Bad, Worst.c_str(), WorstMeanSigma));
+}
