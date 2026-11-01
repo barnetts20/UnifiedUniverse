@@ -44,6 +44,8 @@ Append only. One entry per step start, finish, block, or commit. Times in the ow
 | 16:46 | VOL | start | Owner: "Sure, and any tips on universe-level background density marching?" Tips sent; engine pass started |
 | 17:05 | VOL | note | Builder reads FVolumeSource (pipeline or streamer). Streamer fade-hold rule (D-128 amendment): T2.stream.volume_parity caught new levels ticking to 0.125 before their window existed; fixed |
 | 17:15 | VOL | note | Background direction map + separable composite (D-136): T3.vol.cube 0.000% total, p99 ≤ 0.02% |
-| 17:35 | VOL | note | Engine pass written (UniVolume.usf, sprite slices, RenderVolume_RenderThread, PushFrame, uu.Volume); independent review requested. Uncompiled (UE-9) |
-
-| 18:05 | VOL | done (gate green) | Review fixes applied (Uni_Luminance visibility, float32 radiance targets, FLinearColor clears, FXC-safe slices, LUT cost); gate 53/53; committed and packaged |
+| 17:30 | VOL | note | Engine pass written (UniVolume.usf, sprite slices, RenderVolume_RenderThread, PushFrame, uu.Volume); independent review requested. Uncompiled (UE-9) |
+| 17:38 | VOL | done (gate green) | Review fixes applied (Uni_Luminance visibility, float32 radiance targets, FLinearColor clears, FXC-safe slices, LUT cost); gate 53/53; committed and packaged |
+| 17:45 | SAFE | start | Owner: stage things while away. Escape hatch, GPU parity test, triage sheet first (day-1 branch), then volume debug views, then a decision brief |
+| 17:48 | SAFE | note | uu.Shaders read-only cvar gates every shader's ShouldCompilePermutation; passes and batches skip and fail closed. UnifiedUniverse.Render.GpuParity (UE-4): GPU vs CPU streamer, cell by cell. Docs/BUILD_TRIAGE.md. GRHIGlobals guarded for < 5.3. Uncompiled |
+| 17:50 | SAFE | note | Log times for 17:30–17:48 corrected to the clock (two entries had been stamped ahead) |

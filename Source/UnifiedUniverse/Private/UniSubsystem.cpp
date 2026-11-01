@@ -53,6 +53,11 @@ UUniSubsystem* UUniSubsystem::FindForConsole()
 void UUniSubsystem::EnableUniverse(const FString& Scene)
 {
 	DisableUniverse();
+	if (!FUniRenderer::ShadersEnabled())
+	{
+		UE_LOG(LogUnifiedUniverse, Error, TEXT("UnifiedUniverse: uu.Shaders=0, so the plugin's shaders were not compiled and nothing can render. Remove the setting once the shader errors are fixed (Docs/BUILD_TRIAGE.md)."));
+		return;
+	}
 	SceneName = Scene.IsEmpty() ? TEXT("galaxy") : Scene.ToLower();
 	UniCore::FUniverseDef Def = SceneName == TEXT("web") ? UniScenes::WebToGalaxy() : (SceneName == TEXT("flythrough") ? UniScenes::Flythrough() : UniScenes::GalaxyToStar());
 	Model = MakeUnique<UniCore::FUniverseModel>(MoveTemp(Def));

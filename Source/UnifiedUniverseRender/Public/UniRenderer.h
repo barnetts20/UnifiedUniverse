@@ -72,6 +72,14 @@ class UNIFIEDUNIVERSERENDER_API FUniRenderer
 public:
 	static FUniRenderer& Get();
 
+	/** False when uu.Shaders=0 (nothing compiled): every pass is skipped. */
+	static bool ShadersEnabled();
+
+	/** TEST ONLY (UnifiedUniverse.Render.GpuParity): copies the first Num pool records to the CPU,
+	 *  blocking the calling (game) thread for up to TimeoutSeconds. Never call at runtime
+	 *  (lesson #24). */
+	bool ReadbackPoolBlocking_GameThread(TArray<UniCore::FObjectGPU>& Out, uint32 Num, double TimeoutSeconds = 10.0);
+
 	/** Game thread. Copies the payload to the render thread. */
 	void SetFrame_GameThread(FUniFrameData&& Data);
 

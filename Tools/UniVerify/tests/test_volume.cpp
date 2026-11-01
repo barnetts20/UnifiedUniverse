@@ -625,3 +625,147 @@ UNI_TEST(volume, cube)
 		.Pass(WorstTotal < 0.005 && WorstP99 < 0.03 && Trunc == 0,
 			Uni::Fmt("%s cube: %.0f steps per texel, %zu truncated", Detail.c_str(), CubeTexels ? double(CubeSteps) / double(CubeTexels) : 0.0, Trunc));
 }
+
+// ==========================================================================================
+// Decision brief (not part of the gate): run with UNI_BRIEF=1 univerify test --group brief.
+// Renders and measures the options for D-133 (luminosity budget) and D-132 (sprites behind
+// dust). Images go to Verification/work/brief, numbers to stdout as BRIEF lines.
+// ==========================================================================================
+
+#include <cstdlib>
+
+namespace
+{
+	std::string BriefDir()
+	{
+		const std::string D = UniVerify::Options().OutDir + "/brief";
+		::mkdir(UniVerify::Options().OutDir.c_str(), 0755);
+		::mkdir(D.c_str(), 0755);
+		return D;
+	}
+
+	/** The stellar function with its bright end tilted down (log phi -= S (8 - M) for M < 8) so
+	 *  that 2e11 stars add up to the galaxy's drawn M = -21 (option C). Bisection on S. */
+	FUniverseDef FainterStars(FUniverseDef D, double* OutTilt)
+	{
+		const std::vector<std::pair<double, double>> Base = {
+			{ -10.0, -9.5 }, { -8.0, -8.5 }, { -6.0, -7.3 }, { -4.0, -6.0 }, { -2.0, -4.9 }, { 0.0, -3.7 },
+			{ 2.0, -3.0 }, { 4.0, -2.6 }, { 6.0, -2.3 }, { 8.0, -2.1 }, { 10.0, -1.9 }, { 12.0, -1.8 },
+			{ 14.0, -1.9 }, { 16.0, -2.2 } };
+		auto With = [&](double S)
+		{
+			FUniverseDef X = D;
+			std::vector<std::pair<double, double>> P = Base;
+			for (auto& Pt : P) { if (Pt.first < 8.0) { Pt.second -= S * (8.0 - Pt.first); } }
+			X.Archetypes[UniScenes::kStar].AbsMag = FMagnitudeLut::FromLogControlPoints(P);
+			return X;
+		};
+		double Lo = 0.0, Hi = 1.0;
+		for (int I = 0; I < 40; ++I)
+		{
+			const double Mid = 0.5 * (Lo + Hi);
+			FUniverseModel M(With(Mid));
+			const double Mb = LuminosityBudget(M, UniScenes::kGalaxy, -21.0);
+			if (Mb < -21.0) { Lo = Mid; } else { Hi = Mid; }
+		}
+		if (OutTilt) { *OutTilt = 0.5 * (Lo + Hi); }
+		return With(0.5 * (Lo + Hi));
+	}
+
+	struct FBriefShot { double Vol = 0, Spr = 0; size_t Visible = 0, Resident = 0; };
+
+	/** Interior still towards the centre, at a fixed display gain shared by all options. */
+	FBriefShot BriefInterior(const FUniverseModel& M, double VolumeGain, bool bSlices, float DisplayGain, const std::string& Name, const std::string& Title)
+	{
+		FRefGenerator G(M);
+		FVolumeBuilder VB(M, G);
+		FRefPipeline P(G);
+		const FCoord Cam = UniScenes::SolarCamera();
+		P.Update(Cam, FVec3f{});
+		FCamera Cm; Cm.Coord = Cam; Cm.Width = 480; Cm.Height = 270; Cm.LookAlong({ -1, -0.12, -0.02 });
+		FVolumeScene Sc = VB.Build(P, Cam, FVec3f{}, Cm.View());
+		for (FCarrierGPU& C : Sc.Carriers) { if (!(C.Flags & H::UNI_CARRIER_PERIODIC)) { C.Amplitude = float(double(C.Amplitude) * VolumeGain); } }
+		if (!bSlices) { Sc.View.SliceLnTLo = 80.0f; Sc.View.SliceLnTHi = 81.0f; }   // slices beyond every sprite: T = 1
+		FImage Img(Cm.Width, Cm.Height);
+		FVolumeStats Vs;
+		const FFrameStats St = RenderFrameWithVolume(P, Sc, Cm, Img, &Vs);
+		Gain(Img, DisplayGain);
+		const std::string Base = BriefDir() + "/" + Name;
+		Img.WritePpm(Base + ".ppm");
+		FILE* F = std::fopen((Base + ".hud.json").c_str(), "wb");
+		if (F)
+		{
+			std::fprintf(F, "{\"lines\":[\"%s\",\"%s\"]}\n", Esc(Title).c_str(),
+				Esc(Uni::Fmt("%zu stars visible; glow %.0f%% of the light; display gain x%.3g (same for every option)", St.Visible, 100.0 * Lum(Vs.Flux) / std::max(Lum(Vs.Flux) + Lum(Vs.SpriteFlux), 1e-30), double(DisplayGain))).c_str());
+			std::fclose(F);
+		}
+		FBriefShot R; R.Vol = Lum(Vs.Flux); R.Spr = Lum(Vs.SpriteFlux); R.Visible = St.Visible; R.Resident = St.Resident;
+		return R;
+	}
+
+	/** Handoff brightness jump: in-frame luminosity x d^2 at 300 kpc (all carrier) over 6 Mpc
+	 *  (all sprite). 1 = seamless. */
+	double BriefHandoffRatio(const FUniverseModel& M, double VolumeGain)
+	{
+		FRefGenerator G(M);
+		FVolumeBuilder VB(M, G);
+		const FV3 U = Norm({ 0.5, 0.3, 0.8 });
+		double N[2] = { 0, 0 };
+		const double Ds[2] = { 6.0 * Units::Mpc, 0.3 * Units::Mpc };
+		for (int I = 0; I < 2; ++I)
+		{
+			FRefPipeline P(G);
+			const FCoord Cam = Moved(FCoord::Origin(), U * Ds[I]);
+			P.Update(Cam, FVec3f{});
+			FCamera Cm; Cm.Coord = Cam; Cm.Width = 640; Cm.Height = 360; Cm.LookAlong(U * -1.0);
+			FVolumeScene Sc = VB.Build(P, Cam, FVec3f{}, Cm.View());
+			for (FCarrierGPU& C : Sc.Carriers) { if (!(C.Flags & H::UNI_CARRIER_PERIODIC)) { C.Amplitude = float(double(C.Amplitude) * VolumeGain); } }
+			FImage Img(Cm.Width, Cm.Height);
+			FVolumeStats Vs;
+			RenderFrameWithVolume(P, Sc, Cm, Img, &Vs);
+			N[I] = (Lum(Vs.Flux) + Lum(Vs.SpriteFlux)) * Ds[I] * Ds[I] / double(H::Uni_HorizonDimming(float(Ds[I])));
+		}
+		return N[1] / N[0];
+	}
+}
+
+UNI_TEST(brief, decisions)
+{
+	if (!std::getenv("UNI_BRIEF")) { return; }
+	const double Mb = LuminosityBudget(FUniverseModel(UniScenes::GalaxyToStar()), UniScenes::kGalaxy, -21.0);
+	double Tilt = 0.0;
+	struct FOpt { std::string Key, Title; FUniverseDef Def; double VolumeGain; };
+	std::vector<FOpt> Opts;
+	Opts.push_back({ "a_as_is", "A: as is (2e11 stars, placeholder function)", UniScenes::GalaxyToStar(), 1.0 });
+	Opts.push_back({ "b_ntotal", "B: N_total 2.69e10 (fewer stars)", BudgetConsistent(UniScenes::GalaxyToStar()), 1.0 });
+	Opts.push_back({ "c_fainter", "C: fainter stellar function (2e11 stars)", FainterStars(UniScenes::GalaxyToStar(), &Tilt), 1.0 });
+	Opts.push_back({ "d_gain", "D: render-only glow gain x0.134 (no reroll)", UniScenes::GalaxyToStar(), std::pow(10.0, -0.4 * (-21.0 - Mb)) });
+	// One display gain for every option: auto-exposed on option B, the consistent one.
+	float Shared = 1.0f;
+	{
+		FUniverseModel M(Opts[1].Def);
+		FRefGenerator G(M); FVolumeBuilder VB(M, G); FRefPipeline P(G);
+		const FCoord Cam = UniScenes::SolarCamera(); P.Update(Cam, FVec3f{});
+		FCamera Cm; Cm.Coord = Cam; Cm.Width = 480; Cm.Height = 270; Cm.LookAlong({ -1, -0.12, -0.02 });
+		FImage Img(Cm.Width, Cm.Height);
+		RenderFrameWithVolume(P, VB.Build(P, Cam, FVec3f{}, Cm.View()), Cm, Img);
+		Shared = AutoGain(Img);
+	}
+	std::printf("BRIEF d133 children_mag %.3f tilt %.4f\n", Mb, Tilt);
+	for (const FOpt& O : Opts)
+	{
+		FUniverseModel M(O.Def);
+		const double Budget = LuminosityBudget(M, UniScenes::kGalaxy, -21.0);
+		const FBriefShot S = BriefInterior(M, O.VolumeGain, true, Shared, "d133_" + O.Key, O.Title);
+		const double Hand = BriefHandoffRatio(M, O.VolumeGain);
+		std::printf("BRIEF d133 %s budget %.3f visible %zu resident %zu glow_share %.4f total %.6g handoff_ratio %.4f\n",
+			O.Key.c_str(), Budget, S.Visible, S.Resident, S.Vol / std::max(S.Vol + S.Spr, 1e-30), S.Vol + S.Spr, Hand);
+	}
+	// D-132: the consistent model with and without sprite attenuation behind the dust.
+	{
+		FUniverseModel M(Opts[1].Def);
+		const FBriefShot On = BriefInterior(M, 1.0, true, Shared, "d132_slices_on", "D-132: sprites dimmed behind the dust (slices on)");
+		const FBriefShot Off = BriefInterior(M, 1.0, false, Shared, "d132_slices_off", "D-132: sprites not dimmed (slices off)");
+		std::printf("BRIEF d132 sprite_light_on %.6g off %.6g ratio %.4f\n", On.Spr, Off.Spr, On.Spr / std::max(Off.Spr, 1e-30));
+	}
+}
