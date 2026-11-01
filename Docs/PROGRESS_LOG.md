@@ -36,5 +36,6 @@ Append only. One entry per step start, finish, block, or commit. Times in the ow
 | 12:19 | P5 | decision D-127 | UE review fixes applied: B1, B2, B4, B5, R1, R2/W5, R3, R4, W1, W2, W3, W4, W6, S1. New check T2.stream.fail_closed. Uncompiled (UE-1/3/5) |
 | 12:24 | END | done (gate green) | Final verify_all: 42 checks, 0 failed (new: T2.stream.fail_closed). Committed; zip and patches packaged for D:\Projects\vxl |
 | 17:45 | SAFE | start | Owner: stage things while away. Escape hatch, GPU parity test, triage sheet first (day-1 branch), then volume debug views, then a decision brief |
-| 18:05 | SAFE | note | uu.Shaders read-only cvar gates every shader's ShouldCompilePermutation; passes and batches skip and fail closed. UnifiedUniverse.Render.GpuParity (UE-4): GPU vs CPU streamer, cell by cell. Docs/BUILD_TRIAGE.md. GRHIGlobals guarded for < 5.3. Uncompiled |
-
+| 17:48 | SAFE | note | uu.Shaders read-only cvar gates every shader's ShouldCompilePermutation; passes and batches skip and fail closed. UnifiedUniverse.Render.GpuParity (UE-4): GPU vs CPU streamer, cell by cell. Docs/BUILD_TRIAGE.md. GRHIGlobals guarded for < 5.3. Uncompiled |
+| 17:50 | SAFE | note | Log time for the 17:48 entry corrected to the clock (it had been stamped ahead) |
+| 17:58 | SAFE | note | Decision brief published (D-133, D-132, D-131, D-118 with offline renders); rendered by the volumetrics branch's UNI_BRIEF run |
