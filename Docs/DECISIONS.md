@@ -194,3 +194,57 @@ Decision: Judge each quantity against its float conditioning. Apparent magnitude
 Rationale: Visual effect is nil: 1e-5 mag, or 1e-5 of a radius. A flat 1e-6 would need double precision, which the GPU path does not use.
 Reroll impact: None.
 Status: Provisional
+
+D-101 — Influence term of the relevance radius
+Question: The design says an object's influence relevance is "archetype-defined, so a star system's contributor is live wherever its planets could be relevant". What is the rule?
+Decision: R_influence = max over emitters of (InfluenceMul · R_phys,max + √3 · (N_max + 1) · 2^Lmax_child), where Lmax_child is the coarsest level of that emitter's children. An object is then resident wherever any of its children's windows (up to the sensitivity cap N_max) can touch its influence sphere.
+Rationale: This is what makes a cell's contributor set content-determined, which determinism depends on. T2.gen.determinism (with eviction on exit) and T2.gen.coverage verify it. For galaxies the angular term dominates (19 Mpc against 0.2 Mpc), so it changes nothing today. It will matter for star systems with planets.
+Reroll impact: MEDIUM. It feeds level assignment for archetypes with emitters.
+Status: Provisional
+
+D-102 — Physical radius scatter and level assignment
+Question: Radius is drawn after the level is chosen, but it also feeds the angular relevance term.
+Decision: The radius model is log10 R = a + b(M − M0) + s(2u − 1). Level assignment uses the top of the scatter (u = 1), so a drawn radius can only make an object coarser than needed, never too fine to be covered.
+Reroll impact: MEDIUM (level assignment).
+Status: Provisional
+
+D-103 — Cell integral from the envelope probes
+Question: The design's default integral uses 8 jittered probes, while the envelope uses 128 (D-013).
+Decision: The cell integral is the mean of the same 128 envelope probes, a stratified 4×4×4 grid jittered twice.
+Rationale: Strictly better than 8 at no extra cost, since the probes run anyway. Coarse cells (a contributor spanning ≤ 8 cells per axis) still miscount by 3–18% (T2.gen.slicing measured: 4 cells/axis 1.18, 8 → 0.97, ≥ 16 within 0.3%). That is lesson #10's under-probing showing up as count error at the coarsest star levels. M2 should add adaptive probes when a cell is larger than about 1/8 of its contributor.
+Reroll impact: Content changes if the probe count changes.
+Status: Provisional
+
+D-111 — Children scale with parent luminosity
+Question: A galaxy emitter's N_total ("2e11 stars per galaxy") is per parent, but parents vary by six magnitudes.
+Decision: An emitter may set NTotalRefMag. Then N = NTotal · 10^(−0.4 (M_parent − NTotalRefMag)): luminosity-proportional, 2e11 stars at M* = −21.
+Reroll impact: Content.
+Status: Provisional
+
+D-112 — Tile symmetry without integer offsets
+Question: Tile hashing picks a symmetry and an integer offset per tile. Offsets that are not multiples of 2^mip break the exact mip-integral alignment at coarse mips.
+Decision: Symmetries only (48 per tile, from `hash(level, tile, field id)`). All 48 are used across 2,000 tiles, and integrals are unchanged under each (T2.gen.baked).
+Reroll impact: Content of baked fields when offsets are added.
+Revisit trigger: Visible repetition in baked fields.
+Status: Provisional
+
+D-113 — Regenerate cells whose contributor set grows
+Question: A contributor can be registered after cells it overlaps have already generated, for example when its parent cell enters a coarser window after the finer window was filled.
+Decision: Each cell stores the sorted set of contributor ids it was generated with. If the gathered set for a resident cell gains a member, the cell is regenerated. A set that only shrinks (contributor left the window list but still exists) keeps its content.
+Rationale: This is the determinism contract. Measured regenerations on the test paths: 0. With the D-101 influence term, a contributor first overlaps a level's window at the window edge, beyond relevance, so a regeneration is never visible.
+Reroll impact: None.
+Status: Provisional
+
+D-114 — Candidate budget for rejection placement
+Question: How many candidates may a task evaluate before it gives up on reaching its Poisson count?
+Decision: 256 + 4n / acceptance, where acceptance = probe mean / envelope (floored at 1e-4). The GPU uses the same formula to size its candidate dispatch.
+Rationale: The first version (256 + 64n) under-delivered in the bulge cusp: 8,546 objects short over 12,735 tasks, z = −12. After the change: 0 short, z = −1.05.
+Reroll impact: None (it only adds objects that should exist).
+Status: Provisional
+
+D-115 — Normalising integral uses the cell estimator
+Question: How is a contributor's ∫all F computed?
+Decision: The 128-probe cell estimator over a 32³ tiling of the field's domain, skipping tiles outside the unit ball. That is about 2.4M field evaluations per contributor on first use, then cached.
+Rationale: One jittered sample per stratum (64³) was measured 4% high on the galaxy field, against a 512³ midpoint reference. The disc is thinner than a stratum, and slicing totals missed the 1% bound. Using the same estimator as the cells makes them consistent: tilings at 16–64 cells per axis agree within 0.3%.
+Reroll impact: Content (counts) changes with this estimator.
+Status: Provisional

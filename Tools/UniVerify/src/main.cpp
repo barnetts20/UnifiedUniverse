@@ -3,6 +3,7 @@
 //   univerify test [--quick] [--json FILE] [--group NAME]   run registered tests
 //   univerify fuzzdump N FILE                                coordinate cases for the Python oracle
 //   univerify seeddump                                       seed values for the Python oracle
+//   univerify gen --scene NAME                               run a scene's reference pipeline, print stats
 //   univerify list                                           list tests
 //
 // Every command is run from the plugin root (verify_all does this), so relative paths in
@@ -16,6 +17,7 @@
 
 int UniFuzzDump(int N, const char* Path);   // fuzzdump.cpp
 int UniSeedDump();                          // seeddump.cpp
+int UniGenCommand(int Argc, char** Argv);   // gencmd.cpp
 
 namespace
 {
@@ -80,6 +82,7 @@ int main(int Argc, char** Argv)
 	}
 	if (Cmd == "fuzzdump" && Argc >= 4) { return UniFuzzDump(std::atoi(Argv[2]), Argv[3]); }
 	if (Cmd == "seeddump") { return UniSeedDump(); }
+	if (Cmd == "gen") { return UniGenCommand(Argc, Argv); }
 	std::fprintf(stderr, "unknown command %s\n", Cmd.c_str());
 	return 2;
 }

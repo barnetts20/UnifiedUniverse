@@ -3,10 +3,10 @@
 *Kept current all day. If the session ended early, this file is still the handover.*
 
 ## 1. Summary
-Work is running in a standalone cloud workspace, because laptop folder access was declined and you asked for the cloud space. The handover will be a zip and a patch that apply at the root of `D:\Projects\vxl`. Status: P0 done, P1 in progress.
+Work is running in a standalone cloud workspace, because laptop folder access was declined and you asked for the cloud space. The handover will be a zip and a patch that apply at the root of `D:\Projects\vxl`. Status: P0–P3 gates green (Tier 1 coordinates, seeds, windows, photometry; Tier 2 generation on two scenes plus the baked path). P4 (reference renderer) in progress.
 
 ## 2. Verified
-Nothing yet. See `Verification/REPORT.md` once it exists.
+See `Verification/REPORT.md` (generated). Summary written at the end of the run.
 
 ## 3. Needs UE testing
 Full step-by-step instructions are written as P5 lands. Items tracked by ID (kept in sync with `Tools/UniVerify/unverified.json` by the check `T0.report.unverified_listed`):

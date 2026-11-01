@@ -18,6 +18,8 @@ namespace UniHlsl
 #include "UniCoord.ush"
 #include "UniSeed.ush"
 #include "UniPhotometry.ush"
+#include "UniFields.ush"
+#include "UniPlacement.ush"
 }
 
 #include "UniCoord.h"

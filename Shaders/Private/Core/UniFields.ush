@@ -1,0 +1,215 @@
+// UniFields.ush
+// Analytic stand-in fields (D-012) and the field-ID switch. Shared by GPU generation, GPU
+// volumetrics (later) and the CPU reference pipeline: render and placement evaluate this one
+// function with the same inputs (lesson #1).
+//
+// A field is a SHAPE only (lesson #8). Its absolute scale is unobservable after count
+// normalisation; counts come from the emitter's N_total.
+//
+// COORDINATES. Fields take a point p in field-normalised coordinates:
+//   - contributor-local fields (galaxy, ball): p = Rot * (x - centre) / influence radius, so
+//     the influence sphere is the unit ball and precision is relative to the contributor;
+//   - periodic root fields (cosmic web, const): p in [0, 1)^3 = (coord mod period) / period,
+//     where the modulo is exact integer arithmetic on the CPU (lesson #11: the placement key
+//     stays unwrapped, only the field lookup wraps).
+// Uni_FieldFramePoint builds p from a cell-local unit position u in [0, 1)^3.
+//
+// PARAMETERS. One flat block of four float4s, written at one marshal site (lesson #2):
+// UniCore::FFieldParams::Pack. Derivation happens here from the raw values.
+
+#ifndef UNI_FIELDS_USH
+#define UNI_FIELDS_USH
+
+#include "UniCoreDefs.ush"
+#include "UniSeed.ush"
+
+static const uint UNI_FIELD_NONE = 0u;
+static const uint UNI_FIELD_WEB = 1u;      // periodic cellular cosmic web
+static const uint UNI_FIELD_GALAXY = 2u;   // disc + bulge + log-spiral arms, unit-ball cut
+static const uint UNI_FIELD_BALL = 3u;     // 1 inside the unit ball (tests)
+static const uint UNI_FIELD_CONST = 4u;    // 1 everywhere, periodic (tests)
+
+struct FUniFieldParams
+{
+	float4 A;
+	float4 B;
+	float4 C;
+	float4 D;
+};
+
+/** Where a cell sits in its field's normalised space. One per (cell, contributor). */
+struct FUniFieldFrame
+{
+	float3 OriginP;   // field-space position of the cell's minimum corner (periodic: in [0, 1))
+	float SizeP;      // cell width in field units
+	float3 Rot0;      // rows of the contributor's rotation (identity for periodic fields)
+	uint Periodic;    // 1: wrap p into [0, 1)
+	float3 Rot1;
+	float Pad0;
+	float3 Rot2;
+	float Pad1;
+};
+
+// ------------------------------------------------------------------------------------------
+// Helpers
+// ------------------------------------------------------------------------------------------
+
+UNI_FN int Uni_PosModInt(int InA, int InM)
+{
+	const int R = InA % InM;
+	return (R < 0) ? R + InM : R;
+}
+
+/** Field-space point for cell-local u in [0, 1)^3. */
+UNI_FN float3 Uni_FieldFramePoint(FUniFieldFrame InF, float3 InU)
+{
+	const float3 Q = float3(InF.OriginP.x + InU.x * InF.SizeP, InF.OriginP.y + InU.y * InF.SizeP, InF.OriginP.z + InU.z * InF.SizeP);
+	if (InF.Periodic != 0u)
+	{
+		return frac(Q);
+	}
+	return float3(dot(InF.Rot0, Q), dot(InF.Rot1, Q), dot(InF.Rot2, Q));
+}
+
+/** A feature point's jitter in [0, 1)^3 from its wrapped lattice index. */
+UNI_FN float3 Uni_LatticeJitter(uint InSeed, int InX, int InY, int InZ)
+{
+	const uint H = Uni_SeedMix(Uni_SeedMix(Uni_SeedMix(InSeed, (uint)InX), (uint)InY), (uint)InZ);
+	const uint H2 = Uni_Avalanche(H ^ 0x68E31DA4u);
+	const uint H3 = Uni_Avalanche(H ^ 0xB5297A4Du);
+	return float3((float)(H >> 8u) * (1.0f / 16777216.0f), (float)(H2 >> 8u) * (1.0f / 16777216.0f), (float)(H3 >> 8u) * (1.0f / 16777216.0f));
+}
+
+/** Three nearest feature-point distances of a periodic jittered lattice with G cells per
+ *  unit, in lattice units. Periodic in p with period 1 because indices wrap mod G. */
+UNI_FN void Uni_WebLattice(float3 InP, int InG, uint InSeed, UNI_OUT(float) OutF1, UNI_OUT(float) OutF2, UNI_OUT(float) OutF3)
+{
+	const float G = (float)InG;
+	const float3 Q = InP * G;
+	const int CX = (int)floor(Q.x), CY = (int)floor(Q.y), CZ = (int)floor(Q.z);
+	float F1 = 1.0e9f, F2 = 1.0e9f, F3 = 1.0e9f;
+	for (int DX = -1; DX <= 1; ++DX)
+	{
+		for (int DY = -1; DY <= 1; ++DY)
+		{
+			for (int DZ = -1; DZ <= 1; ++DZ)
+			{
+				const int NX = CX + DX, NY = CY + DY, NZ = CZ + DZ;
+				const float3 J = Uni_LatticeJitter(InSeed, Uni_PosModInt(NX, InG), Uni_PosModInt(NY, InG), Uni_PosModInt(NZ, InG));
+				const float3 FP = float3((float)NX + J.x, (float)NY + J.y, (float)NZ + J.z);
+				const float3 Dv = Q - FP;
+				const float D = sqrt(dot(Dv, Dv));
+				if (D < F1) { F3 = F2; F2 = F1; F1 = D; }
+				else if (D < F2) { F3 = F2; F2 = D; }
+				else if (D < F3) { F3 = D; }
+			}
+		}
+	}
+	OutF1 = F1; OutF2 = F2; OutF3 = F3;
+}
+
+// ------------------------------------------------------------------------------------------
+// Fields
+// ------------------------------------------------------------------------------------------
+
+/** Cosmic web. A = (G, width, void floor, wall weight), B = (filament weight, G2, weight2,
+ *  seed bits). Walls where the two nearest sites are equidistant, filaments where three are.
+ *  G and G2 must be coprime integers (lesson #6). */
+UNI_FN float UniField_Web(float3 InP, FUniFieldParams InPar)
+{
+	const int G = max((int)InPar.A.x, 1);
+	const float Width = max(InPar.A.y, 1.0e-4f);
+	const float Floor = InPar.A.z;
+	const float WallW = InPar.A.w;
+	const float FilW = InPar.B.x;
+	const int G2 = (int)InPar.B.y;
+	const float W2 = InPar.B.z;
+	const uint Seed = asuint(InPar.B.w);
+
+	float F1, F2, F3;
+	Uni_WebLattice(InP, G, Seed, F1, F2, F3);
+	const float E12 = (F2 - F1) / Width;
+	const float E13 = (F3 - F1) / Width;
+	float D = WallW * exp(-E12 * E12) + FilW * exp(-E13 * E13);
+
+	// Second lattice: finer structure. Early-out when unused (lesson #13: keep the guard).
+	if (W2 > 0.0f && G2 > 0)
+	{
+		float S1, S2, S3;
+		Uni_WebLattice(InP, G2, Uni_Avalanche(Seed ^ 0x9E3779B9u), S1, S2, S3);
+		const float T12 = (S2 - S1) / Width;
+		const float T13 = (S3 - S1) / Width;
+		const float D2 = WallW * exp(-T12 * T12) + FilW * exp(-T13 * T13);
+		D = (1.0f - W2) * D + W2 * D2;
+	}
+	return Floor + D;
+}
+
+/** Galaxy in its local frame, unit = influence radius, disc in the xy plane.
+ *  A = (disc scale length, disc scale height, disc weight, bulge effective radius)
+ *  B = (bulge flattening q, bulge weight, arm count, tan(pitch))
+ *  C = (arm amplitude, arm sharpness, arm phase, unused)
+ *  D = (cut radius, unused, unused, unused)
+ *  Zero outside the cut radius, so no child is ever placed outside its contributor's
+ *  influence (T2 contributor coverage). Each layer early-outs when its weight is zero. */
+UNI_FN float UniField_Galaxy(float3 InP, FUniFieldParams InPar)
+{
+	const float Cut = InPar.D.x;
+	const float R2 = dot(InP, InP);
+	if (R2 >= Cut * Cut) { return 0.0f; }
+
+	const float Rcyl = sqrt(InP.x * InP.x + InP.y * InP.y);
+	const float Z = abs(InP.z);
+	float Rho = 0.0f;
+
+	const float DiscW = InPar.A.z;
+	if (DiscW > 0.0f)
+	{
+		float Disc = DiscW * exp(-Rcyl / max(InPar.A.x, 1.0e-5f)) * exp(-Z / max(InPar.A.y, 1.0e-6f));
+		const float ArmAmp = InPar.C.x;
+		if (ArmAmp > 0.0f && InPar.B.z > 0.0f)
+		{
+			const float Theta = atan2(InP.y, InP.x);
+			const float Phi = InPar.B.z * (Theta - log(max(Rcyl, 1.0e-4f)) / max(InPar.B.w, 1.0e-3f) + InPar.C.z);
+			const float Wave = pow(0.5f + 0.5f * cos(Phi), max(InPar.C.y, 0.1f));
+			Disc = Disc * ((1.0f - ArmAmp) + ArmAmp * Wave * (1.0f + InPar.C.y));
+		}
+		Rho += Disc;
+	}
+
+	const float BulgeW = InPar.B.y;
+	if (BulgeW > 0.0f)
+	{
+		const float Q = max(InPar.B.x, 0.05f);
+		const float Re = max(InPar.A.w, 1.0e-5f);
+		const float R3 = sqrt(Rcyl * Rcyl + (Z / Q) * (Z / Q));
+		// Sersic-like, n = 2: exp(-b ((r / re)^(1/2) - 1)), b = 3.67.
+		Rho += BulgeW * exp(-3.67f * (sqrt(R3 / Re) - 1.0f));
+	}
+
+	// Soft edge over the outer 5% of the cut, so the field (and so the placed count) has no
+	// hard shell at the influence radius.
+	const float R = sqrt(R2);
+	return Rho * saturate((Cut - R) / (0.05f * Cut));
+}
+
+UNI_FN float UniField_Ball(float3 InP)
+{
+	return (dot(InP, InP) < 1.0f) ? 1.0f : 0.0f;
+}
+
+// ------------------------------------------------------------------------------------------
+// Registry: the field-ID switch. The design generates this from the field list
+// (UniFieldRegistry.ush); with four fields it is written by hand.
+// ------------------------------------------------------------------------------------------
+
+UNI_FN float Uni_FieldSample(uint InFieldId, float3 InP, FUniFieldParams InPar)
+{
+	if (InFieldId == UNI_FIELD_WEB) { return UniField_Web(InP, InPar); }
+	if (InFieldId == UNI_FIELD_GALAXY) { return UniField_Galaxy(InP, InPar); }
+	if (InFieldId == UNI_FIELD_BALL) { return UniField_Ball(InP); }
+	if (InFieldId == UNI_FIELD_CONST) { return 1.0f; }
+	return 0.0f; // unknown id: no content, never a fallback field (fail closed)
+}
+
+#endif // UNI_FIELDS_USH

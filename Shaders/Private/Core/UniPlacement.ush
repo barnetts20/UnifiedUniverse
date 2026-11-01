@@ -1,0 +1,246 @@
+// UniPlacement.ush
+// Per-cell generation maths, shared by the GPU generation passes (UniGen.usf) and the CPU
+// reference pipeline: probes, envelope and integral, Poisson counts, candidate positions,
+// rejection, property draws, and the 32-byte object record.
+//
+// DETERMINISM. Every draw is counter-based (Uni_DrawU32: seed, channel, index), never a
+// stream walked in thread order. A candidate's identity is its candidate index, never its
+// position in an output buffer (lesson #21). The accepted objects of a (cell, contributor,
+// emitter) are the first n candidates, in candidate-index order, that pass the rejection test.
+// The GPU evaluates candidates in parallel and compacts by candidate index; the CPU walks
+// them in order. Same set, same identities.
+
+#ifndef UNI_PLACEMENT_USH
+#define UNI_PLACEMENT_USH
+
+#include "UniCoreDefs.ush"
+#include "UniSeed.ush"
+#include "UniFields.ush"
+
+static const uint UNI_PROBES_PER_CELL = 128u;   // D-013: two rounds of 64 (lesson #10)
+static const float UNI_ENVELOPE_PAD = 1.25f;    // D-013
+static const uint UNI_MAX_GENERATED_PER_CELL = 32768u; // indices >= 2^15 are anchors
+static const float UNI_POISSON_NORMAL_LAMBDA = 30.0f;
+
+// ------------------------------------------------------------------------------------------
+// Object record: FUniObject, 32 bytes, two uint4 (GPU-MIRROR: UniCore::FObjectGPU)
+//   A.x, A.y, A.z  offset in cell, units of cell width / 2^32
+//   A.w            ArchetypeId (low 16) | Flags (high 16)
+//   B.x            per-object seed
+//   B.y            asuint(log2 physical radius in cm)
+//   B.z            half AbsMag (low 16) | half surface brightness (high 16)
+//   B.w            colour, RGB 10:10:10 (top 2 bits unused)
+// ------------------------------------------------------------------------------------------
+
+struct FUniObject
+{
+	uint4 A;
+	uint4 B;
+};
+
+static const uint UNI_OBJ_FLAG_PROMOTED = 1u;
+static const uint UNI_OBJ_FLAG_DELTA_HIDDEN = 2u;
+static const uint UNI_OBJ_FLAG_HAS_CONTRIBUTOR = 4u;
+static const uint UNI_OBJ_FLAG_EXTENDED = 8u;
+static const uint UNI_OBJ_FLAG_ANCHOR = 16u;
+
+// ------------------------------------------------------------------------------------------
+// Half floats, integer only (bit-identical on both sides; not the f32tof16 intrinsic, whose
+// rounding is implementation-defined)
+// ------------------------------------------------------------------------------------------
+
+/** float32 to IEEE half, round to nearest even, saturating to +-65504, no NaN handling
+ *  (inputs are finite magnitudes). */
+UNI_FN uint Uni_F32ToF16(float InF)
+{
+	const uint Bits = asuint(InF);
+	const uint Sign = (Bits >> 16u) & 0x8000u;
+	const int Exp = (int)((Bits >> 23u) & 0xFFu) - 127 + 15;
+	uint Mant = Bits & 0x007FFFFFu;
+	if (Exp >= 31) { return Sign | 0x7BFFu; }                         // saturate
+	if (Exp <= 0)
+	{
+		if (Exp < -10) { return Sign; }                                  // underflow to zero
+		Mant = Mant | 0x00800000u;                                       // subnormal half
+		const uint Shift = (uint)(14 - Exp);
+		uint H = Mant >> Shift;
+		const uint Rem = Mant & ((1u << Shift) - 1u);
+		const uint Half = 1u << (Shift - 1u);
+		if (Rem > Half || (Rem == Half && (H & 1u) != 0u)) { H = H + 1u; }
+		return Sign | H;
+	}
+	uint H = ((uint)Exp << 10u) | (Mant >> 13u);
+	const uint Rem = Mant & 0x1FFFu;
+	if (Rem > 0x1000u || (Rem == 0x1000u && (H & 1u) != 0u)) { H = H + 1u; }
+	if ((H & 0x7FFFu) >= 0x7C00u) { H = (H & 0x8000u) | 0x7BFFu; }  // rounding carried into inf
+	return Sign | H;
+}
+
+UNI_FN float Uni_F16ToF32(uint InH)
+{
+	const uint Sign = (InH & 0x8000u) << 16u;
+	const uint Exp = (InH >> 10u) & 0x1Fu;
+	const uint Mant = InH & 0x3FFu;
+	if (Exp == 0u)
+	{
+		// Subnormal or zero: Mant * 2^-24.
+		const float V = (float)Mant * (1.0f / 16777216.0f);
+		return (Sign != 0u) ? -V : V;
+	}
+	return asfloat(Sign | ((Exp - 15u + 127u) << 23u) | (Mant << 13u));
+}
+
+UNI_FN uint Uni_PackColour(float3 InRgb)
+{
+	const uint R = (uint)(saturate(InRgb.x) * 1023.0f + 0.5f);
+	const uint G = (uint)(saturate(InRgb.y) * 1023.0f + 0.5f);
+	const uint B = (uint)(saturate(InRgb.z) * 1023.0f + 0.5f);
+	return R | (G << 10u) | (B << 20u);
+}
+
+UNI_FN float3 Uni_UnpackColour(uint InC)
+{
+	return float3((float)(InC & 1023u) / 1023.0f, (float)((InC >> 10u) & 1023u) / 1023.0f, (float)((InC >> 20u) & 1023u) / 1023.0f);
+}
+
+/** Blackbody-ish colour for a temperature in K (Tanner Helland's fit), normalised so the
+ *  brightest channel is 1. Placeholder for a proper LUT (D-014). */
+UNI_FN float3 Uni_TemperatureColour(float InKelvin)
+{
+	const float T = clamp(InKelvin, 1000.0f, 40000.0f) * 0.01f;
+	float R, G, B;
+	if (T <= 66.0f) { R = 1.0f; G = saturate(0.39008158f * log(T) - 0.63184144f); }
+	else { R = saturate(1.29293619f * pow(T - 60.0f, -0.1332047592f)); G = saturate(1.12989086f * pow(T - 60.0f, -0.0755148492f)); }
+	if (T >= 66.0f) { B = 1.0f; }
+	else if (T <= 19.0f) { B = 0.0f; }
+	else { B = saturate(0.54320679f * log(T - 10.0f) - 1.19625409f); }
+	const float M = max(R, max(G, B));
+	return float3(R / M, G / M, B / M);
+}
+
+// ------------------------------------------------------------------------------------------
+// Probes, integral, envelope
+// ------------------------------------------------------------------------------------------
+
+/** Probe k of a cell, cell-local unit position. Two rounds of a jittered 4x4x4 stratification
+ *  (lesson #10: one round under-estimates thin peaks). */
+UNI_FN float3 Uni_ProbeUnit(uint InCellSeed, uint InK)
+{
+	const uint S = InK & 63u;
+	const float3 Stratum = float3((float)(S & 3u), (float)((S >> 2u) & 3u), (float)(S >> 4u));
+	const float JX = Uni_DrawUnit(InCellSeed, UNI_CH_PROBE, InK * 3u + 0u);
+	const float JY = Uni_DrawUnit(InCellSeed, UNI_CH_PROBE, InK * 3u + 1u);
+	const float JZ = Uni_DrawUnit(InCellSeed, UNI_CH_PROBE, InK * 3u + 2u);
+	return float3((Stratum.x + JX) * 0.25f, (Stratum.y + JY) * 0.25f, (Stratum.z + JZ) * 0.25f);
+}
+
+// ------------------------------------------------------------------------------------------
+// Counts
+// ------------------------------------------------------------------------------------------
+
+/** n ~ Poisson(lambda), deterministic from the cell seed. Inversion below 30, a rounded
+ *  normal (Box-Muller) above. */
+UNI_FN uint Uni_PoissonCount(float InLambda, uint InCellSeed)
+{
+	if (!(InLambda > 0.0f)) { return 0u; }
+	if (InLambda < UNI_POISSON_NORMAL_LAMBDA)
+	{
+		const float U = Uni_DrawUnit(InCellSeed, UNI_CH_COUNT, 0u);
+		float P = exp(-InLambda);
+		float F = P;
+		uint K = 0u;
+		while (U > F && K < 256u)
+		{
+			K = K + 1u;
+			P = P * InLambda / (float)K;
+			F = F + P;
+		}
+		return K;
+	}
+	const float U1 = Uni_DrawUnitPos(InCellSeed, UNI_CH_COUNT, 1u);
+	const float U2 = Uni_DrawUnit(InCellSeed, UNI_CH_COUNT, 2u);
+	const float Z = sqrt(-2.0f * log(U1)) * cos(6.28318530718f * U2);
+	const float V = floor(InLambda + sqrt(InLambda) * Z + 0.5f);
+	return (V <= 0.0f) ? 0u : (uint)min(V, 4.0e9f);
+}
+
+// ------------------------------------------------------------------------------------------
+// Candidates
+// ------------------------------------------------------------------------------------------
+
+UNI_FN uint3 Uni_CandidateOffset(uint InCellSeed, uint InJ)
+{
+	return uint3(Uni_DrawU32(InCellSeed, UNI_CH_PLACE, InJ * 3u + 0u),
+		Uni_DrawU32(InCellSeed, UNI_CH_PLACE, InJ * 3u + 1u),
+		Uni_DrawU32(InCellSeed, UNI_CH_PLACE, InJ * 3u + 2u));
+}
+
+/** In-cell offset to a unit position for field evaluation. Offsets are exact; this float is
+ *  only the field lookup. */
+UNI_FN float3 Uni_OffsetUnit(uint3 InOffset)
+{
+	const float S = 1.0f / 4294967296.0f;
+	return float3((float)InOffset.x * S, (float)InOffset.y * S, (float)InOffset.z * S);
+}
+
+/** Rejection test: accept with probability density / envelope. */
+UNI_FN bool Uni_Accept(uint InCellSeed, uint InJ, float InDensity, float InEnvelope)
+{
+	return Uni_DrawUnit(InCellSeed, UNI_CH_ACCEPT, InJ) * InEnvelope < InDensity;
+}
+
+// ------------------------------------------------------------------------------------------
+// Property draws
+// ------------------------------------------------------------------------------------------
+
+/** Linear lookup into a uniformly spaced table of InCount values over x in [0, 1]. */
+UNI_FN float Uni_LutSample(StructuredBuffer<float> InLut, uint InBase, uint InCount, float InX)
+{
+	const float T = saturate(InX) * (float)(InCount - 1u);
+	const uint I0 = min((uint)T, InCount - 2u);
+	const float F = T - (float)I0;
+	const float A = InLut[InBase + I0];
+	const float B = InLut[InBase + I0 + 1u];
+	return A + (B - A) * F;
+}
+
+/** Absolute magnitude for an object of a luminosity slice: the inverse CDF evaluated at a
+ *  uniform draw restricted to the slice's CDF interval [InCdfLo, InCdfHi). */
+UNI_FN float Uni_DrawAbsMag(uint InObjectSeed, float InCdfLo, float InCdfHi, StructuredBuffer<float> InInvCdf, uint InBase, uint InCount)
+{
+	const float U = Uni_DrawUnit(InObjectSeed, UNI_CH_MAG, 0u);
+	return Uni_LutSample(InInvCdf, InBase, InCount, InCdfLo + U * (InCdfHi - InCdfLo));
+}
+
+/** log2 of physical radius in cm: log10 R = A + B (M - M0) + S (2u - 1). */
+UNI_FN float Uni_DrawRadiusLog2(uint InObjectSeed, float InAbsMag, float4 InRadiusModel)
+{
+	const float U = Uni_DrawUnit(InObjectSeed, UNI_CH_RADIUS, 0u);
+	const float Log10R = InRadiusModel.x + InRadiusModel.y * (InAbsMag - InRadiusModel.z) + InRadiusModel.w * (2.0f * U - 1.0f);
+	return Log10R * 3.32192809489f;
+}
+
+/** Colour temperature from magnitude: log10 T = A + B (M - M0), plus scatter. */
+UNI_FN float3 Uni_DrawColour(uint InObjectSeed, float InAbsMag, float4 InColourModel)
+{
+	const float U = Uni_DrawUnit(InObjectSeed, UNI_CH_COLOUR, 0u);
+	const float Log10T = InColourModel.x + InColourModel.y * (InAbsMag - InColourModel.z) + InColourModel.w * (2.0f * U - 1.0f);
+	return Uni_TemperatureColour(pow(10.0f, Log10T));
+}
+
+UNI_FN FUniObject Uni_MakeObject(uint3 InOffset, uint InArchetypeId, uint InFlags, uint InSeed, float InRadiusLog2,
+	float InAbsMag, float InSurfaceBrightness, float3 InRgb)
+{
+	FUniObject O;
+	O.A = uint4(InOffset.x, InOffset.y, InOffset.z, (InArchetypeId & 0xFFFFu) | ((InFlags & 0xFFFFu) << 16u));
+	O.B = uint4(InSeed, asuint(InRadiusLog2), Uni_F32ToF16(InAbsMag) | (Uni_F32ToF16(InSurfaceBrightness) << 16u), Uni_PackColour(InRgb));
+	return O;
+}
+
+UNI_FN uint Uni_ObjectArchetype(FUniObject InO) { return InO.A.w & 0xFFFFu; }
+UNI_FN uint Uni_ObjectFlags(FUniObject InO) { return InO.A.w >> 16u; }
+UNI_FN float Uni_ObjectAbsMag(FUniObject InO) { return Uni_F16ToF32(InO.B.z & 0xFFFFu); }
+UNI_FN float Uni_ObjectSurfaceBrightness(FUniObject InO) { return Uni_F16ToF32(InO.B.z >> 16u); }
+UNI_FN float Uni_ObjectRadiusLog2(FUniObject InO) { return asfloat(InO.B.y); }
+
+#endif // UNI_PLACEMENT_USH
