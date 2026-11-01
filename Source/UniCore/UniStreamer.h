@@ -193,7 +193,11 @@ namespace UniCore
 				if (bSusp) { Lv.bHeld = true; }
 				else if (Lv.bHeld && bJump && Lv.Fade > 0.0f) { bSusp = true; }
 				else { Lv.bHeld = false; }
-				Lv.Fade = bSusp ? std::max(0.0f, Lv.Fade - 0.125f) : std::min(1.0f, Lv.Fade + 0.125f);
+				// D-128: the fade is "the fraction of this level's sprites drawn", which the volume
+				// complements. While any window cell is not Ready it cannot rise (cells still
+				// generating draw nothing), so a filling level shows as glow, then fades in whole.
+				const float Up = (Lv.Win.IsValid() && LevelReady(Lv)) ? 0.125f : 0.0f;   // an unbuilt window is not "ready"
+				Lv.Fade = bSusp ? std::max(0.0f, Lv.Fade - 0.125f) : std::min(1.0f, Lv.Fade + Up);
 				if (bSusp && Lv.Win.IsValid()) { bCoarserReady = bCoarserReady && LevelReady(Lv); continue; }
 
 				// D-126: a sensitivity resize keeps every cell still in the window, Ready ones
@@ -300,13 +304,37 @@ namespace UniCore
 
 		const FCoord& CameraCoord() const { return Camera; }
 
+		// Volume inputs (UniVolume.h, FVolumeSource): resident contributors, the parent object a
+		// contributor came from, and level fades.
+		const std::map<u32, FContributor>& Contributors() const { return Registered; }
+		struct FLevelState { int Level = 0; bool bReady = false; float Fade = 0.0f; };
+		std::vector<FLevelState> LevelStates() const
+		{
+			std::vector<FLevelState> Out;
+			for (const auto& KV : Levels) { Out.push_back({ KV.first, LevelReady(KV.second), KV.second.Fade }); }
+			return Out;
+		}
+		float LevelFade(int L) const { auto It = Levels.find(L); return It == Levels.end() ? 0.0f : It->second.Fade; }
+		const FObjectGPU* FindObject(const FObjectId& Id) const
+		{
+			auto Lt = Levels.find(Id.Cell.Level);
+			if (Lt == Levels.end()) { return nullptr; }
+			auto It = Lt->second.Cells.find(Id.Cell);
+			if (It == Lt->second.Cells.end() || It->second.State != ECellState::Ready) { return nullptr; }
+			for (const FCellContent* C : { &It->second.Readback, &It->second.Anchors })
+			{
+				for (size_t I = 0; I < C->Indices.size() && I < C->Objects.size(); ++I) { if (C->Indices[I] == Id.Index) { return &C->Objects[I]; } }
+			}
+			return nullptr;
+		}
+
 	private:
 		struct FLevel
 		{
 			explicit FLevel(int L) : Win(L, UniHlsl::UNI_WINDOW_N) {}
 			FLevelWindow Win;
 			FVelocityLod Lod;
-			float Fade = 1.0f;
+			float Fade = 0.0f;   // D-128: fades in once the first fill is Ready
 			bool bHeld = false;
 			std::unordered_map<FCellKey, FCell, FCellKeyHasher> Cells;
 		};

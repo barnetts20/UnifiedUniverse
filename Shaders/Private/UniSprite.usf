@@ -4,9 +4,15 @@
 // D-124). The pixel shader converts main-scene depth to true distance along the ray and
 // discards when the scene surface is nearer (Uni_SceneDepthKeep, D-120), which gives correct
 // occlusion by promoted bodies with no per-sprite depth.
+//
+// With the volume pass on (D-132), the sprite's radiance is multiplied by the luminance
+// transmittance of the dust between the camera and the sprite, read from the volume's
+// transmittance slices at the sprite's true distance (piecewise linear in ln t, as
+// Uni_SliceTransmittance). Without it, the slice texture is a 1 x 1 dummy and bVolume = 0.
 
 #include "/Engine/Public/Platform.ush"
 #include "Core/UniProject.ush"
+#include "Core/UniVolume.ush"
 
 StructuredBuffer<FUniSprite> InSprites;
 uint MaxSprites;
@@ -22,6 +28,13 @@ float PixelsPerRadian;              // output pixels per radian at the view cent
 
 Texture2D SceneDepthTexture;
 SamplerState SceneDepthSampler;
+
+Texture2DArray<float> VolumeSlices;  // luminance transmittance at UNI_VOL_SLICES boundaries
+uint bVolume;
+float SliceLnTLo;
+float SliceLnTHi;
+float4 OutToMarch;                  // output pixel -> slice texel: m = p * xy + zw
+uint2 MarchSize;
 
 struct FSpriteVSOut
 {
@@ -77,5 +90,19 @@ void MainPS(in FSpriteVSOut In, out float4 OutColor : SV_Target0)
 	// Gaussian with sigma = 1 corner unit = SigmaPx pixels, normalised per PIXEL, so the energy
 	// summed over the covered pixels equals Radiance whatever the sprite's size.
 	const float W = exp(-0.5f * R2) / (6.2831853f * In.SigmaPx * In.SigmaPx);
-	OutColor = float4(In.Radiance * W, 0.0f);
+	float T = 1.0f;
+	if (bVolume != 0u)
+	{
+		const int2 M = clamp(int2(In.Position.xy * OutToMarch.xy + OutToMarch.zw), int2(0, 0), int2(MarchSize) - 1);
+		const float X = (log(max(In.TrueDistance, 1.0f)) - SliceLnTLo) * (float)UNI_VOL_SLICES / max(SliceLnTHi - SliceLnTLo, 1.0e-3f);
+		if (X >= (float)UNI_VOL_SLICES) { T = VolumeSlices.Load(int4(M, UNI_VOL_SLICES - 1, 0)); }
+		else if (X > 0.0f)
+		{
+			const uint I = (uint)X;
+			const float Lo = (I == 0u) ? 1.0f : VolumeSlices.Load(int4(M, I - 1u, 0));
+			const float Hi = VolumeSlices.Load(int4(M, I, 0));
+			T = Lo + (Hi - Lo) * (X - (float)I);
+		}
+	}
+	OutColor = float4(In.Radiance * (W * T), 0.0f);
 }

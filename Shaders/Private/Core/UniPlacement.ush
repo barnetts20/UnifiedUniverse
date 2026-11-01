@@ -237,14 +237,6 @@ UNI_FN float Uni_DrawRadiusLog2(uint InObjectSeed, float InAbsMag, float4 InRadi
 }
 
 /** Colour temperature from magnitude: log10 T = A + B (M - M0), plus scatter. */
-/** Rec. 709 luminance. Sprite and volume radiance are colour / luminance x intensity, so the
- *  intensity (from the V magnitude) is the luminance and sums of many colours conserve it
- *  exactly when sprites hand light to the volume (D-135). */
-UNI_FN float Uni_Luminance(float3 InRgb)
-{
-	return 0.2126f * InRgb.x + 0.7152f * InRgb.y + 0.0722f * InRgb.z;
-}
-
 /** Colour at scatter quantile U (shared with the volume's tables, as Uni_SliceMagAt). */
 UNI_FN float3 Uni_ColourAt(float InU, float InAbsMag, float4 InColourModel)
 {

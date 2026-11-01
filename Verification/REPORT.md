@@ -4,19 +4,19 @@
 
 | | |
 | --- | --- |
-| Commit | `79eee9c` + uncommitted changes (branch `uu/volumetrics`) |
-| Run | 2026-11-01 15:57 EST, 500 s |
+| Commit | `11226c4` + uncommitted changes (branch `uu/volumetrics`) |
+| Run | 2026-11-01 17:17 EST, 567 s |
 | Environment tier reached | Tier 3 offline (Tier 4 static only: no Unreal, no DXC here — see ENVIRONMENT.md) |
-| Checks | 51 run, 51 pass, **0 fail** |
+| Checks | 53 run, 53 pass, **0 fail** |
 
 ## Tier 1 — core correctness
 
 | Check | Result | Criterion | Measured |
 | --- | --- | --- | --- |
-| `T1.build.gcc` | PASS | Harness and UniCore build with g++, -Wall -Wextra -Werror, C++17 | built in 0 s |
+| `T1.build.gcc` | PASS | Harness and UniCore build with g++, -Wall -Wextra -Werror, C++17 | built in 16 s |
 | `T1.build.strict.gpp` | PASS | Every UniCore header as C++20 with -Wall -Wextra -Wshadow -Werror (g++), as the UE modules compile them | clean |
 | `T1.build.strict.clangpp` | PASS | Every UniCore header as C++20 with -Wall -Wextra -Wshadow -Werror (clang++), as the UE modules compile them | clean |
-| `T1.build.clang` | PASS | Harness and UniCore build with clang++, -Wall -Wextra -Werror, C++17 | built in 12 s |
+| `T1.build.clang` | PASS | Harness and UniCore build with clang++, -Wall -Wextra -Werror, C++17 | built in 13 s |
 | `T1.coord.fuzz` | PASS | Coordinate fuzz: UniCoord.h vs UniCoord.ush (via shim) vs __int128, all ops | 1000000 cases x 3 axes, 0 mismatches (2.1 s) |
 | `T1.coord.edges` | PASS | Targeted edges: borrow chains, root wrap, max magnitude, zero, level shifts, extreme AddDisplacement, hex | 1079 targeted expectations, 0 failed |
 | `T1.coord.hilo` | PASS | ToHiLo relative error <= 2^-46 over the fuzz set | worst relative error 2^-49.00 over 1000000 cases x 3 axes (limit 2^-46), 0 over |
@@ -49,6 +49,7 @@
 | `T2.stream.parity` | PASS | Runtime streamer (probe -> allocate -> place, readback contributors) with the CPU backend reproduces the reference pipeline cell for cell | 5375 cells / 719687 objects compared, 0 differ; galaxy_to_star: 2375 ready cells; flythrough: 3000 ready cells; 43 batches, worst entering-to-ready latency 37 frames, pool peak 361697, 0 alloc failures required (0) |
 | `T2.stream.sensitivity_resize` | PASS | Sensitivity resize keeps resident cells (no interior regeneration) and settles to the reference at the new dm | ready cells 2375 before, 3935 on the resize frame (kept), settled objects 1625782 vs reference 1625782; batches 19 -> 36 |
 | `T2.stream.fail_closed` | PASS | Backend timeouts fail closed: affected cells are not drawn and release their ranges; no unwritten slot is ever drawn | 6 batches failed on purpose, 749 cells failed closed, 257418 slots drawn, 0 of them unwritten |
+| `T2.stream.volume_parity` | PASS | The volume scene built from the streamer (CPU backend, settled) equals the reference pipeline's: carriers and parameters byte-identical, LUTs identical; no filling level has a fade above 0 (D-128) | 3 carriers (identical), 5 parameter blocks (identical), 1024 LUT entries, 0 differ; streamer settled in 48 frames; 0 level-frames filling with fade > 0 |
 
 ## Tier 3 — rendering behaviour
 
@@ -69,6 +70,7 @@
 | `T3.vol.background` | PASS | Extragalactic background (D-131): finite, converged (0.5 vs 2 marched periods within 2%), no truncation; mean surface brightness reported | mean 27.43 mag/arcsec^2 (mu_ref 25); 0.5 -> 2 periods: +0.00%; default (0.5 periods): 107 steps per ray, 0 truncated (2 periods: 282 steps, 0 truncated at the 512 budget) |
 | `T3.vol.frames` | PASS | Reference stills with the volume (galaxy face-on 60 kpc / edge-on 30 kpc, interior x2), no truncation | galaxy_faceon_60kpc: 16 steps/ray, volume 100% of the light; galaxy_edgeon_30kpc: 45 steps/ray, volume 100% of the light; interior_towards_centre: 175 steps/ray, volume 96% of the light; interior_out_of_plane: 136 steps/ray, volume 70% of the light;  |
 | `T3.vol.flythrough` | PASS | Flythrough with the volume (budget-consistent model): 48-frame contact sheet, no truncation; shots where the galaxy shows only as glow are counted | 48 shots, 0 truncated rays, 124 steps per ray on average; 9 shots carry < 1% of their light in sprites. [00 3.24 Gpc: volume 100%] [08 123 kpc: volume 100%] [16 14.8 ly: volume 5%] [24 35.4 AU: volume 0%] [32 2.004e+05 km: volume 0%] [40 7.4 km: volume 0%] [47 1 m: volume 0%]  |
+| `T3.vol.cube` | PASS | Background cube + separable composite (D-136) vs the union march: total luminosity within 0.5%, 99th-percentile pixel within 3% | galaxy+web, towards centre: total +0.000%, p99 pixel 0.00%; galaxy+web, out of plane: total +0.000%, p99 pixel 0.00%; void, web only: total -0.000%, p99 pixel 0.02%;  cube: 107 steps per texel, 0 truncated |
 | `T3.images` | PASS | Reference frames and flythrough contact sheet converted to PNG with HUD (D-018) | 9 PNGs in Verification/images |
 
 ## Tier 4 — Unreal integration (static only in this environment)
@@ -100,7 +102,7 @@ Written by the session after looking at the images: [OBSERVATIONS.md](OBSERVATIO
 
 - Regressed (PASS → FAIL): none
 - Fixed (FAIL → PASS): none
-- New checks: `T3.vol.march`, `T3.vol.conservation`, `T3.vol.budget`, `T3.vol.handoff`, `T3.vol.nested`, `T3.vol.precision`, `T3.vol.background`, `T3.vol.frames`, `T3.vol.flythrough`
+- New checks: none
 
 ## Not verified here
 
@@ -114,4 +116,4 @@ Each item below must also appear in `Docs/REVIEW_TONIGHT.md` §3 with its ID. Th
 - **UE-6** — Flythrough in the editor: `uu.Flythrough` console command on an empty level shows the backdrop, with no jitter and no pops.
 - **UE-7** — Promotion handoff appearance: the reference renderer showed the sprite's glare far larger than the promoted body (OBSERVATIONS.md). In UE there is no promotion actor pool yet, so promoted stars stay sprites; check how the glare reads with real bloom.
 - **UE-8** — Runtime cost: GPU time of the generate / project / sprite passes, the one-time game-thread hitch of the normalising integral when entering a galaxy (D-123), and teleport fill latency (about 37 frames, D-122).
-- **UE-9** — Volume pass in the engine (Docs/VOLUMETRICS.md §8) is not built: only the shared core (UniVolume.ush), the CPU builder (UniVolume.h) and the offline reference exist. The core must compile under the engine shader compiler when UniVolume.usf is written, and the project-and-cull changes it relies on (handoff share, horizon dimming, luminance-normalised colour) must compile now (part of UE-3).
+- **UE-9** — The volume pass in the engine (Docs/VOLUMETRICS.md §8) is written but has never been compiled: UniVolume.usf (MarchCS, BackgroundCS, CompositeVS/PS), the sprite transmittance lookup, RenderVolume_RenderThread and the subsystem's per-frame volume scene. It must compile, show the galaxy glow and the dust lane matching the reference stills, and stay within budget (uu.Volume 0/1 to compare).

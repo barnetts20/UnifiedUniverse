@@ -90,6 +90,14 @@ UNI_FN float Uni_MagFade(float InApparentMag, float InLimitingMag)
 	return saturate((InLimitingMag - InApparentMag) / UNI_FADE_BAND);
 }
 
+/** Rec. 709 luminance. Sprite and volume radiance are colour / luminance x intensity, so the
+ *  intensity (from the V magnitude) is the luminance and sums of many colours conserve it
+ *  exactly when sprites hand light to the volume (D-135). */
+UNI_FN float Uni_Luminance(float3 InRgb)
+{
+	return 0.2126f * InRgb.x + 0.7152f * InRgb.y + 0.0722f * InRgb.z;
+}
+
 /** Background horizon (D-131, render only): every flux is dimmed by (1 + r / r_H)^-2, the
  *  low-redshift form of cosmological surface-brightness dimming. Without it the integrated
  *  light of an endless (toroidal) universe diverges (Olbers). r_H = c / H0. Sprites and

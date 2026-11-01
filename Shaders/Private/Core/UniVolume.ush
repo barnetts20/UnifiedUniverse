@@ -177,6 +177,9 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 
 	const float SliceScale = (float)UNI_VOL_SLICES / max(InView.SliceLnTHi - InView.SliceLnTLo, 1.0e-3f);
 	uint NextSlice = 0u;
+	float3 SliceT[UNI_VOL_SLICES];
+	UNI_UNROLL
+	for (uint Ki = 0u; Ki < UNI_VOL_SLICES; ++Ki) { SliceT[Ki] = float3(1.0f, 1.0f, 1.0f); }
 	float T = TMin;
 	float3 Tr = float3(1.0f, 1.0f, 1.0f);
 	float3 B = float3(0.0f, 0.0f, 0.0f);
@@ -264,18 +267,26 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 		T = T + S;
 		Res.Steps = Step + 1u;
 
-		// Transmittance slices: record T at every boundary passed.
+		// Transmittance slices: record T at every boundary passed. Static indices only (an
+		// unrolled compare per slice): FXC cannot address a struct-member or local array
+		// dynamically inside a [loop] without forcing an unroll.
 		const float SlicePos = (log(T) - InView.SliceLnTLo) * SliceScale;
-		while (NextSlice < UNI_VOL_SLICES && SlicePos >= (float)(NextSlice + 1u))
+		UNI_UNROLL
+		for (uint Ks = 0u; Ks < UNI_VOL_SLICES; ++Ks)
 		{
-			Res.SliceT[NextSlice] = Tr;
-			NextSlice = NextSlice + 1u;
+			if (Ks >= NextSlice && SlicePos >= (float)(Ks + 1u)) { SliceT[Ks] = Tr; }
 		}
+		NextSlice = max(NextSlice, (uint)clamp(floor(SlicePos), 0.0f, (float)UNI_VOL_SLICES));
 		if (T >= TMax) { bDone = true; break; }
 		if (max(Tr.x, max(Tr.y, Tr.z)) < 1.0e-3f) { bDone = true; break; }   // opaque
 	}
 	if (!bDone) { Res.Truncated = 1u; }
-	while (NextSlice < UNI_VOL_SLICES) { Res.SliceT[NextSlice] = Tr; NextSlice = NextSlice + 1u; }
+	UNI_UNROLL
+	for (uint Kf = 0u; Kf < UNI_VOL_SLICES; ++Kf)
+	{
+		if (Kf >= NextSlice) { SliceT[Kf] = Tr; }
+		Res.SliceT[Kf] = SliceT[Kf];
+	}
 
 	// Background tail: past a periodic carrier's march extent its field is its mean, and the
 	// LUT's cumulative tail block gives the rest of the integral (D-131).
@@ -301,6 +312,50 @@ UNI_FN uint Uni_CarrierSubsamples(FUniCarrier InC, float InThetaPixel)
 	const float Dist = max(sqrt(dot(InC.CamLocal, InC.CamLocal)), 1.0e-6f);   // field units
 	const float FeaturePx = InC.ResolveScale / Dist / InThetaPixel;
 	return (uint)clamp(ceil(0.5f / max(FeaturePx, 1.0e-6f)), 1.0f, 8.0f);
+}
+
+// ------------------------------------------------------------------------------------------
+// Background cube (D-136). The periodic (background) carriers start at 0.1 Mpc, beyond every
+// local carrier's chord, so their light is marched once into a direction map and composited
+// per pixel as B = B_near + T_near x B_cube(dir): exact where the intervals do not overlap.
+// The map is a 6-layer texture array with this file's own face convention (not the engine's
+// TextureCube), so the C++ reference and the shader agree by construction.
+// ------------------------------------------------------------------------------------------
+
+/** Face F's basis: forward (the face's axis), right, up. Faces: +X, -X, +Y, -Y, +Z, -Z. */
+UNI_FN void Uni_CubeFaceBasis(uint InFace, UNI_OUT(float3) OutF, UNI_OUT(float3) OutR, UNI_OUT(float3) OutU)
+{
+	const float S = ((InFace & 1u) == 0u) ? 1.0f : -1.0f;
+	const uint Axis = InFace >> 1u;
+	if (Axis == 0u) { OutF = float3(S, 0.0f, 0.0f); OutR = float3(0.0f, -S, 0.0f); OutU = float3(0.0f, 0.0f, 1.0f); }
+	else if (Axis == 1u) { OutF = float3(0.0f, S, 0.0f); OutR = float3(S, 0.0f, 0.0f); OutU = float3(0.0f, 0.0f, 1.0f); }
+	else { OutF = float3(0.0f, 0.0f, S); OutR = float3(0.0f, 1.0f, 0.0f); OutU = float3(-S, 0.0f, 0.0f); }
+}
+
+/** Direction through texel centre (InX, InY) of an InN x InN face (Y down). */
+UNI_FN float3 Uni_CubeTexelDir(uint InFace, float InX, float InY, float InN)
+{
+	float3 F, R, U;
+	Uni_CubeFaceBasis(InFace, F, R, U);
+	const float A = 2.0f * InX / InN - 1.0f;
+	const float B = 1.0f - 2.0f * InY / InN;
+	return normalize(F + R * A + U * B);
+}
+
+/** Face and continuous texel coordinates (texel centres at k + 0.5) of a direction. */
+UNI_FN uint Uni_CubeDirToFace(float3 InD, float InN, UNI_OUT(float) OutX, UNI_OUT(float) OutY)
+{
+	const float Ax = abs(InD.x), Ay = abs(InD.y), Az = abs(InD.z);
+	uint Face;
+	if (Ax >= Ay && Ax >= Az) { Face = InD.x >= 0.0f ? 0u : 1u; }
+	else if (Ay >= Az) { Face = InD.y >= 0.0f ? 2u : 3u; }
+	else { Face = InD.z >= 0.0f ? 4u : 5u; }
+	float3 F, R, U;
+	Uni_CubeFaceBasis(Face, F, R, U);
+	const float Fz = max(dot(InD, F), 1.0e-6f);
+	OutX = (dot(InD, R) / Fz + 1.0f) * 0.5f * InN;
+	OutY = (1.0f - dot(InD, U) / Fz) * 0.5f * InN;
+	return Face;
 }
 
 /** Transmittance at true distance InT from the slices (sprite pass): piecewise linear in ln t,

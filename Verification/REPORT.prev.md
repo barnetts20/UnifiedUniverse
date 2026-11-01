@@ -4,20 +4,20 @@
 
 | | |
 | --- | --- |
-| Commit | `b1222b9` + uncommitted changes (branch `uu/prototype-day1`) |
-| Run | 2026-11-01 12:22 EST, 229 s |
+| Commit | `11226c4` + uncommitted changes (branch `uu/volumetrics`) |
+| Run | 2026-11-01 17:07 EST, 547 s |
 | Environment tier reached | Tier 3 offline (Tier 4 static only: no Unreal, no DXC here — see ENVIRONMENT.md) |
-| Checks | 42 run, 42 pass, **0 fail** |
+| Checks | 53 run, 53 pass, **0 fail** |
 
 ## Tier 1 — core correctness
 
 | Check | Result | Criterion | Measured |
 | --- | --- | --- | --- |
-| `T1.build.gcc` | PASS | Harness and UniCore build with g++, -Wall -Wextra -Werror, C++17 | built in 5 s |
+| `T1.build.gcc` | PASS | Harness and UniCore build with g++, -Wall -Wextra -Werror, C++17 | built in 7 s |
 | `T1.build.strict.gpp` | PASS | Every UniCore header as C++20 with -Wall -Wextra -Wshadow -Werror (g++), as the UE modules compile them | clean |
 | `T1.build.strict.clangpp` | PASS | Every UniCore header as C++20 with -Wall -Wextra -Wshadow -Werror (clang++), as the UE modules compile them | clean |
-| `T1.build.clang` | PASS | Harness and UniCore build with clang++, -Wall -Wextra -Werror, C++17 | built in 4 s |
-| `T1.coord.fuzz` | PASS | Coordinate fuzz: UniCoord.h vs UniCoord.ush (via shim) vs __int128, all ops | 1000000 cases x 3 axes, 0 mismatches (2.2 s) |
+| `T1.build.clang` | PASS | Harness and UniCore build with clang++, -Wall -Wextra -Werror, C++17 | built in 13 s |
+| `T1.coord.fuzz` | PASS | Coordinate fuzz: UniCoord.h vs UniCoord.ush (via shim) vs __int128, all ops | 1000000 cases x 3 axes, 0 mismatches (2.1 s) |
 | `T1.coord.edges` | PASS | Targeted edges: borrow chains, root wrap, max magnitude, zero, level shifts, extreme AddDisplacement, hex | 1079 targeted expectations, 0 failed |
 | `T1.coord.hilo` | PASS | ToHiLo relative error <= 2^-46 over the fuzz set | worst relative error 2^-49.00 over 1000000 cases x 3 axes (limit 2^-46), 0 over |
 | `T1.fr` | PASS | f(r) monotonic over 1..2^128 cm in log steps, C1 at r0, inverse exists (within float conditioning) | 12800 samples, 0 non-monotonic; continuous yes, C1 yes; inverse worst rel error 1.11e-05 = 0.67 of its float bound; 2^128 cm maps to 69.0 r0 |
@@ -49,6 +49,7 @@
 | `T2.stream.parity` | PASS | Runtime streamer (probe -> allocate -> place, readback contributors) with the CPU backend reproduces the reference pipeline cell for cell | 5375 cells / 719687 objects compared, 0 differ; galaxy_to_star: 2375 ready cells; flythrough: 3000 ready cells; 43 batches, worst entering-to-ready latency 37 frames, pool peak 361697, 0 alloc failures required (0) |
 | `T2.stream.sensitivity_resize` | PASS | Sensitivity resize keeps resident cells (no interior regeneration) and settles to the reference at the new dm | ready cells 2375 before, 3935 on the resize frame (kept), settled objects 1625782 vs reference 1625782; batches 19 -> 36 |
 | `T2.stream.fail_closed` | PASS | Backend timeouts fail closed: affected cells are not drawn and release their ranges; no unwritten slot is ever drawn | 6 batches failed on purpose, 749 cells failed closed, 257418 slots drawn, 0 of them unwritten |
+| `T2.stream.volume_parity` | PASS | The volume scene built from the streamer (CPU backend, settled) equals the reference pipeline's: carriers and parameters byte-identical, LUTs identical; no filling level has a fade above 0 (D-128) | 3 carriers (identical), 5 parameter blocks (identical), 1024 LUT entries, 0 differ; streamer settled in 48 frames; 0 level-frames filling with fade > 0 |
 
 ## Tier 3 — rendering behaviour
 
@@ -60,22 +61,37 @@
 | `T3.frames` | PASS | Reference stills written for visual inspection (galaxy interior x2, cosmic web) | still_galaxy_towards_centre: 9904 visible of 367374 resident; still_galaxy_out_of_plane: 1967 visible of 367374 resident; web dm+5: 65 visible of 63829 resident |
 | `T3.flythrough` | PASS | Scripted path 10^28 cm to 1 m from an object: 48-frame contact sheet; objects entering above the fade threshold = 0 (frames 1..N; frame 0 is the initial fill) | 2400 frames, 545902 objects entered residency, 0 above threshold (1% of a just-visible star), 0 with any non-zero intensity; target M = -4.38. [00 3.24 Gpc: 7 vis] [08 123 kpc: 9 vis] [16 14.8 ly: 2553 vis] [24 35.4 AU: 2549 vis] [32 2.004e+05 km: 0 vis] [40 7.4 km: 0 vis] [47 1 m: 0 vis]  |
 | `T3.sensitivity` | PASS | Global sensitivity sweep dm 0 -> +2.5 -> 0: no pops, no level blinks, visible count grows with dm | 120 frames: 3745207 entering objects, 0 pops, 0 level blinks; visible 9918 at dm 0, 259980 at dm +2.5, 9918 back at 0 |
-| `T3.images` | PASS | Reference frames and flythrough contact sheet converted to PNG with HUD (D-018) | 4 PNGs in Verification/images |
+| `T3.vol.march` | PASS | Adaptive march (log steps, field step hints, interval union) vs brute-force fine march: emission within 1%, optical depth within 0.02, no truncation | 576 rays (364 compared): worst emission error 0.799%, worst tau error 0.0013, steps mean 85 max 300, 0 truncated. face-on 60 kpc: worst 0.799%; edge-on 60 kpc: worst 0.296%; inside, towards centre: worst 0.076%; inside, out of plane: worst 0.058%;  |
+| `T3.vol.conservation` | PASS | Sprites + volume = total light over the whole sphere (D-128), at dm = -1, 0, +2: within 3 sigma of the sprites' Poisson spread or 1% | dm -1: volume 2.732e+05 + sprites 1.168e+04 = 2.849e+05 vs all-unresolved 2.853e+05 (-0.16%, z -0.89; sprites carry 4.1%); dm +0: volume 6.73e+05 + sprites 4.269e+04 = 7.157e+05 vs all-unresolved 7.167e+05 (-0.14%, z -0.74; sprites carry 6.0%); dm +2: volume 3.991e+06 + sprites 5.268e+05 = 4.518e+06 vs all-unresolved 4.522e+06 (-0.10%, z -0.53; sprites carry 11.7%);  |
+| `T3.vol.budget` | PASS | Luminosity budget (D-133): the demo galaxy's children vs its drawn magnitude (reported); a rescaled N_total closes it to < 0.01 mag | 2e11 stars from the placeholder stellar function sum to M = -23.18; the galaxy is drawn at M = -21.00 (mismatch -2.18 mag, 7.4x). N_total = 2.69e+10 would close it (corrected model: M = -21.000). Owner decision (D-133). |
+| `T3.vol.handoff` | PASS | Galaxy sprite -> volume carrier while approaching 6 Mpc -> 300 kpc (budget-consistent model): in-frame luminosity x d^2 constant within 2% | worst deviation 0.84%; the sprite carries 100.0% at 6 Mpc and 0.0% at 300 kpc. [6 Mpc: sprite 100% +0.00%] [2.65 Mpc: sprite 100% -0.00%] [1.17 Mpc: sprite 81% +0.08%] [517 kpc: sprite 0% +0.34%] [300 kpc: sprite 0% -0.25%]  |
+| `T3.vol.nested` | PASS | Nested carriers (galaxy inside the web): union march = galaxy alone + background alone within 1% | union 7060.2, galaxy 6958.7 + background 101.49 = 7060.2 (-0.000%); the background is 1.437% of the light out of the plane |
+| `T3.vol.precision` | PASS | Volume translation invariance: the same scene at the origin and ~2^126 cm away renders identically (< 1e-6 of peak); 0.001 cm camera steps change < 1e-4 of peak | origin vs far: max difference 0.00e+00 of peak; 0.001 cm steps: max change 0.00e+00 of peak |
+| `T3.vol.background` | PASS | Extragalactic background (D-131): finite, converged (0.5 vs 2 marched periods within 2%), no truncation; mean surface brightness reported | mean 27.43 mag/arcsec^2 (mu_ref 25); 0.5 -> 2 periods: +0.00%; default (0.5 periods): 107 steps per ray, 0 truncated (2 periods: 282 steps, 0 truncated at the 512 budget) |
+| `T3.vol.frames` | PASS | Reference stills with the volume (galaxy face-on 60 kpc / edge-on 30 kpc, interior x2), no truncation | galaxy_faceon_60kpc: 16 steps/ray, volume 100% of the light; galaxy_edgeon_30kpc: 45 steps/ray, volume 100% of the light; interior_towards_centre: 175 steps/ray, volume 96% of the light; interior_out_of_plane: 136 steps/ray, volume 70% of the light;  |
+| `T3.vol.flythrough` | PASS | Flythrough with the volume (budget-consistent model): 48-frame contact sheet, no truncation; shots where the galaxy shows only as glow are counted | 48 shots, 0 truncated rays, 124 steps per ray on average; 9 shots carry < 1% of their light in sprites. [00 3.24 Gpc: volume 100%] [08 123 kpc: volume 100%] [16 14.8 ly: volume 5%] [24 35.4 AU: volume 0%] [32 2.004e+05 km: volume 0%] [40 7.4 km: volume 0%] [47 1 m: volume 0%]  |
+| `T3.vol.cube` | PASS | Background cube + separable composite (D-136) vs the union march: total luminosity within 0.5%, 99th-percentile pixel within 3% | galaxy+web, towards centre: total +0.000%, p99 pixel 0.00%; galaxy+web, out of plane: total +0.000%, p99 pixel 0.00%; void, web only: total -0.000%, p99 pixel 0.02%;  cube: 107 steps per texel, 0 truncated |
+| `T3.images` | PASS | Reference frames and flythrough contact sheet converted to PNG with HUD (D-018) | 9 PNGs in Verification/images |
 
 ## Tier 4 — Unreal integration (static only in this environment)
 
 | Check | Result | Criterion | Measured |
 | --- | --- | --- | --- |
-| `T4.static.core_subset` | PASS | Shader cores stay in the shared C++/HLSL subset (no swizzles, UNI_FN, f-suffixed literals, no textures) | 8 cores, 0 problems |
-| `T4.static.gpu_structs` | PASS | GPU-mirrored structs (marked // GPU-MIRROR) have a static_assert, size a multiple of 16 (lesson #20) | 7 GPU structs; missing assert: none; not 16-multiple: none |
+| `T4.static.core_subset` | PASS | Shader cores stay in the shared C++/HLSL subset (no swizzles, UNI_FN, f-suffixed literals, no textures) | 9 cores, 0 problems |
+| `T4.static.gpu_structs` | PASS | GPU-mirrored structs (marked // GPU-MIRROR) have a static_assert, size a multiple of 16 (lesson #20) | 9 GPU structs; missing assert: none; not 16-multiple: none |
 | `T4.static.ue_rules` | PASS | UE-facing rules: no UE includes in UniCore, render hooks only in UniRenderHooks.cpp, no absolute FVector | no problems |
-| `T0.report.unverified_listed` | PASS | Every unverified item is listed in REVIEW_TONIGHT.md | 8 unverified items; missing from REVIEW_TONIGHT: none |
+| `T0.report.unverified_listed` | PASS | Every unverified item is listed in REVIEW_TONIGHT.md | 9 unverified items; missing from REVIEW_TONIGHT: none |
 
 ## Images
 
 - [flythrough_contact_sheet.png](images/flythrough_contact_sheet.png)
+- [flythrough_volume_contact_sheet.png](images/flythrough_volume_contact_sheet.png)
 - [still_galaxy_out_of_plane.png](images/still_galaxy_out_of_plane.png)
 - [still_galaxy_towards_centre.png](images/still_galaxy_towards_centre.png)
+- [still_vol_galaxy_edgeon_30kpc.png](images/still_vol_galaxy_edgeon_30kpc.png)
+- [still_vol_galaxy_faceon_60kpc.png](images/still_vol_galaxy_faceon_60kpc.png)
+- [still_vol_interior_out_of_plane.png](images/still_vol_interior_out_of_plane.png)
+- [still_vol_interior_towards_centre.png](images/still_vol_interior_towards_centre.png)
 - [still_web_sensitive_dm5.png](images/still_web_sensitive_dm5.png)
 
 ## Visual inspection
@@ -86,7 +102,7 @@ Written by the session after looking at the images: [OBSERVATIONS.md](OBSERVATIO
 
 - Regressed (PASS → FAIL): none
 - Fixed (FAIL → PASS): none
-- New checks: `T2.stream.fail_closed`
+- New checks: `T2.stream.volume_parity`, `T3.vol.cube`
 
 ## Not verified here
 
@@ -100,3 +116,4 @@ Each item below must also appear in `Docs/REVIEW_TONIGHT.md` §3 with its ID. Th
 - **UE-6** — Flythrough in the editor: `uu.Flythrough` console command on an empty level shows the backdrop, with no jitter and no pops.
 - **UE-7** — Promotion handoff appearance: the reference renderer showed the sprite's glare far larger than the promoted body (OBSERVATIONS.md). In UE there is no promotion actor pool yet, so promoted stars stay sprites; check how the glare reads with real bloom.
 - **UE-8** — Runtime cost: GPU time of the generate / project / sprite passes, the one-time game-thread hitch of the normalising integral when entering a galaxy (D-123), and teleport fill latency (about 37 frames, D-122).
+- **UE-9** — The volume pass in the engine (Docs/VOLUMETRICS.md §8) is written but has never been compiled: UniVolume.usf (MarchCS, BackgroundCS, CompositeVS/PS), the sprite transmittance lookup, RenderVolume_RenderThread and the subsystem's per-frame volume scene. It must compile, show the galaxy glow and the dust lane matching the reference stills, and stay within budget (uu.Volume 0/1 to compare).

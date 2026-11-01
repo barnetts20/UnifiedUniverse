@@ -17,6 +17,7 @@
 //   uu.Teleport <solar|void>            jump the camera (coarse-to-fine rebuild)
 //   uu.Sensitivity <dm>                 limiting-magnitude offset, -5..5
 //   uu.Exposure <mag>                   exposure bias in magnitudes (negative = brighter)
+//   uu.Volume <0|1>                     the volume pass: unresolved glow, dust, background
 //   uu.Stats                            log streaming and render statistics
 //   uu.Disable
 
@@ -27,6 +28,7 @@
 // Complete types, not forward declarations: UHT generates this class's destructor in
 // UniSubsystem.gen.cpp, which sees only this header, and TUniquePtr must be able to delete them.
 #include "UniStreamer.h"
+#include "UniVolume.h"
 #include "UniSubsystem.generated.h"
 
 UENUM(BlueprintType)
@@ -87,6 +89,9 @@ public:
 	void StartFlythrough(float Seconds = 60.0f);
 
 	void SetExposureBias(float Mag) { ExposureBias = Mag; }
+	/** The volume pass (Docs/VOLUMETRICS.md): unresolved light, dust, background. */
+	void SetVolumeEnabled(bool bOn) { bVolume = bOn; }
+	bool IsVolumeEnabled() const { return bVolume; }
 	void LogStats() const;
 
 	static UUniSubsystem* FindForConsole();
@@ -101,6 +106,11 @@ private:
 	TUniquePtr<UniCore::FRefGenerator> Generator;
 	TUniquePtr<UniCore::IGenBackend> Backend;
 	TUniquePtr<UniCore::FUniStreamer> Streamer;
+	TUniquePtr<UniCore::FVolumeBuilder> VolumeBuilder;
+	bool bVolume = true;
+	uint32 BackgroundVersion = 0;
+	UniCore::FCoord BackgroundAnchor;
+	TArray<FVector4f> BackgroundLutLast;
 
 	FUniCoord Camera;
 	FUniCoord LocalAnchor;

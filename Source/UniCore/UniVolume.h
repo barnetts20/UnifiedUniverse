@@ -113,7 +113,7 @@ namespace UniCore
 			{
 				const int Gi = M.SliceIndex(ChildId, S.Level);
 				if (Gi < 0) { continue; }
-				const FSliceGPU& G = M.GpuSlices()[size_t(Gi)];
+				const FSliceGPU& SG = M.GpuSlices()[size_t(Gi)];
 				FRow R;
 				R.Level = S.Level;
 				R.P = S.P;
@@ -122,7 +122,7 @@ namespace UniCore
 				for (int I = 0; I < kU; ++I)
 				{
 					const float U = (float(I) + 0.5f) / float(kU);
-					const float Mag = HV::Uni_SliceMagAt(U, 0.0f, 1.0f, G.BrightM, G.FaintM, LutBuf, G.LutBase, G.LutCount);
+					const float Mag = HV::Uni_SliceMagAt(U, 0.0f, 1.0f, SG.BrightM, SG.FaintM, LutBuf, SG.LutBase, SG.LutCount);
 					Ms[size_t(I)] = Mag;
 					const double L = std::pow(10.0, -0.4 * double(Mag));
 					double C[3] = { 0, 0, 0 };
@@ -188,18 +188,26 @@ namespace UniCore
 
 	inline double LutT(int I) { return std::exp(double(HV::UNI_VOL_LN_T_LO) + (double(HV::UNI_VOL_LN_T_HI) - double(HV::UNI_VOL_LN_T_LO)) * double(I) / double(HV::UNI_VOL_LUT_SIZE - 1u)); }
 
+	/** F_L per table row (fetched once per LUT build, not per sample). */
+	inline std::vector<double> RowFades(const FUnresolvedTable& T, const FLutFrame& F)
+	{
+		std::vector<double> Fl;
+		for (const FUnresolvedTable::FRow& R : T.Rows) { Fl.push_back(F.LevelFade ? std::clamp(double(F.LevelFade(R.Level)), 0.0, 1.0) : 0.0); }
+		return Fl;
+	}
+
 	/** l(t) per child not drawn as a sprite, horizon-dimmed and exposure-scaled. */
-	inline void UnresolvedAt(const FUnresolvedTable& T, const FLutFrame& F, double Tcm, double Out[3])
+	inline void UnresolvedAt(const FUnresolvedTable& T, const FLutFrame& F, const std::vector<double>& Fl, double Tcm, double Out[3])
 	{
 		Out[0] = Out[1] = Out[2] = 0.0;
 		const double Mu = 5.0 * std::log10(std::max(Tcm, 1.0) / kTenPcCm);
 		const double X = F.LimitingMag - Mu;
-		for (const FUnresolvedTable::FRow& R : T.Rows)
+		for (size_t I = 0; I < T.Rows.size(); ++I)
 		{
-			const double Fl = F.LevelFade ? std::clamp(double(F.LevelFade(R.Level)), 0.0, 1.0) : 0.0;
+			const FUnresolvedTable::FRow& R = T.Rows[I];
 			double G[3];
 			T.G(R, X, G);
-			for (int K = 0; K < 3; ++K) { Out[K] += R.P * (R.LbarRgb[K] - Fl * G[K]); }
+			for (int K = 0; K < 3; ++K) { Out[K] += R.P * (R.LbarRgb[K] - Fl[I] * G[K]); }
 		}
 		const double Dim = double(HV::Uni_HorizonDimming(float(Tcm)));
 		const double Exp = std::pow(10.0, 0.4 * F.ExposureMag);
@@ -212,8 +220,9 @@ namespace UniCore
 	{
 		const u32 Block = u32(Lut.size() / HV::UNI_VOL_LUT_SIZE);
 		const int N = int(HV::UNI_VOL_LUT_SIZE);
+		const std::vector<double> Fl = RowFades(T, F);
 		std::vector<std::array<double, 3>> E(static_cast<size_t>(N));
-		for (int I = 0; I < N; ++I) { UnresolvedAt(T, F, LutT(I), E[size_t(I)].data()); Lut.push_back(HV::float4(float(E[size_t(I)][0]), float(E[size_t(I)][1]), float(E[size_t(I)][2]), 0.0f)); }
+		for (int I = 0; I < N; ++I) { UnresolvedAt(T, F, Fl, LutT(I), E[size_t(I)].data()); Lut.push_back(HV::float4(float(E[size_t(I)][0]), float(E[size_t(I)][1]), float(E[size_t(I)][2]), 0.0f)); }
 		// Tail: past t_hi the integrand falls as t^-2 (dimming) at constant l, so the remainder is
 		// l(t_hi) t_hi. Inside, sub-sampled trapezoids in ln t (dt = t d ln t).
 		std::vector<std::array<double, 3>> Tail(static_cast<size_t>(N));
@@ -229,7 +238,7 @@ namespace UniCore
 				const double A = (double(S) + 0.5) / double(Sub);
 				const double Tm = std::exp(std::log(LutT(I)) + A * Dln);
 				double V[3];
-				UnresolvedAt(T, F, Tm, V);
+				UnresolvedAt(T, F, Fl, Tm, V);
 				for (int K = 0; K < 3; ++K) { Acc[size_t(K)] += V[K] * Tm * Dln / double(Sub); }
 			}
 			Tail[size_t(I)] = Acc;
@@ -294,11 +303,43 @@ namespace UniCore
 		FVolumeViewGPU View{};
 		size_t CarriersSkipped = 0;   // over the cap
 
+		/** The same scene with only the periodic (background) carriers, or only the local ones.
+		 *  Parameters and LUTs are shared, so indices stay valid. The engine marches the
+		 *  background into a cube map and the rest per pixel, and composites
+		 *  B = B_near + T_near x B_cube(dir) (D-136). */
+		FVolumeScene Subset(bool bPeriodic) const
+		{
+			FVolumeScene O = *this;
+			O.Carriers.clear();
+			for (const FCarrierGPU& C : Carriers) { if (((C.Flags & HV::UNI_CARRIER_PERIODIC) != 0u) == bPeriodic) { O.Carriers.push_back(C); } }
+			O.View.NumCarriers = u32(O.Carriers.size());
+			return O;
+		}
+
 		HV::StructuredBuffer<HV::FUniCarrier> CarrierBuf() const { return HV::StructuredBuffer<HV::FUniCarrier>(reinterpret_cast<const HV::FUniCarrier*>(Carriers.data()), HV::uint(Carriers.size())); }
 		HV::StructuredBuffer<HV::FUniFieldParams> ParamBuf() const { return HV::StructuredBuffer<HV::FUniFieldParams>(reinterpret_cast<const HV::FUniFieldParams*>(Params.data()), HV::uint(Params.size())); }
 		HV::StructuredBuffer<HV::float4> LutBuf() const { return HV::StructuredBuffer<HV::float4>(Lut.data(), HV::uint(Lut.size())); }
 	};
 	static_assert(sizeof(HV::FUniFieldParams) == sizeof(FFieldParamsGPU), "field params layout");
+
+	/** What the builder reads from the streaming side: the reference pipeline (univerify) or the
+	 *  runtime streamer (the engine) both provide it, so both build identical scenes
+	 *  (T2.stream.volume_parity). */
+	struct FVolumeSource
+	{
+		const std::map<u32, FContributor>* Contributors = nullptr;
+		std::function<const FObjectGPU*(const FObjectId&)> FindObject;
+		std::function<float(int)> LevelFade;
+
+		template <typename T> static FVolumeSource From(const T& P)
+		{
+			FVolumeSource S;
+			S.Contributors = &P.Contributors();
+			S.FindObject = [&P](const FObjectId& Id) { return P.FindObject(Id); };
+			S.LevelFade = [&P](int L) { return P.LevelFade(L); };
+			return S;
+		}
+	};
 
 	class FVolumeBuilder
 	{
@@ -313,12 +354,32 @@ namespace UniCore
 
 		const FUnresolvedTable& Table(u32 Child) const { return Tables.at(Child); }
 
+		/** D-133 from the cached tables (no rebuild): what a parent's children add up to. */
+		double LuminosityBudget(u32 ArchId, double ParentAbsMag) const
+		{
+			double Flux = 0.0;
+			for (const FEmitter& E : Model.Definition().Arch(ArchId).Emitters)
+			{
+				if (E.bDensityMode) { continue; }
+				const double N = std::isfinite(E.NTotalRefMag) ? E.NTotal * std::pow(10.0, -0.4 * (ParentAbsMag - E.NTotalRefMag)) : E.NTotal;
+				Flux += N * Tables.at(E.ChildArchetypeId).MeanFluxV();
+			}
+			return Flux > 0.0 ? -2.5 * std::log10(Flux) : NAN;
+		}
+
 		/** Test hook: override every carrier's level fades (F_L) with a constant (< 0: real fades). */
 		float ForceLevelFade = -1.0f;
 		/** Test hook: skip local carriers, or the background. */
 		bool bLocal = true, bBackground = true;
 
-		FVolumeScene Build(const FRefPipeline& P, const FCoord& Cam, const FVec3f& CamFrac, const HV::FUniView& View, const FVolumeSettings& S = FVolumeSettings()) const
+		/** From anything FVolumeSource::From accepts: FRefPipeline or FUniStreamer. */
+		template <typename T>
+		FVolumeScene Build(const T& P, const FCoord& Cam, const FVec3f& CamFrac, const HV::FUniView& View, const FVolumeSettings& S = FVolumeSettings()) const
+		{
+			return Build(FVolumeSource::From(P), Cam, CamFrac, View, S);
+		}
+
+		FVolumeScene Build(const FVolumeSource& P, const FCoord& Cam, const FVec3f& CamFrac, const HV::FUniView& View, const FVolumeSettings& S = FVolumeSettings()) const
 		{
 			FVolumeScene Out;
 			FLutFrame F;
@@ -327,7 +388,25 @@ namespace UniCore
 			const float Force = ForceLevelFade;
 			F.LevelFade = [&P, Force](int L) { return Force >= 0.0f ? Force : P.LevelFade(L); };
 			std::map<u32, u32> Block;
-			for (const auto& KV : Tables) { Block[KV.first] = BuildEmissionLut(KV.second, F, Out.Lut); }
+			for (const auto& KV : Tables)
+			{
+				// The LUT depends only on (m_lim, m_exp, F_L per slice level): rebuild only when
+				// those change (most frames they do not; a rebuild is ~4k table evaluations).
+				// Quantised to 1e-3 (fades step by 1/8 per frame; magnitudes are user settings).
+				auto Q = [](double V) { return std::round(V * 1000.0) / 1000.0; };
+				std::vector<double> Key = { Q(F.LimitingMag), Q(F.ExposureMag) };
+				for (double Fv : RowFades(KV.second, F)) { Key.push_back(Q(Fv)); }
+				FLutCache& Cache = LutCache[KV.first];
+				Block[KV.first] = u32(Out.Lut.size() / HV::UNI_VOL_LUT_SIZE);
+				if (Cache.Key != Key)
+				{
+					Cache.Key = Key;
+					Cache.Lut.clear();
+					BuildEmissionLut(KV.second, F, Cache.Lut);
+					++LutRebuilds;
+				}
+				Out.Lut.insert(Out.Lut.end(), Cache.Lut.begin(), Cache.Lut.end());
+			}
 
 			// Background: one periodic carrier per root emitter.
 			if (bBackground)
@@ -367,7 +446,7 @@ namespace UniCore
 			if (bLocal)
 			{
 				const FUniverseDef& D = Model.Definition();
-				for (const auto& KV : P.Contributors())
+				for (const auto& KV : *P.Contributors)
 				{
 					const FContributor& C = KV.second;
 					if (C.bRoot) { continue; }
@@ -439,9 +518,14 @@ namespace UniCore
 			return Out;
 		}
 
+		/** LUT rebuilds so far (stats: most frames reuse the cached LUT). */
+		mutable size_t LutRebuilds = 0;
+
 	private:
+		struct FLutCache { std::vector<double> Key; std::vector<HV::float4> Lut; };
 		const FUniverseModel& Model;
 		const FRefGenerator& Gen;
 		std::map<u32, FUnresolvedTable> Tables;
+		mutable std::map<u32, FLutCache> LutCache;
 	};
 }

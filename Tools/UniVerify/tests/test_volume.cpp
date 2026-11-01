@@ -578,3 +578,50 @@ UNI_TEST(volume, flythrough)
 		.Pass(Shot == Shots && Trunc == 0,
 			Uni::Fmt("%d shots, %zu truncated rays, %.0f steps per ray on average; %d shots carry < 1%% of their light in sprites. %s", Shot, Trunc, Rays ? double(Steps) / double(Rays) : 0.0, GlowOnly, Notes.c_str()));
 }
+
+UNI_TEST(volume, cube)
+{
+	// D-136: the background marched once into a 6 x 128^2 direction map and composited per pixel
+	// as B_near + T_near x B_cube(dir), against the union march of everything. Cases: inside
+	// the dusty galaxy inside the web (towards the centre and out of the plane), and
+	// intergalactic space. Per-pixel and total luminosity errors.
+	struct FCase { const char* Name; bool bWeb; FV3 Look; };
+	const FCase Cases[] = { { "galaxy+web, towards centre", false, { -1, -0.12, -0.02 } }, { "galaxy+web, out of plane", false, { -0.3, 0.1, 1 } }, { "void, web only", true, { 1, 0.3, 0.1 } } };
+	double WorstTotal = 0.0, WorstP99 = 0.0;
+	size_t Trunc = 0;
+	u64 CubeSteps = 0; size_t CubeTexels = 0;
+	std::string Detail;
+	for (const FCase& C : Cases)
+	{
+		FUniverseModel M(C.bWeb ? UniScenes::WebToGalaxy() : UniScenes::Flythrough());
+		FRefGenerator G(M);
+		FVolumeBuilder VB(M, G);
+		const FCoord Cam = C.bWeb ? UniScenes::VoidCamera() : UniScenes::SolarCamera();
+		FRefPipeline P(G);
+		P.Update(Cam, FVec3f{});
+		FCamera Cm; Cm.Coord = Cam; Cm.Width = 160; Cm.Height = 90; Cm.LookAlong(C.Look);
+		const FVolumeScene All = VB.Build(P, Cam, FVec3f{}, Cm.View());
+		const FBackgroundCube Cube = RenderBackgroundCube(All.Subset(true), 128);
+		CubeSteps += Cube.Steps; CubeTexels += Cube.Tex.size(); Trunc += Cube.Truncated;
+		FImage A(Cm.Width, Cm.Height), B(Cm.Width, Cm.Height);
+		const FVolumeStats Sa = RenderVolume(All, Cm, A);
+		const FVolumeStats Sb = RenderVolume(All.Subset(false), Cm, B, nullptr, 2, &Cube);
+		Trunc += Sa.Truncated + Sb.Truncated;
+		std::vector<double> Errs;
+		for (size_t I = 0; I + 2 < A.Rgb.size(); I += 3)
+		{
+			const double La = 0.2126 * A.Rgb[I] + 0.7152 * A.Rgb[I + 1] + 0.0722 * A.Rgb[I + 2];
+			const double Lb2 = 0.2126 * B.Rgb[I] + 0.7152 * B.Rgb[I + 1] + 0.0722 * B.Rgb[I + 2];
+			if (La > 0.0) { Errs.push_back(std::fabs(Lb2 - La) / La); }
+		}
+		std::sort(Errs.begin(), Errs.end());
+		const double P99 = Errs.empty() ? 0.0 : Errs[size_t(double(Errs.size() - 1) * 0.99)];
+		const double Tot = std::fabs(Lum(Sb.Flux) - Lum(Sa.Flux)) / Lum(Sa.Flux);
+		WorstTotal = std::max(WorstTotal, Tot); WorstP99 = std::max(WorstP99, P99);
+		Detail += Uni::Fmt("%s: total %+.3f%%, p99 pixel %.2f%%; ", C.Name, 100.0 * (Lum(Sb.Flux) - Lum(Sa.Flux)) / Lum(Sa.Flux), 100.0 * P99);
+	}
+	Uni::Check(3, "T3.vol.cube", "Background cube + separable composite (D-136) vs the union march: total luminosity within 0.5%, 99th-percentile pixel within 3%")
+		.Metric("worst_total", WorstTotal).Metric("worst_p99", WorstP99).Metric("cube_steps_per_texel", CubeTexels ? double(CubeSteps) / double(CubeTexels) : 0.0).Metric("truncated", double(Trunc))
+		.Pass(WorstTotal < 0.005 && WorstP99 < 0.03 && Trunc == 0,
+			Uni::Fmt("%s cube: %.0f steps per texel, %zu truncated", Detail.c_str(), CubeTexels ? double(CubeSteps) / double(CubeTexels) : 0.0, Trunc));
+}

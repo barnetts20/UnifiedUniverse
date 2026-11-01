@@ -41,4 +41,9 @@ Append only. One entry per step start, finish, block, or commit. Times in the ow
 | 15:30 | VOL | note | Handoff check caught one-ray-per-pixel mis-integration of sub-pixel carriers (12–17%) → supersampling by ResolveScale (0.84%). Luminance-normalised colour (D-135) |
 | 15:45 | VOL | note | Flythrough with volume caught 93k truncated rays: background prefilter keyed on the capped step never engaged; background started at 1 pc. Fixed (D-130, D-131): 0 truncated, 124 steps/ray |
 | 15:50 | VOL | decision D-128..D-135 | Volume scheme decisions recorded |
+| 16:46 | VOL | start | Owner: "Sure, and any tips on universe-level background density marching?" Tips sent; engine pass started |
+| 17:05 | VOL | note | Builder reads FVolumeSource (pipeline or streamer). Streamer fade-hold rule (D-128 amendment): T2.stream.volume_parity caught new levels ticking to 0.125 before their window existed; fixed |
+| 17:15 | VOL | note | Background direction map + separable composite (D-136): T3.vol.cube 0.000% total, p99 ≤ 0.02% |
+| 17:35 | VOL | note | Engine pass written (UniVolume.usf, sprite slices, RenderVolume_RenderThread, PushFrame, uu.Volume); independent review requested. Uncompiled (UE-9) |
 
+| 18:05 | VOL | done (gate green) | Review fixes applied (Uni_Luminance visibility, float32 radiance targets, FLinearColor clears, FXC-safe slices, LUT cost); gate 53/53; committed and packaged |

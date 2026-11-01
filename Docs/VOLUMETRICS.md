@@ -100,24 +100,38 @@ A **carrier** is one marched volume: a contributor (the object that owns an emit
 - **Sprites behind dust: transmittance slices** (the design's v2, proposed for v1). The march writes T at 8 slices uniform in ln t (half resolution, R16F, 8 MB at 1080p). The sprite pixel shader reads T at its true distance with bilinear and log interpolation. This gives the Milky Way's dark rift over its own stars, and galaxies hidden behind the disc (the zone of avoidance). Conservation holds because both terms see the same T.
 - **Known gap:** internal extinction makes a dusty galaxy's carrier dimmer than its sprite, by up to about 30% edge-on (to be measured). v1.1 computes the carrier's mean transmittance on the CPU (16 rays through the same core) for carriers in the handoff ramp and applies it to the sprite.
 
-## 8. Engine pass structure (M4)
+## 8. Engine pass (written on `uu/volumetrics`, not compiled: UE-9)
 
-All in `UniRenderHooks.cpp` (the one hook file) and `UniVolume.usf`, in the existing post-MotionBlur callback, before the sprite draw:
+Every hook stays in the existing post-MotionBlur callback (`UniRenderHooks.cpp`); `FUniRenderer::RenderVolume_RenderThread` runs before the sprite draw.
 
-1. **CPU, per frame.**
-   - Carriers (≤ 64) and per-emitter LUTs: unresolved RGB, background tail.
-   - Dust parameter blocks, through the single `Pack` site (lesson #2).
-   - One by-value payload (lesson #25).
-2. **`Uni.Volume.March`** (compute, half output resolution, 8×8 groups).
-   - Inputs: carriers, field parameters, LUTs, scene depth.
-   - Outputs: radiance + T (RGBA16F) and the transmittance slices.
-3. **`Uni.Volume.Composite`** (full resolution, additive into the copied scene colour).
-   - Bilateral upsample weighted by true scene distance, so edges against promoted bodies stay crisp.
-   - Multiplies by the full-resolution Ω_px.
-4. **Sprites** read the transmittance slices.
-5. **Temporal near/far split** (v1.1). Everything beyond `d_far = v · Δt_refresh / θ_px` has under 0.25 px of parallax over the refresh period. It is re-marched 1/8 of the screen per frame and reprojected by rotation. The split adapts to velocity: walking in a galaxy, everything is "far"; in the flythrough, nothing is.
+1. **Game thread, `UUniSubsystem::PushFrame`.**
+   - `FVolumeBuilder::Build(*Streamer, ...)` produces the carriers (≤ 64), parameter blocks (through `FFieldParams::Pack`, lesson #2) and LUTs, in one by-value payload (lesson #25).
+   - The LUT is cached and rebuilt only when m_lim, m_exp or a slice level's fade changes.
+   - The carriers' ThetaPixel is the last rendered frame's (one frame late, only for handoff weights).
+   - A background version bump requests a re-march of the direction map (D-136).
+2. **`Uni.Volume.Background`** (compute). Re-marches the dirty faces of the persistent 6 × 256² RGBA32F direction map, `uu.BackgroundFacesPerFrame` (2) per frame.
+3. **`Uni.Volume.March`** (compute). Marches the local carriers at 1 / `uu.VolumeDivisor` (2) of the output resolution.
+   - Outputs: RGBA32F (radiance, luminance T) and an 8-layer R16F slice array (luminance T).
+   - Pixels on sub-pixel carriers are supersampled up to 8 × 8.
+4. **`Uni.Volume.Composite`** (full-screen triangle, additive into the scene-colour copy).
+   - Depth-aware bilinear upsample (log-distance weights).
+   - Adds T_near × the background map.
+   - Multiplies by the pixel's solid angle and SceneColourScale × PreExposure.
+5. **Sprites** read the slice array at their true distance (luminance transmittance). With the volume off, a 1 × 1 dummy slice texture of 1s is bound.
+6. **Console:** `uu.Volume 0|1`, `uu.VolumeDivisor`, `uu.BackgroundSize`, `uu.BackgroundFacesPerFrame`. `uu.Stats` logs carriers, faces marched and LUT rebuilds.
 
-**Budget target:** ≤ 1.5 ms at 1080p (RTX 3070 class) for one galaxy carrier plus the background (UE-8).
+**Memory at 1080p, half resolution:** volume 8 MB, slices 8 MB, background map 6 MB. The volume and background targets are float32: radiance per steradian overflows half floats, at ~7e4 per sr for a galaxy disc at the default exposure.
+
+**Accepted GPU/CPU differences:**
+- The engine stores luminance-only near transmittance (for the background) and luminance-only slices (for sprites). The reference uses RGB. They differ only in dust reddening of the background and of stars behind dust.
+
+**Budget target:** ≤ 1.5 ms at 1080p for one galaxy carrier plus the background (UE-8).
+
+**v1.1:**
+- temporal accumulation and the near/far split for the local march;
+- sprite internal-extinction correction;
+- suppressors cutting the background;
+- moving the LUT build to a worker thread.
 
 ## 9. Verification (Tools/UniVerify, Tier 3): measured
 
@@ -132,6 +146,8 @@ All in `UniRenderHooks.cpp` (the one hook file) and `UniVolume.usf`, in the exis
 | `T3.vol.budget` | Demo luminosity budget, reported | Children M = −23.18 vs drawn −21.00 |
 | `T3.vol.frames` | Stills: face-on 60 kpc, edge-on 30 kpc, interior ×2 | 16 / 45 / 175 / 136 steps per ray; volume carries 100 / 100 / 96 / 70% of the light |
 | `T3.vol.flythrough` | 48-shot contact sheet of the T3.flythrough path with the volume | 0 truncated; 124 steps per ray; the galaxy shows as glow in the shots where its star levels are suspended |
+| `T3.vol.cube` | Background direction map (6 × 128²) + separable composite vs the union march (D-136) | Total 0.000%, 99th-percentile pixel ≤ 0.02%; 107 steps per texel |
+| `T2.stream.volume_parity` | The streamer's volume scene equals the reference pipeline's; filling levels hold their fade at 0 (D-128) | Byte-identical carriers and parameters, identical LUTs; 0 violations |
 
 ## 10. Decisions (provisional unless marked)
 
@@ -145,6 +161,7 @@ All in `UniRenderHooks.cpp` (the one hook file) and `UniVolume.usf`, in the exis
 | D-133 | `Validate` checks each archetype's luminosity budget: \|M_parent − M(Σ children)\| < 0.1 mag | **HIGH** to fix the demo (**owner**) |
 | D-134 | The carrier normalising integral: a 64k-sample estimate until D-123's full integral is cached (about 1% flux noise at most) | None |
 | D-135 | Sprite colour normalised by luminance (Rec. 709), not by its brightest channel, so light sums conserve | None |
+| D-136 | Background marched into a direction map from 0.1 Mpc; composite B_near + T_near × B_map | None |
 
 ## 11. Build plan
 
@@ -153,6 +170,6 @@ All in `UniRenderHooks.cpp` (the one hook file) and `UniVolume.usf`, in the exis
    - Step hints in `UniFields.ush`.
    - `Source/UniCore/UniVolume.h`: the tables, the per-frame LUT, the carrier builder, the budget validator.
    - The reference renderer and the §9 checks and images.
-2. **Engine:** `UniVolume.usf`, the passes above, sprite T lookup, `uu.Volume` and a debug view (density / steps / truncation, lesson #37).
+2. **Engine (written, uncompiled):** `UniVolume.usf`, the passes above, the sprite transmittance lookup, `uu.Volume`. Still to do: a debug view (density / steps / truncation, lesson #37).
 3. **v1.1:** temporal accumulation and the near/far split; sprite internal-extinction correction.
 4. **v2:** gas emission, nebula profiles, single scattering, baked volumes with mips.

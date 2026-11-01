@@ -38,8 +38,53 @@ namespace UniRender
 		return Norm(Cam.Forward + Cam.Right * Nx + Cam.Up * Ny);
 	}
 
-	/** March every pixel; adds B * Omega to Img and returns per-pixel slices if asked. */
-	inline FVolumeStats RenderVolume(const FVolumeScene& Sc, const FCamera& Cam, FImage& Img, std::vector<H::float3>* SlicesOut = nullptr, int Threads = 2)
+	/** The background cube (D-136): every texel of six N x N faces marched through the periodic
+	 *  carriers only, with the texel's angular size as the prefilter footprint. */
+	struct FBackgroundCube
+	{
+		int N = 0;
+		float StartCm = 0.0f;   // the background's start: nearer scene surfaces block it
+		std::vector<H::float3> Tex;   // 6 * N * N
+		u64 Steps = 0;
+		size_t Truncated = 0;
+
+		H::float3 At(int F, int X, int Y) const { X = std::clamp(X, 0, N - 1); Y = std::clamp(Y, 0, N - 1); return Tex[(size_t(F) * N + Y) * N + X]; }
+		/** Bilinear within the face (seams clamp: the background is low-frequency). */
+		H::float3 Sample(const H::float3& D) const
+		{
+			float X, Y;
+			const int F = int(H::Uni_CubeDirToFace(D, float(N), X, Y));
+			const float Fx = X - 0.5f, Fy = Y - 0.5f;
+			const int X0 = int(std::floor(Fx)), Y0 = int(std::floor(Fy));
+			const float Tx = Fx - float(X0), Ty = Fy - float(Y0);
+			const H::float3 A = At(F, X0, Y0) * (1 - Tx) + At(F, X0 + 1, Y0) * Tx;
+			const H::float3 B = At(F, X0, Y0 + 1) * (1 - Tx) + At(F, X0 + 1, Y0 + 1) * Tx;
+			return A * (1 - Ty) + B * Ty;
+		}
+	};
+
+	inline FBackgroundCube RenderBackgroundCube(const FVolumeScene& Bg, int N)
+	{
+		FBackgroundCube C;
+		C.N = N;
+		C.Tex.assign(size_t(6) * N * N, H::float3(0, 0, 0));
+		C.StartCm = 3.0e38f;
+		for (const FCarrierGPU& G : Bg.Carriers) { C.StartCm = std::min(C.StartCm, G.TStart); }
+		H::FUniVolumeView V = ToHlsl(Bg.View);
+		V.ThetaPixel = 2.0f / float(N);
+		const auto Cb = Bg.CarrierBuf(); const auto Pb = Bg.ParamBuf(); const auto Lb = Bg.LutBuf();
+		for (int F = 0; F < 6; ++F) for (int Y = 0; Y < N; ++Y) for (int X = 0; X < N; ++X)
+		{
+			const H::FUniVolumeResult R = H::Uni_VolumeMarch(H::Uni_CubeTexelDir(u32(F), X + 0.5f, Y + 0.5f, float(N)), 3.0e38f, Cb, Pb, Lb, V);
+			C.Tex[(size_t(F) * N + Y) * N + X] = R.Radiance;
+			C.Steps += R.Steps; C.Truncated += R.Truncated;
+		}
+		return C;
+	}
+
+	/** March every pixel; adds B * Omega to Img and returns per-pixel slices if asked. With a
+	 *  cube, Sc holds the local carriers only and the background comes from the cube. */
+	inline FVolumeStats RenderVolume(const FVolumeScene& Sc, const FCamera& Cam, FImage& Img, std::vector<H::float3>* SlicesOut = nullptr, int Threads = 2, const FBackgroundCube* Cube = nullptr)
 	{
 		FVolumeStats St;
 		const H::FUniVolumeView V = ToHlsl(Sc.View);
@@ -90,6 +135,7 @@ namespace UniRender
 						for (u32 K = 0; K < H::UNI_VOL_SLICES; ++K) { R.SliceT[K] = AccS[K] * Inv; }
 						++S.Supersampled;
 					}
+					if (Cube && TScene > Cube->StartCm) { R.Radiance = R.Radiance + R.Transmittance * Cube->Sample(Dc); }
 					const double Om = PixelSolidAngle(Cam, Img.W, Img.H, X + 0.5, Y + 0.5);
 					float* P = &Img.Rgb[(size_t(Y) * Img.W + X) * 3];
 					P[0] += float(R.Radiance.x * Om); P[1] += float(R.Radiance.y * Om); P[2] += float(R.Radiance.z * Om);

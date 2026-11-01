@@ -21,7 +21,7 @@
 //     -ffp-contract=off. A macro rather than a bare `precise` so the C++ side never
 //     redefines an identifier that engine code might use.
 //   - UNI_LOOP before a loop with a data-dependent trip count: [loop] in HLSL (no unrolling),
-//     empty in C++.
+//     empty in C++. UNI_UNROLL: [unroll] (constant trip count, static array indices).
 
 #ifndef UNI_CORE_DEFS_USH
 #define UNI_CORE_DEFS_USH
@@ -32,6 +32,7 @@
 	#define UNI_OUT(T) out T
 	#define UNI_PRECISE precise
 	#define UNI_LOOP [loop]
+	#define UNI_UNROLL [unroll]
 #endif
 
 #endif // UNI_CORE_DEFS_USH

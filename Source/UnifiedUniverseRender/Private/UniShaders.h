@@ -1,7 +1,7 @@
 #pragma once
 
 // UniShaders.h
-// Global shader classes for UniGen.usf, UniProject.usf and UniSprite.usf. Every GPU struct
+// Global shader classes for UniGen.usf, UniProject.usf, UniSprite.usf and UniVolume.usf. Every GPU struct
 // these bind is mirrored in UniCore/UniGpuTypes.h with a static_assert (lesson #20).
 // Buffer element counts and counter layouts are defined in UniGpuLayout below and nowhere else
 // (lesson #22).
@@ -11,6 +11,7 @@
 #include "ShaderParameterStruct.h"
 #include "RenderGraphResources.h"
 #include "UniGpuTypes.h"
+#include "UniVolume.h"
 
 namespace UniGpuLayout
 {
@@ -26,7 +27,15 @@ namespace UniGpuLayout
 	inline constexpr uint32 MaxPromote = 256;
 	inline constexpr uint32 GenThreads = 64;
 	inline constexpr double ReadbackTimeoutSeconds = 2.0;                       // lesson #24 safety valve
+	inline constexpr uint32 CarrierBytes = sizeof(UniCore::FCarrierGPU);        // 112
+	inline constexpr uint32 VolumeViewBytes = sizeof(UniCore::FVolumeViewGPU);  // 48
+	inline constexpr uint32 FieldParamsBytes = sizeof(UniCore::FFieldParamsGPU); // 64
+	inline constexpr uint32 VolumeSlices = 8;                                   // UNI_VOL_SLICES (UniVolume.ush)
+	inline constexpr uint32 VolumeLutEntries = 256;                             // UNI_VOL_LUT_SIZE
+	inline constexpr uint32 MaxCarriers = 64;
 }
+static_assert(UniGpuLayout::VolumeSlices == UniHlsl::UNI_VOL_SLICES, "slice count");
+static_assert(UniGpuLayout::VolumeLutEntries == UniHlsl::UNI_VOL_LUT_SIZE, "volume LUT size");
 
 /** Mirrors FUniSprite in UniProject.ush. */
 struct FUniSpriteGPU
@@ -143,6 +152,120 @@ public:
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
 };
 
+/** Shared by the three volume passes: carriers, field parameters, LUTs, view (one element),
+ *  all structured (lesson #2), plus the camera basis for ray directions. */
+BEGIN_SHADER_PARAMETER_STRUCT(FUniVolumeCommonParameters, )
+	SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FUniCarrier>, InCarriers)
+	SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FUniFieldParams>, InParams)
+	SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, InLut)
+	SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FUniVolumeView>, InVolumeView)
+	SHADER_PARAMETER(FVector3f, ViewForward)
+	SHADER_PARAMETER(float, TanHalfFovX)
+	SHADER_PARAMETER(FVector3f, ViewRight)
+	SHADER_PARAMETER(float, TanHalfFovY)
+	SHADER_PARAMETER(FVector3f, ViewUp)
+	SHADER_PARAMETER(float, Pad0)
+END_SHADER_PARAMETER_STRUCT()
+
+class FUniVolumeMarchCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FUniVolumeMarchCS);
+	SHADER_USE_PARAMETER_STRUCT(FUniVolumeMarchCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_STRUCT_INCLUDE(FUniVolumeCommonParameters, Common)
+		SHADER_PARAMETER(FVector4f, InvDeviceZToWorldZTransform)
+		SHADER_PARAMETER(FVector4f, MarchToDepthUV)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneDepthTexture)
+		SHADER_PARAMETER_SAMPLER(SamplerState, SceneDepthSampler)
+		SHADER_PARAMETER(FUintVector2, MarchSize)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutVolume)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float>, OutSlices)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& P, FShaderCompilerEnvironment& Env)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(P, Env);
+		Env.SetDefine(TEXT("UNI_VOL_PASS"), 0);
+	}
+};
+
+class FUniVolumeBackgroundCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FUniVolumeBackgroundCS);
+	SHADER_USE_PARAMETER_STRUCT(FUniVolumeBackgroundCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_STRUCT_INCLUDE(FUniVolumeCommonParameters, Common)
+		SHADER_PARAMETER(uint32, CubeSize)
+		SHADER_PARAMETER(uint32, FaceBase)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float4>, OutCube)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& P, FShaderCompilerEnvironment& Env)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(P, Env);
+		Env.SetDefine(TEXT("UNI_VOL_PASS"), 1);
+	}
+};
+
+BEGIN_SHADER_PARAMETER_STRUCT(FUniVolumeCompositeParameters, )
+	SHADER_PARAMETER_STRUCT_INCLUDE(FUniVolumeCommonParameters, Common)
+	SHADER_PARAMETER(FVector4f, InvDeviceZToWorldZTransform)
+	SHADER_PARAMETER(FVector4f, MarchToDepthUV)
+	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneDepthTexture)
+	SHADER_PARAMETER_SAMPLER(SamplerState, SceneDepthSampler)
+	SHADER_PARAMETER(FUintVector2, MarchSize)
+	SHADER_PARAMETER(FVector4f, OutRectMinSize)
+	SHADER_PARAMETER(FVector4f, OutToDepthUV)
+	SHADER_PARAMETER(FVector3f, SceneColourScale)
+	SHADER_PARAMETER(float, FocalPx)
+	SHADER_PARAMETER(uint32, CubeSize)
+	SHADER_PARAMETER(uint32, bBackground)
+	SHADER_PARAMETER(float, BackgroundStartCm)
+	SHADER_PARAMETER(float, Pad1)
+	SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float4>, VolumeTexture)
+	SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float4>, CubeTexture)
+	SHADER_PARAMETER_SAMPLER(SamplerState, LinearClampSampler)
+END_SHADER_PARAMETER_STRUCT()
+
+class FUniVolumeCompositeVS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FUniVolumeCompositeVS);
+	SHADER_USE_PARAMETER_STRUCT(FUniVolumeCompositeVS, FGlobalShader);
+	using FParameters = FUniVolumeCompositeParameters;
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& P, FShaderCompilerEnvironment& Env)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(P, Env);
+		Env.SetDefine(TEXT("UNI_VOL_PASS"), 2);
+	}
+};
+
+class FUniVolumeCompositePS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FUniVolumeCompositePS);
+	SHADER_USE_PARAMETER_STRUCT(FUniVolumeCompositePS, FGlobalShader);
+	using FParameters = FUniVolumeCompositeParameters;
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& P, FShaderCompilerEnvironment& Env)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(P, Env);
+		Env.SetDefine(TEXT("UNI_VOL_PASS"), 2);
+	}
+};
+
+BEGIN_SHADER_PARAMETER_STRUCT(FUniVolumeCompositePassParameters, )
+	SHADER_PARAMETER_STRUCT_INCLUDE(FUniVolumeCompositeParameters, Composite)
+	RENDER_TARGET_BINDING_SLOTS()
+END_SHADER_PARAMETER_STRUCT()
+
 BEGIN_SHADER_PARAMETER_STRUCT(FUniSpriteParameters, )
 	SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FUniSprite>, InSprites)
 	SHADER_PARAMETER(uint32, MaxSprites)
@@ -157,6 +280,12 @@ BEGIN_SHADER_PARAMETER_STRUCT(FUniSpriteParameters, )
 	SHADER_PARAMETER(float, PixelsPerRadian)
 	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneDepthTexture)
 	SHADER_PARAMETER_SAMPLER(SamplerState, SceneDepthSampler)
+	SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float>, VolumeSlices)
+	SHADER_PARAMETER(uint32, bVolume)
+	SHADER_PARAMETER(float, SliceLnTLo)
+	SHADER_PARAMETER(float, SliceLnTHi)
+	SHADER_PARAMETER(FVector4f, OutToMarch)
+	SHADER_PARAMETER(FUintVector2, MarchSize)
 END_SHADER_PARAMETER_STRUCT()
 
 class FUniSpriteVS : public FGlobalShader

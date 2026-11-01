@@ -33,6 +33,6 @@
   },
   {
     "id": "UE-9",
-    "what": "Volume pass in the engine (Docs/VOLUMETRICS.md \u00a78) is not built: only the shared core (UniVolume.ush), the CPU builder (UniVolume.h) and the offline reference exist. The core must compile under the engine shader compiler when UniVolume.usf is written, and the project-and-cull changes it relies on (handoff share, horizon dimming, luminance-normalised colour) must compile now (part of UE-3)."
+    "what": "The volume pass in the engine (Docs/VOLUMETRICS.md \u00a78) is written but has never been compiled: UniVolume.usf (MarchCS, BackgroundCS, CompositeVS/PS), the sprite transmittance lookup, RenderVolume_RenderThread and the subsystem's per-frame volume scene. It must compile, show the galaxy glow and the dust lane matching the reference stills, and stay within budget (uu.Volume 0/1 to compare)."
   }
 ]
