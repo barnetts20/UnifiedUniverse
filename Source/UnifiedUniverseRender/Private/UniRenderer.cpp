@@ -19,6 +19,8 @@ static TAutoConsoleVariable<float> CVarUniSpriteExtent(TEXT("uu.SpriteExtent"), 
 static TAutoConsoleVariable<float> CVarUniGlare(TEXT("uu.GlareGain"), 0.35f, TEXT("Sprite footprint growth with flux."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniVolumeDivisor(TEXT("uu.VolumeDivisor"), 2, TEXT("Volume march resolution divisor (1 = full, 2 = half, 4 = quarter)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniBackgroundSize(TEXT("uu.BackgroundSize"), 256, TEXT("Background direction-map face size (texels)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<int32> CVarUniVolumeDebug(TEXT("uu.VolumeDebug"), 0, TEXT("Volume debug view (lesson #37): 0 off, 1 steps per ray (magenta = truncated), 2 coverage (R carriers, G supersampling, B truncated), 3 emission (log10 heat), 4 dust transmittance."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniVolumeDebugLogLo(TEXT("uu.VolumeDebugLogLo"), 0.0f, TEXT("uu.VolumeDebug 3: log10 radiance mapped to the bottom of the heat ramp (the ramp spans 6 decades)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniBackgroundFaces(TEXT("uu.BackgroundFacesPerFrame"), 2, TEXT("Background faces re-marched per frame while dirty (1..6)."), ECVF_RenderThreadSafe);
 
 namespace
@@ -238,6 +240,8 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		P->SceneDepthTexture = SceneDepth;
 		P->SceneDepthSampler = PointClamp;
 		P->MarchSize = FUintVector2(uint32(MarchSize.X), uint32(MarchSize.Y));
+		P->DebugMode = uint32(FMath::Clamp(CVarUniVolumeDebug.GetValueOnRenderThread(), 0, 4));
+		P->DebugLogLo = CVarUniVolumeDebugLogLo.GetValueOnRenderThread();
 		P->OutVolume = GraphBuilder.CreateUAV(VolumeTex);
 		P->OutSlices = GraphBuilder.CreateUAV(Slices);
 		TShaderMapRef<FUniVolumeMarchCS> CS(GetGlobalShaderMap(View.GetFeatureLevel()));
@@ -262,6 +266,8 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		C.bBackground = bBackground ? 1u : 0u;
 		C.BackgroundStartCm = F.BackgroundStartCm;
 		C.Pad1 = 0.0f;
+		C.DebugMode = uint32(FMath::Clamp(CVarUniVolumeDebug.GetValueOnRenderThread(), 0, 4));
+		C.DebugScale = 1.0f / FMath::Max(PreExposure, 1.0e-6f);
 		C.VolumeTexture = VolumeTex;
 		C.CubeTexture = Cube;
 		C.LinearClampSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();

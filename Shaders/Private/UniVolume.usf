@@ -15,6 +15,12 @@
 //                   march, plus T_near x background(dir), times the pixel's solid angle, into
 //                   the scene-colour copy the view extension made (before the sprites).
 //
+// DEBUG VIEWS (uu.VolumeDebug, lesson #37; exposure-independent false colour, no background):
+//   1 steps         mean steps per ray / MaxSteps as a heat ramp; truncated rays magenta
+//   2 coverage      red = carriers hit (/4), green = supersampling factor (/8), blue = truncated
+//   3 emission      log10 of the march's luminance radiance over [DebugLogLo, DebugLogLo + 6]
+//   4 transmittance near luminance transmittance (dust) as grey
+//
 // Structured buffers carry every struct, including the view (lesson #2: no constant buffer
 // mirroring a C++ layout). Each is mirrored in UniCore/UniVolume.h with a static_assert.
 
@@ -39,6 +45,16 @@ float Pad0;
 
 /** Unit view direction through a pixel of a W x H grid covering the view (same as the CPU
  *  reference's PixelDir). */
+/** Blue -> cyan -> green -> yellow -> red over [0, 1]. */
+float3 DebugHeat(float InX)
+{
+	const float X = saturate(InX) * 4.0f;
+	if (X < 1.0f) { return float3(0.0f, X, 1.0f); }
+	if (X < 2.0f) { return float3(0.0f, 1.0f, 2.0f - X); }
+	if (X < 3.0f) { return float3(X - 2.0f, 1.0f, 0.0f); }
+	return float3(1.0f, 4.0f - X, 0.0f);
+}
+
 float3 PixelDir(float2 InPx, float2 InSize)
 {
 	const float Nx = (InPx.x / InSize.x - 0.5f) * 2.0f * TanHalfFovX;
@@ -69,6 +85,8 @@ float SceneDistanceAtUV(float2 InUV, float InCosToForward)
 #if UNI_VOL_PASS == 0
 
 uint2 MarchSize;
+uint DebugMode;
+float DebugLogLo;
 RWTexture2D<float4> OutVolume;
 RWTexture2DArray<float> OutSlices;
 
@@ -93,6 +111,7 @@ void MarchCS(uint3 Id : SV_DispatchThreadID)
 
 	float3 B = float3(0.0f, 0.0f, 0.0f);
 	float3 T = float3(0.0f, 0.0f, 0.0f);
+	uint StepSum = 0u, ActiveMax = 0u, AnyTruncated = 0u;
 	float Slice[UNI_VOL_SLICES];
 	for (uint K = 0u; K < UNI_VOL_SLICES; ++K) { Slice[K] = 0.0f; }
 	[loop]
@@ -105,11 +124,34 @@ void MarchCS(uint3 Id : SV_DispatchThreadID)
 			const FUniVolumeResult R = Uni_VolumeMarch(SS == 1u ? Dir : PixelDir(Sub, Size), TScene, InCarriers, InParams, InLut, V);
 			B += R.Radiance;
 			T += R.Transmittance;
+			StepSum += R.Steps;
+			ActiveMax = max(ActiveMax, R.Active);
+			AnyTruncated = max(AnyTruncated, R.Truncated);
 			for (uint K2 = 0u; K2 < UNI_VOL_SLICES; ++K2) { Slice[K2] += Uni_Luminance(R.SliceT[K2]); }
 		}
 	}
 	const float Inv = 1.0f / (float)(SS * SS);
-	OutVolume[Id.xy] = float4(B * Inv, Uni_Luminance(T * Inv));
+	float4 Out = float4(B * Inv, Uni_Luminance(T * Inv));
+	if (DebugMode == 1u)
+	{
+		Out = float4(AnyTruncated != 0u ? float3(1.0f, 0.0f, 1.0f) : DebugHeat((float)StepSum * Inv / (float)max(V.MaxSteps, 1u)), 0.0f);
+		if (ActiveMax == 0u) { Out = float4(0.0f, 0.0f, 0.0f, 0.0f); }
+	}
+	else if (DebugMode == 2u)
+	{
+		Out = float4(saturate((float)ActiveMax * 0.25f), saturate((float)SS * 0.125f), (float)AnyTruncated, 0.0f);
+	}
+	else if (DebugMode == 3u)
+	{
+		const float L = Uni_Luminance(B * Inv);
+		Out = float4(L > 0.0f ? DebugHeat((log10(L) - DebugLogLo) / 6.0f) : float3(0.0f, 0.0f, 0.0f), 0.0f);
+	}
+	else if (DebugMode == 4u)
+	{
+		const float Tl = Uni_Luminance(T * Inv);
+		Out = float4(Tl, Tl, Tl, 0.0f);
+	}
+	OutVolume[Id.xy] = Out;
 	for (uint K3 = 0u; K3 < UNI_VOL_SLICES; ++K3) { OutSlices[uint3(Id.x, Id.y, K3)] = Slice[K3] * Inv; }
 }
 
@@ -142,6 +184,8 @@ uint CubeSize;
 uint bBackground;
 float BackgroundStartCm;
 float Pad1;
+uint DebugMode;
+float DebugScale;            // debug colours -> scene colour (1 / pre-exposure)
 Texture2D<float4> VolumeTexture;
 Texture2DArray<float4> CubeTexture;
 SamplerState LinearClampSampler;
@@ -184,6 +228,12 @@ void CompositePS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Targe
 		}
 	}
 	const float4 Vol = Acc / WSum;
+	if (DebugMode != 0u)
+	{
+		// Debug views: false colour straight to scene colour, no solid angle, no background.
+		OutColor = float4(Vol.rgb * DebugScale, 0.0f);
+		return;
+	}
 	float3 B = Vol.rgb;
 	if (bBackground != 0u && DPix > BackgroundStartCm)
 	{
