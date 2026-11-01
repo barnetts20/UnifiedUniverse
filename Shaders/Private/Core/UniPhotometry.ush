@@ -90,6 +90,19 @@ UNI_FN float Uni_MagFade(float InApparentMag, float InLimitingMag)
 	return saturate((InLimitingMag - InApparentMag) / UNI_FADE_BAND);
 }
 
+/** Background horizon (D-131, render only): every flux is dimmed by (1 + r / r_H)^-2, the
+ *  low-redshift form of cosmological surface-brightness dimming. Without it the integrated
+ *  light of an endless (toroidal) universe diverges (Olbers). r_H = c / H0. Sprites and
+ *  volumes use the same factor, so their sum is conserved (D-128). Visibility, relevance and
+ *  level assignment use undimmed magnitudes, so content is unaffected. */
+static const float UNI_HORIZON_CM = 1.37e28f;
+
+UNI_FN float Uni_HorizonDimming(float InDistanceCm)
+{
+	const float X = 1.0f + InDistanceCm * (1.0f / UNI_HORIZON_CM);
+	return 1.0f / (X * X);
+}
+
 /** Sprite intensity in exposure-calibrated units (lesson #36):
  *  10^(-0.4 (m - m_exposure)), faded across the band. */
 UNI_FN float Uni_SpriteIntensity(float InApparentMag, float InExposureMag, float InLimitingMag)

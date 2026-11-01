@@ -35,3 +35,10 @@ Append only. One entry per step start, finish, block, or commit. Times in the ow
 | 12:09 | P6 | done (stretch 1) | Global sensitivity: new checks T3.sensitivity, T2.stream.sensitivity_resize caught blink/regenerate-on-resize; fixed (D-126). Ping shell not started |
 | 12:19 | P5 | decision D-127 | UE review fixes applied: B1, B2, B4, B5, R1, R2/W5, R3, R4, W1, W2, W3, W4, W6, S1. New check T2.stream.fail_closed. Uncompiled (UE-1/3/5) |
 | 12:24 | END | done (gate green) | Final verify_all: 42 checks, 0 failed (new: T2.stream.fail_closed). Committed; zip and patches packaged for D:\Projects\vxl |
+| 14:46 | VOL | start | Owner (on phone): "devise our density raymarching scheme". Branch uu/volumetrics on top of day 1 |
+| 15:00 | VOL | note | Design draft Docs/VOLUMETRICS.md (also in the claude.ai project). Found the demo luminosity budget mismatch: 2e11 stars = M −23.18 vs drawn −21.00 (D-133) |
+| 15:20 | VOL | note | UniVolume.ush core, UniVolume.h builder, reference renderer. T3.vol.march green after tightening galaxy step hints (2.5% → 0.8%); T3.vol.conservation green first time (≤ 0.17%) |
+| 15:30 | VOL | note | Handoff check caught one-ray-per-pixel mis-integration of sub-pixel carriers (12–17%) → supersampling by ResolveScale (0.84%). Luminance-normalised colour (D-135) |
+| 15:45 | VOL | note | Flythrough with volume caught 93k truncated rays: background prefilter keyed on the capped step never engaged; background started at 1 pc. Fixed (D-130, D-131): 0 truncated, 124 steps/ray |
+| 15:50 | VOL | decision D-128..D-135 | Volume scheme decisions recorded |
+

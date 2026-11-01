@@ -212,4 +212,98 @@ UNI_FN float Uni_FieldSample(uint InFieldId, float3 InP, FUniFieldParams InPar)
 	return 0.0f; // unknown id: no content, never a fallback field (fail closed)
 }
 
+// ------------------------------------------------------------------------------------------
+// Volume support (D-130): step hints and feature scales, next to the fields they describe so
+// a field and its sampling rule are one source.
+// ------------------------------------------------------------------------------------------
+
+/** Galaxy: the largest safe ray step (field units) at p along unit local direction InD, from
+ *  the local length scale of each layer (step <= a fraction of the distance over which that
+ *  layer's log-density changes by one):
+ *    disc vertical   exp(-|z| / h): 0.25 h / |d_z| inside the slab |z| < 4h, so a crossing
+ *                    takes >= 32 samples (the mid-plane kink needs them); outside, the step
+ *                    stops at the slab surface when heading towards it;
+ *    disc radial     0.3 R_d;
+ *    arms            0.25 rad of arm phase: |grad Phi| = (m / R) sqrt(1 + 1 / tan^2 pitch),
+ *                    with R floored at R_d / 2 (the phase winds without limit at the axis);
+ *    bulge           0.3 of its log-slope length 2 sqrt(r r_e) / 3.67 (the n = 2 cusp),
+ *                    inside 6 r_e.
+ *  T3.vol.march measures the result against a brute-force march. */
+UNI_FN float Uni_GalaxyStepHint(float3 InP, float3 InD, FUniFieldParams InPar)
+{
+	const float H = max(InPar.A.y, 1.0e-6f);
+	const float Slab = 4.0f * H;
+	const float Rcyl = sqrt(InP.x * InP.x + InP.y * InP.y);
+	const float Dz = max(abs(InD.z), 1.0e-3f);
+	const float Z = abs(InP.z);
+	float S = 0.25f;
+	if (InPar.A.z > 0.0f)
+	{
+		S = min(S, 0.3f * max(InPar.A.x, 1.0e-4f));
+		if (Z < Slab)
+		{
+			S = min(S, 0.25f * H / Dz);
+			if (InPar.C.x > 0.0f && InPar.B.z > 0.0f)
+			{
+				const float TanP = max(InPar.B.w, 1.0e-3f);
+				// Inside half a scale length the phase winds without limit (log R): the pattern is
+				// averaged there, not resolved, or the step collapses on the axis.
+				const float Grad = InPar.B.z / max(Rcyl, 0.5f * max(InPar.A.x, 1.0e-4f)) * sqrt(1.0f + 1.0f / (TanP * TanP));
+				S = min(S, 0.25f / Grad);
+			}
+		}
+		else
+		{
+			const bool bToward = (InP.z > 0.0f) == (InD.z < 0.0f);
+			if (bToward) { S = min(S, max((Z - Slab) / Dz, 0.25f * H / Dz)); }
+		}
+	}
+	if (InPar.B.y > 0.0f)
+	{
+		const float Re = max(InPar.A.w, 1.0e-5f);
+		const float Q = max(InPar.B.x, 0.05f);
+		const float R3 = sqrt(Rcyl * Rcyl + (Z / Q) * (Z / Q));
+		// Only where the bulge matters: beyond 6 r_e it is < 1% of its value at r_e.
+		if (R3 < 6.0f * Re) { S = min(S, 0.3f * Q * max(2.0f * sqrt(R3 * Re) / 3.67f, 0.02f * Re)); }
+	}
+	return max(S, 1.0e-6f);
+}
+
+/** Smallest structure (field units) for prefiltered sampling: a step whose footprint is several
+ *  times this samples the field's mean instead (mips are integrals). 0 = never prefilter. */
+UNI_FN float Uni_FieldFeatureScale(uint InFieldId, FUniFieldParams InPar)
+{
+	if (InFieldId == UNI_FIELD_WEB)
+	{
+		const int G = max((int)InPar.A.x, 1);
+		const int G2 = (int)InPar.B.y;
+		const int Gmax = (InPar.B.z > 0.0f && G2 > G) ? G2 : G;
+		return max(InPar.A.y, 1.0e-4f) / (float)Gmax;
+	}
+	return 0.0f;
+}
+
+/** Smallest feature that must be resolved across the image (field units): a carrier whose
+ *  ResolveScale projects to less than half a pixel is supersampled (Uni_CarrierSubsamples),
+ *  or its light is mis-integrated by one ray per pixel (measured: 12-17% at the handoff). */
+UNI_FN float Uni_FieldResolveScale(uint InFieldId, FUniFieldParams InPar)
+{
+	if (InFieldId == UNI_FIELD_GALAXY)
+	{
+		float S = 0.25f;
+		if (InPar.A.z > 0.0f) { S = min(S, max(InPar.A.y, 1.0e-6f)); }
+		if (InPar.B.y > 0.0f) { S = min(S, 0.5f * max(InPar.A.w, 1.0e-5f)); }
+		return S;
+	}
+	return Uni_FieldFeatureScale(InFieldId, InPar);
+}
+
+/** Largest safe step (field units) for any field. */
+UNI_FN float Uni_FieldStepHint(uint InFieldId, float3 InP, float3 InD, FUniFieldParams InPar)
+{
+	if (InFieldId == UNI_FIELD_GALAXY) { return Uni_GalaxyStepHint(InP, InD, InPar); }
+	if (InFieldId == UNI_FIELD_WEB) { return 0.5f * Uni_FieldFeatureScale(InFieldId, InPar); }
+	return 0.25f;
+}
+
 #endif // UNI_FIELDS_USH

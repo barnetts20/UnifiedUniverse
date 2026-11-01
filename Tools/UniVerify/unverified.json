@@ -30,5 +30,9 @@
   {
     "id": "UE-8",
     "what": "Runtime cost: GPU time of the generate / project / sprite passes, the one-time game-thread hitch of the normalising integral when entering a galaxy (D-123), and teleport fill latency (about 37 frames, D-122)."
+  },
+  {
+    "id": "UE-9",
+    "what": "Volume pass in the engine (Docs/VOLUMETRICS.md \u00a78) is not built: only the shared core (UniVolume.ush), the CPU builder (UniVolume.h) and the offline reference exist. The core must compile under the engine shader compiler when UniVolume.usf is written, and the project-and-cull changes it relies on (handoff share, horizon dimming, luminance-normalised colour) must compile now (part of UE-3)."
   }
 ]

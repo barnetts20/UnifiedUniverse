@@ -643,6 +643,16 @@ namespace UniCore
 		bool LevelSuspended(int L) const { auto It = Levels.find(L); return It != Levels.end() && It->second.Lod.bSuspended; }
 		bool LevelActive(int L) const { auto It = Levels.find(L); return It != Levels.end() && It->second.bActive; }
 		size_t ContributorCount() const { return Registered.size(); }
+		/** Resident contributors by id (the volume builds its carriers from these). */
+		const std::map<u32, FContributor>& Contributors() const { return Registered; }
+		/** The resident object an id names, or nullptr. */
+		const FObjectGPU* FindObject(const FObjectId& Id) const
+		{
+			auto It = Cache.find(Id.Cell);
+			if (It == Cache.end()) { return nullptr; }
+			for (size_t I = 0; I < It->second.Indices.size(); ++I) { if (It->second.Indices[I] == Id.Index) { return &It->second.Objects[I]; } }
+			return nullptr;
+		}
 
 	private:
 		struct FLevel

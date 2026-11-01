@@ -48,7 +48,7 @@ struct FUniSprite
 {
 	float3 RenderPos;         // camera-relative, compressed: dir * f(r)
 	float AngularRadius;      // rad, for the sprite quad (render size = AngularRadius * f(r))
-	float3 Radiance;          // colour * intensity, exposure-calibrated
+	float3 Radiance;          // colour / luminance * intensity, exposure-calibrated (D-135)
 	float TrueDistance;       // cm, for the scene-depth test
 	float NdcX;               // [-1, 1] across the view
 	float NdcY;
@@ -61,6 +61,32 @@ UNI_FN bool Uni_PromoteTest(float InDistance, float InRadius, bool InWasPromoted
 {
 	const float H = InWasPromoted ? UNI_PROMOTE_HYSTERESIS : 1.0f;
 	return (InDistance - InRadius < UNI_R0_CM * H) || (InRadius / InDistance > UNI_THETA_PROMOTE / H);
+}
+
+/** Volume handoff (D-129): weight of an extended object's light carried by its volume
+ *  carrier instead of its sprite. A smoothstep in angular radius from Theta1 / 2 to Theta1,
+ *  Theta1 = min(8 px, theta_promote), so the ramp always completes before the promotion
+ *  threshold, at any resolution. The CPU carrier builder calls this same function. */
+static const float UNI_VOL_HANDOFF_PX = 8.0f;
+
+UNI_FN float Uni_CarrierHandoff(float InPhysAngularRadius, float InThetaPixel)
+{
+	const float T1 = min(UNI_VOL_HANDOFF_PX * InThetaPixel, UNI_THETA_PROMOTE);
+	const float X = saturate((InPhysAngularRadius - 0.5f * T1) / (0.5f * T1));
+	return X * X * (3.0f - 2.0f * X);
+}
+
+/** Visibility of an object before the level fade: point fade from its apparent magnitude and,
+ *  for extended sources, the resolved surface-brightness fade (D-121). Shared by the sprite
+ *  and the volume carrier, which must agree on it (D-128). */
+UNI_FN float Uni_ObjectVisibility(FUniObject InObj, float InDistance, float InPhysAngularRadius, FUniView InView)
+{
+	const float AppMag = Uni_ApparentMag(Uni_ObjectAbsMag(InObj), InDistance);
+	const float PointFade = Uni_MagFade(AppMag, InView.LimitingMag);
+	if ((Uni_ObjectFlags(InObj) & UNI_OBJ_FLAG_EXTENDED) == 0u) { return PointFade; }
+	const float Resolve = saturate(InPhysAngularRadius / UNI_THETA_MIN - 1.0f);
+	const float ExtFade = Uni_MagFade(Uni_ObjectSurfaceBrightness(InObj), InView.SurfaceLimit) * Resolve;
+	return max(PointFade, ExtFade);
 }
 
 /** Pixel-shader scene-depth test: keep the sprite only if the scene surface along this ray is
@@ -103,17 +129,13 @@ UNI_FN FUniSprite Uni_ProjectObject(uint4 InCellDeltaX, uint4 InCellDeltaY, uint
 	// photometry is continuous (no pop when a galaxy grows past theta_min, D-121).
 	const float AbsMag = Uni_ObjectAbsMag(InObj);
 	const float AppMag = Uni_ApparentMag(AbsMag, R);
-	const float PointFade = Uni_MagFade(AppMag, InView.LimitingMag);
-	float Fade = PointFade;
-	bool bExtended = false;
-	if ((ObjFlags & UNI_OBJ_FLAG_EXTENDED) != 0u)
-	{
-		const float Resolve = saturate(S.PhysAngularRadius / UNI_THETA_MIN - 1.0f);
-		const float ExtFade = Uni_MagFade(Uni_ObjectSurfaceBrightness(InObj), InView.SurfaceLimit) * Resolve;
-		Fade = max(PointFade, ExtFade);
-		bExtended = Resolve > 0.0f;
-	}
-	const float Intensity = pow(10.0f, -0.4f * (AppMag - InView.ExposureMag)) * Fade * saturate(InLevelFade);
+	const float Fade = Uni_ObjectVisibility(InObj, R, S.PhysAngularRadius, InView);
+	const bool bExtended = (ObjFlags & UNI_OBJ_FLAG_EXTENDED) != 0u && S.PhysAngularRadius > UNI_THETA_MIN;
+	// An extended object with children hands its light to its volume carrier as it grows
+	// (D-129), and every flux is horizon-dimmed (D-131). Both are render-only.
+	const bool bCarrier = (ObjFlags & (UNI_OBJ_FLAG_EXTENDED | UNI_OBJ_FLAG_HAS_CONTRIBUTOR)) == (UNI_OBJ_FLAG_EXTENDED | UNI_OBJ_FLAG_HAS_CONTRIBUTOR);
+	const float SpriteShare = bCarrier ? 1.0f - Uni_CarrierHandoff(S.PhysAngularRadius, InView.ThetaPixel) : 1.0f;
+	const float Intensity = pow(10.0f, -0.4f * (AppMag - InView.ExposureMag)) * Fade * saturate(InLevelFade) * SpriteShare * Uni_HorizonDimming(R);
 	if (!(Intensity > 0.0f)) { return S; }
 
 	// Frustum.
@@ -128,7 +150,8 @@ UNI_FN FUniSprite Uni_ProjectObject(uint4 InCellDeltaX, uint4 InCellDeltaY, uint
 	S.NdcY = Ny;
 	S.RenderPos = Dir * Uni_Compress(R);
 	S.AngularRadius = max(S.PhysAngularRadius, InView.ThetaPixel * (1.0f + InView.GlareGain * log2(1.0f + Intensity)));
-	S.Radiance = Uni_UnpackColour(InObj.B.w) * Intensity;
+	const float3 Col = Uni_UnpackColour(InObj.B.w);
+	S.Radiance = Col * (Intensity / max(Uni_Luminance(Col), 1.0e-3f));   // luminance = intensity (D-135)
 	S.Flags = S.Flags | UNI_SPRITE_VISIBLE | (bExtended ? UNI_SPRITE_EXTENDED : 0u);
 	return S;
 }
