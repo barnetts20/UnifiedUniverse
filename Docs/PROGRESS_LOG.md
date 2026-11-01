@@ -28,3 +28,6 @@ Append only. One entry per step start, finish, block, or commit. Times in the ow
 | 11:28 | P4 | note | Visual inspection: Milky-Way band correct; web filaments not legible at 65 points; renderer square-kernel artifact fixed; sprite→body handoff glare discontinuity → UE-5 |
 | 11:35 | P4 | decision D-116..D-121 | Resume fades, per-slice LUT + clamp, N_eff, θ_promote, true-distance depth test, extended blend |
 | 11:38 | P4 | done (gate green) | 36 checks green. Tier 3: jitter 2.6e-3 px worst (limit 0.01), ordering 0 reversed / per-depth 2,284 wrong, occlusion 0 wrong / 20k, flythrough 0 pops / 545,902 entering |
+| 11:40 | P5 | start | Unreal integration. First: task decomposition core (UniGenTask.ush) and runtime streamer (UniStreamer.h) so the GPU protocol is verifiable offline |
+| 12:05 | P5 | note | CPU reference refactored onto the GPU's probe → allocate → place phases; Tier 2 unchanged. T2.stream.parity: streamer + CPU backend = reference, 5,375 cells / 719,687 objects (caught anchor-only cells skipping allocation) |
+| 12:12 | P5 | commit | Checkpoint (37 checks green); UE shaders and renderer written, unbuilt |

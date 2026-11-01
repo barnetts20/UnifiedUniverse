@@ -75,8 +75,20 @@ namespace UniCore
 		uint32_t PoolBase;               // first object index for this task in the batch output
 		uint32_t PoolCapacity;           // objects this task may write (per-cell truncation keeps lowest candidates)
 		uint32_t IndexBase;              // object index within its cell for the first accepted object
+		float Suppress[4];               // suppressor centre (cell units, from the cell origin) and radius; w <= 0: none
 	};
-	static_assert(sizeof(FGenTaskGPU) == 160, "FGenTaskGPU must match FUniGenTask (UniGen.usf)");
+	static_assert(sizeof(FGenTaskGPU) == 176, "FGenTaskGPU must match FUniGenTask (UniGenTask.ush)");
+
+	// GPU-MIRROR
+	struct FTaskCountGPU
+	{
+		// Mirrors FUniTaskCount (UniGenTask.ush): probe-phase result, read back per task.
+		uint32_t Count;
+		uint32_t CandidateBudget;
+		float Mean;
+		float Envelope;
+	};
+	static_assert(sizeof(FTaskCountGPU) == 16, "FTaskCountGPU must match FUniTaskCount (UniGenTask.ush)");
 
 	// GPU-MIRROR
 	struct FSliceGPU
@@ -93,5 +105,5 @@ namespace UniCore
 		float BrightM;                   // slice magnitude interval: draws are clamped to it (D-117)
 		float FaintM;
 	};
-	static_assert(sizeof(FSliceGPU) == 64, "FSliceGPU must match FUniSlice (UniGen.usf)");
+	static_assert(sizeof(FSliceGPU) == 64, "FSliceGPU must match FUniSlice (UniGenTask.ush)");
 }

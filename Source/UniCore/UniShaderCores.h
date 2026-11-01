@@ -21,6 +21,7 @@ namespace UniHlsl
 #include "UniFields.ush"
 #include "UniPlacement.ush"
 #include "UniProject.ush"
+#include "UniGenTask.ush"
 }
 
 #include "UniCoord.h"

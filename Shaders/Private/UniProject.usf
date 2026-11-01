@@ -1,0 +1,91 @@
+// UniProject.usf
+// Project and cull, every frame, every resident object: one group of 64 per resident cell,
+// looping over the cell's pool range. All per-object logic is Uni_ProjectObject in
+// Core/UniProject.ush, shared with the CPU reference renderer (Tier 3).
+//
+// Outputs: compacted sprites + an indirect draw argument block {6, instances, 0, 0}, and
+// promotion candidates (cell index, object index in cell) for the CPU readback.
+//
+// The view is passed as raw floats and rebuilt here (lesson #2: no derived struct mirrored as a
+// constant buffer). The cell table carries exact 128-bit deltas (D-104).
+
+#include "/Engine/Public/Platform.ush"
+#include "Core/UniProject.ush"
+
+struct FUniCellGPU   // GPU-MIRROR: UniCore::FCellGPU (64 bytes)
+{
+	uint4 DeltaX;
+	uint4 DeltaY;
+	uint4 DeltaZ;
+	uint Level;
+	uint PoolStart;
+	uint PoolCount;
+	uint Flags;      // bit 0 suspended, bits 8..15 level fade
+};
+
+StructuredBuffer<FUniCellGPU> InCells;
+StructuredBuffer<FUniObject> InPool;
+RWStructuredBuffer<FUniSprite> OutSprites;
+RWBuffer<uint> OutDrawArgs;          // {VertexCountPerInstance, InstanceCount, StartVertex, StartInstance}
+RWStructuredBuffer<uint2> OutPromote;
+RWBuffer<uint> OutPromoteCount;
+
+uint NumCells;
+uint DispatchGroupsX;
+uint MaxSprites;
+uint MaxPromote;
+
+float3 ViewForward;
+float TanHalfFovX;
+float3 ViewRight;
+float TanHalfFovY;
+float3 ViewUp;
+float LimitingMag;
+float3 CameraFraction;
+float ExposureMag;
+float SurfaceLimit;
+float ThetaPixel;
+float GlareGain;
+
+[numthreads(64, 1, 1)]
+void MainCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint CellIndex = GroupId.y * DispatchGroupsX + GroupId.x;
+	if (CellIndex == 0 && GroupIndex == 0) { OutDrawArgs[0] = 6; }   // two triangles per sprite
+	if (CellIndex >= NumCells) { return; }
+	const FUniCellGPU Cell = InCells[CellIndex];
+
+	FUniView V;
+	V.Forward = ViewForward;
+	V.TanHalfFovX = TanHalfFovX;
+	V.Right = ViewRight;
+	V.TanHalfFovY = TanHalfFovY;
+	V.Up = ViewUp;
+	V.LimitingMag = LimitingMag;
+	V.CameraFraction = CameraFraction;
+	V.ExposureMag = ExposureMag;
+	V.SurfaceLimit = SurfaceLimit;
+	V.ThetaPixel = ThetaPixel;
+	V.GlareGain = GlareGain;
+	V.Pad = 0.0f;
+
+	const float LevelFade = (float)((Cell.Flags >> 8u) & 255u) / 255.0f;
+	for (uint I = GroupIndex; I < Cell.PoolCount; I += 64)
+	{
+		const FUniObject O = InPool[Cell.PoolStart + I];
+		const FUniSprite S = Uni_ProjectObject(Cell.DeltaX, Cell.DeltaY, Cell.DeltaZ, Cell.Level, LevelFade, O, V,
+			(Uni_ObjectFlags(O) & UNI_OBJ_FLAG_PROMOTED) != 0u);
+		if ((S.Flags & UNI_SPRITE_PROMOTE_CANDIDATE) != 0u)
+		{
+			uint P;
+			InterlockedAdd(OutPromoteCount[0], 1u, P);
+			if (P < MaxPromote) { OutPromote[P] = uint2(CellIndex, I); }
+		}
+		if ((S.Flags & UNI_SPRITE_VISIBLE) != 0u)
+		{
+			uint Slot;
+			InterlockedAdd(OutDrawArgs[1], 1u, Slot);
+			if (Slot < MaxSprites) { OutSprites[Slot] = S; }
+		}
+	}
+}

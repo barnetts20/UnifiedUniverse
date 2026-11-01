@@ -1,0 +1,154 @@
+// UniGen.usf
+// GPU generation: one thread group of 64 per task (cell, contributor, emitter). Orchestration
+// only; every decision is in the shared cores (Core/UniGenTask.ush), which the CPU reference
+// runs in the same order (UniGenRef.h, verified offline by Tier 2).
+//
+//   UNI_GEN_PASS 0  PROBE: 128 probes (2 per thread), group reduction to sum and max,
+//                   Uni_TaskCount -> OutCounts[task]. Read back; the CPU allocates pool ranges.
+//   UNI_GEN_PASS 1  PLACE: candidates in chunks of 64; a group-wide inclusive scan of the
+//                   accept flags gives each accepted candidate its rank, so ranks follow
+//                   candidate index exactly as the CPU's sequential loop does. The first
+//                   PoolCapacity accepted are written; the rest of the range is blanked
+//                   (lesson #27). OutAccepted[task] = filled count.
+//   UNI_GEN_PASS 2  SCATTER: authored records (anchors) written at CPU-chosen pool indices.
+//
+// Dispatch is wrapped into 2D (lesson #23): task = GroupId.y * DispatchGroupsX + GroupId.x.
+// Parity note (D-105): the probe sum is a tree reduction here and a sequential sum on the CPU,
+// so mean and lambda differ in the last bits and a Poisson count can differ in rare boundary
+// cases. Integer parts (seeds, offsets, ranks) are bit-identical.
+
+#include "/Engine/Public/Platform.ush"
+#include "Core/UniGenTask.ush"
+
+#ifndef UNI_GEN_PASS
+	#define UNI_GEN_PASS 0
+#endif
+
+#define UNI_GEN_THREADS 64
+
+StructuredBuffer<FUniGenTask> InTasks;
+uint NumTasks;
+uint DispatchGroupsX;
+
+#if UNI_GEN_PASS == 0
+
+RWStructuredBuffer<FUniTaskCount> OutCounts;
+groupshared float GsSum[UNI_GEN_THREADS];
+groupshared float GsMax[UNI_GEN_THREADS];
+
+[numthreads(UNI_GEN_THREADS, 1, 1)]
+void MainCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint TaskIndex = GroupId.y * DispatchGroupsX + GroupId.x;
+	if (TaskIndex >= NumTasks) { return; }   // whole group exits together
+	const FUniGenTask T = InTasks[TaskIndex];
+
+	float Sum = 0.0f;
+	float Max = 0.0f;
+	for (uint K = GroupIndex; K < UNI_PROBES_PER_CELL; K += UNI_GEN_THREADS)
+	{
+		const float V = Uni_TaskProbe(T, K);
+		Sum += V;
+		Max = max(Max, V);
+	}
+	GsSum[GroupIndex] = Sum;
+	GsMax[GroupIndex] = Max;
+	GroupMemoryBarrierWithGroupSync();
+	for (uint Stride = UNI_GEN_THREADS / 2; Stride > 0; Stride >>= 1)
+	{
+		if (GroupIndex < Stride)
+		{
+			GsSum[GroupIndex] += GsSum[GroupIndex + Stride];
+			GsMax[GroupIndex] = max(GsMax[GroupIndex], GsMax[GroupIndex + Stride]);
+		}
+		GroupMemoryBarrierWithGroupSync();
+	}
+	if (GroupIndex == 0)
+	{
+		OutCounts[TaskIndex] = Uni_TaskCount(T, GsSum[0], GsMax[0]);
+	}
+}
+
+#elif UNI_GEN_PASS == 1
+
+StructuredBuffer<FUniTaskCount> InCounts;
+StructuredBuffer<FUniSlice> InSlices;
+StructuredBuffer<float> InLut;
+RWStructuredBuffer<FUniObject> OutPool;
+RWStructuredBuffer<uint> OutAccepted;
+
+groupshared uint GsScan[UNI_GEN_THREADS];
+groupshared uint GsBase;
+
+[numthreads(UNI_GEN_THREADS, 1, 1)]
+void MainCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint TaskIndex = GroupId.y * DispatchGroupsX + GroupId.x;
+	if (TaskIndex >= NumTasks) { return; }
+	const FUniGenTask T = InTasks[TaskIndex];
+	const FUniTaskCount C = InCounts[TaskIndex];
+	const FUniSlice S = InSlices[T.SliceIndex];
+
+	if (GroupIndex == 0) { GsBase = 0; }
+	GroupMemoryBarrierWithGroupSync();
+
+	if (T.PoolCapacity > 0)
+	{
+		for (uint Chunk = 0; ; ++Chunk)
+		{
+			const uint J = Chunk * UNI_GEN_THREADS + GroupIndex;
+			uint3 Offset = uint3(0, 0, 0);
+			float Density = 0.0f;
+			bool bAccepted = false;
+			if (J < C.CandidateBudget)
+			{
+				bAccepted = Uni_TaskCandidate(T, C.Envelope, J, Offset, Density);
+			}
+			// Inclusive scan of accept flags (Hillis-Steele): rank = acceptance order.
+			GsScan[GroupIndex] = bAccepted ? 1u : 0u;
+			GroupMemoryBarrierWithGroupSync();
+			for (uint Off = 1; Off < UNI_GEN_THREADS; Off <<= 1)
+			{
+				const uint Add = (GroupIndex >= Off) ? GsScan[GroupIndex - Off] : 0u;
+				GroupMemoryBarrierWithGroupSync();
+				GsScan[GroupIndex] += Add;
+				GroupMemoryBarrierWithGroupSync();
+			}
+			const uint Base = GsBase;
+			const uint Rank = Base + GsScan[GroupIndex] - (bAccepted ? 1u : 0u);
+			if (bAccepted && Rank < T.PoolCapacity)
+			{
+				OutPool[T.PoolBase + Rank] = Uni_TaskSuppressed(T, Offset) ? Uni_BlankObject() : Uni_TaskMakeObject(T, S, InLut, Rank, Offset);
+			}
+			const uint ChunkTotal = GsScan[UNI_GEN_THREADS - 1];
+			GroupMemoryBarrierWithGroupSync();
+			if (GroupIndex == 0) { GsBase = Base + ChunkTotal; }
+			GroupMemoryBarrierWithGroupSync();
+			// Group-uniform exit: every thread reads the same GsBase after the barrier.
+			if (GsBase >= T.PoolCapacity || (Chunk + 1) * UNI_GEN_THREADS >= C.CandidateBudget) { break; }
+		}
+	}
+
+	const uint Filled = min(GsBase, T.PoolCapacity);
+	for (uint I = Filled + GroupIndex; I < T.PoolCapacity; I += UNI_GEN_THREADS)
+	{
+		OutPool[T.PoolBase + I] = Uni_BlankObject();
+	}
+	if (GroupIndex == 0) { OutAccepted[TaskIndex] = Filled; }
+}
+
+#else // UNI_GEN_PASS == 2: scatter authored records (anchors) into the pool
+
+StructuredBuffer<uint> InScatterIndex;
+StructuredBuffer<FUniObject> InScatterRecord;
+RWStructuredBuffer<FUniObject> OutPool;
+uint NumWrites;
+
+[numthreads(64, 1, 1)]
+void ScatterCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+	if (ThreadId.x >= NumWrites) { return; }
+	OutPool[InScatterIndex[ThreadId.x]] = InScatterRecord[ThreadId.x];
+}
+
+#endif

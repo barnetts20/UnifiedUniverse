@@ -1,0 +1,125 @@
+// UniGenTask.ush
+// One generation task = (cell, contributor, emitter), decomposed exactly as the GPU runs it:
+//
+//   PROBE PHASE   (UniGen.usf, PASS 0): 128 probes -> sum and max -> mean, envelope, lambda,
+//                 Poisson count n and the candidate budget. Counts are read back.
+//   ALLOCATION    (CPU, between passes): per cell, IndexBase = prefix sum of n over the cell's
+//                 tasks in contributor order (truncated at 2^15, lowest indices kept), and a
+//                 pool range of n records per task.
+//   PLACE PHASE   (UniGen.usf, PASS 1): candidates in index order; the first n accepted are
+//                 written at PoolBase + local index. Slots of the range not written (budget
+//                 shortfall) are blanked with a hidden record (lesson #27).
+//
+// The CPU reference (UniGenRef.h) runs these same functions in the same order, so Tier 2
+// verifies the GPU algorithm offline; only the parallel orchestration in UniGen.usf (group
+// reduction, chunked scan) is UE-4.
+//
+// Identity: an object's index within its cell is IndexBase + its acceptance rank. IndexBase
+// advances by n (the drawn count), not by the accepted count, so it is known after the probe
+// phase alone.
+
+#ifndef UNI_GEN_TASK_USH
+#define UNI_GEN_TASK_USH
+
+#include "UniCoreDefs.ush"
+#include "UniSeed.ush"
+#include "UniFields.ush"
+#include "UniPlacement.ush"
+
+/** GPU-MIRROR: UniCore::FGenTaskGPU (176 bytes). */
+struct FUniGenTask
+{
+	FUniFieldFrame Frame;
+	FUniFieldParams Params;
+	uint CellSeed;
+	uint FieldId;
+	uint ChildArchetypeId;
+	uint SliceIndex;
+	float LambdaScale;        // N_total P(L) cellVolume / integralAll, times any test multiplier
+	uint PoolBase;            // set by the allocation step
+	uint PoolCapacity;        // n after truncation
+	uint IndexBase;
+	float4 Suppress;          // suppressor centre in cell units relative to the cell origin, radius in cell units (w <= 0: none)
+};
+
+/** GPU-MIRROR: UniCore::FSliceGPU (64 bytes). */
+struct FUniSlice
+{
+	float CdfLo;
+	float CdfHi;
+	uint LutBase;
+	uint LutCount;
+	float4 RadiusModel;
+	float4 ColourModel;
+	uint ChildFlags;
+	uint Pad;
+	float BrightM;
+	float FaintM;
+};
+
+/** Probe-phase result per task, read back to the CPU. 16 bytes. */
+struct FUniTaskCount
+{
+	uint Count;               // Poisson n (before truncation)
+	uint CandidateBudget;
+	float Mean;
+	float Envelope;
+};
+
+UNI_FN float Uni_TaskProbe(FUniGenTask InT, uint InK)
+{
+	return Uni_FieldSample(InT.FieldId, Uni_FieldFramePoint(InT.Frame, Uni_ProbeUnit(InT.CellSeed, InK)), InT.Params);
+}
+
+/** Probe reduction -> count. Sum and max are over all UNI_PROBES_PER_CELL probes. */
+UNI_FN FUniTaskCount Uni_TaskCount(FUniGenTask InT, float InProbeSum, float InProbeMax)
+{
+	FUniTaskCount C;
+	C.Mean = InProbeSum / (float)UNI_PROBES_PER_CELL;
+	C.Envelope = InProbeMax * UNI_ENVELOPE_PAD;
+	const float Lambda = InT.LambdaScale * C.Mean;
+	C.Count = (C.Envelope > 0.0f) ? Uni_PoissonCount(Lambda, InT.CellSeed) : 0u;
+	// D-114: budget follows the expected acceptance with 4x headroom.
+	const float Accept = (C.Envelope > 0.0f) ? max(C.Mean / C.Envelope, 1.0e-4f) : 1.0f;
+	C.CandidateBudget = (uint)min(256.0f + 4.0f * (float)C.Count / Accept, 4.0e9f);
+	return C;
+}
+
+/** Candidate J: its offset, and whether it passes rejection. */
+UNI_FN bool Uni_TaskCandidate(FUniGenTask InT, float InEnvelope, uint InJ, UNI_OUT(uint3) OutOffset, UNI_OUT(float) OutDensity)
+{
+	OutOffset = Uni_CandidateOffset(InT.CellSeed, InJ);
+	OutDensity = Uni_FieldSample(InT.FieldId, Uni_FieldFramePoint(InT.Frame, Uni_OffsetUnit(OutOffset)), InT.Params);
+	return Uni_Accept(InT.CellSeed, InJ, OutDensity, InEnvelope);
+}
+
+/** Inside the task's suppressor? Masked, not relocated: the index is still consumed. */
+UNI_FN bool Uni_TaskSuppressed(FUniGenTask InT, uint3 InOffset)
+{
+	if (!(InT.Suppress.w > 0.0f)) { return false; }
+	const float3 U = Uni_OffsetUnit(InOffset);
+	const float3 D = float3(U.x - InT.Suppress.x, U.y - InT.Suppress.y, U.z - InT.Suppress.z);
+	return dot(D, D) < InT.Suppress.w * InT.Suppress.w;
+}
+
+/** The record for the object with acceptance rank InLocal. */
+UNI_FN FUniObject Uni_TaskMakeObject(FUniGenTask InT, FUniSlice InS, StructuredBuffer<float> InLut, uint InLocal, uint3 InOffset)
+{
+	const uint ObjSeed = Uni_ObjectSeed(InT.CellSeed, InLocal);
+	const float M = Uni_DrawAbsMag(ObjSeed, 0.0f, 1.0f, InS.BrightM, InS.FaintM, InLut, InS.LutBase, InS.LutCount);
+	const float RL2 = Uni_DrawRadiusLog2(ObjSeed, M, InS.RadiusModel);
+	const float3 Rgb = Uni_DrawColour(ObjSeed, M, InS.ColourModel);
+	const float SB = ((InS.ChildFlags & UNI_OBJ_FLAG_EXTENDED) != 0u) ? Uni_SurfaceBrightness(M, RL2) : 0.0f;
+	return Uni_MakeObject(InOffset, InT.ChildArchetypeId, InS.ChildFlags, ObjSeed, RL2, M, SB, Rgb);
+}
+
+/** The blank written to pool slots a task reserved but did not fill (lesson #27). */
+UNI_FN FUniObject Uni_BlankObject()
+{
+	FUniObject O;
+	O.A = uint4(0u, 0u, 0u, UNI_OBJ_FLAG_DELTA_HIDDEN << 16u);
+	O.B = uint4(0u, asuint(0.0f), 0u, 0u);
+	return O;
+}
+
+#endif // UNI_GEN_TASK_USH

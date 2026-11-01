@@ -286,6 +286,16 @@ namespace UniCore
 
 		int LevelOf(u32 ArchId, double M) const { return LevelForRelevance(Relevance(ArchId, M)); }
 
+		/** GPU slice table and flattened per-slice LUTs, uploaded once per definition. */
+		const std::vector<FSliceGPU>& GpuSlices() const { return GpuSliceTable; }
+		const std::vector<float>& GpuLut() const { return GpuLutTable; }
+		/** Index into GpuSlices() for (child archetype, level), or -1. */
+		int SliceIndex(u32 ChildId, int Level) const
+		{
+			auto It = SliceIndexMap.find((u64(ChildId) << 8) | u64(u32(Level)));
+			return It == SliceIndexMap.end() ? -1 : It->second;
+		}
+
 		/** Validation (UE: archetype validation in the editor module). Returns problems. */
 		std::vector<std::string> Validate() const
 		{
@@ -323,6 +333,24 @@ namespace UniCore
 			// Bottom-up: an archetype's slice table needs its own children's tables for the
 			// influence term. Emitter graphs are acyclic (validated), so recursion terminates.
 			for (const FArchetype& A : Def.Archetypes) { BuildSlices(A.Id, 0); }
+			// GPU tables: one FSliceGPU per (archetype, level), LUTs concatenated.
+			for (const auto& KV : Slices)
+			{
+				const FArchetype& A = Def.Arch(KV.first);
+				const u32 Flags = (A.Visibility == EVisibility::Extended ? UniHlsl::UNI_OBJ_FLAG_EXTENDED : 0u) | (A.Emitters.empty() ? 0u : UniHlsl::UNI_OBJ_FLAG_HAS_CONTRIBUTOR);
+				for (const FSlice& S : KV.second.Slices)
+				{
+					FSliceGPU G{};
+					G.CdfLo = float(S.CdfLo); G.CdfHi = float(S.CdfHi);
+					G.LutBase = u32(GpuLutTable.size()); G.LutCount = u32(S.InvCdf.size());
+					for (int I = 0; I < 4; ++I) { G.RadiusModel[I] = A.RadiusModel[I]; G.ColourModel[I] = A.ColourModel[I]; }
+					G.ChildFlags = Flags;
+					G.BrightM = float(S.BrightM); G.FaintM = float(S.FaintM);
+					GpuLutTable.insert(GpuLutTable.end(), S.InvCdf.begin(), S.InvCdf.end());
+					SliceIndexMap[(u64(KV.first) << 8) | u64(u32(S.Level))] = int(GpuSliceTable.size());
+					GpuSliceTable.push_back(G);
+				}
+			}
 		}
 
 		void BuildSlices(u32 Id, int Depth)
@@ -406,5 +434,8 @@ namespace UniCore
 
 		FUniverseDef Def;
 		std::map<u32, FSliceTable> Slices;
+		std::vector<FSliceGPU> GpuSliceTable;
+		std::vector<float> GpuLutTable;
+		std::map<u64, int> SliceIndexMap;
 	};
 }

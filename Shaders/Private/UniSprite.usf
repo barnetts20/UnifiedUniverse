@@ -1,0 +1,78 @@
+// UniSprite.usf
+// Backdrop sprites: one instanced indirect draw for every visible point source at every level.
+// Additive, drawn into scene colour after motion blur (post-TSR, pre-bloom/tonemap, D-006,
+// D-124). The pixel shader converts main-scene depth to true distance along the ray and
+// discards when the scene surface is nearer (Uni_SceneDepthKeep, D-120), which gives correct
+// occlusion by promoted bodies with no per-sprite depth.
+
+#include "/Engine/Public/Platform.ush"
+#include "Core/UniProject.ush"
+
+StructuredBuffer<FUniSprite> InSprites;
+uint MaxSprites;
+float4x4 TranslatedWorldToClip;     // camera-relative positions are translated-world positions
+float3 ViewForward;
+float3 ViewRight;
+float3 ViewUp;
+float SpriteExtent;                 // quad half size in Gaussian sigmas
+float4 InvDeviceZToWorldZTransform; // FSceneView::InvDeviceZToWorldZTransform
+float4 DepthUVScaleBias;            // output pixel -> scene-depth UV (TSR upscaling changes resolution)
+float3 SceneColourScale;            // exposure-calibrated radiance -> scene colour units (lesson #36)
+float PixelsPerRadian;              // output pixels per radian at the view centre
+
+Texture2D SceneDepthTexture;
+SamplerState SceneDepthSampler;
+
+struct FSpriteVSOut
+{
+	float4 Position : SV_POSITION;
+	float2 Corner : TEXCOORD0;
+	nointerpolation float3 Radiance : TEXCOORD1;
+	nointerpolation float TrueDistance : TEXCOORD2;
+	nointerpolation float CosToForward : TEXCOORD3;
+	nointerpolation float SigmaPx : TEXCOORD4;
+};
+
+void MainVS(uint VertexId : SV_VertexID, uint InstanceId : SV_InstanceID, out FSpriteVSOut Out)
+{
+	Out = (FSpriteVSOut)0;
+	if (InstanceId >= MaxSprites) { Out.Position = float4(0, 0, -1, 1); return; }   // past the cap: degenerate
+	const FUniSprite S = InSprites[InstanceId];
+	// Two triangles: (-1,-1) (1,-1) (1,1) / (-1,-1) (1,1) (-1,1).
+	const float2 Corners[6] = { float2(-1, -1), float2(1, -1), float2(1, 1), float2(-1, -1), float2(1, 1), float2(-1, 1) };
+	const float2 C = Corners[VertexId % 6];
+	const float R = length(S.RenderPos);
+	const float3 Dir = S.RenderPos / max(R, 1.0f);
+	// Quad in the plane facing the camera, sized so the angular radius is preserved under
+	// compression: render size = angular radius * f(r) (parallax-exact by construction).
+	const float3 Side = normalize(cross(Dir, ViewUp + ViewRight * 1.0e-3));
+	const float3 Up = cross(Side, Dir);
+	const float HalfSize = S.AngularRadius * R * SpriteExtent;
+	const float3 P = S.RenderPos + (Side * C.x + Up * C.y) * HalfSize;
+	Out.Position = mul(float4(P, 1.0f), TranslatedWorldToClip);
+	Out.Corner = C * SpriteExtent;
+	Out.Radiance = S.Radiance * SceneColourScale;
+	Out.TrueDistance = S.TrueDistance;
+	Out.CosToForward = max(dot(Dir, ViewForward), 1.0e-3);
+	Out.SigmaPx = max(S.AngularRadius * PixelsPerRadian, 0.5f);
+}
+
+float SceneDistance(float2 PixelPos, float CosToForward)
+{
+	const float2 UV = PixelPos * DepthUVScaleBias.xy + DepthUVScaleBias.zw;
+	const float DeviceZ = SceneDepthTexture.SampleLevel(SceneDepthSampler, UV, 0).r;
+	// ConvertFromDeviceZ (Common.ush), spelled out so this file needs only Platform.ush.
+	const float ViewZ = DeviceZ * InvDeviceZToWorldZTransform[0] + InvDeviceZToWorldZTransform[1]
+		+ 1.0f / (DeviceZ * InvDeviceZToWorldZTransform[2] - InvDeviceZToWorldZTransform[3]);
+	return ViewZ / CosToForward;   // view depth to distance along the ray
+}
+
+void MainPS(in FSpriteVSOut In, out float4 OutColor : SV_Target0)
+{
+	if (!Uni_SceneDepthKeep(In.TrueDistance, SceneDistance(In.Position.xy, In.CosToForward))) { discard; }
+	const float R2 = dot(In.Corner, In.Corner);
+	// Gaussian with sigma = 1 corner unit = SigmaPx pixels, normalised per PIXEL, so the energy
+	// summed over the covered pixels equals Radiance whatever the sprite's size.
+	const float W = exp(-0.5f * R2) / (6.2831853f * In.SigmaPx * In.SigmaPx);
+	OutColor = float4(In.Radiance * W, 0.0f);
+}

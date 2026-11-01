@@ -5,7 +5,7 @@
 | | |
 | --- | --- |
 | Commit | `6a292b8` + uncommitted changes (branch `uu/prototype-day1`) |
-| Run | 2026-11-01 11:34 EST, 220 s |
+| Run | 2026-11-01 11:39 EST, 229 s |
 | Environment tier reached | Tier 3 offline (Tier 4 static only: no Unreal, no DXC here — see ENVIRONMENT.md) |
 | Checks | 36 run, 36 pass, **0 fail** |
 
@@ -80,7 +80,7 @@ Written by the session after looking at the images: [OBSERVATIONS.md](OBSERVATIO
 
 - Regressed (PASS → FAIL): none
 - Fixed (FAIL → PASS): none
-- New checks: `T2.gen.slice_draws`, `T3.jitter`, `T3.ordering`, `T3.occlusion`, `T3.frames`, `T3.flythrough`, `T3.images`
+- New checks: none
 
 ## Not verified here
 

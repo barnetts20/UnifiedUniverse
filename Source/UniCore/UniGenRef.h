@@ -263,7 +263,103 @@ namespace UniCore
 			return C.NTotal * S.P * V / IntegralAll(C);
 		}
 
-		/** Generate one cell from the given contributors (all that overlap it). */
+		/** The GPU task for contributor C in cell K (lambda scale, frame, seed, slice, suppressor).
+		 *  Returns false if C does not emit at K's level. Pool fields are filled by allocation. */
+		bool BuildTask(const FContributor& C, const FCellKey& K, FGenTaskGPU& Out) const
+		{
+			const FUniverseDef& D = Model.Definition();
+			const u32 Child = C.Emitter->ChildArchetypeId;
+			const FSlice* S = Model.SlicesOf(Child).ForLevel(K.Level);
+			const int SliceIdx = Model.SliceIndex(Child, K.Level);
+			if (!S || S->P <= 0.0 || SliceIdx < 0) { return false; }
+			Out = FGenTaskGPU{};
+			Out.Frame = Frame(C, K);
+			Out.Params = C.Params.Pack();
+			Out.CellSeed = CellSeed(D.Seed, K, Child, C.Id, u32(C.EmitterIndex));
+			Out.FieldId = C.Emitter->FieldId;
+			Out.ChildArchetypeId = Child;
+			Out.SliceIndex = u32(SliceIdx);
+			Out.LambdaScale = float(LambdaScale(C, K, *S, Out.Frame.SizeP) * LambdaMultiplier);
+			// One suppressor per task (the first that touches the cell), in cell units.
+			const double W = CellWidthCm(K.Level);
+			for (const FSuppressor& Sp : D.Suppressors)
+			{
+				if (Sp.ArchetypeId != Child) { continue; }
+				const FVec3d Rel = ToDouble(Sub(Sp.Centre, CellOrigin(K)));
+				const double P[3] = { Rel.X, Rel.Y, Rel.Z };
+				double Dist2 = 0.0;
+				for (double V : P) { const double E = V < 0.0 ? -V : (V > W ? V - W : 0.0); Dist2 += E * E; }
+				if (Dist2 >= Sp.RadiusCm * Sp.RadiusCm) { continue; }
+				Out.Suppress[0] = float(Rel.X / W); Out.Suppress[1] = float(Rel.Y / W); Out.Suppress[2] = float(Rel.Z / W);
+				Out.Suppress[3] = float(Sp.RadiusCm / W);
+				break;
+			}
+			return true;
+		}
+
+		static H::FUniGenTask ToHlsl(const FGenTaskGPU& T)
+		{
+			H::FUniGenTask R;
+			R.Frame = ToHlsl(T.Frame);
+			R.Params.A = H::float4(T.Params.V[0], T.Params.V[1], T.Params.V[2], T.Params.V[3]);
+			R.Params.B = H::float4(T.Params.V[4], T.Params.V[5], T.Params.V[6], T.Params.V[7]);
+			R.Params.C = H::float4(T.Params.V[8], T.Params.V[9], T.Params.V[10], T.Params.V[11]);
+			R.Params.D = H::float4(T.Params.V[12], T.Params.V[13], T.Params.V[14], T.Params.V[15]);
+			R.CellSeed = T.CellSeed; R.FieldId = T.FieldId; R.ChildArchetypeId = T.ChildArchetypeId; R.SliceIndex = T.SliceIndex;
+			R.LambdaScale = T.LambdaScale; R.PoolBase = T.PoolBase; R.PoolCapacity = T.PoolCapacity; R.IndexBase = T.IndexBase;
+			R.Suppress = H::float4(T.Suppress[0], T.Suppress[1], T.Suppress[2], T.Suppress[3]);
+			return R;
+		}
+
+		H::FUniSlice SliceHlsl(u32 Index) const
+		{
+			const FSliceGPU& G = Model.GpuSlices()[Index];
+			H::FUniSlice S;
+			S.CdfLo = G.CdfLo; S.CdfHi = G.CdfHi; S.LutBase = G.LutBase; S.LutCount = G.LutCount;
+			S.RadiusModel = H::float4(G.RadiusModel[0], G.RadiusModel[1], G.RadiusModel[2], G.RadiusModel[3]);
+			S.ColourModel = H::float4(G.ColourModel[0], G.ColourModel[1], G.ColourModel[2], G.ColourModel[3]);
+			S.ChildFlags = G.ChildFlags; S.Pad = 0u; S.BrightM = G.BrightM; S.FaintM = G.FaintM;
+			return S;
+		}
+
+		/** Probe phase on the CPU: the GPU's PASS 0 for one task. */
+		FTaskCountGPU RunProbe(const FGenTaskGPU& T) const
+		{
+			const H::FUniGenTask HT = ToHlsl(T);
+			float Sum = 0.0f, Max = 0.0f;
+			for (u32 K = 0; K < H::UNI_PROBES_PER_CELL; ++K) { const float V = H::Uni_TaskProbe(HT, K); Sum += V; Max = std::max(Max, V); }
+			const H::FUniTaskCount C = H::Uni_TaskCount(HT, Sum, Max);
+			return FTaskCountGPU{ C.Count, C.CandidateBudget, C.Mean, C.Envelope };
+		}
+
+		/** Place phase on the CPU: the GPU's PASS 1 for one task, candidates in index order (the
+		 *  GPU's chunked scan gives the same order). Writes T.PoolCapacity records into Out
+		 *  (accepted objects, suppressed and unfilled slots as blanks) and fills St. */
+		void RunPlace(const FGenTaskGPU& T, const FTaskCountGPU& C, std::vector<FObjectGPU>& OutRecords, FTaskStats& St) const
+		{
+			const H::FUniGenTask HT = ToHlsl(T);
+			const H::FUniSlice S = SliceHlsl(T.SliceIndex);
+			const std::vector<float>& L = Model.GpuLut();
+			const H::StructuredBuffer<float> Lut(L.data(), u32(L.size()));
+			OutRecords.assign(T.PoolCapacity, FromHlsl(H::Uni_BlankObject()));
+			u32 Accepted = 0;
+			for (u32 J = 0; Accepted < T.PoolCapacity && J < C.CandidateBudget; ++J)
+			{
+				H::uint3 Off; float Dens;
+				const bool bAcc = H::Uni_TaskCandidate(HT, C.Envelope, J, Off, Dens);
+				++St.Candidates;
+				if (double(Dens) > double(C.Envelope)) { ++St.Clipped; }
+				if (!bAcc) { continue; }
+				const u32 Local = Accepted++;
+				if (H::Uni_TaskSuppressed(HT, Off)) { continue; }          // masked: index consumed, slot stays blank
+				OutRecords[Local] = FromHlsl(H::Uni_TaskMakeObject(HT, S, Lut, Local, Off));
+				++St.Emitted;
+			}
+			St.Accepted = Accepted;
+		}
+
+		/** Generate one cell from the given contributors (all that overlap it): build tasks,
+		 *  probe, allocate (prefix sum of n, per-cell truncation keeps the lowest indices), place. */
 		void GenerateCell(const FCellKey& K, std::vector<const FContributor*> Contribs, FCellContent& Out) const
 		{
 			const FUniverseDef& D = Model.Definition();
@@ -276,67 +372,30 @@ namespace UniCore
 			{
 				if (!Overlaps(*C, K)) { continue; }
 				Out.ContributorSet.push_back(C->Id);
-				const u32 Child = C->Emitter->ChildArchetypeId;
-				const FArchetype& CA = D.Arch(Child);
-				const FSlice* S = Model.SlicesOf(Child).ForLevel(K.Level);
-				if (!S || S->P <= 0.0) { continue; }
-
+				FGenTaskGPU T;
+				if (!BuildTask(*C, K, T)) { continue; }
 				FTaskStats St;
 				St.ContributorId = C->Id;
-				const u32 Seed = CellSeed(D.Seed, K, Child, C->Id, u32(C->EmitterIndex));
-				const FFieldFrameGPU FG = Frame(*C, K);
-				const H::FUniFieldFrame F = ToHlsl(FG);
-				const H::FUniFieldParams P = C->Params.ToHlsl();
-				const u32 FieldId = C->Emitter->FieldId;
-
-				// Pass 1: probe -> mean (integral) and max (envelope).
-				double Sum = 0.0, Max = 0.0;
-				for (u32 Kp = 0; Kp < H::UNI_PROBES_PER_CELL; ++Kp)
-				{
-					const float V = H::Uni_FieldSample(FieldId, H::Uni_FieldFramePoint(F, H::Uni_ProbeUnit(Seed, Kp)), P);
-					Sum += V; Max = std::max(Max, double(V));
-				}
-				St.Mean = Sum / double(H::UNI_PROBES_PER_CELL);
-				St.Envelope = Max * H::UNI_ENVELOPE_PAD;
-				St.Lambda = LambdaScale(*C, K, *S, FG.SizeP) * St.Mean * LambdaMultiplier;
-				u32 N = St.Envelope > 0.0 ? H::Uni_PoissonCount(float(St.Lambda), Seed) : 0u;
-
-				// Pass 2: per-cell truncation keeps the LOWEST candidate indices (D-005, lesson #21).
+				const FTaskCountGPU Cnt = RunProbe(T);
+				St.Mean = Cnt.Mean;
+				St.Envelope = Cnt.Envelope;
+				St.Lambda = double(T.LambdaScale) * double(Cnt.Mean);
+				u32 N = Cnt.Count;
 				const u32 Room = IndexBase < MaxPerCell ? MaxPerCell - IndexBase : 0u;
 				if (N > Room) { St.Truncated = N - Room; N = Room; }
 				St.Count = N;
-
-				// Pass 3: candidates in index order; the first N accepted are the objects. The
-				// candidate budget follows the expected acceptance (mean / envelope) with 4x
-				// headroom (D-114): a fixed multiple of N under-delivers in cusped fields.
-				const double Accept = St.Envelope > 0.0 ? std::max(St.Mean / St.Envelope, 1.0e-4) : 1.0;
-				const u32 Cap = u32(std::min(256.0 + 4.0 * double(N) / Accept, 4.0e9));
-				const FSlice& Sl = *S;
-				H::StructuredBuffer<float> Lut(Sl.InvCdf.data(), u32(Sl.InvCdf.size()));   // the slice's own LUT (D-117)
-				const H::float4 RadM(CA.RadiusModel[0], CA.RadiusModel[1], CA.RadiusModel[2], CA.RadiusModel[3]);
-				const H::float4 ColM(CA.ColourModel[0], CA.ColourModel[1], CA.ColourModel[2], CA.ColourModel[3]);
-				u32 Flags = (CA.Visibility == EVisibility::Extended ? H::UNI_OBJ_FLAG_EXTENDED : 0u) | (CA.Emitters.empty() ? 0u : H::UNI_OBJ_FLAG_HAS_CONTRIBUTOR);
-				for (u32 J = 0; St.Accepted < N && J < Cap; ++J)
+				T.IndexBase = IndexBase;
+				T.PoolCapacity = N;
+				std::vector<FObjectGPU> Records;
+				RunPlace(T, Cnt, Records, St);
+				for (u32 I = 0; I < N; ++I)
 				{
-					const H::uint3 Off = H::Uni_CandidateOffset(Seed, J);
-					const float Dens = H::Uni_FieldSample(FieldId, H::Uni_FieldFramePoint(F, H::Uni_OffsetUnit(Off)), P);
-					++St.Candidates;
-					if (double(Dens) > St.Envelope) { ++St.Clipped; }
-					if (!H::Uni_Accept(Seed, J, Dens, float(St.Envelope))) { continue; }
-					const u32 Local = St.Accepted++;
-					const u32 OffA[3] = { Off.x, Off.y, Off.z };
-					if (Suppressed(Child, K, OffA)) { continue; }   // masked, not relocated
-					const u32 ObjSeed = H::Uni_ObjectSeed(Seed, Local);
-					const float M = H::Uni_DrawAbsMag(ObjSeed, 0.0f, 1.0f, float(Sl.BrightM), float(Sl.FaintM), Lut, 0u, Lut.Count);
-					const float RL2 = H::Uni_DrawRadiusLog2(ObjSeed, M, RadM);
-					const H::float3 Rgb = H::Uni_DrawColour(ObjSeed, M, ColM);
-					const float SB = CA.Visibility == EVisibility::Extended ? SurfaceBrightness(M, RL2) : 0.0f;
-					Out.Objects.push_back(FromHlsl(H::Uni_MakeObject(Off, Child, Flags, ObjSeed, RL2, M, SB, Rgb)));
-					Out.Indices.push_back(IndexBase + Local);
+					if ((Records[I].A[3] >> 16) & H::UNI_OBJ_FLAG_DELTA_HIDDEN) { continue; }   // blank (suppressed or unfilled)
+					Out.Objects.push_back(Records[I]);
+					Out.Indices.push_back(IndexBase + I);
 					Out.ObjectContributor.push_back(C->Id);
-					++St.Emitted;
 				}
-				IndexBase += St.Accepted;
+				IndexBase += N;   // by the drawn count: known after the probe phase (UniGenTask.ush)
 				Out.Tasks.push_back(St);
 			}
 
@@ -415,19 +474,6 @@ namespace UniCore
 		const std::vector<FCellKey>& AnchorCellList() const { return AnchorCells; }
 
 	private:
-		bool Suppressed(u32 Child, const FCellKey& K, const u32 Off[3]) const
-		{
-			const FUniverseDef& D = Model.Definition();
-			if (D.Suppressors.empty()) { return false; }
-			const FCoord P = ObjectCoord(K, Off);
-			for (const FSuppressor& S : D.Suppressors)
-			{
-				if (S.ArchetypeId != Child) { continue; }
-				if (Length(ToDouble(Sub(P, S.Centre))) < S.RadiusCm) { return true; }
-			}
-			return false;
-		}
-
 		/** Uniform random rotation (quaternion from three uniforms, Shoemake). Rows into M. */
 		static void RandomRotation(u32 Seed, float M[9])
 		{
