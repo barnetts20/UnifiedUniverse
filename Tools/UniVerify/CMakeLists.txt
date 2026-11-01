@@ -14,7 +14,7 @@ endif()
 
 set(UNI_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../..)
 
-file(GLOB UNI_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp)
+file(GLOB UNI_SRC CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp)
 add_executable(univerify ${UNI_SRC})
 target_include_directories(univerify PRIVATE
   ${UNI_ROOT}/Source/UniCore

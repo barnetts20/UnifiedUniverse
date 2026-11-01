@@ -4,29 +4,39 @@
 
 | | |
 | --- | --- |
-| Commit | `7c03d49` + uncommitted changes (branch `uu/prototype-day1`) |
-| Run | 2026-11-01 10:20 EST, 35 s |
+| Commit | `3764b5a` + uncommitted changes (branch `uu/prototype-day1`) |
+| Run | 2026-11-01 10:42 EST, 53 s |
 | Environment tier reached | Tier 1 offline (Tier 4 static only: no Unreal, no DXC here — see ENVIRONMENT.md) |
-| Checks | 11 run, 10 pass, **1 fail** |
+| Checks | 21 run, 20 pass, **1 fail** |
 
 ## Tier 1 — core correctness
 
 | Check | Result | Criterion | Measured |
 | --- | --- | --- | --- |
-| `T1.build.gcc` | PASS | Harness and UniCore build with g++, -Wall -Wextra -Werror, C++17 | built in 2 s |
+| `T1.build.gcc` | PASS | Harness and UniCore build with g++, -Wall -Wextra -Werror, C++17 | built in 4 s |
 | `T1.build.clang` | PASS | Harness and UniCore build with clang++, -Wall -Wextra -Werror, C++17 | built in 3 s |
 | `T1.coord.fuzz` | PASS | Coordinate fuzz: UniCoord.h vs UniCoord.ush (via shim) vs __int128, all ops | 1000000 cases x 3 axes, 0 mismatches (2.2 s) |
 | `T1.coord.edges` | PASS | Targeted edges: borrow chains, root wrap, max magnitude, zero, level shifts, extreme AddDisplacement, hex | 1079 targeted expectations, 0 failed |
 | `T1.coord.hilo` | PASS | ToHiLo relative error <= 2^-46 over the fuzz set | worst relative error 2^-49.00 over 1000000 cases x 3 axes (limit 2^-46), 0 over |
-| `T1.clang.coord_seed` | PASS | clang++ build gives the same coordinate and seed results (quick fuzz, 10^5 cases) | 3 checks, failing: none |
+| `T1.fr` | PASS | f(r) monotonic over 1..2^128 cm in log steps, C1 at r0, inverse exists (within float conditioning) | 12800 samples, 0 non-monotonic; continuous yes, C1 yes; inverse worst rel error 1.11e-05 = 0.67 of its float bound; 2^128 cm maps to 69.0 r0 |
+| `T1.photometry` | PASS | Apparent magnitude, fade band and sensitivity k = 10^(dm/5) match closed form (1e-6, condition-aware) | 200k samples: worst m err 3.72e-07 of term size, k rel err 2.47e-07, intensity rel err 6.65e-05, fade violations 0; window N(dm) ok; relevance inverse err 3.6e-15 |
+| `T1.seed.channels` | PASS | Shader channel constants equal ChannelId(name), all distinct, runtime form case-insensitive | 14 channels, 0 problems |
+| `T1.seed.quality` | PASS | Chi-squared over 64 bins within the 99% band for sequential inputs (Avalanche/MixSeed/CellSeed/ObjectSeed/draws) | band [37.8, 95.7], 200k sequential inputs: MixSeed(root, PLACE)=72.5, MixSeedIdx(7, PLACE, i)=81.1, FRandomStream(MixSeed(root)).FRand=81.7, CellSeed(sequential x cells)=55.9, ObjectSeed(cell, i)=54.0, DrawUnit(root, PLACE, 0)=54.9, DrawUnit(seed, PLACE, k)=45.2. (Without Avalanche: 1.26e+07, ProcSeed lesson reproduced) |
+| `T1.seed.injective` | PASS | Object seeds injective in index (0 collisions over 300 cells x 2^15); cell seeds near birthday bound | object-seed collisions 0 (must be 0); cell-seed collisions over 64^3 cells 10 (birthday ~8) |
+| `T1.seed.stream_port` | PASS | FRandomStream port: FRand sequence, RandRange bounds, RollRange quantize/clamp | 16,000 FRand draws, 0 mismatches; RandRange(2,6) out of range 0, ends hit 1931/2020; quantized roll 5.0 |
+| `T1.window.bijection` | PASS | Toroidal slot bijection; residents keep their slot while sliding; correct entering/exiting diff (N = 1..6) | 648 windows, 5184 slides (393 seam rebuilds), 0 bijection / 0 stability / 0 diff violations; unit slide 25 in / 25 out: yes |
+| `T1.window.velocity_lod` | PASS | Velocity LOD suspends above 1 cell per K = 4 frames, resumes below 0.8 of that | transitions as specified |
+| `T1.level.coverage` | PASS | L = ceil(log2(R/N)): for random camera offsets in the centre cell, every object with distance <= R is inside its level's window | 240000 trials over N = 1..6 and R = 4 cm..2^123 cm, 0 violations; min N*2^L / R = 1.000002 |
+| `T1.clang.coord_seed` | PASS | clang++ build passes every Tier 1 group (coord, seed, window, level, photometry; quick fuzz 10^5) | 12 checks, failing: none |
 | `T1.coord.oracle` | PASS | Coordinate fuzz vs Python big-int oracle: Sub, ToDouble, ToHiLo, CellOf, Neighbour, AddDisplacement, object-relative (shader core) | 1000000 cases x 3 axes vs Python big-int oracle, 0 mismatches (25 s) |
+| `T1.seed.oracle` | PASS | UniSeed vs Python oracle: Avalanche, HashCombine, MixSeed, FRandomStream, CellSeed, ObjectSeed, draws, ChannelId | 2007 cases vs Python oracle (fast HashCombine), 0 mismatches |
 
 ## Tier 4 — Unreal integration (static only in this environment)
 
 | Check | Result | Criterion | Measured |
 | --- | --- | --- | --- |
-| `T4.static.core_subset` | PASS | Shader cores stay in the shared C++/HLSL subset (no swizzles, UNI_FN, f-suffixed literals, no textures) | 2 cores, 0 problems |
-| `T4.static.gpu_structs` | FAIL | GPU-mirrored structs (marked // GPU-MIRROR) have a static_assert, size a multiple of 16 (lesson #20) | 0 GPU structs; missing assert: none; not 16-multiple: none |
+| `T4.static.core_subset` | FAIL | Shader cores stay in the shared C++/HLSL subset (no swizzles, UNI_FN, f-suffixed literals, no textures) | 4 cores, 4 problems: UniPhotometry.ush: unsuffixed float literal 8.0; UniPhotometry.ush: unsuffixed float literal 1.0; UniPhotometry.ush: unsuffixed float literal 3.0856775; UniPhotometry.ush: unsuffixed float literal 1.0 |
+| `T4.static.gpu_structs` | PASS | GPU-mirrored structs (marked // GPU-MIRROR) have a static_assert, size a multiple of 16 (lesson #20) | 0 GPU structs; missing assert: none; not 16-multiple: none |
 | `T4.static.ue_rules` | PASS | UE-facing rules: no UE includes in UniCore, render hooks only in UniRenderHooks.cpp, no absolute FVector | no problems |
 | `T0.report.unverified_listed` | PASS | Every unverified item is listed in REVIEW_TONIGHT.md | 6 unverified items; missing from REVIEW_TONIGHT: none |
 
@@ -36,7 +46,9 @@ None generated in this run.
 
 ## Regressions since the previous run
 
-No previous report.
+- Regressed (PASS → FAIL): `T4.static.core_subset`
+- Fixed (FAIL → PASS): none
+- New checks: `T1.fr`, `T1.photometry`, `T1.seed.channels`, `T1.seed.quality`, `T1.seed.injective`, `T1.seed.stream_port`, `T1.window.bijection`, `T1.window.velocity_lod`, `T1.level.coverage`, `T1.seed.oracle`
 
 ## Not verified here
 

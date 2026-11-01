@@ -2,6 +2,7 @@
 //
 //   univerify test [--quick] [--json FILE] [--group NAME]   run registered tests
 //   univerify fuzzdump N FILE                                coordinate cases for the Python oracle
+//   univerify seeddump                                       seed values for the Python oracle
 //   univerify list                                           list tests
 //
 // Every command is run from the plugin root (verify_all does this), so relative paths in
@@ -14,6 +15,7 @@
 #include <string>
 
 int UniFuzzDump(int N, const char* Path);   // fuzzdump.cpp
+int UniSeedDump();                          // seeddump.cpp
 
 namespace
 {
@@ -77,6 +79,7 @@ int main(int Argc, char** Argv)
 		return 0;
 	}
 	if (Cmd == "fuzzdump" && Argc >= 4) { return UniFuzzDump(std::atoi(Argv[2]), Argv[3]); }
+	if (Cmd == "seeddump") { return UniSeedDump(); }
 	std::fprintf(stderr, "unknown command %s\n", Cmd.c_str());
 	return 2;
 }

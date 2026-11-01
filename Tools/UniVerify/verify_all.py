@@ -87,8 +87,9 @@ def lint_cores(results):
         # every function definition at file scope must carry UNI_FN
         for m in re.finditer(r"^(?!\s*(?:#|UNI_FN|static|struct|return|if|else|for|while|//))\s*(?:float[234]?|uint[234]?|int3?|bool|void)\s+(\w+)\s*\(", src, flags=re.M):
             problems.append(f"{f}: function '{m.group(1)}' without UNI_FN")
-        for m in re.finditer(r"\b(\d+\.\d+)(?![fF\d])", src):
-            problems.append(f"{f}: unsuffixed float literal {m.group(1)}")
+        for m in re.finditer(r"(?<![\w.])(\d+\.\d*(?:[eE][+-]?\d+)?|\d+[eE][+-]?\d+)([fF]?)", src):
+            if not m.group(2):
+                problems.append(f"{f}: unsuffixed float literal {m.group(1)}")
         for kw in ("Texture3D", "SamplerState", "RWStructuredBuffer", "groupshared"):
             if re.search(r"\b" + kw + r"\b", src):
                 problems.append(f"{f}: resource/keyword '{kw}' not in the shared subset")
@@ -272,13 +273,15 @@ def main():
         cj = os.path.join(WORK, "results_clang.jsonl")
         if os.path.exists(cj):
             os.remove(cj)
-        code, out, secs = run([clang, "test", "--json", cj, "--quick", "--group", "coord"], timeout=3600)
-        code2, out2, _ = run([clang, "test", "--json", cj, "--quick", "--group", "seed"], timeout=3600)
-        open(os.path.join(WORK, "test_clang.log"), "w").write(out + out2)
+        logs = ""
+        for grp in ("coord", "seed", "window", "level", "photometry"):
+            code, out, secs = run([clang, "test", "--json", cj, "--quick", "--group", grp], timeout=3600)
+            logs += out
+        open(os.path.join(WORK, "test_clang.log"), "w").write(logs)
         rows = [json.loads(l) for l in open(cj) if l.strip()] if os.path.exists(cj) else []
         # The quick fuzz check fails by design (case count); judge the clang run on mismatches.
         bad = [r["id"] for r in rows if not r["pass"] and not (r["id"] == "T1.coord.fuzz" and r["metrics"].get("mismatches", 1) == 0)]
-        add(results, 1, "T1.clang.coord_seed", "clang++ build gives the same coordinate and seed results (quick fuzz, 10^5 cases)",
+        add(results, 1, "T1.clang.coord_seed", "clang++ build passes every Tier 1 group (coord, seed, window, level, photometry; quick fuzz 10^5)",
             rows and not bad, f"{len(rows)} checks, failing: {bad or 'none'}", {"checks": len(rows)})
 
     if gcc:

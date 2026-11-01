@@ -1,0 +1,91 @@
+// UniPhotometry.ush
+// Radial compression f(r), apparent magnitude, visibility fade, sensitivity scaling.
+// Shared by the GPU project-and-cull pass and the CPU reference renderer.
+//
+// Constants are the provisional baselines from D-009 and D-011. They are defined ONCE, here,
+// and the CPU reads them through the shim (UniHlsl::UNI_M_REF ...), so level assignment and
+// rendering can never disagree about them. m_ref and theta_min feed level assignment:
+// changing either rerolls content (D-011, HIGH reroll impact).
+
+#ifndef UNI_PHOTOMETRY_USH
+#define UNI_PHOTOMETRY_USH
+
+#include "UniCoreDefs.ush"
+
+static const float UNI_M_REF = 6.5f;            // baseline limiting magnitude, V band (D-011)
+static const float UNI_THETA_MIN = 8.0e-4f;     // rad, about 1 px at 1920 px over 90 degrees (D-011)
+static const float UNI_MU_REF = 25.0f;          // mag / arcsec^2 surface-brightness limit (D-011)
+static const float UNI_DM_MIN = -5.0f;          // sensitivity clamp (D-011)
+static const float UNI_DM_MAX = 5.0f;
+static const float UNI_FADE_BAND = 0.5f;        // mag: intensity reaches zero across [m_lim - 0.5, m_lim]
+static const float UNI_R0_CM = 1.0e9f;          // promotion radius and compression knee (D-009)
+static const float UNI_TEN_PC_CM = 3.0856775e19f;
+static const int UNI_WINDOW_N = 2;              // D-010: half-width; frozen once content exists
+static const int UNI_WINDOW_N_MAX = 6;          // D-010: sensitivity cap (13^3 cells)
+static const int UNI_VELOCITY_LOD_K = 4;        // D-010: suspend when a cell is crossed faster than once per K frames
+
+/** Euclidean length without overflow for components up to float max. */
+UNI_FN float Uni_SafeLength(float3 InV)
+{
+	const float M = max(abs(InV.x), max(abs(InV.y), abs(InV.z)));
+	if (M <= 0.0f) { return 0.0f; }
+	const float3 S = InV * (1.0f / M);
+	return M * sqrt(dot(S, S));
+}
+
+/** f(r): identity inside r0, logarithmic outside. Monotonic and C1 at r0. All of 2^128 cm
+ *  fits inside about 69 r0 of render space. */
+UNI_FN float Uni_Compress(float InR)
+{
+	return (InR <= UNI_R0_CM) ? InR : UNI_R0_CM * (1.0f + log(InR / UNI_R0_CM));
+}
+
+UNI_FN float Uni_CompressInverse(float InS)
+{
+	return (InS <= UNI_R0_CM) ? InS : UNI_R0_CM * exp(InS / UNI_R0_CM - 1.0f);
+}
+
+/** df/dr, for tests and for screen-space size scaling diagnostics. */
+UNI_FN float Uni_CompressSlope(float InR)
+{
+	return (InR <= UNI_R0_CM) ? 1.0f : UNI_R0_CM / InR;
+}
+
+/** Apparent magnitude of a point source with absolute magnitude M at distance r (cm). */
+UNI_FN float Uni_ApparentMag(float InAbsMag, float InDistanceCm)
+{
+	return InAbsMag + 5.0f * log10(max(InDistanceCm, 1.0f) / UNI_TEN_PC_CM);
+}
+
+/** k = 10^(dm/5): the factor sensitivity applies to every relevance radius. */
+UNI_FN float Uni_SensitivityScale(float InDeltaMag)
+{
+	return pow(10.0f, clamp(InDeltaMag, UNI_DM_MIN, UNI_DM_MAX) * 0.2f);
+}
+
+UNI_FN float Uni_LimitingMag(float InDeltaMag)
+{
+	return UNI_M_REF + clamp(InDeltaMag, UNI_DM_MIN, UNI_DM_MAX);
+}
+
+/** N_L = min(ceil(N * k), N_max). */
+UNI_FN int Uni_WindowHalfWidth(float InDeltaMag)
+{
+	const float K = Uni_SensitivityScale(InDeltaMag);
+	return min((int)ceil((float)UNI_WINDOW_N * K - 1.0e-5f), UNI_WINDOW_N_MAX);
+}
+
+/** Render-only visibility fade: 1 at m <= m_lim - band, 0 at m >= m_lim (lesson #12). */
+UNI_FN float Uni_MagFade(float InApparentMag, float InLimitingMag)
+{
+	return saturate((InLimitingMag - InApparentMag) / UNI_FADE_BAND);
+}
+
+/** Sprite intensity in exposure-calibrated units (lesson #36):
+ *  10^(-0.4 (m - m_exposure)), faded across the band. */
+UNI_FN float Uni_SpriteIntensity(float InApparentMag, float InExposureMag, float InLimitingMag)
+{
+	return pow(10.0f, -0.4f * (InApparentMag - InExposureMag)) * Uni_MagFade(InApparentMag, InLimitingMag);
+}
+
+#endif // UNI_PHOTOMETRY_USH

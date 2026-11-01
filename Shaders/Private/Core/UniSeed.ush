@@ -1,0 +1,212 @@
+// UniSeed.ush
+// Seeds, integer only. The GPU and the CPU (through UniHlslShim.h, see UniSeed.h) run this
+// one source.
+//
+// TWO FAMILIES, DELIBERATELY SEPARATE (D-109)
+//
+//   1. The ProcSeed port (UltraLargeScale ProceduralSpaceActor.h): Avalanche, HashCombine,
+//      MixSeed, and the FRandomStream LCG. Used ONLY for name-keyed rolled parameters
+//      (archetype ranges), where A/B parity with UltraLargeScale's rolls is the point.
+//      ChannelId (FNV-1a over the uppercased name) lives in UniSeed.h because HLSL has no
+//      strings; channel constants are precomputed below and checked against it in tests.
+//
+//   2. Identity seeds: cell seeds, object seeds and counter-based draws. These use
+//      Uni_SeedMix, an avalanche-per-input chain that is injective in each input. Measured
+//      before choosing it: MixSeed(root, CH, index) over 32,768 indices gave 5x the
+//      birthday-expected collisions with the Jenkins HashCombine and 260x with the fast
+//      form. Duplicate object seeds would mean twin objects in a cell. Uni_SeedMix gives
+//      none by construction, because each step is a bijection of the varying input.
+//      Identity seeds also do not depend on which HashCombine the engine has (D-107).
+//
+// CHANNEL RULE (lesson #14): add channels, never reuse or repurpose them. Each name below is
+// permanent once content exists.
+
+#ifndef UNI_SEED_USH
+#define UNI_SEED_USH
+
+#include "UniCoreDefs.ush"
+
+// Which HashCombine the engine's ProcSeed actually calls. 1: the form that reproduces
+// ProcSeed's recorded measurement ("0.047% of the range, chi-squared 1.3e7" over 200k
+// sequential roots): C ^ (A + 0x9E3779B9 + (C << 6) + (C >> 2)). 0: the legacy Bob Jenkins
+// 96-bit mix. UE-2 compares both against the engine; set the winner here (D-107).
+#ifndef UNI_SEED_HASHCOMBINE_FAST
+	#define UNI_SEED_HASHCOMBINE_FAST 1
+#endif
+
+// ------------------------------------------------------------------------------------------
+// Channels: FNV-1a of the uppercased name. Checked against UniCore::ChannelId in tests.
+// ------------------------------------------------------------------------------------------
+
+static const uint UNI_CH_OBJECT = 0x1B2E0F7Au;      // ChannelId("OBJECT")      per-object property seed
+static const uint UNI_CH_COUNT = 0xA3F7B2D4u;       // ChannelId("COUNT")       Poisson count draw
+static const uint UNI_CH_PROBE = 0x4DCE6451u;       // ChannelId("PROBE")       envelope/integral probes
+static const uint UNI_CH_PLACE = 0xD8C24E5Cu;       // ChannelId("PLACE")       candidate positions
+static const uint UNI_CH_ACCEPT = 0x209E17E9u;      // ChannelId("ACCEPT")      rejection test
+static const uint UNI_CH_MAG = 0x3559B9D4u;         // ChannelId("MAG")         absolute magnitude within slice
+static const uint UNI_CH_RADIUS = 0x972D0473u;      // ChannelId("RADIUS")      physical radius scatter
+static const uint UNI_CH_COLOUR = 0x8C17FC7Du;      // ChannelId("COLOUR")      colour scatter
+static const uint UNI_CH_ORIENT = 0x84E67334u;      // ChannelId("ORIENT")      contributor orientation
+static const uint UNI_CH_TILE = 0x76BBADC9u;        // ChannelId("TILE")        tile symmetry hash (baked fields)
+static const uint UNI_CH_ANCHOR = 0x97F56434u;      // ChannelId("ANCHOR")      authored anchor seeds
+static const uint UNI_CH_CONTRIBUTOR = 0x98C9F94Au; // ChannelId("CONTRIBUTOR") contributor id
+static const uint UNI_CH_SLICE = 0x4A3EBEB1u;       // ChannelId("SLICE")       reserved: slice-local draws
+static const uint UNI_CH_SHAPE = 0x458FA9C6u;       // ChannelId("SHAPE")       field shape params per contributor
+
+// ------------------------------------------------------------------------------------------
+// ProcSeed port
+// ------------------------------------------------------------------------------------------
+
+/** MurmurHash3 fmix32. Not optional: see ProcSeed::Avalanche for the measured reason. */
+UNI_FN uint Uni_Avalanche(uint InValue)
+{
+	InValue ^= InValue >> 16u;
+	InValue *= 0x85EBCA6Bu;
+	InValue ^= InValue >> 13u;
+	InValue *= 0xC2B2AE35u;
+	InValue ^= InValue >> 16u;
+	return InValue;
+}
+
+/** UE HashCombine(A, C), either form (see UNI_SEED_HASHCOMBINE_FAST). Not commutative. */
+UNI_FN uint Uni_HashCombine(uint InA, uint InC)
+{
+#if UNI_SEED_HASHCOMBINE_FAST
+	return InC ^ (InA + 0x9E3779B9u + (InC << 6u) + (InC >> 2u));
+#else
+	uint A = InA;
+	uint B = 0x9E3779B9u;
+	uint C = InC;
+	A += B;
+	A -= B; A -= C; A ^= (C >> 13u);
+	B -= C; B -= A; B ^= (A << 8u);
+	C -= A; C -= B; C ^= (B >> 13u);
+	A -= B; A -= C; A ^= (C >> 12u);
+	B -= C; B -= A; B ^= (A << 16u);
+	C -= A; C -= B; C ^= (B >> 5u);
+	A -= B; A -= C; A ^= (C >> 3u);
+	B -= C; B -= A; B ^= (A << 10u);
+	C -= A; C -= B; C ^= (B >> 15u);
+	return C;
+#endif
+}
+
+/** ProcSeed::MixSeed(Root, Channel): masked to 31 bits so it stays a non-negative int32. */
+UNI_FN uint Uni_MixSeed(uint InRoot, uint InChannel)
+{
+	return Uni_Avalanche(Uni_HashCombine(InRoot, InChannel)) & 0x7FFFFFFFu;
+}
+
+/** ProcSeed::MixSeed(Root, Channel, Index). */
+UNI_FN uint Uni_MixSeedIdx(uint InRoot, uint InChannel, uint InIndex)
+{
+	return Uni_MixSeed(InRoot, Uni_HashCombine(InChannel, InIndex));
+}
+
+// FRandomStream, state = the stream's uint32 Seed. Initialise with the (int32) seed's bits.
+// Take a stream ONCE and draw from the local copy: two streams from the same seed draw the
+// identical sequence (ProcSeed::Stream's footgun note).
+
+UNI_FN void Uni_StreamMutate(UNI_INOUT(uint) Seed)
+{
+	Seed = (Seed * 196314165u) + 907633515u;
+}
+
+/** FRandomStream::GetFraction / FRand: [0, 1) from the top 23 bits. */
+UNI_FN float Uni_StreamFraction(UNI_INOUT(uint) Seed)
+{
+	Uni_StreamMutate(Seed);
+	return asfloat(0x3F800000u | (Seed >> 9u)) - 1.0f;
+}
+
+/** FRandomStream::GetUnsignedInt. */
+UNI_FN uint Uni_StreamUint(UNI_INOUT(uint) Seed)
+{
+	Uni_StreamMutate(Seed);
+	return Seed;
+}
+
+/** FRandomStream::RandHelper(A): [0, A). */
+UNI_FN int Uni_StreamRandHelper(UNI_INOUT(uint) Seed, int InA)
+{
+	if (InA <= 0) { return 0; }
+	const int V = (int)(Uni_StreamFraction(Seed) * (float)InA);
+	return min(V, InA - 1);
+}
+
+/** FRandomStream::RandRange(Min, Max), inclusive. */
+UNI_FN int Uni_StreamRandRange(UNI_INOUT(uint) Seed, int InMin, int InMax)
+{
+	return InMin + Uni_StreamRandHelper(Seed, (InMax - InMin) + 1);
+}
+
+/** One rolled parameter, exactly UGalaxyArchetype::RollRange: a stream per parameter keyed by
+ *  its name's channel, Lerp(Min, Max, pow(FRand(), Bias)), then GridSnap by Quantize in
+ *  absolute terms and re-clamp. */
+UNI_FN float Uni_RollRange(uint InSeed, uint InNameChannel, float InMin, float InMax, float InBias, float InQuantize)
+{
+	uint Stream = Uni_MixSeed(InSeed, InNameChannel);
+	const float Alpha = pow(Uni_StreamFraction(Stream), max(InBias, 0.01f));
+	float Value = InMin + (InMax - InMin) * Alpha;
+	if (InQuantize > 0.0f)
+	{
+		// FMath::GridSnap: floor((V + Grid/2) / Grid) * Grid
+		Value = floor((Value + 0.5f * InQuantize) / InQuantize) * InQuantize;
+		Value = clamp(Value, min(InMin, InMax), max(InMin, InMax));
+	}
+	return Value;
+}
+
+// ------------------------------------------------------------------------------------------
+// Identity seeds (D-109)
+// ------------------------------------------------------------------------------------------
+
+/** One step of the identity chain. For fixed InH it is a bijection of InV (Avalanche is a
+ *  bijection; XOR with a constant is a bijection), and vice versa. */
+UNI_FN uint Uni_SeedMix(uint InH, uint InV)
+{
+	return Uni_Avalanche(InH ^ Uni_Avalanche(InV ^ 0x9E3779B9u));
+}
+
+/** CellSeed = Avalanche(hash(L, cell limbs, ArchetypeId, ContributorId, EmitterIndex)).
+ *  The cell coordinate is the UNWRAPPED placement key (lesson #11): only field lookups wrap. */
+UNI_FN uint Uni_CellSeed(uint InUniverseSeed, uint InLevel, uint4 InCellX, uint4 InCellY, uint4 InCellZ,
+	uint InArchetypeId, uint InContributorId, uint InEmitterIndex)
+{
+	uint H = Uni_SeedMix(InUniverseSeed, 0x55C0FFEEu);
+	H = Uni_SeedMix(H, InLevel);
+	H = Uni_SeedMix(H, InCellX.x); H = Uni_SeedMix(H, InCellX.y); H = Uni_SeedMix(H, InCellX.z); H = Uni_SeedMix(H, InCellX.w);
+	H = Uni_SeedMix(H, InCellY.x); H = Uni_SeedMix(H, InCellY.y); H = Uni_SeedMix(H, InCellY.z); H = Uni_SeedMix(H, InCellY.w);
+	H = Uni_SeedMix(H, InCellZ.x); H = Uni_SeedMix(H, InCellZ.y); H = Uni_SeedMix(H, InCellZ.z); H = Uni_SeedMix(H, InCellZ.w);
+	H = Uni_SeedMix(H, InArchetypeId);
+	H = Uni_SeedMix(H, InContributorId);
+	H = Uni_SeedMix(H, InEmitterIndex);
+	return Uni_Avalanche(H);
+}
+
+/** Per-object seed: MixSeed(CellSeed, index) in the design, injective in index here. */
+UNI_FN uint Uni_ObjectSeed(uint InCellSeed, uint InIndex)
+{
+	return Uni_SeedMix(Uni_SeedMix(InCellSeed, UNI_CH_OBJECT), InIndex);
+}
+
+/** Counter-based draw: the K-th uint of a channel. Stateless, so a GPU thread can draw any
+ *  element without walking a stream, and the result never depends on evaluation order. */
+UNI_FN uint Uni_DrawU32(uint InSeed, uint InChannel, uint InK)
+{
+	return Uni_SeedMix(Uni_SeedMix(InSeed, InChannel), InK);
+}
+
+/** Uniform [0, 1) with 24 bits. */
+UNI_FN float Uni_DrawUnit(uint InSeed, uint InChannel, uint InK)
+{
+	return (float)(Uni_DrawU32(InSeed, InChannel, InK) >> 8u) * (1.0f / 16777216.0f);
+}
+
+/** Uniform (0, 1]: safe for log(). */
+UNI_FN float Uni_DrawUnitPos(uint InSeed, uint InChannel, uint InK)
+{
+	return ((float)(Uni_DrawU32(InSeed, InChannel, InK) >> 8u) + 1.0f) * (1.0f / 16777216.0f);
+}
+
+#endif // UNI_SEED_USH

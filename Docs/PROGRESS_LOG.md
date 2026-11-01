@@ -12,3 +12,8 @@ Append only. One entry per step start, finish, block, or commit. Times in the ow
 | 10:10 | P1 | start | Shim, UniCoord.ush, UniCoord.h, harness, oracle, UE scaffold |
 | 10:24 | P1 | decision D-104..D-108 | Exact per-cell deltas, parity scope, engine targeting, HashCombine re-impl, type names |
 | 10:26 | P1 | done (gate green) | Tier 1 coordinate checks: fuzz 10^6 (3 implementations) 0 mismatches; Python oracle 10^6 0 mismatches (mutation-tested); hi/lo worst 2^-49; g++ and clang build. UE scaffold written, unbuilt (UE-1) |
+| 10:28 | P2 | start | UniSeed, windows, level assignment, photometry, f(r) |
+| 10:35 | P2 | decision D-109 | Measured MixSeed(CellSeed, index) collisions (5x / 260x birthday) → injective identity mixer; ProcSeed port kept for rolled params |
+| 10:50 | P2 | note | Window test caught two real bugs (half-axis seam rule aliasing at 16-cell axes; seam mode tracked globally not per axis). Fixed: D-100 |
+| 10:55 | P2 | decision D-100, D-110 | Window seam/coarse axes; condition-aware float tolerances |
+| 10:58 | P2 | done (gate green) | 21 checks green: seeds (chi² in band, 0 object-seed collisions, Python oracle 2007 cases), windows (0 violations / 5184 slides), coverage (0 / 240k), f(r), photometry, clang parity |
