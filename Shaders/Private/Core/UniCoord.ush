@@ -1,0 +1,317 @@
+// UniCoord.ush
+// 128-bit universal coordinate maths, integer only. Mirrors Source/UniCore/UniCoord.h.
+//
+// REPRESENTATION. One axis is a uint4: .x is limb 0 (bits 96..127, most significant) and
+// .w is limb 3 (bits 0..31, 1 cm units). An FUniCoord is three of them. A signed quantity
+// (a delta) uses the same uint4 as a 128-bit two's-complement value.
+//
+// WHY THIS FILE EXISTS ALONGSIDE UniCoord.h. The C++ header is the API. This is the GPU
+// implementation, written independently and in the shared subset, so the harness can run
+// it on the CPU through UniHlslShim.h and compare it with UniCoord.h and with a Python
+// big-int oracle (Tools/UniVerify). Integer arithmetic makes the comparison exact (lesson
+// #34): there is no float-versus-double rounding to argue about until the very last step,
+// and that step (Uni_U128ToFloat) is itself integer bit construction.
+//
+// SHIFT COUNTS. HLSL masks a shift count to five bits and C++ makes a count >= 32 undefined,
+// so every variable shift goes through Uni_Shl32 / Uni_Shr32, which define >= 32 as zero.
+
+#ifndef UNI_COORD_USH
+#define UNI_COORD_USH
+
+#include "UniCoreDefs.ush"
+
+// ------------------------------------------------------------------------------------------
+// 32-bit helpers
+// ------------------------------------------------------------------------------------------
+
+UNI_FN uint Uni_Shl32(uint InX, uint InS)
+{
+	return (InS >= 32u) ? 0u : (InX << InS);
+}
+
+UNI_FN uint Uni_Shr32(uint InX, uint InS)
+{
+	return (InS >= 32u) ? 0u : (InX >> InS);
+}
+
+/** Sum with carry in and carry out. Carry out is 0 or 1. */
+UNI_FN uint Uni_AddC(uint InA, uint InB, uint InCarry, UNI_OUT(uint) OutCarry)
+{
+	const uint S = InA + InB;
+	const uint C1 = (S < InA) ? 1u : 0u;
+	const uint S2 = S + InCarry;
+	const uint C2 = (S2 < S) ? 1u : 0u;
+	OutCarry = C1 + C2;
+	return S2;
+}
+
+/** Difference with borrow in and borrow out. Borrow out is 0 or 1. */
+UNI_FN uint Uni_SubB(uint InA, uint InB, uint InBorrow, UNI_OUT(uint) OutBorrow)
+{
+	const uint D = InA - InB;
+	const uint B1 = (InA < InB) ? 1u : 0u;
+	const uint D2 = D - InBorrow;
+	const uint B2 = (D < InBorrow) ? 1u : 0u;
+	OutBorrow = B1 + B2;
+	return D2;
+}
+
+// ------------------------------------------------------------------------------------------
+// 128-bit unsigned / two's complement
+// ------------------------------------------------------------------------------------------
+
+UNI_FN uint4 Uni_U128(uint InHigh, uint InMidHigh, uint InMidLow, uint InLow)
+{
+	return uint4(InHigh, InMidHigh, InMidLow, InLow);
+}
+
+UNI_FN bool Uni_U128IsZero(uint4 InA)
+{
+	return (InA.x | InA.y | InA.z | InA.w) == 0u;
+}
+
+UNI_FN bool Uni_U128Equal(uint4 InA, uint4 InB)
+{
+	return InA.x == InB.x && InA.y == InB.y && InA.z == InB.z && InA.w == InB.w;
+}
+
+/** Bit 127 set: negative when read as two's complement. */
+UNI_FN bool Uni_S128IsNeg(uint4 InA)
+{
+	return (InA.x & 0x80000000u) != 0u;
+}
+
+UNI_FN uint4 Uni_U128Add(uint4 InA, uint4 InB)
+{
+	uint C = 0u;
+	uint4 R;
+	R.w = Uni_AddC(InA.w, InB.w, 0u, C);
+	R.z = Uni_AddC(InA.z, InB.z, C, C);
+	R.y = Uni_AddC(InA.y, InB.y, C, C);
+	R.x = Uni_AddC(InA.x, InB.x, C, C);
+	return R; // carry out of bit 127 is dropped: arithmetic is mod 2^128 (the root torus)
+}
+
+UNI_FN uint4 Uni_U128Sub(uint4 InA, uint4 InB)
+{
+	uint B = 0u;
+	uint4 R;
+	R.w = Uni_SubB(InA.w, InB.w, 0u, B);
+	R.z = Uni_SubB(InA.z, InB.z, B, B);
+	R.y = Uni_SubB(InA.y, InB.y, B, B);
+	R.x = Uni_SubB(InA.x, InB.x, B, B);
+	return R;
+}
+
+UNI_FN uint4 Uni_U128Neg(uint4 InA)
+{
+	return Uni_U128Sub(uint4(0u, 0u, 0u, 0u), InA);
+}
+
+/** Magnitude of a two's-complement value. -2^127 maps to 2^127, which is its true
+ *  magnitude read as unsigned. */
+UNI_FN uint4 Uni_S128Abs(uint4 InA)
+{
+	return Uni_S128IsNeg(InA) ? Uni_U128Neg(InA) : InA;
+}
+
+/** Sign-extends a 32-bit signed integer to 128 bits. */
+UNI_FN uint4 Uni_S128FromInt(int InV)
+{
+	const uint Fill = (InV < 0) ? 0xFFFFFFFFu : 0u;
+	return uint4(Fill, Fill, Fill, (uint)InV);
+}
+
+/** Logical shift right by InS in [0, 128]. InS >= 128 gives zero. */
+UNI_FN uint4 Uni_U128Shr(uint4 InA, uint InS)
+{
+	if (InS >= 128u) { return uint4(0u, 0u, 0u, 0u); }
+	const uint Limbs = InS >> 5u;
+	const uint Bits = InS & 31u;
+
+	// Whole-limb move first.
+	uint4 T = InA;
+	if (Limbs == 1u) { T = uint4(0u, InA.x, InA.y, InA.z); }
+	else if (Limbs == 2u) { T = uint4(0u, 0u, InA.x, InA.y); }
+	else if (Limbs == 3u) { T = uint4(0u, 0u, 0u, InA.x); }
+
+	if (Bits == 0u) { return T; }
+	const uint Back = 32u - Bits;
+	return uint4(
+		T.x >> Bits,
+		(T.y >> Bits) | (T.x << Back),
+		(T.z >> Bits) | (T.y << Back),
+		(T.w >> Bits) | (T.z << Back));
+}
+
+/** Shift left by InS in [0, 128]. Bits shifted past bit 127 are lost (mod 2^128). */
+UNI_FN uint4 Uni_U128Shl(uint4 InA, uint InS)
+{
+	if (InS >= 128u) { return uint4(0u, 0u, 0u, 0u); }
+	const uint Limbs = InS >> 5u;
+	const uint Bits = InS & 31u;
+
+	uint4 T = InA;
+	if (Limbs == 1u) { T = uint4(InA.y, InA.z, InA.w, 0u); }
+	else if (Limbs == 2u) { T = uint4(InA.z, InA.w, 0u, 0u); }
+	else if (Limbs == 3u) { T = uint4(InA.w, 0u, 0u, 0u); }
+
+	if (Bits == 0u) { return T; }
+	const uint Back = 32u - Bits;
+	return uint4(
+		(T.x << Bits) | (T.y >> Back),
+		(T.y << Bits) | (T.z >> Back),
+		(T.z << Bits) | (T.w >> Back),
+		T.w << Bits);
+}
+
+/** Keeps the low InBits bits, InBits in [0, 128]. */
+UNI_FN uint4 Uni_U128MaskLow(uint4 InA, uint InBits)
+{
+	if (InBits >= 128u) { return InA; }
+	// Limb i (x = 0) holds bits [96 - 32i, 127 - 32i]. Keep min(32, max(0, InBits - base)).
+	const uint KeepX = (InBits > 96u) ? (InBits - 96u) : 0u;
+	const uint KeepY = (InBits > 64u) ? min(InBits - 64u, 32u) : 0u;
+	const uint KeepZ = (InBits > 32u) ? min(InBits - 32u, 32u) : 0u;
+	const uint KeepW = min(InBits, 32u);
+	return uint4(
+		InA.x & (Uni_Shl32(1u, KeepX) - 1u),
+		(KeepY >= 32u) ? InA.y : (InA.y & (Uni_Shl32(1u, KeepY) - 1u)),
+		(KeepZ >= 32u) ? InA.z : (InA.z & (Uni_Shl32(1u, KeepZ) - 1u)),
+		(KeepW >= 32u) ? InA.w : (InA.w & (Uni_Shl32(1u, KeepW) - 1u)));
+}
+
+/** Index of the highest set bit, 0..127, or -1 for zero. */
+UNI_FN int Uni_U128Msb(uint4 InA)
+{
+	if (InA.x != 0u) { return 96 + (int)firstbithigh(InA.x); }
+	if (InA.y != 0u) { return 64 + (int)firstbithigh(InA.y); }
+	if (InA.z != 0u) { return 32 + (int)firstbithigh(InA.z); }
+	if (InA.w != 0u) { return (int)firstbithigh(InA.w); }
+	return -1;
+}
+
+// ------------------------------------------------------------------------------------------
+// Conversion to float (correctly rounded, round-half-to-even, integer bit construction)
+// ------------------------------------------------------------------------------------------
+
+/** Rounds an unsigned 128-bit magnitude to the nearest float, ties to even, and also returns
+ *  that float's exact value as a 128-bit integer, so the caller can form the residual.
+ *  Magnitudes up to 2^128 - 2^103 round to finite floats; above that they round to 2^128,
+ *  which is +inf. Deltas never exceed 2^127, so callers stay finite. */
+UNI_FN float Uni_U128ToFloatEx(uint4 InMag, UNI_OUT(uint4) OutExact)
+{
+	const int P = Uni_U128Msb(InMag);
+	if (P < 24)
+	{
+		// Exact: fits the 24-bit significand. InMag.w < 2^24 here.
+		OutExact = InMag;
+		return (float)InMag.w;
+	}
+
+	// Keep 25 bits: the 24-bit significand plus the rounding bit.
+	const uint Drop = (uint)(P - 24);
+	const uint4 Top = Uni_U128Shr(InMag, Drop);           // in [2^24, 2^25)
+	uint Mant = Top.w >> 1u;                               // in [2^23, 2^24)
+	const uint RoundBit = Top.w & 1u;
+	const uint4 Rest = Uni_U128Sub(InMag, Uni_U128Shl(Top, Drop));
+	const bool Sticky = !Uni_U128IsZero(Rest);
+
+	uint E = (uint)P;
+	if (RoundBit != 0u && (Sticky || (Mant & 1u) != 0u))
+	{
+		Mant = Mant + 1u;
+		if (Mant == 0x01000000u) { Mant = 0x00800000u; E = E + 1u; }
+	}
+
+	// Exact value of the rounded float: Mant * 2^(E - 23).
+	OutExact = Uni_U128Shl(uint4(0u, 0u, 0u, Mant), E - 23u);
+	if (E >= 128u)
+	{
+		OutExact = uint4(0u, 0u, 0u, 0u); // 2^128 is not representable; result is +inf
+		return asfloat(0x7F800000u);
+	}
+	return asfloat(((E + 127u) << 23u) | (Mant & 0x007FFFFFu));
+}
+
+UNI_FN float Uni_U128ToFloat(uint4 InMag)
+{
+	uint4 Exact;
+	return Uni_U128ToFloatEx(InMag, Exact);
+}
+
+/** Two's-complement 128-bit to float, correctly rounded. */
+UNI_FN float Uni_S128ToFloat(uint4 InV)
+{
+	const bool Neg = Uni_S128IsNeg(InV);
+	const float F = Uni_U128ToFloat(Neg ? Uni_U128Neg(InV) : InV);
+	return Neg ? -F : F;
+}
+
+/** Hi = float(v), Lo = float(v - Hi). Hi + Lo represents v to about 2^-48 of |v|. */
+UNI_FN void Uni_S128ToHiLo(uint4 InV, UNI_OUT(float) OutHi, UNI_OUT(float) OutLo)
+{
+	const bool Neg = Uni_S128IsNeg(InV);
+	const uint4 Mag = Neg ? Uni_U128Neg(InV) : InV;
+	uint4 Exact;
+	const float Hi = Uni_U128ToFloatEx(Mag, Exact);
+	// Residual Mag - Exact is signed: Hi may have rounded up.
+	const float Lo = Uni_S128ToFloat(Uni_U128Sub(Mag, Exact));
+	OutHi = Neg ? -Hi : Hi;
+	OutLo = Neg ? -Lo : Lo;
+}
+
+// ------------------------------------------------------------------------------------------
+// Cells
+// ------------------------------------------------------------------------------------------
+
+/** Cell coordinate of an axis value at level L in [0, 128]: Coord >> L. */
+UNI_FN uint4 Uni_CellAxis(uint4 InCoordAxis, uint InLevel)
+{
+	return Uni_U128Shr(InCoordAxis, InLevel);
+}
+
+/** Absolute coordinate of a cell's minimum corner on one axis. */
+UNI_FN uint4 Uni_CellOriginAxis(uint4 InCellAxis, uint InLevel)
+{
+	return Uni_U128Shl(InCellAxis, InLevel);
+}
+
+/** Cell coordinate plus a signed step, wrapping over the 2^(128-L) cells of the root torus. */
+UNI_FN uint4 Uni_CellStepAxis(uint4 InCellAxis, int InStep, uint InLevel)
+{
+	const uint4 Sum = Uni_U128Add(InCellAxis, Uni_S128FromInt(InStep));
+	return Uni_U128MaskLow(Sum, 128u - min(InLevel, 128u));
+}
+
+/** An object's in-cell offset (units of cell width / 2^32) as whole cm, for level L.
+ *  Below L = 32 a cell is narrower than 2^32 cm and the low offset bits fall below the 1 cm
+ *  floor (D-002); they are truncated, which defines the object's coordinate. */
+UNI_FN uint4 Uni_ObjectOffsetCm(uint InOffset, uint InLevel)
+{
+	if (InLevel >= 32u)
+	{
+		return Uni_U128Shl(uint4(0u, 0u, 0u, InOffset), InLevel - 32u);
+	}
+	return uint4(0u, 0u, 0u, Uni_Shr32(InOffset, 32u - InLevel));
+}
+
+/** Exact camera-relative vector of an object, as floats (D-104).
+ *
+ *  InCellDelta* is the per-cell two's-complement delta CellOrigin - CameraCoord, computed
+ *  exactly on the CPU. The offset is added in integer, so the only rounding is the final
+ *  float conversion: relative error 2^-24 of the object's own distance, at any distance and
+ *  any level. The camera's sub-cm fraction is subtracted after conversion. */
+UNI_FN float3 Uni_ObjectRelative(uint4 InCellDeltaX, uint4 InCellDeltaY, uint4 InCellDeltaZ,
+	uint3 InOffset, uint InLevel, float3 InCameraFraction)
+{
+	const uint4 DX = Uni_U128Add(InCellDeltaX, Uni_ObjectOffsetCm(InOffset.x, InLevel));
+	const uint4 DY = Uni_U128Add(InCellDeltaY, Uni_ObjectOffsetCm(InOffset.y, InLevel));
+	const uint4 DZ = Uni_U128Add(InCellDeltaZ, Uni_ObjectOffsetCm(InOffset.z, InLevel));
+	return float3(
+		Uni_S128ToFloat(DX) - InCameraFraction.x,
+		Uni_S128ToFloat(DY) - InCameraFraction.y,
+		Uni_S128ToFloat(DZ) - InCameraFraction.z);
+}
+
+#endif // UNI_COORD_USH

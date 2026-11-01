@@ -9,7 +9,14 @@ Work is running in a standalone cloud workspace, because laptop folder access wa
 Nothing yet. See `Verification/REPORT.md` once it exists.
 
 ## 3. Needs UE testing
-To be written as P5 lands.
+Full step-by-step instructions are written as P5 lands. Items tracked by ID (kept in sync with `Tools/UniVerify/unverified.json` by the check `T0.report.unverified_listed`):
+
+- **UE-1** Plugin compiles (four modules, UHT).
+- **UE-2** Automation tests, including UniSeed engine parity.
+- **UE-3** Shader compilation.
+- **UE-4** GPU execution parity of the shared cores.
+- **UE-5** Render hooks and scene-depth occlusion.
+- **UE-6** Flythrough in the editor.
 
 ## 4. Needs your decision
 - **Laptop access.** Nothing was written to your machine. Tonight, unzip the handover into `D:\Projects\vxl` (or `git apply` the patch on a new `uu/prototype-day1` branch there).

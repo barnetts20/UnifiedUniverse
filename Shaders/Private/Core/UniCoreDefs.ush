@@ -1,0 +1,34 @@
+// UniCoreDefs.ush
+// Macros that let one core source compile as HLSL and, through UniHlslShim.h, as C++.
+//
+// Every .ush in Shaders/Private/Core includes this first. In HLSL the macros expand to
+// plain HLSL; in C++ UniHlslShim.h defines UNI_CPP and its own versions BEFORE any core is
+// included, so the definitions below are skipped.
+//
+// THE SHARED SUBSET (D-015). A core may use only:
+//   - scalar float / uint / int / bool, and float2/3/4, uint2/3/4, int3 with .x .y .z .w
+//     member access. NO multi-component swizzles (.xy, .xyz), NO vector comparisons,
+//     NO implicit scalar-to-vector promotion in constructors (write float3(a, a, a)).
+//   - the intrinsics UniHlslShim.h defines. Anything else is a C++ compile error, which
+//     is the intended failure: a build break instead of a silent CPU/GPU divergence.
+//   - UNI_FN on every function, UNI_INOUT(T) / UNI_OUT(T) for reference parameters.
+//   - shifts by a constant or by a value proven < 32. HLSL masks the shift count to five
+//     bits and C++ makes a shift >= 32 undefined, so the two disagree silently. Use the
+//     guarded helpers in UniCoord.ush for variable shifts.
+//   - float literals with an f suffix. C++ types an unsuffixed literal as double.
+//   - UNI_PRECISE (HLSL `precise`) on any float whose rounding is part of the result, such
+//     as error-free transforms. It is empty in C++, where the harness compiles with
+//     -ffp-contract=off. A macro rather than a bare `precise` so the C++ side never
+//     redefines an identifier that engine code might use.
+
+#ifndef UNI_CORE_DEFS_USH
+#define UNI_CORE_DEFS_USH
+
+#ifndef UNI_CPP
+	#define UNI_FN
+	#define UNI_INOUT(T) inout T
+	#define UNI_OUT(T) out T
+	#define UNI_PRECISE precise
+#endif
+
+#endif // UNI_CORE_DEFS_USH

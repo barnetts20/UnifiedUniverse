@@ -1,0 +1,39 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1-prototype",
+	"FriendlyName": "Unified Universe",
+	"Description": "One coordinate, one generator, one renderer: nested-octree scale levels over a 128-bit universal coordinate, GPU-resident generation and a radially compressed backdrop. Prototype; runs alongside UltraLargeScale for A/B and has no dependency on it.",
+	"Category": "vxl",
+	"CreatedBy": "Sam Barnett",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": true,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": true,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "UnifiedUniverseCore",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "UnifiedUniverseRender",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit"
+		},
+		{
+			"Name": "UnifiedUniverse",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "UnifiedUniverseEditor",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		}
+	]
+}

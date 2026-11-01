@@ -1,0 +1,8 @@
+[
+  {"id": "UE-1", "what": "The plugin compiles in the vxl project: all four modules, with UHT on the USTRUCTs (FUniCoord, FUniCellKey, FUniObjectId) and the UFUNCTION library."},
+  {"id": "UE-2", "what": "UE Automation tests (UnifiedUniverse.*) pass headless with -nullrhi, including engine-parity checks of the UniSeed port against ProcSeed / HashCombine / FRandomStream."},
+  {"id": "UE-3", "what": "Every .usf entry point compiles under the engine shader compiler (DXC was not runnable here)."},
+  {"id": "UE-4", "what": "GPU execution parity: the shared cores give the same results on the GPU as their CPU runs through UniHlslShim.h (integer cores bitwise, float cores statistically, D-105)."},
+  {"id": "UE-5", "what": "Render hooks: the scene view extension subscribes at the intended points on the project's engine version (D-006), and sprites appear with scene-depth occlusion."},
+  {"id": "UE-6", "what": "Flythrough in the editor: `uu.Flythrough` console command on an empty level shows the backdrop, with no jitter and no pops."}
+]
