@@ -27,5 +27,11 @@ public class UnifiedUniverse : ModuleRules
 			"UnifiedUniverseCore",
 			"UnifiedUniverseRender",
 		});
+
+		PrivateDependencyModuleNames.AddRange(new string[]
+		{
+			"RHI",                  // GDynamicRHI (GPU parity test: skip without a GPU)
+			"RenderCore",           // FlushRenderingCommands (GPU parity test readback)
+		});
 	}
 }

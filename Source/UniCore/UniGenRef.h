@@ -74,7 +74,7 @@ namespace UniCore
 		FObjectId Parent;
 		u32 ParentArchetypeId = 0;
 		int EmitterIndex = 0;
-		const FEmitter* Emitter = nullptr;
+		const FUniEmitter* Emitter = nullptr;
 		FCoord Centre;
 		double InfluenceCm = 0.0;
 		float Rot[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
@@ -412,8 +412,8 @@ namespace UniCore
 					Off[Ax] = K.Level >= 32 ? u32(Shr(Rel, K.Level - 32).L[3]) : u32(Shl(Rel, 32 - K.Level).L[3]);
 				}
 				const FArchetype& AA = D.Arch(A.ArchetypeId);
-				const u32 Flags = H::UNI_OBJ_FLAG_ANCHOR | (AA.Visibility == EVisibility::Extended ? H::UNI_OBJ_FLAG_EXTENDED : 0u) | (AA.Emitters.empty() ? 0u : H::UNI_OBJ_FLAG_HAS_CONTRIBUTOR);
-				const float SB = AA.Visibility == EVisibility::Extended ? SurfaceBrightness(A.AbsMag, A.RadiusLog2) : 0.0f;
+				const u32 Flags = H::UNI_OBJ_FLAG_ANCHOR | (AA.Visibility == EUniVisibility::Extended ? H::UNI_OBJ_FLAG_EXTENDED : 0u) | (AA.Emitters.empty() ? 0u : H::UNI_OBJ_FLAG_HAS_CONTRIBUTOR);
+				const float SB = AA.Visibility == EUniVisibility::Extended ? SurfaceBrightness(A.AbsMag, A.RadiusLog2) : 0.0f;
 				const H::float3 Rgb = H::Uni_TemperatureColour(std::pow(10.0f, AA.ColourModel[0]));
 				Out.Objects.push_back(FromHlsl(H::Uni_MakeObject(H::uint3(Off[0], Off[1], Off[2]), A.ArchetypeId, Flags, A.Seed, A.RadiusLog2, A.AbsMag, SB, Rgb)));
 				Out.Indices.push_back(kFirstAnchorIndex + u32(I));
@@ -442,7 +442,7 @@ namespace UniCore
 				const u32 Off[3] = { O.A[0], O.A[1], O.A[2] };
 				for (size_t E = 0; E < A.Emitters.size(); ++E)
 				{
-					const FEmitter& Em = A.Emitters[E];
+					const FUniEmitter& Em = A.Emitters[E];
 					FContributor Ct;
 					Ct.Parent.Cell = C.Key;
 					Ct.Parent.Index = C.Indices[I];
@@ -515,7 +515,7 @@ namespace UniCore
 		{
 			const FUniverseDef& D = Gen.ModelRef().Definition();
 			std::set<int> Ls;
-			for (const FEmitter& E : D.RootEmitters) { AddRange(Ls, E.ChildArchetypeId, 0); }
+			for (const FUniEmitter& E : D.RootEmitters) { AddRange(Ls, E.ChildArchetypeId, 0); }
 			for (const FAnchor& A : D.Anchors) { Ls.insert(Gen.ModelRef().LevelOf(A.ArchetypeId, A.AbsMag)); AddRange(Ls, A.ArchetypeId, 1); }
 			for (int L : Ls) { Levels.emplace(L, FLevel(L)); }
 		}
@@ -680,7 +680,7 @@ namespace UniCore
 			const FUniverseDef& D = Gen.ModelRef().Definition();
 			const FSliceTable& T = Gen.ModelRef().SlicesOf(ParentArch);
 			if (Depth == 0) { for (int L = T.LMin; L <= T.LMax; ++L) { Ls.insert(L); } }
-			for (const FEmitter& E : D.Arch(ParentArch).Emitters)
+			for (const FUniEmitter& E : D.Arch(ParentArch).Emitters)
 			{
 				const FSliceTable& C = Gen.ModelRef().SlicesOf(E.ChildArchetypeId);
 				for (int L = C.LMin; L <= C.LMax; ++L) { Ls.insert(L); }

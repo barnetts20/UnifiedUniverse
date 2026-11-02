@@ -293,7 +293,7 @@ namespace
 		FUniverseModel M0(D);
 		const double Mb = LuminosityBudget(M0, UniScenes::kGalaxy, -21.0);
 		if (OutBudgetMag) { *OutBudgetMag = Mb; }
-		for (FEmitter& E : D.Archetypes[UniScenes::kGalaxy].Emitters) { E.NTotal *= std::pow(10.0, 0.4 * (Mb - (-21.0))); }
+		for (FUniEmitter& E : D.Archetypes[UniScenes::kGalaxy].Emitters) { E.NTotal *= std::pow(10.0, 0.4 * (Mb - (-21.0))); }
 		return D;
 	}
 }

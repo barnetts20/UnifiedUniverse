@@ -34,6 +34,20 @@
 
 namespace UniCore
 {
+	/** fopen without MSVC's C4996 deprecation warning (fopen_s there, std::fopen elsewhere). */
+	inline FILE* UniFOpen(const char* InPath, const char* InMode)
+	{
+#if defined(_MSC_VER)
+		FILE* F = nullptr;
+		return fopen_s(&F, InPath, InMode) == 0 ? F : nullptr;
+#else
+		return std::fopen(InPath, InMode);
+#endif
+	}
+}
+
+namespace UniCore
+{
 	class FUniVol
 	{
 	public:
@@ -125,7 +139,7 @@ namespace UniCore
 
 		bool Write(const std::string& Path) const
 		{
-			FILE* F = std::fopen(Path.c_str(), "wb");
+			FILE* F = UniFOpen(Path.c_str(), "wb");
 			if (!F) { return false; }
 			const char Magic[4] = { 'U', 'V', 'O', 'L' };
 			const u32 Header[8] = { 1u, Size, Size, Size, Channels, Format, Flags, MipCount() };
@@ -147,7 +161,7 @@ namespace UniCore
 
 		bool Read(const std::string& Path)
 		{
-			FILE* F = std::fopen(Path.c_str(), "rb");
+			FILE* F = UniFOpen(Path.c_str(), "rb");
 			if (!F) { return false; }
 			char Magic[4];
 			u32 H[8];

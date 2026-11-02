@@ -252,7 +252,7 @@ namespace UniCore
 	{
 		const FArchetype& A = M.Definition().Arch(ArchId);
 		double Flux = 0.0;
-		for (const FEmitter& E : A.Emitters)
+		for (const FUniEmitter& E : A.Emitters)
 		{
 			if (E.bDensityMode) { continue; }
 			const FUnresolvedTable T = FUnresolvedTable::Build(M, E.ChildArchetypeId);
@@ -348,8 +348,8 @@ namespace UniCore
 		{
 			const FUniverseDef& D = Model.Definition();
 			auto Add = [&](u32 Child) { if (!Tables.count(Child)) { Tables[Child] = FUnresolvedTable::Build(Model, Child); } };
-			for (const FEmitter& E : D.RootEmitters) { Add(E.ChildArchetypeId); }
-			for (const FArchetype& A : D.Archetypes) { for (const FEmitter& E : A.Emitters) { Add(E.ChildArchetypeId); } }
+			for (const FUniEmitter& E : D.RootEmitters) { Add(E.ChildArchetypeId); }
+			for (const FArchetype& A : D.Archetypes) { for (const FUniEmitter& E : A.Emitters) { Add(E.ChildArchetypeId); } }
 		}
 
 		const FUnresolvedTable& Table(u32 Child) const { return Tables.at(Child); }
@@ -358,7 +358,7 @@ namespace UniCore
 		double LuminosityBudget(u32 ArchId, double ParentAbsMag) const
 		{
 			double Flux = 0.0;
-			for (const FEmitter& E : Model.Definition().Arch(ArchId).Emitters)
+			for (const FUniEmitter& E : Model.Definition().Arch(ArchId).Emitters)
 			{
 				if (E.bDensityMode) { continue; }
 				const double N = std::isfinite(E.NTotalRefMag) ? E.NTotal * std::pow(10.0, -0.4 * (ParentAbsMag - E.NTotalRefMag)) : E.NTotal;

@@ -51,3 +51,4 @@ Append only. One entry per step start, finish, block, or commit. Times in the ow
 | 17:50 | SAFE | note | Log times for 17:30–17:48 corrected to the clock (two entries had been stamped ahead) |
 | 17:58 | SAFE | note | Decision brief published (D-133, D-132, D-131, D-118 with offline renders) |
 | 19:42 | CTRL | note | Owner: speed control is needed to test. Added uu.Fly (steerable free flight, WASD/QE, wheel x2/x0.5, any speed), uu.Speed, latched uu.Cruise (was ignored below 1e8 cm/s), HUD readout; InputCore dependency. Uncompiled |
+| 20:10 | UE57 | done (UE-1 compiles, shaders compile) | First engine build on UE 5.7: EVisibility/FEmitter clashed with engine globals (renamed EUniVisibility/FUniEmitter), fopen C4996 (UniFOpen), RHI/RenderCore link deps for the GPU parity test, DXC rejects ?: on structs (UniGen.usf). Owner confirms the galaxy renders |
