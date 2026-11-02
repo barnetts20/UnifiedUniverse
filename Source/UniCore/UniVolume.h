@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cstring>
 #include <functional>
+#include <type_traits>
 #include <map>
 #include <vector>
 
@@ -330,6 +331,13 @@ namespace UniCore
 		const std::map<u32, FContributor>* Contributors = nullptr;
 		std::function<const FObjectGPU*(const FObjectId&)> FindObject;
 		std::function<float(int)> LevelFade;
+		/** D-140: set for the runtime streamer. False means the contributor's normalising
+		 *  integral is still being computed on a worker (the request starts it): skip its carrier
+		 *  this frame rather than compute it on the game thread. Empty: compute inline. */
+		std::function<bool(const FContributor&)> IntegralReady;
+
+		template <typename T, typename = void> struct THasRequestIntegral : std::false_type {};
+		template <typename T> struct THasRequestIntegral<T, std::void_t<decltype(std::declval<const T&>().RequestIntegral(std::declval<const FContributor&>()))>> : std::true_type {};
 
 		template <typename T> static FVolumeSource From(const T& P)
 		{
@@ -337,6 +345,7 @@ namespace UniCore
 			S.Contributors = &P.Contributors();
 			S.FindObject = [&P](const FObjectId& Id) { return P.FindObject(Id); };
 			S.LevelFade = [&P](int L) { return P.LevelFade(L); };
+			if constexpr (THasRequestIntegral<T>::value) { S.IntegralReady = [&P](const FContributor& C) { return P.RequestIntegral(C); }; }
 			return S;
 		}
 	};
@@ -413,6 +422,7 @@ namespace UniCore
 			{
 				for (const FContributor& C : Gen.RootContributors())
 				{
+					if (P.IntegralReady && !P.IntegralReady(C)) { continue; }   // D-140: on a worker; the background waits
 					const int PB = C.Emitter->PeriodBits;
 					const double Period = std::ldexp(1.0, PB);
 					FCarrierGPU G{};
@@ -464,6 +474,9 @@ namespace UniCore
 					const float Fg = Force >= 0.0f ? 1.0f : P.LevelFade(C.Parent.Cell.Level);
 					const float Weight = W * V * Fg;
 					if (!(Weight > 0.0f)) { continue; }
+					// D-140: requested here, at the start of the handoff ramp (the carrier's weight is
+					// near 0), so it is normally ready long before the carrier matters.
+					if (P.IntegralReady && !P.IntegralReady(C)) { continue; }
 					FCand Cd;
 					Cd.Theta = Theta;
 					FCarrierGPU& G = Cd.G;

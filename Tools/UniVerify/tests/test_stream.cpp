@@ -8,8 +8,10 @@
 #include "../scenes/UniScenes.h"
 #include "UniStreamer.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <map>
+#include <thread>
 
 using namespace UniCore;
 
@@ -46,6 +48,7 @@ UNI_TEST(stream, parity)
 		FCpuGenBackend Be(G, 2097152u);
 		FUniStreamer S(G, Be);
 		S.bVelocityLod = false;
+		S.bAsyncIntegrals = false;   // frame-counted check: integrals inline (D-140)
 		for (const FCoord& X : Path) { S.Update(X); }
 		for (int I = 0; I < 40 && !S.AllReady(); ++I) { S.Update(Path.back()); }
 		S.ForEachReady([&](const FCellKey& K, u32 Start, u32 Count, float)
@@ -88,6 +91,7 @@ UNI_TEST(stream, sensitivity_resize)
 	FCpuGenBackend Be(G, 2097152u);
 	FUniStreamer S(G, Be);
 	S.bVelocityLod = false;
+	S.bAsyncIntegrals = false;   // frame-counted check: integrals inline (D-140)
 	const FCoord C = UniScenes::SolarCamera();
 	S.Update(C);   // AllReady() is trivially true before the first update
 	for (int I = 0; I < 60 && !S.AllReady(); ++I) { S.Update(C); }
@@ -144,6 +148,7 @@ UNI_TEST(stream, fail_closed)
 	FFlakyBackend Be(Cpu, 3);
 	FUniStreamer S(G, Be);
 	S.bVelocityLod = false;
+	S.bAsyncIntegrals = false;   // frame-counted check: integrals inline (D-140)
 	const FCoord C = UniScenes::SolarCamera();
 	S.Update(C);
 	for (int I = 0; I < 80 && !S.AllReady(); ++I) { S.Update(C); }
@@ -184,6 +189,7 @@ UNI_TEST(stream, volume_parity)
 	FCpuGenBackend Be(G, 2097152u);
 	FUniStreamer S(G, Be);
 	S.bVelocityLod = false;
+	S.bAsyncIntegrals = false;   // frame-counted check: integrals inline (D-140)
 	long long HoldViolations = 0;
 	int Frames = 0;
 	for (; Frames < 80; ++Frames)
@@ -209,4 +215,190 @@ UNI_TEST(stream, volume_parity)
 		.Pass(bCarriers && bParams && bLut && !A.Carriers.empty() && HoldViolations == 0,
 			Uni::Fmt("%zu carriers (%s), %zu parameter blocks (%s), %zu LUT entries, %zu differ; streamer settled in %d frames; %lld level-frames filling with fade > 0",
 				A.Carriers.size(), bCarriers ? "identical" : "DIFFER", A.Params.size(), bParams ? "identical" : "DIFFER", A.Lut.size(), LutDiff, Frames, HoldViolations));
+}
+
+namespace
+{
+	/** CPU backend with GPU-like latency: each phase reports done LatFrames frames after it was
+	 *  submitted (submit, render thread, GPU, readback, copy). The test advances Frame. */
+	class FLagBackend : public IGenBackend
+	{
+	public:
+		FLagBackend(FCpuGenBackend& In, int InLat) : Inner(In), Lat(InLat) {}
+		void SubmitProbe(std::shared_ptr<FGenBatch> B) override { Inner.SubmitProbe(B); ProbeAt[B->Ticket] = Frame; }
+		bool PollProbe(const FGenBatch& B) override { return Frame - ProbeAt[B.Ticket] >= Lat; }
+		void SubmitPlace(std::shared_ptr<FGenBatch> B) override { Inner.SubmitPlace(B); PlaceAt[B->Ticket] = Frame; }
+		bool PollPlace(const FGenBatch& B) override { return Frame - PlaceAt[B.Ticket] >= Lat; }
+		u32 PoolCapacity() const override { return Inner.PoolCapacity(); }
+		long Frame = 0;
+	private:
+		FCpuGenBackend& Inner;
+		int Lat;
+		std::map<u64, long> ProbeAt, PlaceAt;
+	};
+}
+
+UNI_TEST(stream, responsive)
+{
+	// D-137/D-138/D-139: in flight, with a backend that takes 3 frames per phase (the GPU's order):
+	//   - every cell is Ready within 2 x 3 frames of entering. Before D-137 a level waited for
+	//     every coarser level: 36-132 frames;
+	//   - in steady flight, every cell inside the visible radius N_eff of an active (not
+	//     suspended) level is Ready on every frame. Before D-139 the window assumed one frame of
+	//     lag, so cells were still generating when they came inside N_eff: pop-in. The first
+	//     AccelFrames after going from rest to full speed in one frame are reported separately:
+	//     the widened shell takes one fill to arrive (the case B-001's warp streaks are for);
+	//   - the per-frame time of Update is reported (it includes the CPU backend's generation, so
+	//     it is an upper bound on bookkeeping; before D-138 the web scene spent ~10 ms in Gather).
+	constexpr int Lat = 3;
+	struct FRun { const char* Name; int Scene; double CmPerFrame; };
+	const FRun Runs[] = {
+		{ "galaxy at 1 kpc/s", 0, 1.0 * Units::Kpc / 60.0 },
+		{ "galaxy at 10 kpc/s", 0, 10.0 * Units::Kpc / 60.0 },
+		{ "web at 10 Mpc/s", 1, 10.0 * Units::Mpc / 60.0 },
+		{ "web at 30 Mpc/s", 1, 30.0 * Units::Mpc / 60.0 },
+		{ "flythrough at 10 kpc/s", 2, 10.0 * Units::Kpc / 60.0 },
+	};
+	const double NEff = double(UniHlsl::UNI_WINDOW_N_EFF);
+	size_t WorstLatency = 0;
+	double WorstVisible = 1.0, WorstMs = 0.0;
+	long long Holes = 0, AccelHoles = 0;
+	size_t WorstPool = 0, Failures = 0;
+	constexpr int AccelFrames = 2 * Lat + 2;
+	std::string Detail;
+	for (const FRun& R : Runs)
+	{
+		FUniverseModel M(R.Scene == 0 ? UniScenes::GalaxyToStar() : (R.Scene == 1 ? UniScenes::WebToGalaxy() : UniScenes::Flythrough()));
+		FRefGenerator G(M);
+		FCpuGenBackend Cpu(G, 8388608u);
+		FLagBackend Be(Cpu, Lat);
+		FUniStreamer S(G, Be);
+		S.bAsyncIntegrals = false;   // frame-counted check: integrals inline (D-140)
+		FCoord C = R.Scene == 1 ? UniScenes::VoidCamera() : UniScenes::SolarCamera();
+		FVec3f F{};
+		S.Update(C); ++Be.Frame;
+		for (int I = 0; I < 300 && !S.AllReady(); ++I) { S.Update(C); ++Be.Frame; }
+		const int Frames = 240;
+		int VisibleOk = 0, MaxN = 0, Suspended = 0;
+		size_t PoolPeak = 0;
+		double SumMs = 0.0;
+		for (int Fr = 0; Fr < Frames; ++Fr)
+		{
+			AddDisplacement(C, F, FVec3d{ R.CmPerFrame, 0.31 * R.CmPerFrame, 0.07 * R.CmPerFrame });
+			const auto T0 = std::chrono::steady_clock::now();
+			S.Update(C);
+			SumMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - T0).count();
+			++Be.Frame;
+			PoolPeak = std::max(PoolPeak, S.Stats().PoolUsed);
+			// Ready cells inside the visible radius, per level: Chebyshev distance from the camera
+			// to the cell's box < N_eff, in the level's cells.
+			auto Frac = [&](int L, int A)
+			{
+				const FCellKey Cc = CellOf(S.CameraCoord(), L);
+				const FVec3d D = ToDouble(Sub(S.CameraCoord(), CellOrigin(Cc)));
+				return (A == 0 ? D.X : (A == 1 ? D.Y : D.Z)) / CellWidthCm(L);
+			};
+			auto Visible = [&](const int O[3], const double Fc[3])
+			{
+				double Cheb = 0.0;
+				for (int A = 0; A < 3; ++A) { Cheb = std::max(Cheb, std::max({ 0.0, double(O[A]) - Fc[A], Fc[A] - double(O[A]) - 1.0 })); }
+				return Cheb < NEff;
+			};
+			std::map<int, int> ReadyVisible;
+			S.ForEachReady([&](const FCellKey& K, u32, u32, float)
+			{
+				const FCellKey Cc = CellOf(S.CameraCoord(), K.Level);
+				const double Fc[3] = { Frac(K.Level, 0), Frac(K.Level, 1), Frac(K.Level, 2) };
+				int O[3];
+				for (int A = 0; A < 3; ++A) { O[A] = int32_t(K.C[A].L[3] - Cc.C[A].L[3]); }
+				if (Visible(O, Fc)) { ++ReadyVisible[K.Level]; }
+			});
+			bool bOk = true;
+			for (const auto& L : S.LevelStates())
+			{
+				MaxN = std::max(MaxN, L.HalfWidth);
+				if (L.bSuspended) { ++Suspended; continue; }
+				if (L.Cells == 0) { continue; }
+				const double Fc[3] = { Frac(L.Level, 0), Frac(L.Level, 1), Frac(L.Level, 2) };
+				int Want = 0;
+				for (int X = -6; X <= 6; ++X) for (int Y = -6; Y <= 6; ++Y) for (int Z = -6; Z <= 6; ++Z)
+				{
+					const int O[3] = { X, Y, Z };
+					Want += Visible(O, Fc) ? 1 : 0;
+				}
+				if (ReadyVisible[L.Level] < Want && Fr < AccelFrames) { AccelHoles += Want - ReadyVisible[L.Level]; continue; }
+				if (ReadyVisible[L.Level] < Want) { bOk = false; Holes += Want - ReadyVisible[L.Level]; if (std::getenv("UNI_DEBUG_HOLES")) { std::printf("    %s frame %d L%d fade %.2f N %d: %d of %d visible cells Ready\n", R.Name, Fr, L.Level, L.Fade, L.HalfWidth, ReadyVisible[L.Level], Want); } }
+			}
+			VisibleOk += bOk ? 1 : 0;
+		}
+		const double Vis = double(VisibleOk) / Frames;   // acceleration frames count as OK here; their holes are in AccelHoles
+		const double Ms = SumMs / Frames;
+		WorstLatency = std::max(WorstLatency, S.Stats().MaxLatencyFrames);
+		WorstVisible = std::min(WorstVisible, Vis);
+		WorstMs = std::max(WorstMs, Ms);
+		Detail += Uni::Fmt("%s%s: latency <= %zu frames (measured %.1f), visible cells all Ready on %.1f%% of frames, widest window N = %d, %.1f levels suspended per frame, Update %.2f ms, pool peak %zu, alloc failures %zu",
+			Detail.empty() ? "" : "; ", R.Name, S.Stats().MaxLatencyFrames, S.LatencyFrames(), 100.0 * Vis, MaxN, double(Suspended) / Frames, Ms, PoolPeak, S.Stats().AllocFailures);
+		WorstPool = std::max(WorstPool, PoolPeak);
+		Failures += S.Stats().AllocFailures;
+	}
+	Detail += Uni::Fmt("; steady-flight holes %lld; holes in the %d frames after a standing start %lld (reported, not required)", Holes, AccelFrames, AccelHoles);
+	Uni::Check(2, "T2.stream.responsive", "In flight with 3-frame backend phases: every cell Ready within 6 frames of entering; in steady flight every cell inside N_eff of an active level is Ready on every frame")
+		.Metric("worst_latency_frames", double(WorstLatency)).Metric("worst_visible_ready", WorstVisible).Metric("visible_holes", double(Holes)).Metric("accel_holes", double(AccelHoles)).Metric("update_ms_upper_bound", WorstMs).Metric("pool_peak", double(WorstPool))
+		.Pass(WorstLatency <= size_t(2 * Lat) && Holes == 0 && Failures == 0, Detail);
+}
+
+UNI_TEST(stream, async_integrals)
+{
+	// D-140: with integrals on worker threads, no normalising integral is computed on the
+	// calling (game) thread, cells that need one wait for it, and the settled content is
+	// identical to the reference pipeline's (same values, computed elsewhere).
+	FUniverseModel M(UniScenes::Flythrough());
+	FRefGenerator G(M);
+	FCpuGenBackend Be(G, 4194304u);
+	FUniStreamer S(G, Be);
+	S.bVelocityLod = false;
+	const FCoord C = UniScenes::SolarCamera();
+	S.Update(C);
+	int Frames = 1;
+	size_t MaxJobs = 0;
+	const auto T0 = std::chrono::steady_clock::now();
+	while (!S.AllReady() && std::chrono::steady_clock::now() - T0 < std::chrono::seconds(60))
+	{
+		S.Update(C);
+		++Frames;
+		MaxJobs = std::max(MaxJobs, S.PendingIntegrals());
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	const size_t Inline = G.InlineIntegrals;
+	FRefGenerator G2(M);
+	FRefPipeline P(G2);
+	P.bVelocityLod = false;
+	P.Update(C, FVec3f{});
+	std::map<std::string, std::vector<FObjectGPU>> Ref;
+	for (const auto& KV : P.CacheRef())
+	{
+		const std::string Key = std::to_string(KV.first.Level) + ToHex(KV.first.C[0]) + ToHex(KV.first.C[1]) + ToHex(KV.first.C[2]);
+		Ref[Key] = KV.second.Objects;
+	}
+	long long Cells = 0, Mismatch = 0;
+	S.ForEachReady([&](const FCellKey& K, u32 Start, u32 Count, float)
+	{
+		const std::string Key = std::to_string(K.Level) + ToHex(K.C[0]) + ToHex(K.C[1]) + ToHex(K.C[2]);
+		std::vector<FObjectGPU> Got;
+		for (u32 I = 0; I < Count; ++I)
+		{
+			const FObjectGPU& O = Be.PoolData()[Start + I];
+			if (!((O.A[3] >> 16) & UniHlsl::UNI_OBJ_FLAG_DELTA_HIDDEN)) { Got.push_back(O); }
+		}
+		auto It = Ref.find(Key);
+		const size_t Want = It == Ref.end() ? 0 : It->second.size();
+		bool Same = Got.size() == Want;
+		for (size_t I = 0; Same && I < Want; ++I) { Same = std::memcmp(&Got[I], &It->second[I], sizeof(FObjectGPU)) == 0; }
+		++Cells;
+		Mismatch += Same ? 0 : 1;
+	});
+	Uni::Check(2, "T2.stream.async_integrals", "Normalising integrals on worker threads: none computed on the calling thread, settled content identical to the reference")
+		.Metric("inline_integrals", double(Inline)).Metric("max_jobs", double(MaxJobs)).Metric("cells", double(Cells)).Metric("mismatch", double(Mismatch)).Metric("frames", Frames)
+		.Pass(Inline == 0 && MaxJobs > 0 && Cells > 1000 && Mismatch == 0 && S.AllReady(),
+			Uni::Fmt("%zu integrals computed inline, up to %zu worker jobs at once; settled after %d frames; %lld cells compared with the reference, %lld differ", Inline, MaxJobs, Frames, Cells, Mismatch));
 }
