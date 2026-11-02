@@ -4,20 +4,20 @@
 
 | | |
 | --- | --- |
-| Commit | `7e14ced` + uncommitted changes (branch `uu/volumetrics`) |
-| Run | 2026-11-01 19:49 EST, 499 s |
+| Commit | `33433fd` + uncommitted changes (branch `uu/volumetrics`) |
+| Run | 2026-11-01 21:50 EST, 572 s |
 | Environment tier reached | Tier 3 offline (Tier 4 static only: no Unreal, no DXC here — see ENVIRONMENT.md) |
-| Checks | 53 run, 53 pass, **0 fail** |
+| Checks | 55 run, 55 pass, **0 fail** |
 
 ## Tier 1 — core correctness
 
 | Check | Result | Criterion | Measured |
 | --- | --- | --- | --- |
-| `T1.build.gcc` | PASS | Harness and UniCore build with g++, -Wall -Wextra -Werror, C++17 | built in 0 s |
+| `T1.build.gcc` | PASS | Harness and UniCore build with g++, -Wall -Wextra -Werror, C++17 | built in 8 s |
 | `T1.build.strict.gpp` | PASS | Every UniCore header as C++20 with -Wall -Wextra -Wshadow -Werror (g++), as the UE modules compile them | clean |
 | `T1.build.strict.clangpp` | PASS | Every UniCore header as C++20 with -Wall -Wextra -Wshadow -Werror (clang++), as the UE modules compile them | clean |
-| `T1.build.clang` | PASS | Harness and UniCore build with clang++, -Wall -Wextra -Werror, C++17 | built in 0 s |
-| `T1.coord.fuzz` | PASS | Coordinate fuzz: UniCoord.h vs UniCoord.ush (via shim) vs __int128, all ops | 1000000 cases x 3 axes, 0 mismatches (1.7 s) |
+| `T1.build.clang` | PASS | Harness and UniCore build with clang++, -Wall -Wextra -Werror, C++17 | built in 6 s |
+| `T1.coord.fuzz` | PASS | Coordinate fuzz: UniCoord.h vs UniCoord.ush (via shim) vs __int128, all ops | 1000000 cases x 3 axes, 0 mismatches (2.2 s) |
 | `T1.coord.edges` | PASS | Targeted edges: borrow chains, root wrap, max magnitude, zero, level shifts, extreme AddDisplacement, hex | 1079 targeted expectations, 0 failed |
 | `T1.coord.hilo` | PASS | ToHiLo relative error <= 2^-46 over the fuzz set | worst relative error 2^-49.00 over 1000000 cases x 3 axes (limit 2^-46), 0 over |
 | `T1.fr` | PASS | f(r) monotonic over 1..2^128 cm in log steps, C1 at r0, inverse exists (within float conditioning) | 12800 samples, 0 non-monotonic; continuous yes, C1 yes; inverse worst rel error 1.11e-05 = 0.67 of its float bound; 2^128 cm maps to 69.0 r0 |
@@ -26,7 +26,7 @@
 | `T1.seed.quality` | PASS | Chi-squared over 64 bins within the 99% band for sequential inputs (Avalanche/MixSeed/CellSeed/ObjectSeed/draws) | band [37.8, 95.7], 200k sequential inputs: MixSeed(root, PLACE)=72.5, MixSeedIdx(7, PLACE, i)=81.1, FRandomStream(MixSeed(root)).FRand=81.7, CellSeed(sequential x cells)=55.9, ObjectSeed(cell, i)=54.0, DrawUnit(root, PLACE, 0)=54.9, DrawUnit(seed, PLACE, k)=45.2. (Without Avalanche: 1.26e+07, ProcSeed lesson reproduced) |
 | `T1.seed.injective` | PASS | Object seeds injective in index (0 collisions over 300 cells x 2^15); cell seeds near birthday bound | object-seed collisions 0 (must be 0); cell-seed collisions over 64^3 cells 10 (birthday ~8) |
 | `T1.seed.stream_port` | PASS | FRandomStream port: FRand sequence, RandRange bounds, RollRange quantize/clamp | 16,000 FRand draws, 0 mismatches; RandRange(2,6) out of range 0, ends hit 1931/2020; quantized roll 5.0 |
-| `T1.window.bijection` | PASS | Toroidal slot bijection; residents keep their slot while sliding; correct entering/exiting diff (N = 1..6) | 648 windows, 5184 slides (391 seam rebuilds), 0 bijection / 0 stability / 0 diff violations; unit slide 25 in / 25 out: yes |
+| `T1.window.bijection` | PASS | Toroidal slot bijection; residents keep their slot while sliding; correct entering/exiting diff (N = 1..6) | 648 windows, 5184 slides (393 seam rebuilds), 0 bijection / 0 stability / 0 diff violations; unit slide 25 in / 25 out: yes |
 | `T1.window.velocity_lod` | PASS | Velocity LOD suspends above 1 cell per K = 4 frames, resumes below 0.8 of that | transitions as specified |
 | `T1.level.coverage` | PASS | L = ceil(log2(R/N_eff)), N_eff = N - 1/K: for random camera offsets in the centre cell, every object with distance <= R is inside its level's window | 240000 trials over N = 1..6 and R = 4 cm..2^123 cm, 0 violations; min N_eff*2^L / R = 1.000002 |
 | `T1.clang.coord_seed` | PASS | clang++ build passes every Tier 1 group (coord, seed, window, level, photometry; quick fuzz 10^5) | 12 checks, failing: none |
@@ -46,16 +46,18 @@
 | `T2.gen.gather` | PASS | Max contributor list length per level logged (D-004 trigger: 256) | max 1 contributors gathered (L82); D-004 trigger 256 not reached |
 | `T2.gen.baked` | PASS | Baked UniVol path: file round trip, mips are exact means, mip-descent placement follows texels, counts follow mip integrals, 48 tile symmetries | R32 round trip exact, R16 max rel err 4.9e-04; mip mean err 6.0e-08; descent vs texel r = 0.9987 (400k draws); count z = -1.19; 48/48 symmetries used, integral change 0.0e+00; periodic yes |
 | `T2.gen.slice_draws` | PASS | Magnitude draws stay inside their slice (as stored, half precision) and match the slice's conditional mean | 24 slices x 20,000 draws: 0 outside their slice, 0 with a biased mean; worst Star L71 mean -3.1607 vs -3.1516 (3.2 sigma) |
-| `T2.stream.parity` | PASS | Runtime streamer (probe -> allocate -> place, readback contributors) with the CPU backend reproduces the reference pipeline cell for cell | 5375 cells / 719687 objects compared, 0 differ; galaxy_to_star: 2375 ready cells; flythrough: 3000 ready cells; 43 batches, worst entering-to-ready latency 37 frames, pool peak 361697, 0 alloc failures required (0) |
-| `T2.stream.sensitivity_resize` | PASS | Sensitivity resize keeps resident cells (no interior regeneration) and settles to the reference at the new dm | ready cells 2375 before, 3935 on the resize frame (kept), settled objects 1625782 vs reference 1625782; batches 19 -> 36 |
+| `T2.stream.parity` | PASS | Runtime streamer (probe -> allocate -> place, readback contributors) with the CPU backend reproduces the reference pipeline cell for cell | 5375 cells / 719687 objects compared, 0 differ; galaxy_to_star: 2375 ready cells; flythrough: 3000 ready cells; 183 batches, worst entering-to-ready latency 2 frames, pool peak 361697, 0 alloc failures required (0) |
+| `T2.stream.sensitivity_resize` | PASS | Sensitivity resize keeps resident cells (no interior regeneration) and settles to the reference at the new dm | ready cells 2375 before, 3936 on the resize frame (kept), settled objects 1625782 vs reference 1625782; batches 19 -> 36 |
 | `T2.stream.fail_closed` | PASS | Backend timeouts fail closed: affected cells are not drawn and release their ranges; no unwritten slot is ever drawn | 6 batches failed on purpose, 749 cells failed closed, 257418 slots drawn, 0 of them unwritten |
-| `T2.stream.volume_parity` | PASS | The volume scene built from the streamer (CPU backend, settled) equals the reference pipeline's: carriers and parameters byte-identical, LUTs identical; no filling level has a fade above 0 (D-128) | 3 carriers (identical), 5 parameter blocks (identical), 1024 LUT entries, 0 differ; streamer settled in 48 frames; 0 level-frames filling with fade > 0 |
+| `T2.stream.volume_parity` | PASS | The volume scene built from the streamer (CPU backend, settled) equals the reference pipeline's: carriers and parameters byte-identical, LUTs identical; no filling level has a fade above 0 (D-128) | 3 carriers (identical), 5 parameter blocks (identical), 1024 LUT entries, 0 differ; streamer settled in 13 frames; 0 level-frames filling with fade > 0 |
+| `T2.stream.responsive` | PASS | In flight with 3-frame backend phases: every cell Ready within 6 frames of entering; in steady flight every cell inside N_eff of an active level is Ready on every frame | galaxy at 1 kpc/s: latency <= 6 frames (measured 6.0), visible cells all Ready on 100.0% of frames, widest window N = 4, 10.0 levels suspended per frame, Update 3.88 ms, pool peak 1291318, alloc failures 0; galaxy at 10 kpc/s: latency <= 6 frames (measured 6.0), visible cells all Ready on 100.0% of frames, widest window N = 4, 13.0 levels suspended per frame, Update 1.07 ms, pool peak 629482, alloc failures 0; web at 10 Mpc/s: latency <= 6 frames (measured 6.0), visible cells all Ready on 100.0% of frames, widest window N = 3, 18.0 levels suspended per frame, Update 2.50 ms, pool peak 3696, alloc failures 0; web at 30 Mpc/s: latency <= 6 frames (measured 6.0), visible cells all Ready on 100.0% of frames, widest window N = 4, 19.0 levels suspended per frame, Update 4.37 ms, pool peak 5718, alloc failures 0; flythrough at 10 kpc/s: latency <= 6 frames (measured 6.0), visible cells all Ready on 100.0% of frames, widest window N = 4, 13.0 levels suspended per frame, Update 2.31 ms, pool peak 633189, alloc failures 0; steady-flight holes 0; holes in the 8 frames after a standing start 361 (reported, not required) |
+| `T2.stream.async_integrals` | PASS | Normalising integrals on worker threads: none computed on the calling thread, settled content identical to the reference | 0 integrals computed inline, up to 1 worker jobs at once; settled after 2650 frames; 3000 cells compared with the reference, 0 differ |
 
 ## Tier 3 — rendering behaviour
 
 | Check | Result | Criterion | Measured |
 | --- | --- | --- | --- |
-| `T3.jitter` | PASS | Camera parked at 1e30 / 1e35 / 2^127 cm, 0.001 cm per frame for 100 frames: max screen error of static objects vs long-double reference < 0.01 px | 51300 samples (objects 10 cm .. 10^27 cm away, plus objects 10^9..10^14 cm away stored in L60/68/75 cells; 1920 px over 90 deg): worst error 2.63e-03 px, worst frame-to-frame jitter 1.67e-04 px. For the record, the design's hi/lo + float-offset form: 6.26e-05 px when cells match distance, 1.62e+04 px for near objects in coarse cells (D-104) |
+| `T3.jitter` | PASS | Camera parked at 1e30 / 1e35 / 2^127 cm, 0.001 cm per frame for 100 frames: max screen error of static objects vs long-double reference < 0.01 px | 51300 samples (objects 10 cm .. 10^27 cm away, plus objects 10^9..10^14 cm away stored in L60/68/75 cells; 1920 px over 90 deg): worst error 2.63e-03 px, worst frame-to-frame jitter 1.11e-04 px. For the record, the design's hi/lo + float-offset form: 6.89e-05 px when cells match distance, 1.62e+04 px for near objects in coarse cells (D-104) |
 | `T3.ordering` | PASS | Compressed render depth order equals true distance order for 10^5 random pairs; per-depth compression shown to fail on the same set | 100000 pairs: radial f(r) reverses 0 (float ties 0); per-depth z compression misorders 2284; fixed layer compositing misorders 7 |
 | `T3.occlusion` | PASS | Synthetic promoted occluder: backdrop objects behind it are culled, objects in front kept, for all test placements | 20000 placements (3386 behind, 550 in front on the disc, 16064 beside), 0 wrong |
 | `T3.frames` | PASS | Reference stills written for visual inspection (galaxy interior x2, cosmic web) | still_galaxy_towards_centre: 9904 visible of 367374 resident; still_galaxy_out_of_plane: 1967 visible of 367374 resident; web dm+5: 65 visible of 63829 resident |
@@ -101,8 +103,8 @@ Written by the session after looking at the images: [OBSERVATIONS.md](OBSERVATIO
 ## Regressions since the previous run
 
 - Regressed (PASS → FAIL): none
-- Fixed (FAIL → PASS): none
-- New checks: none
+- Fixed (FAIL → PASS): `T1.build.gcc`, `T1.build.clang`
+- New checks: `T1.coord.fuzz`, `T1.coord.edges`, `T1.coord.hilo`, `T2.gen.determinism`, `T2.gen.counts`, `T2.gen.slicing`, `T2.gen.fidelity`, `T2.gen.coverage`, `T2.gen.budget`, `T2.gen.gather`, `T2.gen.baked`, `T2.gen.slice_draws`, `T1.fr`, `T1.photometry`, `T3.jitter`, `T3.ordering`, `T3.occlusion`, `T3.frames`, `T3.flythrough`, `T3.sensitivity`, `T1.seed.channels`, `T1.seed.quality`, `T1.seed.injective`, `T1.seed.stream_port`, `T2.stream.parity`, `T2.stream.sensitivity_resize`, `T2.stream.fail_closed`, `T2.stream.volume_parity`, `T2.stream.responsive`, `T2.stream.async_integrals`, `T3.vol.march`, `T3.vol.conservation`, `T3.vol.budget`, `T3.vol.handoff`, `T3.vol.nested`, `T3.vol.precision`, `T3.vol.background`, `T3.vol.frames`, `T3.vol.flythrough`, `T3.vol.cube`, `T1.window.bijection`, `T1.window.velocity_lod`, `T1.level.coverage`, `T1.clang.coord_seed`, `T1.coord.oracle`, `T1.seed.oracle`
 
 ## Not verified here
 

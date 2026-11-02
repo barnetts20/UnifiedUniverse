@@ -24,3 +24,7 @@ target_compile_options(univerify PRIVATE -O2 -Wall -Wextra -Werror -Wno-unused-f
 find_package(Threads REQUIRED)
 target_link_libraries(univerify PRIVATE Threads::Threads)
 set_target_properties(univerify PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/build)
+
+# D-140: the streamer computes normalising integrals with std::async.
+find_package(Threads REQUIRED)
+target_link_libraries(univerify PRIVATE Threads::Threads)
