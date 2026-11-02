@@ -30,5 +30,9 @@
   {
     "id": "UE-8",
     "what": "Runtime cost: GPU time of the generate / project / sprite passes, the one-time game-thread hitch of the normalising integral when entering a galaxy (D-123), and teleport fill latency (about 37 frames, D-122)."
+  },
+  {
+    "id": "UE-9",
+    "what": "The volume pass in the engine (Docs/VOLUMETRICS.md \u00a78) is written but has never been compiled: UniVolume.usf (MarchCS, BackgroundCS, CompositeVS/PS), the sprite transmittance lookup, RenderVolume_RenderThread and the subsystem's per-frame volume scene. It must compile, show the galaxy glow and the dust lane matching the reference stills, and stay within budget (uu.Volume 0/1 to compare)."
   }
 ]

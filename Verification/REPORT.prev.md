@@ -4,78 +4,39 @@
 
 | | |
 | --- | --- |
-| Commit | `50538dc` + uncommitted changes (branch `uu/prototype-day1`) |
-| Run | 2026-11-01 21:33 EST, 260 s |
-| Environment tier reached | Tier 3 offline (Tier 4 static only: no Unreal, no DXC here — see ENVIRONMENT.md) |
-| Checks | 44 run, 44 pass, **0 fail** |
+| Commit | `33433fd` + uncommitted changes (branch `uu/volumetrics`) |
+| Run | 2026-11-01 21:40 EST, 20 s |
+| Environment tier reached | Tier 0 offline (Tier 4 static only: no Unreal, no DXC here — see ENVIRONMENT.md) |
+| Checks | 9 run, 7 pass, **2 fail** |
 
 ## Tier 1 — core correctness
 
 | Check | Result | Criterion | Measured |
 | --- | --- | --- | --- |
-| `T1.build.gcc` | PASS | Harness and UniCore build with g++, -Wall -Wextra -Werror, C++17 | built in 6 s |
+| `T1.build.gcc` | FAIL | Harness and UniCore build with g++, -Wall -Wextra -Werror, C++17 | BUILD FAILED: /home/claude/uu-vol/Plugins/UnifiedUniverse/Tools/UniVerify/tests/test_stream.cpp:220:1: error: expected identifier before ‘{’ token | /home/claude/uu-vol/Plugins/UnifiedUniverse/Tools/UniVerify/tests/../src/UniTest.h:181:9: error: cannot declare static function inside another function | /home/claude/uu-vol/Plugins/UnifiedUniverse/Tools/UniVerify/tests/test_stream.cpp:241:1: error: a function-definition is not allowed here before ‘{’ token | /home/claude/uu-vol/Plugins/UnifiedUniverse/Tools/UniVerify/tests/../src/UniTest.h:181:9: error: cannot declare static function inside another function | /home/claude/uu-vol/Plugins/UnifiedUniverse/Tools/UniVerify/tests/test_stream.cpp:350:1: error: a function-definition is not allowed here before ‘{’ token | /home/claude/uu-vol/Plugins/UnifiedUniverse/Tools/UniVerify/tests/test_stream.cpp:403:2: error: expected ‘}’ at end of input | gmake[2]: *** [CMakeFiles/univerify.dir/build.make:202: CMakeFiles/univerify.dir/tests/test_stream.cpp.o] Error 1 | gmake[1]: *** [CMakeFiles/Makefile2:83: CMakeFiles/univerify.dir/all] Error 2 |
 | `T1.build.strict.gpp` | PASS | Every UniCore header as C++20 with -Wall -Wextra -Wshadow -Werror (g++), as the UE modules compile them | clean |
 | `T1.build.strict.clangpp` | PASS | Every UniCore header as C++20 with -Wall -Wextra -Wshadow -Werror (clang++), as the UE modules compile them | clean |
-| `T1.build.clang` | PASS | Harness and UniCore build with clang++, -Wall -Wextra -Werror, C++17 | built in 5 s |
-| `T1.coord.fuzz` | PASS | Coordinate fuzz: UniCoord.h vs UniCoord.ush (via shim) vs __int128, all ops | 1000000 cases x 3 axes, 0 mismatches (2.1 s) |
-| `T1.coord.edges` | PASS | Targeted edges: borrow chains, root wrap, max magnitude, zero, level shifts, extreme AddDisplacement, hex | 1079 targeted expectations, 0 failed |
-| `T1.coord.hilo` | PASS | ToHiLo relative error <= 2^-46 over the fuzz set | worst relative error 2^-49.00 over 1000000 cases x 3 axes (limit 2^-46), 0 over |
-| `T1.fr` | PASS | f(r) monotonic over 1..2^128 cm in log steps, C1 at r0, inverse exists (within float conditioning) | 12800 samples, 0 non-monotonic; continuous yes, C1 yes; inverse worst rel error 1.11e-05 = 0.67 of its float bound; 2^128 cm maps to 69.0 r0 |
-| `T1.photometry` | PASS | Apparent magnitude, fade band and sensitivity k = 10^(dm/5) match closed form (1e-6, condition-aware) | 200k samples: worst m err 3.72e-07 of term size, k rel err 2.47e-07, intensity rel err 6.65e-05, fade violations 0; window N(dm) ok; relevance inverse err 3.6e-15 |
-| `T1.seed.channels` | PASS | Shader channel constants equal ChannelId(name), all distinct, runtime form case-insensitive | 14 channels, 0 problems |
-| `T1.seed.quality` | PASS | Chi-squared over 64 bins within the 99% band for sequential inputs (Avalanche/MixSeed/CellSeed/ObjectSeed/draws) | band [37.8, 95.7], 200k sequential inputs: MixSeed(root, PLACE)=72.5, MixSeedIdx(7, PLACE, i)=81.1, FRandomStream(MixSeed(root)).FRand=81.7, CellSeed(sequential x cells)=55.9, ObjectSeed(cell, i)=54.0, DrawUnit(root, PLACE, 0)=54.9, DrawUnit(seed, PLACE, k)=45.2. (Without Avalanche: 1.26e+07, ProcSeed lesson reproduced) |
-| `T1.seed.injective` | PASS | Object seeds injective in index (0 collisions over 300 cells x 2^15); cell seeds near birthday bound | object-seed collisions 0 (must be 0); cell-seed collisions over 64^3 cells 10 (birthday ~8) |
-| `T1.seed.stream_port` | PASS | FRandomStream port: FRand sequence, RandRange bounds, RollRange quantize/clamp | 16,000 FRand draws, 0 mismatches; RandRange(2,6) out of range 0, ends hit 1931/2020; quantized roll 5.0 |
-| `T1.window.bijection` | PASS | Toroidal slot bijection; residents keep their slot while sliding; correct entering/exiting diff (N = 1..6) | 648 windows, 5184 slides (393 seam rebuilds), 0 bijection / 0 stability / 0 diff violations; unit slide 25 in / 25 out: yes |
-| `T1.window.velocity_lod` | PASS | Velocity LOD suspends above 1 cell per K = 4 frames, resumes below 0.8 of that | transitions as specified |
-| `T1.level.coverage` | PASS | L = ceil(log2(R/N_eff)), N_eff = N - 1/K: for random camera offsets in the centre cell, every object with distance <= R is inside its level's window | 240000 trials over N = 1..6 and R = 4 cm..2^123 cm, 0 violations; min N_eff*2^L / R = 1.000002 |
-| `T1.clang.coord_seed` | PASS | clang++ build passes every Tier 1 group (coord, seed, window, level, photometry; quick fuzz 10^5) | 12 checks, failing: none |
-| `T1.coord.oracle` | PASS | Coordinate fuzz vs Python big-int oracle: Sub, ToDouble, ToHiLo, CellOf, Neighbour, AddDisplacement, object-relative (shader core) | 1000000 cases x 3 axes vs Python big-int oracle, 0 mismatches (24 s) |
-| `T1.seed.oracle` | PASS | UniSeed vs Python oracle: Avalanche, HashCombine, MixSeed, FRandomStream, CellSeed, ObjectSeed, draws, ChannelId | 2007 cases vs Python oracle (fast HashCombine), 0 mismatches |
-
-## Tier 2 — generation behaviour
-
-| Check | Result | Criterion | Measured |
-| --- | --- | --- | --- |
-| `T2.gen.determinism` | PASS | Per-cell content hashes identical across batch orders, window histories, and revisits after 10 slides (evicted, regenerated) | web_to_galaxy: 8474 compared, 0 differ; galaxy_to_star: 46390 compared, 0 differ (contributor-growth regenerations on path A: 0) |
-| `T2.gen.counts` | PASS | Aggregate z-score of placed count vs lambda within +-3 over >= 10^4 cells | 12735 tasks, sum lambda 8.441e+05, z = -0.88; rejection-cap shortfall 0; candidates over envelope 0.109% |
-| `T2.gen.slicing` | PASS | Luminosity slicing conserves totals: sum over levels of expected children = N_total within 1% | sum P(L): stars 1.000000000 over L58..L75, galaxies 1.000000000 over L82..L87; tiling sum / integral: 4 cells/axis: 1.1798, 8 cells/axis: 0.9725, 16 cells/axis: 0.9975, 32 cells/axis: 1.0029, 64 cells/axis: 1.0021; expected total / N_total = 1.0021 |
-| `T2.gen.fidelity` | PASS | Objects sit on structure: per-voxel placed density vs field correlation > 0.9 | galaxy disc cell: r = 0.9194 (199983 objects, 4096 voxels); cosmic web cell: r = 0.9832 (200492 objects, 4096 voxels) |
-| `T2.gen.coverage` | PASS | No child placed outside its contributor's influence | 416053 children checked against their contributor sphere, 0 outside |
-| `T2.gen.budget` | PASS | Residency under D-005 caps (131,072 per level, 2,097,152 total); peaks logged | peak per level 82644 (L69), peak total 367375. web_to_galaxy resident by level: L83:30 L84:197 L85:935 L86:2098 L87:426; galaxy_to_star resident by level: L61:1 L62:7 L63:41 L64:211 L65:1225 L66:5586 L67:20569 L68:52251 L69:78404 L70:53544 L71:44989 L72:51111 L73:38194 L74:9889 L75:1997 L86:1 |
-| `T2.gen.gather` | PASS | Max contributor list length per level logged (D-004 trigger: 256) | max 1 contributors gathered (L82); D-004 trigger 256 not reached |
-| `T2.gen.baked` | PASS | Baked UniVol path: file round trip, mips are exact means, mip-descent placement follows texels, counts follow mip integrals, 48 tile symmetries | R32 round trip exact, R16 max rel err 4.9e-04; mip mean err 6.0e-08; descent vs texel r = 0.9987 (400k draws); count z = -1.19; 48/48 symmetries used, integral change 0.0e+00; periodic yes |
-| `T2.gen.slice_draws` | PASS | Magnitude draws stay inside their slice (as stored, half precision) and match the slice's conditional mean | 24 slices x 20,000 draws: 0 outside their slice, 0 with a biased mean; worst Star L71 mean -3.1607 vs -3.1516 (3.2 sigma) |
-| `T2.stream.parity` | PASS | Runtime streamer (probe -> allocate -> place, readback contributors) with the CPU backend reproduces the reference pipeline cell for cell | 5375 cells / 719687 objects compared, 0 differ; galaxy_to_star: 2375 ready cells; flythrough: 3000 ready cells; 183 batches, worst entering-to-ready latency 2 frames, pool peak 361697, 0 alloc failures required (0) |
-| `T2.stream.sensitivity_resize` | PASS | Sensitivity resize keeps resident cells (no interior regeneration) and settles to the reference at the new dm | ready cells 2375 before, 3936 on the resize frame (kept), settled objects 1625782 vs reference 1625782; batches 19 -> 36 |
-| `T2.stream.fail_closed` | PASS | Backend timeouts fail closed: affected cells are not drawn and release their ranges; no unwritten slot is ever drawn | 6 batches failed on purpose, 749 cells failed closed, 257418 slots drawn, 0 of them unwritten |
-| `T2.stream.responsive` | PASS | In flight with 3-frame backend phases: every cell Ready within 6 frames of entering; in steady flight every cell inside N_eff of an active level is Ready on every frame | galaxy at 1 kpc/s: latency <= 6 frames (measured 6.0), visible cells all Ready on 100.0% of frames, widest window N = 4, 10.0 levels suspended per frame, Update 3.91 ms, pool peak 1291318, alloc failures 0; galaxy at 10 kpc/s: latency <= 6 frames (measured 6.0), visible cells all Ready on 100.0% of frames, widest window N = 4, 13.0 levels suspended per frame, Update 1.04 ms, pool peak 629482, alloc failures 0; web at 10 Mpc/s: latency <= 6 frames (measured 6.0), visible cells all Ready on 100.0% of frames, widest window N = 3, 18.0 levels suspended per frame, Update 2.48 ms, pool peak 3696, alloc failures 0; web at 30 Mpc/s: latency <= 6 frames (measured 6.0), visible cells all Ready on 100.0% of frames, widest window N = 4, 19.0 levels suspended per frame, Update 4.52 ms, pool peak 5718, alloc failures 0; flythrough at 10 kpc/s: latency <= 6 frames (measured 6.0), visible cells all Ready on 100.0% of frames, widest window N = 4, 13.0 levels suspended per frame, Update 2.27 ms, pool peak 633189, alloc failures 0; steady-flight holes 0; holes in the 8 frames after a standing start 361 (reported, not required) |
-| `T2.stream.async_integrals` | PASS | Normalising integrals on worker threads: none computed on the calling thread, settled content identical to the reference | 0 integrals computed inline, up to 1 worker jobs at once; settled after 2563 frames; 3000 cells compared with the reference, 0 differ |
+| `T1.build.clang` | FAIL | Harness and UniCore build with clang++, -Wall -Wextra -Werror, C++17 | BUILD FAILED: /home/claude/uu-vol/Plugins/UnifiedUniverse/Tools/UniVerify/tests/test_stream.cpp:220:1: error: namespaces can only be defined in global or namespace scope | /home/claude/uu-vol/Plugins/UnifiedUniverse/Tools/UniVerify/tests/test_stream.cpp:240:1: error: function declared in block scope cannot have 'static' storage class | /home/claude/uu-vol/Plugins/UnifiedUniverse/Tools/UniVerify/tests/test_stream.cpp:241:1: error: function definition is not allowed here | /home/claude/uu-vol/Plugins/UnifiedUniverse/Tools/UniVerify/tests/test_stream.cpp:349:1: error: function declared in block scope cannot have 'static' storage class | /home/claude/uu-vol/Plugins/UnifiedUniverse/Tools/UniVerify/tests/test_stream.cpp:350:1: error: function definition is not allowed here | /home/claude/uu-vol/Plugins/UnifiedUniverse/Tools/UniVerify/tests/test_stream.cpp:403:2: error: expected '}' | 6 errors generated. | gmake[2]: *** [CMakeFiles/univerify.dir/build.make:202: CMakeFiles/univerify.dir/tests/test_stream.cpp.o] Error 1 |
 
 ## Tier 3 — rendering behaviour
 
 | Check | Result | Criterion | Measured |
 | --- | --- | --- | --- |
-| `T3.jitter` | PASS | Camera parked at 1e30 / 1e35 / 2^127 cm, 0.001 cm per frame for 100 frames: max screen error of static objects vs long-double reference < 0.01 px | 51300 samples (objects 10 cm .. 10^27 cm away, plus objects 10^9..10^14 cm away stored in L60/68/75 cells; 1920 px over 90 deg): worst error 2.63e-03 px, worst frame-to-frame jitter 1.11e-04 px. For the record, the design's hi/lo + float-offset form: 6.89e-05 px when cells match distance, 1.62e+04 px for near objects in coarse cells (D-104) |
-| `T3.ordering` | PASS | Compressed render depth order equals true distance order for 10^5 random pairs; per-depth compression shown to fail on the same set | 100000 pairs: radial f(r) reverses 0 (float ties 0); per-depth z compression misorders 2284; fixed layer compositing misorders 7 |
-| `T3.occlusion` | PASS | Synthetic promoted occluder: backdrop objects behind it are culled, objects in front kept, for all test placements | 20000 placements (3386 behind, 550 in front on the disc, 16064 beside), 0 wrong |
-| `T3.frames` | PASS | Reference stills written for visual inspection (galaxy interior x2, cosmic web) | still_galaxy_towards_centre: 9904 visible of 367374 resident; still_galaxy_out_of_plane: 1967 visible of 367374 resident; web dm+5: 65 visible of 63829 resident |
-| `T3.flythrough` | PASS | Scripted path 10^28 cm to 1 m from an object: 48-frame contact sheet; objects entering above the fade threshold = 0 (frames 1..N; frame 0 is the initial fill) | 2400 frames, 545902 objects entered residency, 0 above threshold (1% of a just-visible star), 0 with any non-zero intensity; target M = -4.38. [00 3.24 Gpc: 7 vis] [08 123 kpc: 9 vis] [16 14.8 ly: 2553 vis] [24 35.4 AU: 2549 vis] [32 2.004e+05 km: 0 vis] [40 7.4 km: 0 vis] [47 1 m: 0 vis]  |
-| `T3.sensitivity` | PASS | Global sensitivity sweep dm 0 -> +2.5 -> 0: no pops, no level blinks, visible count grows with dm | 120 frames: 3745207 entering objects, 0 pops, 0 level blinks; visible 9918 at dm 0, 259980 at dm +2.5, 9918 back at 0 |
-| `T3.images` | PASS | Reference frames and flythrough contact sheet converted to PNG with HUD (D-018) | 8 PNGs in Verification/images |
+| `T3.images` | PASS | Reference frames and flythrough contact sheet converted to PNG with HUD (D-018) | 9 PNGs in Verification/images |
 
 ## Tier 4 — Unreal integration (static only in this environment)
 
 | Check | Result | Criterion | Measured |
 | --- | --- | --- | --- |
-| `T4.static.core_subset` | PASS | Shader cores stay in the shared C++/HLSL subset (no swizzles, UNI_FN, f-suffixed literals, no textures) | 8 cores, 0 problems |
-| `T4.static.gpu_structs` | PASS | GPU-mirrored structs (marked // GPU-MIRROR) have a static_assert, size a multiple of 16 (lesson #20) | 7 GPU structs; missing assert: none; not 16-multiple: none |
+| `T4.static.core_subset` | PASS | Shader cores stay in the shared C++/HLSL subset (no swizzles, UNI_FN, f-suffixed literals, no textures) | 9 cores, 0 problems |
+| `T4.static.gpu_structs` | PASS | GPU-mirrored structs (marked // GPU-MIRROR) have a static_assert, size a multiple of 16 (lesson #20) | 9 GPU structs; missing assert: none; not 16-multiple: none |
 | `T4.static.ue_rules` | PASS | UE-facing rules: no UE includes in UniCore, render hooks only in UniRenderHooks.cpp, no absolute FVector | no problems |
-| `T0.report.unverified_listed` | PASS | Every unverified item is listed in REVIEW_TONIGHT.md | 8 unverified items; missing from REVIEW_TONIGHT: none |
+| `T0.report.unverified_listed` | PASS | Every unverified item is listed in REVIEW_TONIGHT.md | 9 unverified items; missing from REVIEW_TONIGHT: none |
 
 ## Images
 
 - [flythrough_contact_sheet.png](images/flythrough_contact_sheet.png)
+- [flythrough_volume_contact_sheet.png](images/flythrough_volume_contact_sheet.png)
 - [still_galaxy_out_of_plane.png](images/still_galaxy_out_of_plane.png)
 - [still_galaxy_towards_centre.png](images/still_galaxy_towards_centre.png)
 - [still_vol_galaxy_edgeon_30kpc.png](images/still_vol_galaxy_edgeon_30kpc.png)
@@ -90,7 +51,7 @@ Written by the session after looking at the images: [OBSERVATIONS.md](OBSERVATIO
 
 ## Regressions since the previous run
 
-- Regressed (PASS → FAIL): none
+- Regressed (PASS → FAIL): `T1.build.gcc`, `T1.build.clang`
 - Fixed (FAIL → PASS): none
 - New checks: none
 
@@ -106,3 +67,4 @@ Each item below must also appear in `Docs/REVIEW_TONIGHT.md` §3 with its ID. Th
 - **UE-6** — Flythrough in the editor: `uu.Flythrough` console command on an empty level shows the backdrop, with no jitter and no pops.
 - **UE-7** — Promotion handoff appearance: the reference renderer showed the sprite's glare far larger than the promoted body (OBSERVATIONS.md). In UE there is no promotion actor pool yet, so promoted stars stay sprites; check how the glare reads with real bloom.
 - **UE-8** — Runtime cost: GPU time of the generate / project / sprite passes, the one-time game-thread hitch of the normalising integral when entering a galaxy (D-123), and teleport fill latency (about 37 frames, D-122).
+- **UE-9** — The volume pass in the engine (Docs/VOLUMETRICS.md §8) is written but has never been compiled: UniVolume.usf (MarchCS, BackgroundCS, CompositeVS/PS), the sprite transmittance lookup, RenderVolume_RenderThread and the subsystem's per-frame volume scene. It must compile, show the galaxy glow and the dust lane matching the reference stills, and stay within budget (uu.Volume 0/1 to compare).

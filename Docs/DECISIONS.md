@@ -335,6 +335,76 @@ Rationale: Each item is a likely first-build or first-frame failure. The streame
 Reroll impact: None. Every change is render-path or protocol only. The generator emits the same objects (writes are gated by rank, and padding groups write nothing).
 Status: Provisional
 
+D-128 — The volume draws the complement of the drawn sprites
+Question: What does the volume pass draw, and how does it hand off to sprites without double counting or gaps?
+Decision: Per emitter, the volume carries each child's expected flux not drawn as a sprite: l(t) = Σ_s P_s (L̄_s − F_L(s) G_s(m_lim − μ(t))). That is integrated over each slice with the same Uni_SliceMagAt and Uni_ColourAt that placement draws with, times the field shape, N_total and the normalising integral generation uses. F_L means "the fraction of level L's sprites drawn". In the streamer a level must hold F_L = 0 until its window is filled (an amendment to D-116; not yet implemented in UniStreamer).
+Rationale: Sprites plus volume equal the total light at any distance, sensitivity, level fade or velocity LOD. T3.vol.conservation measured −0.16% / −0.14% / −0.10% at Δm = −1 / 0 / +2 over the whole sphere (z < 1).
+Reroll impact: None (render only).
+Status: Provisional
+
+D-129 — Carriers, and the sprite-to-carrier handoff
+Question: Which objects become marched volumes, and how does an object's own sprite hand over?
+Decision: A carrier is built on the CPU from each resident contributor, using its exact centre, rotation, rolled parameters and integral. The camera-local position comes from the exact 128-bit delta. One periodic carrier is added per root emitter. The cap is 64 carriers, ranked by angular size. The handoff weight w = smoothstep over angular radius [T1/2, T1], T1 = min(8 px, θ_promote), is shared: the object's sprite gets 1 − w and the carrier w · V · F_L. No screen tiling in v1. The carrier record is 112 B.
+Rationale: T3.vol.handoff: in-frame luminosity × d² is constant within 0.84% from 6 Mpc to 300 kpc, while the sprite's share goes from 100% to 0%.
+Reroll impact: None.
+Status: Provisional
+
+D-130 — Stepping: log-uniform with field step hints, interval union, prefiltering, supersampling
+Question: How is the march stepped so that it is accurate at every scale and bounded in cost?
+Decision:
+- s = clamp(0.08 t, ...), capped by each active carrier's Uni_FieldStepHint (galaxy: disc, arms, bulge length scales) and by interval boundaries. Nested carriers are marched over the union of their intervals.
+- Periodic fields blend to their mean once the pixel's transverse footprint is several feature scales wide. It must be the pixel footprint, not the step: the step is capped by the hint, so a step-based footprint never engaged.
+- Pixels whose centre ray hits a carrier whose finest feature (Uni_FieldResolveScale) is under half a pixel are supersampled, up to 8×8. Cost per carrier is about 1/(4 s²) rays.
+- Budget: 512 steps, reporting truncation. No jitter in v1.
+Rationale:
+- T3.vol.march: 0.8% worst against brute force, 85 steps per ray on average.
+- One ray per pixel mis-integrated small carriers by 12–17% (measured); with supersampling it is 0.84%.
+- Background: 500 → 107 steps per ray.
+Reroll impact: None.
+Status: Provisional
+
+D-131 — Horizon dimming
+Question: An endless toroidal universe has an infinite background (Olbers): the torus is about 10^10 mean free paths to a galaxy.
+Decision: Every flux, sprite and volume alike, is multiplied by D(r) = (1 + r / r_H)^−2 with r_H = c / H₀ = 1.37e28 cm. Visibility, relevance and level assignment use undimmed magnitudes. The background marches 0.1 Mpc to 0.5 periods (50 Mpc), then adds an analytic mean tail.
+Rationale: T3.vol.background: 27.43 mag/arcsec², matching the analytic estimate; changing the march extent from 0.5 to 2 periods changes it by < 0.01%.
+Reroll impact: None.
+Status: Provisional (owner: value of r_H)
+
+D-132 — Dust and transmittance slices
+Question: How do dust lanes attenuate the glow and the sprites behind them?
+Decision: The archetype has a render-only FVolumeProfile. The dust field is the galaxy field with a thinner disc (0.5 h), no bulge, arms shifted −0.35 rad, normalised to a face-on τ (0.6 for the demo), with reddening (0.8, 1.0, 1.3). The march writes transmittance at 8 slices uniform in ln t over 1 pc – 100 kpc. Sprites read it at their true distance.
+Rationale: The interior still shows the dark lane across the band. T3.vol.march checks τ within 0.0013. Known gap: a dusty galaxy's sprite does not carry its internal extinction (v1.1).
+Reroll impact: None.
+Status: Provisional (owner: slices in v1 or v2)
+
+D-133 — Luminosity budget validation
+Question: The volume makes a parent's own magnitude and its children's summed light visible side by side. Are they consistent?
+Decision: LuminosityBudget(model, archetype, M) computes the magnitude a parent's children add up to, and Validate should require agreement within 0.1 mag. Measured for the demo: 2e11 stars sum to M = −23.18, against the drawn −21.00 (7.4×). Fixing it is the owner's call: N_total = 2.69e10, a fainter stellar function, or NTotalRefMag. The checks use a corrected copy.
+Reroll impact: HIGH for the fix (star content). The check itself has no reroll impact.
+Status: Open (owner)
+
+D-134 — The carrier's normalising integral
+Question: A carrier needs the contributor's ∫ρ before any child cell exists.
+Decision: The prototype calls the same IntegralAll (D-115/D-123), so it shares D-123's one-time cost. In the engine, use a 64k-sample estimate until the full integral is cached (≤ 1% flux noise).
+Reroll impact: None.
+Status: Provisional
+
+D-135 — Sprite colour normalised by luminance
+Question: Sprite colour was normalised so the brightest channel is 1, so no channel of a sum of many coloured stars is conserved when they hand light to the volume.
+Decision: Radiance = colour / Y(colour) × intensity, where Y is Rec. 709 luminance. The intensity (from the V magnitude) is then the luminance, and sums conserve it exactly. The volume tables use the same normalisation.
+Rationale: Exact luminance conservation regardless of hue (T3.vol.handoff, T3.vol.conservation). The packed object colour is unchanged.
+Reroll impact: None. The colour of red stars brightens by 1/Y on screen (brightness is uncalibrated, lesson #36).
+Status: Provisional
+
+D-136 — Background direction map and separable composite
+Question: Marching the background (the web's unresolved galaxies) per pixel costs ~107 steps of the expensive web field, every frame, for light that is faint and has almost no parallax.
+Decision: The periodic carriers start at 0.1 Mpc, beyond every local carrier's chord. They are marched into a 6-layer direction map (256² per face, this core's own face convention so the CPU reference and the shader agree). Per pixel, B = B_near + T_near × B_map(dir). The map is re-marched, a few faces per frame, when the camera has moved a quarter texel's parallax at 0.1 Mpc (~3e20 cm) or the background's LUT has changed by more than 1%. In the engine T_near is luminance only.
+Rationale: T3.vol.cube: total 0.000% and 99th-percentile pixel ≤ 0.02% against the union march, inside the dusty galaxy and in intergalactic space, at 107 steps per texel once rather than per pixel per frame.
+Reroll impact: None.
+Status: Provisional
+
+D-128 (amendment, implemented) — In FUniStreamer a level's fade starts at 0 and cannot rise while its window is unbuilt or any of its cells is not Ready, so a filling level is drawn as glow and then fades in whole. T2.stream.volume_parity: 0 level-frames filling with a fade above 0, and the streamer's volume scene is byte-identical to the reference pipeline's.
+
 D-137 — A level waits for its parent levels only (amends the design's coarse-to-fine ordering)
 Question: Owner, first engine run: "galaxy movement level slow responsiveness at high speeds"; star pop-in inside the galaxy.
 Decision: A level builds its cells once the windows of its PARENT levels are Ready. A parent is a level that holds an archetype whose emitters place objects at this level. Levels fed only by root emitters (the web's galaxy levels) wait for nothing. Before, every level waited for every coarser level, so latency cascaded down the ladder.
@@ -367,4 +437,15 @@ Question: D-123 computes a contributor's field integral (about 2.4M field evalua
 Decision: The generator also caches the integral by contributor id; the id fixes the parameters, so the value is the same. The runtime streamer computes missing integrals on worker threads, at most 4 at a time. The UE module supplies its thread pool (AsyncTask); offline builds use a std::thread. Cells that need a missing integral stay Waiting until it arrives, and nothing else waits. Offline checks that count frames compute it inline, as before.
 Rationale: Flying past galaxies hitched about 0.2 s for each new galaxy and again for each reloaded one, which plausibly explains the "chunky" movement between galaxies. New check T2.stream.async_integrals: 0 integrals computed on the calling thread, and the settled content is identical to the reference in all 3,000 cells.
 Reroll impact: None. Same function, same values.
+Status: Provisional
+
+D-141 — Volumetrics: the fade hold counts visible cells only, and carriers wait for worker integrals (amends D-128 and D-140 on this branch)
+Question: After merging D-137–D-140, two volumetrics rules worked against them.
+- The D-128 fade hold kept a level's fade from rising while ANY cell in its window was generating. In a window widened for speed, the outer shell is almost always filling, so a level that had faded (after a teleport or a suspension) would stay as glow for as long as the camera kept moving.
+- The volume builder computed normalising integrals inline, on the game thread, for every carrier. A galaxy needs a carrier from its 4 px handoff onwards, Mpc away and long before its stars are requested, so the D-123 hitch would have come back.
+Decision:
+- The hold counts only cells within ceil(N_eff·k) of the window centre (Chebyshev), the only ones that can hold visible objects. At rest (N = 2) that is the whole window, the same as before.
+- The builder asks the streamer (FVolumeSource::IntegralReady). A missing integral starts the worker job and that carrier is skipped for those frames. The request comes at the start of the handoff ramp, where the carrier's weight is about 0. The reference pipeline still computes inline, so offline renders are unchanged.
+Rationale: T2.stream.volume_parity still holds: 0 hold violations, identical carriers and LUTs (at rest the rule is unchanged). The flight cases are covered by T2.stream.responsive.
+Reroll impact: None.
 Status: Provisional

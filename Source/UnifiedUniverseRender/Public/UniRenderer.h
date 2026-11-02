@@ -17,7 +17,9 @@
 
 #include "CoreMinimal.h"
 #include "RenderGraphResources.h"
+#include "RendererInterface.h"   // IPooledRenderTarget
 #include "UniStreamer.h"
+#include "UniVolume.h"
 
 #include <atomic>
 #include <memory>
@@ -37,6 +39,18 @@ struct FUniFrameData
 	float SceneColourScale = 1.0f; // exposure units -> scene colour (lesson #36), tuned in UE
 	bool bEnabled = false;
 	uint64 FrameNumber = 0;
+
+	// Volume pass (Docs/VOLUMETRICS.md, UniCore::FVolumeBuilder). Local carriers are marched per
+	// pixel; background (periodic) carriers into the direction map whenever BackgroundVersion
+	// changes (D-136). Parameters and LUT are shared by both.
+	bool bVolume = false;
+	TArray<UniCore::FCarrierGPU> VolumeCarriers;
+	TArray<UniCore::FCarrierGPU> BackgroundCarriers;
+	TArray<UniCore::FFieldParamsGPU> VolumeParams;
+	TArray<FVector4f> VolumeLut;
+	UniCore::FVolumeViewGPU VolumeView{};
+	float BackgroundStartCm = 3.0856775e23f;
+	uint32 BackgroundVersion = 0;
 };
 
 struct FUniRenderStats
@@ -46,6 +60,11 @@ struct FUniRenderStats
 	std::atomic<uint32> CellsLastFrame{ 0 };
 	std::atomic<uint32> GenBatchesCompleted{ 0 };
 	std::atomic<uint32> GenBatchesFailed{ 0 };
+	std::atomic<uint32> VolumeCarriersLastFrame{ 0 };
+	std::atomic<uint32> BackgroundFacesMarched{ 0 };
+	/** The last rendered view's angular pixel size (rad): the game thread builds the next
+	 *  frame's carriers with it (one frame late, harmless: it only sets handoff weights). */
+	std::atomic<float> ThetaPixelLastFrame{ 1.0f / 960.0f };
 };
 
 class UNIFIEDUNIVERSERENDER_API FUniRenderer
@@ -93,6 +112,13 @@ private:
 	TRefCountPtr<FRDGPooledBuffer> SlicesBuffer;
 	TRefCountPtr<FRDGPooledBuffer> LutBuffer;
 	bool bTablesDirty = true;
+
+	// Volume: the background direction map persists across frames (D-136); faces still to march.
+	TRefCountPtr<IPooledRenderTarget> BackgroundCube;
+	uint32 BackgroundVersionRT = ~0u;
+	uint32 BackgroundDirtyFaces = 0x3Fu;
+	void RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& View, const FScreenPassRenderTarget& Output,
+		FRDGTextureRef SceneDepth, const FIntRect& DepthViewRect, float PreExposure, FRDGTextureRef& OutSlices, FIntPoint& OutMarchSize);
 
 	// Promotion readbacks, a small ring so the render thread never waits on the GPU.
 	struct FPromoteReadback;

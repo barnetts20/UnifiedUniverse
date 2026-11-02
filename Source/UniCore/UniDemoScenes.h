@@ -88,6 +88,9 @@ namespace UniScenes
 			{ "Arms.Phase", 10, 0.0f, 6.2831853f, 1.0f, 0.0f },
 		};
 		A.Emitters.push_back(E);
+		// Render-only dust (D-132): placeholder, about the Milky Way's face-on A_V.
+		A.Volume.bDust = true;
+		A.Volume.DustTau = 0.6f;
 		return A;
 	}
 

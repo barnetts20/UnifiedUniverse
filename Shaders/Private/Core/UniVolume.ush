@@ -1,0 +1,375 @@
+// UniVolume.ush
+// Volumetric density raymarch (Docs/VOLUMETRICS.md, D-128..D-134). Shared by the GPU volume
+// pass (UniVolume.usf, M4) and the CPU reference renderer, like every core.
+//
+// WHAT IT DRAWS. The light the sprite pass does not: each carrier is an emitter (a galaxy's
+// stars, the web's galaxies) whose expected unresolved flux per child at distance t is a
+// per-frame LUT built on the CPU from the same slices, fades and draws placement uses
+// (UniVolume.h, D-128). Sprites + volume add up to the population's total light. Dust is the
+// same machinery with absorption (D-132).
+//
+// RAY. True distance t (cm) from the camera along the exact view direction. Radial
+// compression never enters: it changes neither the direction nor the integral. Each carrier
+// maps t to its own field units, p = CamLocal + t * InvRadius * Rot * d, with CamLocal from
+// the exact 128-bit delta on the CPU (D-104), so precision is relative to the carrier.
+//
+// STEPS (D-130, lesson #35). Log-uniform s = StepRatio * t, at least MinStepCm, capped by
+// every active carrier's field step hint (Uni_FieldStepHint) and by the next interval
+// boundary, so chords are marched exactly. Nested carriers are marched together over the
+// union of their intervals; gaps are skipped. Prefiltering: a periodic field whose pixel
+// footprint (t x theta_px) is several feature scales wide samples its mean instead. MaxSteps is a budget:
+// a march that hits it reports Truncated (a truncated march looks finished otherwise).
+//
+// OUTPUT. Radiance B in exposure units per steradian (the renderer multiplies by the pixel's
+// solid angle), RGB transmittance, the step count, and transmittance at UNI_VOL_SLICES
+// boundaries uniform in ln t, which the sprite pass reads to attenuate sprites behind dust.
+
+#ifndef UNI_VOLUME_USH
+#define UNI_VOLUME_USH
+
+#include "UniCoreDefs.ush"
+#include "UniFields.ush"
+#include "UniPhotometry.ush"
+
+static const uint UNI_VOL_LUT_SIZE = 256u;          // entries per emission LUT block
+static const float UNI_VOL_LN_T_LO = 34.538776f;    // ln(1e15 cm): below, entry 0
+static const float UNI_VOL_LN_T_HI = 71.383884f;    // ln(1e31 cm): above, last entry
+static const uint UNI_VOL_MAX_ACTIVE = 8u;          // carriers intersected by one ray
+static const uint UNI_VOL_SLICES = 8u;              // transmittance slices
+
+static const uint UNI_CARRIER_PERIODIC = 1u;        // root field: p = frac(...), unbounded chord
+static const uint UNI_CARRIER_DUST = 2u;            // has an absorbing field
+static const uint UNI_CARRIER_TAIL = 4u;            // add the analytic tail past TEnd (background)
+
+/** One marched volume. 112 bytes (UniCore::FCarrierGPU, static_assert). */
+struct FUniCarrier
+{
+	float3 CamLocal;        // camera in field units (periodic: in [0, 1))
+	float InvRadius;        // field units per cm (periodic: 1 / period)
+	float3 Rot0;            // world -> field rotation rows (the contributor's, lesson #1)
+	uint FieldId;
+	float3 Rot1;
+	uint ParamIndex;        // into the field-parameter buffer (emission field)
+	float3 Rot2;
+	uint LutIndex;          // emission LUT block; the tail block is LutIndex + 1
+	float Amplitude;        // flux units per sr per field unit, per unit density and LUT value
+	float Weight;           // handoff share x visibility x level fade (D-129)
+	uint Flags;
+	uint DustParamIndex;    // dust field parameters; D.y holds sigma per field unit at rho = 1
+	float MeanDensity;      // field mean (prefilter target, tail)
+	float FeatureScale;     // field units; 0 = never prefilter
+	float TStart;           // cm
+	float TEnd;             // cm (local carriers: the chord bounds it; periodic: march extent)
+	float ResolveScale;     // field units: smallest feature to resolve (supersampling)
+	float Pad0;
+	float Pad1;
+	float Pad2;
+};
+
+struct FUniVolumeView
+{
+	float StepRatio;        // k: s = k t
+	float MinStepCm;
+	uint MaxSteps;          // budget
+	uint NumCarriers;
+	float ThetaPixel;       // rad per pixel (prefilter footprint)
+	float SliceLnTLo;       // transmittance slices span [lo, hi] in ln t
+	float SliceLnTHi;
+	float Pad0;
+	float3 DustSigmaRgb;    // reddening: sigma per channel relative to sigma
+	float Pad1;
+};
+
+struct FUniVolumeResult
+{
+	float3 Radiance;        // exposure units per sr
+	float3 Transmittance;
+	uint Steps;
+	uint Truncated;         // 1: the budget ran out before the ray finished
+	uint Active;            // carriers intersected
+	uint Pad;
+	float3 SliceT[UNI_VOL_SLICES];
+};
+
+/** Emission LUT lookup: linear in ln t over UNI_VOL_LUT_SIZE entries. */
+UNI_FN float3 Uni_VolumeLut(StructuredBuffer<float4> InLut, uint InBlock, float InT)
+{
+	const float X = saturate((log(max(InT, 1.0f)) - UNI_VOL_LN_T_LO) / (UNI_VOL_LN_T_HI - UNI_VOL_LN_T_LO)) * (float)(UNI_VOL_LUT_SIZE - 1u);
+	const uint I0 = min((uint)X, UNI_VOL_LUT_SIZE - 2u);
+	const float F = X - (float)I0;
+	const float4 A = InLut[InBlock * UNI_VOL_LUT_SIZE + I0];
+	const float4 B = InLut[InBlock * UNI_VOL_LUT_SIZE + I0 + 1u];
+	return float3(A.x + (B.x - A.x) * F, A.y + (B.y - A.y) * F, A.z + (B.z - A.z) * F);
+}
+
+/** Carrier field point at distance t along world direction InDir. */
+UNI_FN float3 Uni_CarrierPoint(FUniCarrier InC, float3 InLocalDir, float InT)
+{
+	const float U = InT * InC.InvRadius;
+	const float3 P = float3(InC.CamLocal.x + U * InLocalDir.x, InC.CamLocal.y + U * InLocalDir.y, InC.CamLocal.z + U * InLocalDir.z);
+	if ((InC.Flags & UNI_CARRIER_PERIODIC) != 0u) { return frac(P); }
+	return P;
+}
+
+UNI_FN float3 Uni_CarrierLocalDir(FUniCarrier InC, float3 InDir)
+{
+	return float3(dot(InC.Rot0, InDir), dot(InC.Rot1, InDir), dot(InC.Rot2, InDir));
+}
+
+/** The carrier's interval along the ray, clipped to [TStart, min(TEnd, InTScene)]. Local
+ *  carriers are bounded by their unit ball (the influence sphere: every local field is zero
+ *  outside it). Returns false when the ray misses. */
+UNI_FN bool Uni_CarrierInterval(FUniCarrier InC, float3 InLocalDir, float InTScene, UNI_OUT(float) OutT0, UNI_OUT(float) OutT1)
+{
+	float T0 = InC.TStart;
+	float T1 = min(InC.TEnd, InTScene);
+	if ((InC.Flags & UNI_CARRIER_PERIODIC) == 0u)
+	{
+		const float B = dot(InC.CamLocal, InLocalDir);
+		const float C = dot(InC.CamLocal, InC.CamLocal) - 1.0f;
+		const float Disc = B * B - C;
+		if (Disc <= 0.0f) { OutT0 = 0.0f; OutT1 = 0.0f; return false; }
+		const float Sq = sqrt(Disc);
+		const float InvR = 1.0f / InC.InvRadius;
+		T0 = max(T0, (-B - Sq) * InvR);
+		T1 = min(T1, (-B + Sq) * InvR);
+	}
+	OutT0 = T0;
+	OutT1 = T1;
+	return T1 > T0;
+}
+
+UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
+	StructuredBuffer<FUniCarrier> InCarriers, StructuredBuffer<FUniFieldParams> InParams,
+	StructuredBuffer<float4> InLut, FUniVolumeView InView)
+{
+	FUniVolumeResult Res;
+	Res.Radiance = float3(0.0f, 0.0f, 0.0f);
+	Res.Transmittance = float3(1.0f, 1.0f, 1.0f);
+	Res.Steps = 0u;
+	Res.Truncated = 0u;
+	Res.Active = 0u;
+	Res.Pad = 0u;
+	for (uint K = 0u; K < UNI_VOL_SLICES; ++K) { Res.SliceT[K] = float3(1.0f, 1.0f, 1.0f); }
+
+	// Gather the carriers this ray intersects.
+	uint Act[UNI_VOL_MAX_ACTIVE];
+	float A0[UNI_VOL_MAX_ACTIVE];
+	float A1[UNI_VOL_MAX_ACTIVE];
+	float3 ADir[UNI_VOL_MAX_ACTIVE];
+	uint NA = 0u;
+	float TMin = 3.0e38f;
+	float TMax = 0.0f;
+	for (uint C = 0u; C < InView.NumCarriers; ++C)
+	{
+		const FUniCarrier Ca = InCarriers[C];
+		if (!(Ca.Weight > 0.0f) || NA >= UNI_VOL_MAX_ACTIVE) { continue; }
+		const float3 Ld = Uni_CarrierLocalDir(Ca, InDir);
+		float T0, T1;
+		if (!Uni_CarrierInterval(Ca, Ld, InTScene, T0, T1)) { continue; }
+		Act[NA] = C; A0[NA] = T0; A1[NA] = T1; ADir[NA] = Ld;
+		TMin = min(TMin, T0);
+		TMax = max(TMax, T1);
+		NA = NA + 1u;
+	}
+	Res.Active = NA;
+	if (NA == 0u) { return Res; }
+
+	const float SliceScale = (float)UNI_VOL_SLICES / max(InView.SliceLnTHi - InView.SliceLnTLo, 1.0e-3f);
+	uint NextSlice = 0u;
+	float3 SliceT[UNI_VOL_SLICES];
+	UNI_UNROLL
+	for (uint Ki = 0u; Ki < UNI_VOL_SLICES; ++Ki) { SliceT[Ki] = float3(1.0f, 1.0f, 1.0f); }
+	float T = TMin;
+	float3 Tr = float3(1.0f, 1.0f, 1.0f);
+	float3 B = float3(0.0f, 0.0f, 0.0f);
+	bool bDone = false;
+	UNI_LOOP
+	for (uint Step = 0u; Step < InView.MaxSteps; ++Step)
+	{
+		// Active set at T, the next interval boundary, and the step.
+		float Next = TMax;
+		float S = max(InView.StepRatio * T, InView.MinStepCm);
+		bool bAny = false;
+		for (uint I = 0u; I < NA; ++I)
+		{
+			if (T < A0[I]) { Next = min(Next, A0[I]); continue; }
+			if (T >= A1[I]) { continue; }
+			bAny = true;
+			Next = min(Next, A1[I]);
+			const FUniCarrier Ca = InCarriers[Act[I]];
+			const FUniFieldParams Par = InParams[Ca.ParamIndex];
+			const float3 P = Uni_CarrierPoint(Ca, ADir[I], T);
+			bool bHint = true;
+			if (Ca.FeatureScale > 0.0f)
+			{
+				// Prefiltered fields need no hint once the pixel footprint is past the blend.
+				bHint = T * InView.ThetaPixel * Ca.InvRadius < 4.0f * Ca.FeatureScale;
+			}
+			if (bHint) { S = min(S, Uni_FieldStepHint(Ca.FieldId, P, ADir[I], Par) / Ca.InvRadius); }
+		}
+		if (!bAny)
+		{
+			if (Next >= TMax) { bDone = true; break; }
+			T = Next;   // a gap between intervals: nothing to integrate
+			continue;
+		}
+		S = max(min(S, Next - T), 1.0e-6f * T);
+		const float Tm = T + 0.5f * S;
+
+		float3 E = float3(0.0f, 0.0f, 0.0f);      // emission over this step
+		float3 Tau = float3(0.0f, 0.0f, 0.0f);    // optical depth over this step
+		for (uint J = 0u; J < NA; ++J)
+		{
+			if (Tm < A0[J] || Tm >= A1[J]) { continue; }
+			const FUniCarrier Ca = InCarriers[Act[J]];
+			const FUniFieldParams Par = InParams[Ca.ParamIndex];
+			const float3 P = Uni_CarrierPoint(Ca, ADir[J], Tm);
+			const float Du = S * Ca.InvRadius;    // step in field units
+			float Rho;
+			float Blend = 0.0f;
+			if (Ca.FeatureScale > 0.0f)
+			{
+				// The pixel's transverse footprint, not the step: the step is capped by the hint,
+				// so a step-based footprint would never reach the blend.
+				const float Foot = Tm * InView.ThetaPixel * Ca.InvRadius;
+				Blend = saturate((Foot / Ca.FeatureScale - 1.0f) * (1.0f / 3.0f));
+			}
+			if (Blend < 1.0f)
+			{
+				Rho = Uni_FieldSample(Ca.FieldId, P, Par);
+				Rho = Rho + (Ca.MeanDensity - Rho) * Blend;
+			}
+			else
+			{
+				Rho = Ca.MeanDensity;
+			}
+			if (Rho > 0.0f)
+			{
+				const float3 L = Uni_VolumeLut(InLut, Ca.LutIndex, Tm);
+				const float K = (Ca.Amplitude * Ca.Weight * Rho) * Du;
+				E = E + L * K;
+			}
+			if ((Ca.Flags & UNI_CARRIER_DUST) != 0u)
+			{
+				const FUniFieldParams DPar = InParams[Ca.DustParamIndex];
+				const float Rd = Uni_FieldSample(Ca.FieldId, P, DPar);
+				if (Rd > 0.0f) { Tau = Tau + InView.DustSigmaRgb * (DPar.D.y * Rd * Du); }
+			}
+		}
+		// Exact within the step for constant emission and extinction.
+		const float3 Ex = float3(exp(-Tau.x), exp(-Tau.y), exp(-Tau.z));
+		const float3 W = float3(Tau.x > 1.0e-5f ? (1.0f - Ex.x) / Tau.x : 1.0f - 0.5f * Tau.x,
+			Tau.y > 1.0e-5f ? (1.0f - Ex.y) / Tau.y : 1.0f - 0.5f * Tau.y,
+			Tau.z > 1.0e-5f ? (1.0f - Ex.z) / Tau.z : 1.0f - 0.5f * Tau.z);
+		B = B + Tr * (E * W);
+		Tr = Tr * Ex;
+		T = T + S;
+		Res.Steps = Step + 1u;
+
+		// Transmittance slices: record T at every boundary passed. Static indices only (an
+		// unrolled compare per slice): FXC cannot address a struct-member or local array
+		// dynamically inside a [loop] without forcing an unroll.
+		const float SlicePos = (log(T) - InView.SliceLnTLo) * SliceScale;
+		UNI_UNROLL
+		for (uint Ks = 0u; Ks < UNI_VOL_SLICES; ++Ks)
+		{
+			if (Ks >= NextSlice && SlicePos >= (float)(Ks + 1u)) { SliceT[Ks] = Tr; }
+		}
+		NextSlice = max(NextSlice, (uint)clamp(floor(SlicePos), 0.0f, (float)UNI_VOL_SLICES));
+		if (T >= TMax) { bDone = true; break; }
+		if (max(Tr.x, max(Tr.y, Tr.z)) < 1.0e-3f) { bDone = true; break; }   // opaque
+	}
+	if (!bDone) { Res.Truncated = 1u; }
+	UNI_UNROLL
+	for (uint Kf = 0u; Kf < UNI_VOL_SLICES; ++Kf)
+	{
+		if (Kf >= NextSlice) { SliceT[Kf] = Tr; }
+		Res.SliceT[Kf] = SliceT[Kf];
+	}
+
+	// Background tail: past a periodic carrier's march extent its field is its mean, and the
+	// LUT's cumulative tail block gives the rest of the integral (D-131).
+	for (uint Q = 0u; Q < NA; ++Q)
+	{
+		const FUniCarrier Ca = InCarriers[Act[Q]];
+		if ((Ca.Flags & UNI_CARRIER_TAIL) == 0u || A1[Q] < Ca.TEnd || InTScene <= Ca.TEnd) { continue; }
+		const float3 Tail = Uni_VolumeLut(InLut, Ca.LutIndex + 1u, Ca.TEnd);
+		B = B + Tr * (Tail * ((Ca.Amplitude * Ca.Weight * Ca.MeanDensity) * Ca.InvRadius));
+	}
+	Res.Radiance = B;
+	Res.Transmittance = Tr;
+	return Res;
+}
+
+/** Rays per pixel axis this carrier needs (D-130): enough that its ResolveScale spans at least
+ *  half a pixel, capped at 8 x 8. Local carriers only (periodic fields prefilter instead).
+ *  The pass marches a pixel with the maximum over the carriers its centre ray intersects;
+ *  small carriers cover few pixels, so the cost per carrier is bounded (~1 / (4 s^2) rays). */
+UNI_FN uint Uni_CarrierSubsamples(FUniCarrier InC, float InThetaPixel)
+{
+	if ((InC.Flags & UNI_CARRIER_PERIODIC) != 0u || !(InC.ResolveScale > 0.0f)) { return 1u; }
+	const float Dist = max(sqrt(dot(InC.CamLocal, InC.CamLocal)), 1.0e-6f);   // field units
+	const float FeaturePx = InC.ResolveScale / Dist / InThetaPixel;
+	return (uint)clamp(ceil(0.5f / max(FeaturePx, 1.0e-6f)), 1.0f, 8.0f);
+}
+
+// ------------------------------------------------------------------------------------------
+// Background cube (D-136). The periodic (background) carriers start at 0.1 Mpc, beyond every
+// local carrier's chord, so their light is marched once into a direction map and composited
+// per pixel as B = B_near + T_near x B_cube(dir): exact where the intervals do not overlap.
+// The map is a 6-layer texture array with this file's own face convention (not the engine's
+// TextureCube), so the C++ reference and the shader agree by construction.
+// ------------------------------------------------------------------------------------------
+
+/** Face F's basis: forward (the face's axis), right, up. Faces: +X, -X, +Y, -Y, +Z, -Z. */
+UNI_FN void Uni_CubeFaceBasis(uint InFace, UNI_OUT(float3) OutF, UNI_OUT(float3) OutR, UNI_OUT(float3) OutU)
+{
+	const float S = ((InFace & 1u) == 0u) ? 1.0f : -1.0f;
+	const uint Axis = InFace >> 1u;
+	if (Axis == 0u) { OutF = float3(S, 0.0f, 0.0f); OutR = float3(0.0f, -S, 0.0f); OutU = float3(0.0f, 0.0f, 1.0f); }
+	else if (Axis == 1u) { OutF = float3(0.0f, S, 0.0f); OutR = float3(S, 0.0f, 0.0f); OutU = float3(0.0f, 0.0f, 1.0f); }
+	else { OutF = float3(0.0f, 0.0f, S); OutR = float3(0.0f, 1.0f, 0.0f); OutU = float3(-S, 0.0f, 0.0f); }
+}
+
+/** Direction through texel centre (InX, InY) of an InN x InN face (Y down). */
+UNI_FN float3 Uni_CubeTexelDir(uint InFace, float InX, float InY, float InN)
+{
+	float3 F, R, U;
+	Uni_CubeFaceBasis(InFace, F, R, U);
+	const float A = 2.0f * InX / InN - 1.0f;
+	const float B = 1.0f - 2.0f * InY / InN;
+	return normalize(F + R * A + U * B);
+}
+
+/** Face and continuous texel coordinates (texel centres at k + 0.5) of a direction. */
+UNI_FN uint Uni_CubeDirToFace(float3 InD, float InN, UNI_OUT(float) OutX, UNI_OUT(float) OutY)
+{
+	const float Ax = abs(InD.x), Ay = abs(InD.y), Az = abs(InD.z);
+	uint Face;
+	if (Ax >= Ay && Ax >= Az) { Face = InD.x >= 0.0f ? 0u : 1u; }
+	else if (Ay >= Az) { Face = InD.y >= 0.0f ? 2u : 3u; }
+	else { Face = InD.z >= 0.0f ? 4u : 5u; }
+	float3 F, R, U;
+	Uni_CubeFaceBasis(Face, F, R, U);
+	const float Fz = max(dot(InD, F), 1.0e-6f);
+	OutX = (dot(InD, R) / Fz + 1.0f) * 0.5f * InN;
+	OutY = (1.0f - dot(InD, U) / Fz) * 0.5f * InN;
+	return Face;
+}
+
+/** Transmittance at true distance InT from the slices (sprite pass): piecewise linear in ln t,
+ *  1 at the near end of the first slice. */
+UNI_FN float3 Uni_SliceTransmittance(float3 InSliceT[UNI_VOL_SLICES], float InT, FUniVolumeView InView)
+{
+	const float X = (log(max(InT, 1.0f)) - InView.SliceLnTLo) * (float)UNI_VOL_SLICES / max(InView.SliceLnTHi - InView.SliceLnTLo, 1.0e-3f);
+	if (X <= 0.0f) { return float3(1.0f, 1.0f, 1.0f); }
+	if (X >= (float)UNI_VOL_SLICES) { return InSliceT[UNI_VOL_SLICES - 1u]; }
+	const uint I = (uint)X;
+	const float F = X - (float)I;
+	const float3 Lo = (I == 0u) ? float3(1.0f, 1.0f, 1.0f) : InSliceT[I - 1u];
+	const float3 Hi = InSliceT[I];
+	return Lo + (Hi - Lo) * F;
+}
+
+#endif // UNI_VOLUME_USH

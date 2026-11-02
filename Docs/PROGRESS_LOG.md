@@ -35,13 +35,26 @@ Append only. One entry per step start, finish, block, or commit. Times in the ow
 | 12:09 | P6 | done (stretch 1) | Global sensitivity: new checks T3.sensitivity, T2.stream.sensitivity_resize caught blink/regenerate-on-resize; fixed (D-126). Ping shell not started |
 | 12:19 | P5 | decision D-127 | UE review fixes applied: B1, B2, B4, B5, R1, R2/W5, R3, R4, W1, W2, W3, W4, W6, S1. New check T2.stream.fail_closed. Uncompiled (UE-1/3/5) |
 | 12:24 | END | done (gate green) | Final verify_all: 42 checks, 0 failed (new: T2.stream.fail_closed). Committed; zip and patches packaged for D:\Projects\vxl |
+| 14:46 | VOL | start | Owner (on phone): "devise our density raymarching scheme". Branch uu/volumetrics on top of day 1 |
+| 15:00 | VOL | note | Design draft Docs/VOLUMETRICS.md (also in the claude.ai project). Found the demo luminosity budget mismatch: 2e11 stars = M −23.18 vs drawn −21.00 (D-133) |
+| 15:20 | VOL | note | UniVolume.ush core, UniVolume.h builder, reference renderer. T3.vol.march green after tightening galaxy step hints (2.5% → 0.8%); T3.vol.conservation green first time (≤ 0.17%) |
+| 15:30 | VOL | note | Handoff check caught one-ray-per-pixel mis-integration of sub-pixel carriers (12–17%) → supersampling by ResolveScale (0.84%). Luminance-normalised colour (D-135) |
+| 15:45 | VOL | note | Flythrough with volume caught 93k truncated rays: background prefilter keyed on the capped step never engaged; background started at 1 pc. Fixed (D-130, D-131): 0 truncated, 124 steps/ray |
+| 15:50 | VOL | decision D-128..D-135 | Volume scheme decisions recorded |
+| 16:46 | VOL | start | Owner: "Sure, and any tips on universe-level background density marching?" Tips sent; engine pass started |
+| 17:05 | VOL | note | Builder reads FVolumeSource (pipeline or streamer). Streamer fade-hold rule (D-128 amendment): T2.stream.volume_parity caught new levels ticking to 0.125 before their window existed; fixed |
+| 17:15 | VOL | note | Background direction map + separable composite (D-136): T3.vol.cube 0.000% total, p99 ≤ 0.02% |
+| 17:30 | VOL | note | Engine pass written (UniVolume.usf, sprite slices, RenderVolume_RenderThread, PushFrame, uu.Volume); independent review requested. Uncompiled (UE-9) |
+| 17:38 | VOL | done (gate green) | Review fixes applied (Uni_Luminance visibility, float32 radiance targets, FLinearColor clears, FXC-safe slices, LUT cost); gate 53/53; committed and packaged |
 | 17:45 | SAFE | start | Owner: stage things while away. Escape hatch, GPU parity test, triage sheet first (day-1 branch), then volume debug views, then a decision brief |
 | 17:48 | SAFE | note | uu.Shaders read-only cvar gates every shader's ShouldCompilePermutation; passes and batches skip and fail closed. UnifiedUniverse.Render.GpuParity (UE-4): GPU vs CPU streamer, cell by cell. Docs/BUILD_TRIAGE.md. GRHIGlobals guarded for < 5.3. Uncompiled |
-| 17:50 | SAFE | note | Log time for the 17:48 entry corrected to the clock (it had been stamped ahead) |
-| 17:58 | SAFE | note | Decision brief published (D-133, D-132, D-131, D-118 with offline renders); rendered by the volumetrics branch's UNI_BRIEF run |
+| 17:50 | SAFE | note | Log times for 17:30–17:48 corrected to the clock (two entries had been stamped ahead) |
+| 17:58 | SAFE | note | Decision brief published (D-133, D-132, D-131, D-118 with offline renders) |
 | 19:42 | CTRL | note | Owner: speed control is needed to test. Added uu.Fly (steerable free flight, WASD/QE, wheel x2/x0.5, any speed), uu.Speed, latched uu.Cruise (was ignored below 1e8 cm/s), HUD readout; InputCore dependency. Uncompiled |
 | 20:10 | UE57 | done (UE-1 compiles, shaders compile) | First engine build on UE 5.7: EVisibility/FEmitter clashed with engine globals (renamed EUniVisibility/FUniEmitter), fopen C4996 (UniFOpen), RHI/RenderCore link deps for the GPU parity test, DXC rejects ?: on structs (UniGen.usf). Owner confirms the galaxy renders |
 | 20:16 | IDEA | note | Owner idea recorded as Docs/BACKLOG.md B-001: warp streaks for late-loading stars, with Doppler tint; for the sprite-work milestone |
 | 21:05 | SPEED | note | Owner, first engine run: slow responsiveness at speed in the galaxy, chunky movement and frame lag between galaxies, star pop-in. Profiled offline with a 3-frame-per-phase backend: cascading coarse-to-fine waits (worst 36-132 frames), ~10 ms/frame of Gather in the web scene, a window margin sized for 1 frame of lag instead of ~6, and D-123's 0.2 s integral repeated per galaxy |
 | 21:40 | SPEED | done (offline) | D-137 parent-level gating, D-138 per-frame contributor distances, D-139 speed-widened windows (amends D-118), D-140 integrals cached by id and on worker threads (amends D-123). New T2.stream.responsive and T2.stream.async_integrals; gate 44/44. uu.Stats prints per-level state and latency. Needs UE (REVIEW_TONIGHT 8b) |
 | 21:45 | IDEA | note | Backlog B-002 (planets: orbital emitter, activation like promotion, Kepler in the shared core) and B-003 (promote at the glare/physical crossover; it lands at ~16-17 px for every star, just under theta_promote) |
+| 21:58 | MERGE | done (offline) | D-137-D-140 merged into volumetrics. D-141: the D-128 fade hold counts visible cells only, and volume carriers request worker integrals instead of computing them on the game thread. Gate 55/55 |
+| 22:05 | IDEA | note | Owner answers for B-002: on-rails orbits, real-time clock (configurable, maybe relativistic scaling later), no binaries in v1 (later: generated at the system level, one sprite resolving into its stars) |

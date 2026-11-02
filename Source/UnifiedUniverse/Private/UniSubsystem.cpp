@@ -71,6 +71,20 @@ void UUniSubsystem::EnableUniverse(const FString& Scene)
 	Generator = MakeUnique<UniCore::FRefGenerator>(*Model);
 	Backend = MakeUnique<FUniGpuGenBackend>();
 	Streamer = MakeUnique<UniCore::FUniStreamer>(*Generator, *Backend);
+	VolumeBuilder = MakeUnique<UniCore::FVolumeBuilder>(*Model, *Generator);
+	BackgroundLutLast.Reset();
+	++BackgroundVersion;
+	// D-133: the volume shows a parent's own magnitude and its children's summed light side by
+	// side; warn when they disagree (the demo galaxy does, by 2.18 mag).
+	for (const UniCore::FArchetype& A : Model->Definition().Archetypes)
+	{
+		if (A.Emitters.empty() || A.AbsMag.Pdf.empty()) { continue; }
+		const double Mc = VolumeBuilder->LuminosityBudget(A.Id, -21.0);
+		if (std::isfinite(Mc) && std::fabs(Mc + 21.0) > 0.1)
+		{
+			UE_LOG(LogUnifiedUniverse, Warning, TEXT("UnifiedUniverse: luminosity budget (D-133): a %s of M = -21 has children adding up to M = %.2f; its volume glow will not match its sprite."), UTF8_TO_TCHAR(A.Name.c_str()), Mc);
+		}
+	}
 	// D-140: normalising integrals (~0.2 s each, the first time a galaxy's stars are needed) run
 	// on the engine's background thread pool instead of hitching the game thread.
 	Streamer->RunJob = [](std::function<void()> InJob)
@@ -104,6 +118,7 @@ void UUniSubsystem::DisableUniverse()
 	FUniFrameData Off;
 	Off.bEnabled = false;
 	FUniRenderer::Get().SetFrame_GameThread(MoveTemp(Off));
+	VolumeBuilder.Reset();
 	Streamer.Reset();
 	Backend.Reset();       // flushes rendering commands: in-flight requests are released safely
 	Generator.Reset();
@@ -334,6 +349,49 @@ void UUniSubsystem::PushFrame()
 	F.ExposureBias = ExposureBias;
 	F.bEnabled = true;
 	F.FrameNumber = FrameCounter;
+	if (bVolume && VolumeBuilder)
+	{
+		// The carriers' handoff weights use the same view quantities as project-and-cull.
+		UniHlsl::FUniView V{};
+		V.LimitingMag = UniHlsl::Uni_LimitingMag(DeltaMag);
+		V.SurfaceLimit = UniHlsl::UNI_MU_REF + FMath::Clamp(DeltaMag, -5.0f, 5.0f);
+		V.ExposureMag = V.LimitingMag - 1.0f + ExposureBias;
+		V.ThetaPixel = FUniRenderer::Get().Stats.ThetaPixelLastFrame.load();
+		const UniCore::FCoord Cam = Camera.ToCore();
+		const UniCore::FVolumeSettings Settings;
+		const UniCore::FVolumeScene Sc = VolumeBuilder->Build(*Streamer, Cam, UniCore::FVec3f{ CameraFraction.X, CameraFraction.Y, CameraFraction.Z }, V, Settings);
+		for (const UniCore::FCarrierGPU& C : Sc.Carriers)
+		{
+			((C.Flags & UniHlsl::UNI_CARRIER_PERIODIC) ? F.BackgroundCarriers : F.VolumeCarriers).Add(C);
+		}
+		F.VolumeParams.Append(Sc.Params.data(), int32(Sc.Params.size()));
+		F.VolumeLut.Reserve(int32(Sc.Lut.size()));
+		for (const UniHlsl::float4& L : Sc.Lut) { F.VolumeLut.Add(FVector4f(L.x, L.y, L.z, L.w)); }
+		F.VolumeView = Sc.View;
+		F.BackgroundStartCm = float(Settings.BackgroundStartCm);
+		F.bVolume = true;
+
+		// Re-march the background map (D-136) when the camera has moved a quarter texel's
+		// parallax at the background's start, or its LUT has changed by more than 1%.
+		static IConsoleVariable* CVarBgSize = IConsoleManager::Get().FindConsoleVariable(TEXT("uu.BackgroundSize"));
+		const double TexelRad = 2.0 / double(FMath::Max(CVarBgSize ? CVarBgSize->GetInt() : 256, 16));
+		const UniCore::FVec3d Moved = UniCore::ToDouble(UniCore::Sub(Cam, BackgroundAnchor));
+		bool bDirty = BackgroundLutLast.Num() != F.VolumeLut.Num() || FMath::Sqrt(Moved.X * Moved.X + Moved.Y * Moved.Y + Moved.Z * Moved.Z) > 0.25 * TexelRad * Settings.BackgroundStartCm;
+		// Only the background's own LUT blocks (emission and tail) matter here.
+		for (const UniCore::FCarrierGPU& C : F.BackgroundCarriers)
+		{
+			for (uint32 Blk = C.LutIndex; Blk <= C.LutIndex + 1u && !bDirty; ++Blk)
+			{
+				for (int32 I = int32(Blk * UniHlsl::UNI_VOL_LUT_SIZE); !bDirty && I < int32((Blk + 1u) * UniHlsl::UNI_VOL_LUT_SIZE) && I < F.VolumeLut.Num(); ++I)
+				{
+					const FVector4f A = F.VolumeLut[I], B = BackgroundLutLast[I];
+					bDirty = FMath::Abs(A.Y - B.Y) > 0.01f * FMath::Max(FMath::Abs(B.Y), 1.0e-30f);
+				}
+			}
+		}
+		if (bDirty) { ++BackgroundVersion; BackgroundAnchor = Cam; BackgroundLutLast = F.VolumeLut; }
+		F.BackgroundVersion = BackgroundVersion;
+	}
 	FUniRenderer::Get().SetFrame_GameThread(MoveTemp(F));
 }
 
@@ -347,6 +405,8 @@ void UUniSubsystem::LogStats() const
 		uint64(S.CellsReady), uint64(S.CellsPending), uint64(S.PoolUsed), Backend ? Backend->PoolCapacity() : 0u,
 		uint64(S.Batches), R.GenBatchesCompleted.load(), R.GenBatchesFailed.load(), uint64(S.Regenerations), uint64(S.MaxGather),
 		uint64(S.AllocFailures), uint64(S.MaxLatencyFrames), R.CellsLastFrame.load(), R.PromoteCandidatesLastFrame.load(), *Camera.ToHexString());
+	UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: volume %s | %u local carriers last frame | background faces marched %u | LUT rebuilds %llu"),
+		bVolume ? TEXT("on") : TEXT("off"), R.VolumeCarriersLastFrame.load(), R.BackgroundFacesMarched.load(), uint64(VolumeBuilder ? VolumeBuilder->LutRebuilds : 0));
 	// Per level, coarse first (D-137/D-139): how full each window is, how wide, and whether
 	// velocity LOD has suspended it. "parents" is how many levels it waits for.
 	UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: generation latency %.1f frames (submit to ready)"), Streamer->LatencyFrames());
@@ -376,6 +436,12 @@ namespace
 		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
 		{
 			if (UUniSubsystem* S = Sub(World)) { S->EnableUniverse(Args.Num() ? Args[0] : FString()); }
+		}));
+
+	FAutoConsoleCommandWithWorldAndArgs CmdVolume(TEXT("uu.Volume"), TEXT("uu.Volume <0|1>: the volume pass (unresolved glow, dust, background)."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
+		{
+			if (UUniSubsystem* S = Sub(World)) { S->SetVolumeEnabled(Args.Num() ? FCString::Atoi(*Args[0]) != 0 : !S->IsVolumeEnabled()); }
 		}));
 
 	FAutoConsoleCommandWithWorldAndArgs CmdDisable(TEXT("uu.Disable"), TEXT("Stop the universe."),

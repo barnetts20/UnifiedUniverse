@@ -320,7 +320,15 @@ namespace UniCore
 				if (bSusp) { Lv.bHeld = true; }
 				else if (Lv.bHeld && bJump && Lv.Fade > 0.0f) { bSusp = true; }
 				else { Lv.bHeld = false; }
-				Lv.Fade = bSusp ? std::max(0.0f, Lv.Fade - 0.125f) : std::min(1.0f, Lv.Fade + 0.125f);
+				// D-128: the fade is "the fraction of this level's sprites drawn", which the volume
+				// complements, so it cannot rise while visible cells are still generating (they draw
+				// nothing): a filling level shows as glow, then fades in whole. D-139 amendment: only
+				// cells that can hold visible objects count, those within ceil(N_eff k) of the
+				// window centre. At rest (N = 2) that is the whole window, as before; in a window
+				// widened for speed, the outer shell (beyond relevance by assignment) still filling
+				// no longer holds the fade at 0 for as long as the camera keeps moving.
+				const float Up = (Lv.Win.IsValid() && VisibleReady(Lv)) ? 0.125f : 0.0f;   // an unbuilt window is not "ready"
+				Lv.Fade = bSusp ? std::max(0.0f, Lv.Fade - 0.125f) : std::min(1.0f, Lv.Fade + Up);
 				if (bSusp && Lv.Win.IsValid()) { continue; }
 
 				// D-126: a sensitivity resize keeps every cell still in the window, Ready ones
@@ -454,13 +462,33 @@ namespace UniCore
 			return Out;
 		}
 
+		// Volume inputs (UniVolume.h, FVolumeSource): resident contributors, the parent object a
+		// contributor came from, and level fades.
+		const std::map<u32, FContributor>& Contributors() const { return Registered; }
+		float LevelFade(int L) const { auto It = Levels.find(L); return It == Levels.end() ? 0.0f : It->second.Fade; }
+		const FObjectGPU* FindObject(const FObjectId& Id) const
+		{
+			auto Lt = Levels.find(Id.Cell.Level);
+			if (Lt == Levels.end()) { return nullptr; }
+			auto It = Lt->second.Cells.find(Id.Cell);
+			if (It == Lt->second.Cells.end() || It->second.State != ECellState::Ready) { return nullptr; }
+			for (const FCellContent* C : { &It->second.Readback, &It->second.Anchors })
+			{
+				for (size_t I = 0; I < C->Indices.size() && I < C->Objects.size(); ++I) { if (C->Indices[I] == Id.Index) { return &C->Objects[I]; } }
+			}
+			return nullptr;
+		}
+		/** D-140 for the volume builder: true if C's normalising integral is known; otherwise starts
+		 *  its worker job (once) and returns false, so the carrier waits instead of hitching. */
+		bool RequestIntegral(const FContributor& C) const { return IntegralReady(C); }
+
 	private:
 		struct FLevel
 		{
 			explicit FLevel(int L) : Win(L, UniHlsl::UNI_WINDOW_N) {}
 			FLevelWindow Win;
 			FVelocityLod Lod;
-			float Fade = 1.0f;
+			float Fade = 0.0f;   // D-128: fades in once the first fill is Ready
 			bool bHeld = false;
 			std::unordered_map<FCellKey, FCell, FCellKeyHasher> Cells;
 			std::vector<int> Parents;      // D-137: levels whose objects can be contributors here
@@ -471,6 +499,21 @@ namespace UniCore
 		static bool LevelReady(const FLevel& Lv)
 		{
 			for (const auto& KV : Lv.Cells) { if (KV.second.State != ECellState::Ready && KV.second.State != ECellState::Failed) { return false; } }
+			return true;
+		}
+
+		/** D-128 with the D-139 amendment: every cell within ceil(N_eff k) of the window centre
+		 *  (Chebyshev, in cells) is Ready or Failed. */
+		bool VisibleReady(const FLevel& Lv) const
+		{
+			const FWindowGeometry& G = Lv.Win.Geometry();
+			const double SensScale = double(UniHlsl::Uni_SensitivityScale(float(DeltaMag)));
+			const int64_t R = int64_t(std::ceil(double(UniHlsl::UNI_WINDOW_N_EFF) * SensScale - 1.0e-5));
+			for (const auto& KV : Lv.Cells)
+			{
+				if (KV.second.State == ECellState::Ready || KV.second.State == ECellState::Failed) { continue; }
+				if (CentreJump(G, KV.first) <= R) { return false; }
+			}
 			return true;
 		}
 
@@ -618,7 +661,7 @@ namespace UniCore
 
 		/** D-140: true if Ct's integral is known (or will be computed inline); otherwise starts
 		 *  (or keeps) a worker job for it and returns false. */
-		bool IntegralReady(const FContributor& Ct)
+		bool IntegralReady(const FContributor& Ct) const
 		{
 			if (!bAsyncIntegrals || Gen.HasIntegral(Ct)) { return true; }
 			if (!IntegralJobs.count(Ct.Id) && IntegralJobs.size() < MaxIntegralJobs)
@@ -806,7 +849,7 @@ namespace UniCore
 		u64 FrameNo = 0;
 		double LatencyEst = 6.0;   // D-139: frames, submit to Ready; starts at the GPU's order
 		struct FIntegralJob { std::atomic<bool> bDone{ false }; double Value = 0.0; };
-		std::map<u32, std::shared_ptr<FIntegralJob>> IntegralJobs;   // D-140
+		mutable std::map<u32, std::shared_ptr<FIntegralJob>> IntegralJobs;   // D-140 (mutable: the volume builder requests jobs through a const streamer)
 		size_t BatchesSubmitted = 0, Regenerations = 0, MaxGather = 0, AllocFailures = 0, MaxLatency = 0;
 	};
 }

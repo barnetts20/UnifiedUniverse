@@ -43,8 +43,12 @@ def main():
         img.save(os.path.join(dst, name + ".png"), optimize=True)
         stills.append(name)
 
-    frames = sorted(glob.glob(os.path.join(src, "fly_*.ppm")))
-    if frames:
+    n_frames = 0
+    for prefix, out in (("fly_", "flythrough_contact_sheet.png"), ("volfly_", "flythrough_volume_contact_sheet.png")):
+        frames = sorted(glob.glob(os.path.join(src, prefix + "*.ppm")))
+        if not frames:
+            continue
+        n_frames += len(frames)
         tiles = []
         for ppm in frames:
             hud = json.load(open(ppm[:-4] + ".hud.json"))["lines"]
@@ -55,8 +59,8 @@ def main():
         sheet = Image.new("RGB", (cols * w + (cols + 1) * 2, rows * h + (rows + 1) * 2), (40, 40, 48))
         for i, t in enumerate(tiles):
             sheet.paste(t, (2 + (i % cols) * (w + 2), 2 + (i // cols) * (h + 2)))
-        sheet.save(os.path.join(dst, "flythrough_contact_sheet.png"), optimize=True)
-    print(f"{len(stills)} stills, {len(frames)} flythrough frames -> {dst}")
+        sheet.save(os.path.join(dst, out), optimize=True)
+    print(f"{len(stills)} stills, {n_frames} flythrough frames -> {dst}")
 
 
 if __name__ == "__main__":

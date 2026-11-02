@@ -164,6 +164,16 @@ namespace UniCore
 		bool bRandomOrientation = true;
 	};
 
+	/** Render-only volume appearance of an archetype (Docs/VOLUMETRICS.md, D-132). Never read by
+	 *  generation: changing it changes no content. */
+	struct FVolumeProfile
+	{
+		bool bDust = false;
+		float DustTau = 0.0f;           // face-on optical depth through the centre (V band)
+		float DustHeightRatio = 0.5f;   // dust scale height / stellar scale height
+		float DustArmPhase = -0.35f;    // rad: dust lanes on the inner (trailing) edge of the arms
+	};
+
 	struct FArchetype
 	{
 		u32 Id = 0;                           // stable, never reused
@@ -175,6 +185,7 @@ namespace UniCore
 		double ThetaMin = UniHlsl::UNI_THETA_MIN;
 		std::vector<FUniEmitter> Emitters;
 		bool bDefaultsOnly = false;          // lesson #16
+		FVolumeProfile Volume;               // render only
 
 		double RadiusMaxCm(double M) const
 		{

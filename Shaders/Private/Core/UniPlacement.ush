@@ -211,12 +211,21 @@ UNI_FN float Uni_LutSample(StructuredBuffer<float> InLut, uint InBase, uint InCo
  *  visible beyond its level's window, which is a pop. The bright bound carries a margin of one
  *  half-float step (the record stores M as half; rounding to nearest moves it by at most half a
  *  step, 0.008 mag for |M| < 32). */
+/** Absolute magnitude at quantile U of a slice. Placement draws U from the object seed
+ *  (Uni_DrawAbsMag); the volume's unresolved-light tables integrate over U with this same
+ *  function, so both see one distribution (lesson #1, D-128). */
+UNI_FN float Uni_SliceMagAt(float InU, float InCdfLo, float InCdfHi, float InBrightM, float InFaintM,
+	StructuredBuffer<float> InInvCdf, uint InBase, uint InCount)
+{
+	const float M = Uni_LutSample(InInvCdf, InBase, InCount, InCdfLo + InU * (InCdfHi - InCdfLo));
+	return clamp(M, InBrightM + 0.016f, max(InFaintM, InBrightM + 0.016f));
+}
+
 UNI_FN float Uni_DrawAbsMag(uint InObjectSeed, float InCdfLo, float InCdfHi, float InBrightM, float InFaintM,
 	StructuredBuffer<float> InInvCdf, uint InBase, uint InCount)
 {
 	const float U = Uni_DrawUnit(InObjectSeed, UNI_CH_MAG, 0u);
-	const float M = Uni_LutSample(InInvCdf, InBase, InCount, InCdfLo + U * (InCdfHi - InCdfLo));
-	return clamp(M, InBrightM + 0.016f, max(InFaintM, InBrightM + 0.016f));
+	return Uni_SliceMagAt(U, InCdfLo, InCdfHi, InBrightM, InFaintM, InInvCdf, InBase, InCount);
 }
 
 /** log2 of physical radius in cm: log10 R = A + B (M - M0) + S (2u - 1). */
@@ -228,11 +237,16 @@ UNI_FN float Uni_DrawRadiusLog2(uint InObjectSeed, float InAbsMag, float4 InRadi
 }
 
 /** Colour temperature from magnitude: log10 T = A + B (M - M0), plus scatter. */
+/** Colour at scatter quantile U (shared with the volume's tables, as Uni_SliceMagAt). */
+UNI_FN float3 Uni_ColourAt(float InU, float InAbsMag, float4 InColourModel)
+{
+	const float Log10T = InColourModel.x + InColourModel.y * (InAbsMag - InColourModel.z) + InColourModel.w * (2.0f * InU - 1.0f);
+	return Uni_TemperatureColour(pow(10.0f, Log10T));
+}
+
 UNI_FN float3 Uni_DrawColour(uint InObjectSeed, float InAbsMag, float4 InColourModel)
 {
-	const float U = Uni_DrawUnit(InObjectSeed, UNI_CH_COLOUR, 0u);
-	const float Log10T = InColourModel.x + InColourModel.y * (InAbsMag - InColourModel.z) + InColourModel.w * (2.0f * U - 1.0f);
-	return Uni_TemperatureColour(pow(10.0f, Log10T));
+	return Uni_ColourAt(Uni_DrawUnit(InObjectSeed, UNI_CH_COLOUR, 0u), InAbsMag, InColourModel);
 }
 
 /** Surface brightness of an extended source, mag / arcsec^2 (distance independent):

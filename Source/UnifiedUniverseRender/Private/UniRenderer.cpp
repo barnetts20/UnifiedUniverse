@@ -19,6 +19,11 @@
 
 static TAutoConsoleVariable<float> CVarUniSpriteExtent(TEXT("uu.SpriteExtent"), 3.0f, TEXT("Sprite quad half size in Gaussian sigmas."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<float> CVarUniGlare(TEXT("uu.GlareGain"), 0.35f, TEXT("Sprite footprint growth with flux."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<int32> CVarUniVolumeDivisor(TEXT("uu.VolumeDivisor"), 2, TEXT("Volume march resolution divisor (1 = full, 2 = half, 4 = quarter)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<int32> CVarUniBackgroundSize(TEXT("uu.BackgroundSize"), 256, TEXT("Background direction-map face size (texels)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<int32> CVarUniVolumeDebug(TEXT("uu.VolumeDebug"), 0, TEXT("Volume debug view (lesson #37): 0 off, 1 steps per ray (magenta = truncated), 2 coverage (R carriers, G supersampling, B truncated), 3 emission (log10 heat), 4 dust transmittance."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniVolumeDebugLogLo(TEXT("uu.VolumeDebugLogLo"), 0.0f, TEXT("uu.VolumeDebug 3: log10 radiance mapped to the bottom of the heat ramp (the ramp spans 6 decades)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<int32> CVarUniBackgroundFaces(TEXT("uu.BackgroundFacesPerFrame"), 2, TEXT("Background faces re-marched per frame while dirty (1..6)."), ECVF_RenderThreadSafe);
 
 namespace
 {
@@ -175,8 +180,168 @@ void FUniRenderer::Release_RenderThread()
 	SlicesBuffer.SafeRelease();
 	LutBuffer.SafeRelease();
 	PromoteRing.Empty();
+	BackgroundCube.SafeRelease();
+	BackgroundVersionRT = ~0u;
+	BackgroundDirtyFaces = 0x3Fu;
 	RenderFrame = FUniFrameData();
 	bTablesDirty = true;
+}
+
+void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& View, const FScreenPassRenderTarget& Output,
+	FRDGTextureRef SceneDepth, const FIntRect& DepthViewRect, float PreExposure, FRDGTextureRef& OutSlices, FIntPoint& OutMarchSize)
+{
+	const FUniFrameData& F = RenderFrame;
+	RDG_EVENT_SCOPE(GraphBuilder, "Uni.Volume");
+	const FIntRect OutRect = Output.ViewRect;
+	const FMatrix Proj = View.ViewMatrices.ComputeProjectionNoAAMatrix();   // post-TSR: unjittered (W2)
+	const float TanX = 1.0f / float(Proj.M[0][0]);
+	const float TanY = 1.0f / float(Proj.M[1][1]);
+	const int32 Div = FMath::Clamp(CVarUniVolumeDivisor.GetValueOnRenderThread(), 1, 8);
+	const FIntPoint MarchSize(FMath::Max(OutRect.Width() / Div, 1), FMath::Max(OutRect.Height() / Div, 1));
+	OutMarchSize = MarchSize;
+
+	// Shared inputs. The view's ThetaPixel is the march texel's, so prefiltering and
+	// supersampling follow the resolution actually marched.
+	UniCore::FVolumeViewGPU VV = F.VolumeView;
+	VV.ThetaPixel = 2.0f * TanX / float(MarchSize.X);
+	FRDGBufferRef ParamBuf = UploadStructured(GraphBuilder, TEXT("UniVolumeParams"), F.VolumeParams);
+	FRDGBufferRef LutBuf = UploadStructured(GraphBuilder, TEXT("UniVolumeLut"), F.VolumeLut);
+	auto FillCommon = [&](FUniVolumeCommonParameters& C, const TArray<UniCore::FCarrierGPU>& Carriers, const UniCore::FVolumeViewGPU& V)
+	{
+		TArray<UniCore::FVolumeViewGPU> One; One.Add(V);
+		One[0].NumCarriers = uint32(Carriers.Num());
+		C.InCarriers = GraphBuilder.CreateSRV(UploadStructured(GraphBuilder, TEXT("UniVolumeCarriers"), Carriers));
+		C.InParams = GraphBuilder.CreateSRV(ParamBuf);
+		C.InLut = GraphBuilder.CreateSRV(LutBuf);
+		C.InVolumeView = GraphBuilder.CreateSRV(UploadStructured(GraphBuilder, TEXT("UniVolumeView"), One));
+		C.ViewForward = FVector3f(View.GetViewDirection());
+		C.ViewRight = FVector3f(View.GetViewRight());
+		C.ViewUp = FVector3f(View.GetViewUp());
+		C.TanHalfFovX = TanX;
+		C.TanHalfFovY = TanY;
+		C.Pad0 = 0.0f;
+	};
+	FRHISamplerState* PointClamp = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+	const FIntPoint DepthExtent = SceneDepth->Desc.Extent;
+	// March pixel p (0..MarchSize) -> depth UV; output pixel (absolute) -> depth UV.
+	const FVector4f MarchToDepthUV(
+		float(DepthViewRect.Width()) / float(MarchSize.X) / float(DepthExtent.X), float(DepthViewRect.Height()) / float(MarchSize.Y) / float(DepthExtent.Y),
+		float(DepthViewRect.Min.X) / float(DepthExtent.X), float(DepthViewRect.Min.Y) / float(DepthExtent.Y));
+	const FVector2f OScale(float(DepthViewRect.Width()) / float(FMath::Max(OutRect.Width(), 1)) / float(DepthExtent.X),
+		float(DepthViewRect.Height()) / float(FMath::Max(OutRect.Height(), 1)) / float(DepthExtent.Y));
+	const FVector4f OutToDepthUV(OScale.X, OScale.Y,
+		float(DepthViewRect.Min.X) / float(DepthExtent.X) - float(OutRect.Min.X) * OScale.X,
+		float(DepthViewRect.Min.Y) / float(DepthExtent.Y) - float(OutRect.Min.Y) * OScale.Y);
+
+	// 1. Background direction map: re-march dirty faces, a few per frame (D-136).
+	const bool bBackground = F.BackgroundCarriers.Num() > 0;
+	const int32 CubeSize = FMath::Clamp(CVarUniBackgroundSize.GetValueOnRenderThread(), 16, 1024);
+	if (bBackground && (!BackgroundCube.IsValid() || BackgroundCube->GetDesc().Extent.X != CubeSize)) { BackgroundCube.SafeRelease(); BackgroundDirtyFaces = 0x3Fu; }
+	FRDGTextureRef Cube = nullptr;
+	if (bBackground)
+	{
+		if (!BackgroundCube.IsValid())
+		{
+			// Float32: radiance per steradian in exposure units overflows half floats (a galaxy disc
+			// is ~7e4 per sr at the default exposure; sensitivity and exposure scale it further).
+			const FRDGTextureDesc Desc = FRDGTextureDesc::Create2DArray(FIntPoint(CubeSize, CubeSize), PF_A32B32G32R32F, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV, 6);
+			Cube = GraphBuilder.CreateTexture(Desc, TEXT("UniBackgroundCube"));
+			AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(Cube), FLinearColor(0.0f, 0.0f, 0.0f, 0.0f));
+			BackgroundCube = GraphBuilder.ConvertToExternalTexture(Cube);
+		}
+		else
+		{
+			Cube = GraphBuilder.RegisterExternalTexture(BackgroundCube, TEXT("UniBackgroundCube"));
+		}
+		if (F.BackgroundVersion != BackgroundVersionRT) { BackgroundVersionRT = F.BackgroundVersion; BackgroundDirtyFaces = 0x3Fu; }
+		int32 Budget = FMath::Clamp(CVarUniBackgroundFaces.GetValueOnRenderThread(), 1, 6);
+		for (uint32 Face = 0; Face < 6 && Budget > 0; ++Face)
+		{
+			if (!(BackgroundDirtyFaces & (1u << Face))) { continue; }
+			FUniVolumeBackgroundCS::FParameters* P = GraphBuilder.AllocParameters<FUniVolumeBackgroundCS::FParameters>();
+			FillCommon(P->Common, F.BackgroundCarriers, F.VolumeView);
+			P->CubeSize = uint32(CubeSize);
+			P->FaceBase = Face;
+			P->OutCube = GraphBuilder.CreateUAV(Cube);
+			TShaderMapRef<FUniVolumeBackgroundCS> CS(GetGlobalShaderMap(View.GetFeatureLevel()));
+			FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Volume.Background face %u", Face), CS, P, FIntVector(FMath::DivideAndRoundUp(CubeSize, 8), FMath::DivideAndRoundUp(CubeSize, 8), 1));
+			BackgroundDirtyFaces &= ~(1u << Face);
+			--Budget;
+			Stats.BackgroundFacesMarched++;
+		}
+	}
+	else
+	{
+		Cube = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(FIntPoint(1, 1), PF_A32B32G32R32F, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV, 6), TEXT("UniBackgroundDummy"));
+		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(Cube), FLinearColor(0.0f, 0.0f, 0.0f, 0.0f));
+	}
+
+	// 2. March the local carriers at reduced resolution.
+	FRDGTextureRef VolumeTex = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(MarchSize, PF_A32B32G32R32F, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV), TEXT("UniVolume"));   // float32: see the cube
+	FRDGTextureRef Slices = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(MarchSize, PF_R16F, FClearValueBinding::White, TexCreate_ShaderResource | TexCreate_UAV, UniGpuLayout::VolumeSlices), TEXT("UniVolumeSlices"));
+	{
+		FUniVolumeMarchCS::FParameters* P = GraphBuilder.AllocParameters<FUniVolumeMarchCS::FParameters>();
+		FillCommon(P->Common, F.VolumeCarriers, VV);
+		P->InvDeviceZToWorldZTransform = FVector4f(View.InvDeviceZToWorldZTransform);
+		P->MarchToDepthUV = MarchToDepthUV;
+		P->SceneDepthTexture = SceneDepth;
+		P->SceneDepthSampler = PointClamp;
+		P->MarchSize = FUintVector2(uint32(MarchSize.X), uint32(MarchSize.Y));
+		P->DebugMode = uint32(FMath::Clamp(CVarUniVolumeDebug.GetValueOnRenderThread(), 0, 4));
+		P->DebugLogLo = CVarUniVolumeDebugLogLo.GetValueOnRenderThread();
+		P->OutVolume = GraphBuilder.CreateUAV(VolumeTex);
+		P->OutSlices = GraphBuilder.CreateUAV(Slices);
+		TShaderMapRef<FUniVolumeMarchCS> CS(GetGlobalShaderMap(View.GetFeatureLevel()));
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Volume.March %dx%d, %d carriers", MarchSize.X, MarchSize.Y, F.VolumeCarriers.Num()), CS, P, FComputeShaderUtils::GetGroupCount(MarchSize, 8));
+	}
+
+	// 3. Composite: upsample + background, additive into the output (before the sprites).
+	{
+		FUniVolumeCompositePassParameters* P = GraphBuilder.AllocParameters<FUniVolumeCompositePassParameters>();
+		FUniVolumeCompositeParameters& C = P->Composite;
+		FillCommon(C.Common, F.VolumeCarriers, VV);
+		C.InvDeviceZToWorldZTransform = FVector4f(View.InvDeviceZToWorldZTransform);
+		C.MarchToDepthUV = MarchToDepthUV;
+		C.SceneDepthTexture = SceneDepth;
+		C.SceneDepthSampler = PointClamp;
+		C.MarchSize = FUintVector2(uint32(MarchSize.X), uint32(MarchSize.Y));
+		C.OutRectMinSize = FVector4f(float(OutRect.Min.X), float(OutRect.Min.Y), float(OutRect.Width()), float(OutRect.Height()));
+		C.OutToDepthUV = OutToDepthUV;
+		C.SceneColourScale = FVector3f(F.SceneColourScale * PreExposure);
+		C.FocalPx = float(OutRect.Width()) * 0.5f / TanX;
+		C.CubeSize = bBackground ? uint32(CubeSize) : 1u;
+		C.bBackground = bBackground ? 1u : 0u;
+		C.BackgroundStartCm = F.BackgroundStartCm;
+		C.Pad1 = 0.0f;
+		C.DebugMode = uint32(FMath::Clamp(CVarUniVolumeDebug.GetValueOnRenderThread(), 0, 4));
+		C.DebugScale = 1.0f / FMath::Max(PreExposure, 1.0e-6f);
+		C.VolumeTexture = VolumeTex;
+		C.CubeTexture = Cube;
+		C.LinearClampSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+		P->RenderTargets[0] = FRenderTargetBinding(Output.Texture, ERenderTargetLoadAction::ELoad);
+		TShaderMapRef<FUniVolumeCompositeVS> VS(GetGlobalShaderMap(View.GetFeatureLevel()));
+		TShaderMapRef<FUniVolumeCompositePS> PS(GetGlobalShaderMap(View.GetFeatureLevel()));
+		GraphBuilder.AddPass(RDG_EVENT_NAME("Uni.Volume.Composite"), P, ERDGPassFlags::Raster,
+			[P, VS, PS, OutRect](FRHICommandList& RHICmdList)
+			{
+				RHICmdList.SetViewport(float(OutRect.Min.X), float(OutRect.Min.Y), 0.0f, float(OutRect.Max.X), float(OutRect.Max.Y), 1.0f);
+				FGraphicsPipelineStateInitializer Pso;
+				RHICmdList.ApplyCachedRenderTargets(Pso);
+				Pso.BlendState = TStaticBlendState<CW_RGB, BO_Add, BF_One, BF_One>::GetRHI();
+				Pso.RasterizerState = TStaticRasterizerState<FM_Solid, CM_None>::GetRHI();
+				Pso.DepthStencilState = TStaticDepthStencilState<false, CF_Always>::GetRHI();
+				Pso.BoundShaderState.VertexDeclarationRHI = GEmptyVertexDeclaration.VertexDeclarationRHI;
+				Pso.BoundShaderState.VertexShaderRHI = VS.GetVertexShader();
+				Pso.BoundShaderState.PixelShaderRHI = PS.GetPixelShader();
+				Pso.PrimitiveType = PT_TriangleList;
+				SetGraphicsPipelineState(RHICmdList, Pso, 0);
+				SetShaderParameters(RHICmdList, VS, VS.GetVertexShader(), P->Composite);
+				SetShaderParameters(RHICmdList, PS, PS.GetPixelShader(), P->Composite);
+				RHICmdList.DrawPrimitive(0, 1, 1);
+			});
+	}
+	OutSlices = Slices;
+	Stats.VolumeCarriersLastFrame = uint32(F.VolumeCarriers.Num());
 }
 
 void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& View, const FScreenPassRenderTarget& SceneColor,
@@ -214,6 +379,7 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 	const FIntRect OutRect = SceneColor.ViewRect;
 	const float PixelsPerRadian = float(OutRect.Width()) * 0.5f / TanX;
 	const float LimitingMag = 6.5f + FMath::Clamp(F.DeltaMag, -5.0f, 5.0f);   // UNI_M_REF + dm (UniPhotometry.ush)
+	Stats.ThetaPixelLastFrame = 1.0f / PixelsPerRadian;
 
 	{
 		FUniProjectCS::FParameters* P = GraphBuilder.AllocParameters<FUniProjectCS::FParameters>();
@@ -264,6 +430,16 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 		}
 	}
 
+	// Volume (D-128..D-136): drawn first so sprites can read its transmittance slices.
+	FRDGTextureRef VolumeSlices = nullptr;
+	FIntPoint MarchSize(1, 1);
+	if (F.bVolume) { RenderVolume_RenderThread(GraphBuilder, View, SceneColor, SceneDepth, DepthViewRect, PreExposure, VolumeSlices, MarchSize); }
+	if (!VolumeSlices)
+	{
+		VolumeSlices = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(FIntPoint(1, 1), PF_R16F, FClearValueBinding::White, TexCreate_ShaderResource | TexCreate_UAV, UniGpuLayout::VolumeSlices), TEXT("UniVolumeSlicesDummy"));
+		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(VolumeSlices), FLinearColor::White);
+	}
+
 	// Sprites, additive, into scene colour, tested against scene depth.
 	{
 		FUniSpritePassParameters* P = GraphBuilder.AllocParameters<FUniSpritePassParameters>();
@@ -285,6 +461,13 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 		P->Sprite.PixelsPerRadian = PixelsPerRadian;
 		P->Sprite.SceneDepthTexture = SceneDepth;
 		P->Sprite.SceneDepthSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+		P->Sprite.VolumeSlices = VolumeSlices;
+		P->Sprite.bVolume = F.bVolume ? 1u : 0u;
+		P->Sprite.SliceLnTLo = F.VolumeView.SliceLnTLo;
+		P->Sprite.SliceLnTHi = F.VolumeView.SliceLnTHi;
+		P->Sprite.OutToMarch = FVector4f(float(MarchSize.X) / float(FMath::Max(OutRect.Width(), 1)), float(MarchSize.Y) / float(FMath::Max(OutRect.Height(), 1)),
+			-float(OutRect.Min.X) * float(MarchSize.X) / float(FMath::Max(OutRect.Width(), 1)), -float(OutRect.Min.Y) * float(MarchSize.Y) / float(FMath::Max(OutRect.Height(), 1)));
+		P->Sprite.MarchSize = FUintVector2(uint32(MarchSize.X), uint32(MarchSize.Y));
 		P->DrawArgs = ArgsBuf;
 		P->RenderTargets[0] = FRenderTargetBinding(SceneColor.Texture, ERenderTargetLoadAction::ELoad);   // a render-targetable copy (R1)
 

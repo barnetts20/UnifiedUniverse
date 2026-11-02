@@ -15,6 +15,7 @@
 #include "UniGenRef.h"
 #include "UniStreamer.h"
 #include "UniDemoScenes.h"
+#include "UniVolume.h"
 
 int main()
 {
@@ -24,5 +25,7 @@ int main()
 	FCpuGenBackend B(G, 1024u * 1024u);
 	FUniStreamer S(G, B);
 	S.Update(UniScenes::SolarCamera());
-	return int(S.CellTable().size() > 1000000);
+	FVolumeBuilder VB(M, G);
+	const double Budget = LuminosityBudget(M, UniScenes::kGalaxy, -21.0);
+	return int(S.CellTable().size() > 1000000) + int(!(Budget < 0.0)) + int(VB.Table(UniScenes::kStar).Rows.empty());
 }

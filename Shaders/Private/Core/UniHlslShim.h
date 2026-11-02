@@ -50,6 +50,8 @@
 #define UNI_INOUT(T) T&
 #define UNI_OUT(T) T&
 #define UNI_PRECISE
+#define UNI_LOOP
+#define UNI_UNROLL
 
 namespace UniHlsl
 {

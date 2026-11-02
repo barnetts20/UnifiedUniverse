@@ -170,6 +170,53 @@ UNI_TEST(stream, fail_closed)
 			Uni::Fmt("%d batches failed on purpose, %zu cells failed closed, %zu slots drawn, %zu of them unwritten", Be.Failed, St.AllocFailures, Drawn, DrawnHidden));
 }
 
+#include "UniVolume.h"
+#include "../src/UniRenderRef.h"
+
+UNI_TEST(stream, volume_parity)
+{
+	// The volume scene the engine builds from the streamer equals the one univerify builds from
+	// the reference pipeline: same carriers (bytes), parameters and LUTs, once the streamer has
+	// settled. While a level fills, its fade may not rise (D-128): sprites of a filling level are
+	// not drawn, so the volume carries their light; counted over the whole fill.
+	FUniverseModel M(UniScenes::Flythrough());
+	FRefGenerator G(M);
+	FVolumeBuilder VB(M, G);
+	const FCoord Cam = UniScenes::SolarCamera();
+	FRefPipeline P(G);
+	P.bVelocityLod = false;
+	P.Update(Cam, FVec3f{});
+	FCpuGenBackend Be(G, 2097152u);
+	FUniStreamer S(G, Be);
+	S.bVelocityLod = false;
+	S.bAsyncIntegrals = false;   // frame-counted check: integrals inline (D-140)
+	long long HoldViolations = 0;
+	int Frames = 0;
+	for (; Frames < 80; ++Frames)
+	{
+		S.Update(Cam);
+		// During the first fill a level with any non-Ready cell must have fade 0 (it starts at 0
+		// and cannot rise until its window is complete).
+		for (const FUniStreamer::FLevelState& L : S.LevelStates()) { if (!L.bReady && L.Fade > 0.0f) { ++HoldViolations; if (std::getenv("UNI_DEBUG_HOLD")) { std::printf("frame %d level %d fade %.3f\n", Frames, L.Level, double(L.Fade)); } } }
+		if (S.AllReady() && Frames > 12) { break; }
+	}
+	for (int I = 0; I < 10; ++I) { S.Update(Cam); }
+	UniRender::FCamera Cm; Cm.Coord = Cam;
+	const H::FUniView V = Cm.View();
+	const FVolumeScene A = VB.Build(P, Cam, FVec3f{}, V);
+	const FVolumeScene B = VB.Build(S, Cam, FVec3f{}, V);
+	const bool bCarriers = A.Carriers.size() == B.Carriers.size() && (A.Carriers.empty() || std::memcmp(A.Carriers.data(), B.Carriers.data(), A.Carriers.size() * sizeof(FCarrierGPU)) == 0);
+	const bool bParams = A.Params.size() == B.Params.size() && (A.Params.empty() || std::memcmp(A.Params.data(), B.Params.data(), A.Params.size() * sizeof(FFieldParamsGPU)) == 0);
+	size_t LutDiff = 0;
+	for (size_t I = 0; I < std::min(A.Lut.size(), B.Lut.size()); ++I) { if (A.Lut[I].x != B.Lut[I].x || A.Lut[I].y != B.Lut[I].y || A.Lut[I].z != B.Lut[I].z) { ++LutDiff; } }
+	const bool bLut = A.Lut.size() == B.Lut.size() && LutDiff == 0;
+	Uni::Check(2, "T2.stream.volume_parity", "The volume scene built from the streamer (CPU backend, settled) equals the reference pipeline's: carriers and parameters byte-identical, LUTs identical; no filling level has a fade above 0 (D-128)")
+		.Metric("carriers", double(A.Carriers.size())).Metric("params", double(A.Params.size())).Metric("lut_diff", double(LutDiff)).Metric("frames", Frames).Metric("hold_violations", double(HoldViolations))
+		.Pass(bCarriers && bParams && bLut && !A.Carriers.empty() && HoldViolations == 0,
+			Uni::Fmt("%zu carriers (%s), %zu parameter blocks (%s), %zu LUT entries, %zu differ; streamer settled in %d frames; %lld level-frames filling with fade > 0",
+				A.Carriers.size(), bCarriers ? "identical" : "DIFFER", A.Params.size(), bParams ? "identical" : "DIFFER", A.Lut.size(), LutDiff, Frames, HoldViolations));
+}
+
 namespace
 {
 	/** CPU backend with GPU-like latency: each phase reports done LatFrames frames after it was

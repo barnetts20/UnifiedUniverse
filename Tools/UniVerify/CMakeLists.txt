@@ -21,6 +21,8 @@ target_include_directories(univerify PRIVATE
   ${UNI_ROOT}/Shaders/Private/Core
   ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_options(univerify PRIVATE -O2 -Wall -Wextra -Werror -Wno-unused-function -ffp-contract=off -fno-fast-math)
+find_package(Threads REQUIRED)
+target_link_libraries(univerify PRIVATE Threads::Threads)
 set_target_properties(univerify PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/build)
 
 # D-140: the streamer computes normalising integrals with std::async.

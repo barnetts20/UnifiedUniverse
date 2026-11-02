@@ -1,0 +1,251 @@
+// UniVolume.usf
+// The volume pass (Docs/VOLUMETRICS.md §8, D-128..D-136). Orchestration only: the march, the
+// carriers, the LUT lookup, the step rules, the supersampling rule and the cube face convention
+// are all in Core/UniVolume.ush, which the CPU reference runs (Tools/UniVerify, T3.vol.*).
+//
+//   UNI_VOL_PASS 0  MARCH (compute, reduced resolution): local carriers only. Writes radiance
+//                   (rgb, exposure units per sr) + luminance transmittance (a), and luminance
+//                   transmittance at UNI_VOL_SLICES boundaries for the sprite pass. Pixels whose
+//                   centre ray hits a carrier finer than half a pixel are supersampled
+//                   (Uni_CarrierSubsamples, up to 8 x 8).
+//   UNI_VOL_PASS 1  BACKGROUND (compute): periodic carriers into a 6-layer direction map, a few
+//                   faces per frame (the background starts at 0.1 Mpc: no parallax unless the
+//                   camera moves ~0.1 Mpc x theta_texel; the CPU decides when to re-march).
+//   UNI_VOL_PASS 2  COMPOSITE (full-screen triangle, additive): depth-aware upsample of the
+//                   march, plus T_near x background(dir), times the pixel's solid angle, into
+//                   the scene-colour copy the view extension made (before the sprites).
+//
+// DEBUG VIEWS (uu.VolumeDebug, lesson #37; exposure-independent false colour, no background):
+//   1 steps         mean steps per ray / MaxSteps as a heat ramp; truncated rays magenta
+//   2 coverage      red = carriers hit (/4), green = supersampling factor (/8), blue = truncated
+//   3 emission      log10 of the march's luminance radiance over [DebugLogLo, DebugLogLo + 6]
+//   4 transmittance near luminance transmittance (dust) as grey
+//
+// Structured buffers carry every struct, including the view (lesson #2: no constant buffer
+// mirroring a C++ layout). Each is mirrored in UniCore/UniVolume.h with a static_assert.
+
+#include "/Engine/Public/Platform.ush"
+#include "Core/UniVolume.ush"
+
+#ifndef UNI_VOL_PASS
+	#define UNI_VOL_PASS 0
+#endif
+
+StructuredBuffer<FUniCarrier> InCarriers;
+StructuredBuffer<FUniFieldParams> InParams;
+StructuredBuffer<float4> InLut;
+StructuredBuffer<FUniVolumeView> InVolumeView;
+
+float3 ViewForward;
+float TanHalfFovX;
+float3 ViewRight;
+float TanHalfFovY;
+float3 ViewUp;
+float Pad0;
+
+/** Unit view direction through a pixel of a W x H grid covering the view (same as the CPU
+ *  reference's PixelDir). */
+/** Blue -> cyan -> green -> yellow -> red over [0, 1]. */
+float3 DebugHeat(float InX)
+{
+	const float X = saturate(InX) * 4.0f;
+	if (X < 1.0f) { return float3(0.0f, X, 1.0f); }
+	if (X < 2.0f) { return float3(0.0f, 1.0f, 2.0f - X); }
+	if (X < 3.0f) { return float3(X - 2.0f, 1.0f, 0.0f); }
+	return float3(1.0f, 4.0f - X, 0.0f);
+}
+
+float3 PixelDir(float2 InPx, float2 InSize)
+{
+	const float Nx = (InPx.x / InSize.x - 0.5f) * 2.0f * TanHalfFovX;
+	const float Ny = (0.5f - InPx.y / InSize.y) * 2.0f * TanHalfFovY;
+	return normalize(ViewForward + ViewRight * Nx + ViewUp * Ny);
+}
+
+#if UNI_VOL_PASS == 0 || UNI_VOL_PASS == 2
+
+float4 InvDeviceZToWorldZTransform;
+float4 MarchToDepthUV;     // march pixel coordinate -> scene-depth UV: uv = p * xy + zw
+Texture2D SceneDepthTexture;
+SamplerState SceneDepthSampler;
+
+/** True distance along the ray to the scene surface at a depth UV (the sprite pass's rule,
+ *  with the reverse-Z sky guard, W1). */
+float SceneDistanceAtUV(float2 InUV, float InCosToForward)
+{
+	const float DeviceZ = SceneDepthTexture.SampleLevel(SceneDepthSampler, InUV, 0).r;
+	if (DeviceZ <= 0.0f) { return 3.0e38f; }
+	const float ViewZ = DeviceZ * InvDeviceZToWorldZTransform[0] + InvDeviceZToWorldZTransform[1]
+		+ 1.0f / (DeviceZ * InvDeviceZToWorldZTransform[2] - InvDeviceZToWorldZTransform[3]);
+	return ViewZ / max(InCosToForward, 1.0e-3f);
+}
+
+#endif
+
+#if UNI_VOL_PASS == 0
+
+uint2 MarchSize;
+uint DebugMode;
+float DebugLogLo;
+RWTexture2D<float4> OutVolume;
+RWTexture2DArray<float> OutSlices;
+
+[numthreads(8, 8, 1)]
+void MarchCS(uint3 Id : SV_DispatchThreadID)
+{
+	// No group-shared memory and no barriers in this pass, so an early return is safe.
+	if (Id.x >= MarchSize.x || Id.y >= MarchSize.y) { return; }
+	const FUniVolumeView V = InVolumeView[0];
+	const float2 Size = float2((float)MarchSize.x, (float)MarchSize.y);
+	const float2 Px = float2((float)Id.x + 0.5f, (float)Id.y + 0.5f);
+	const float3 Dir = PixelDir(Px, Size);
+	const float TScene = SceneDistanceAtUV(Px * MarchToDepthUV.xy + MarchToDepthUV.zw, dot(Dir, ViewForward));
+
+	uint SS = 1u;
+	for (uint C = 0u; C < V.NumCarriers; ++C)
+	{
+		const FUniCarrier Ca = InCarriers[C];
+		float T0, T1;
+		if (Ca.Weight > 0.0f && Uni_CarrierInterval(Ca, Uni_CarrierLocalDir(Ca, Dir), TScene, T0, T1)) { SS = max(SS, Uni_CarrierSubsamples(Ca, V.ThetaPixel)); }
+	}
+
+	float3 B = float3(0.0f, 0.0f, 0.0f);
+	float3 T = float3(0.0f, 0.0f, 0.0f);
+	uint StepSum = 0u, ActiveMax = 0u, AnyTruncated = 0u;
+	float Slice[UNI_VOL_SLICES];
+	for (uint K = 0u; K < UNI_VOL_SLICES; ++K) { Slice[K] = 0.0f; }
+	[loop]
+	for (uint J = 0u; J < SS; ++J)
+	{
+		[loop]
+		for (uint I = 0u; I < SS; ++I)
+		{
+			const float2 Sub = float2((float)Id.x + ((float)I + 0.5f) / (float)SS, (float)Id.y + ((float)J + 0.5f) / (float)SS);
+			const FUniVolumeResult R = Uni_VolumeMarch(SS == 1u ? Dir : PixelDir(Sub, Size), TScene, InCarriers, InParams, InLut, V);
+			B += R.Radiance;
+			T += R.Transmittance;
+			StepSum += R.Steps;
+			ActiveMax = max(ActiveMax, R.Active);
+			AnyTruncated = max(AnyTruncated, R.Truncated);
+			for (uint K2 = 0u; K2 < UNI_VOL_SLICES; ++K2) { Slice[K2] += Uni_Luminance(R.SliceT[K2]); }
+		}
+	}
+	const float Inv = 1.0f / (float)(SS * SS);
+	float4 Out = float4(B * Inv, Uni_Luminance(T * Inv));
+	if (DebugMode == 1u)
+	{
+		Out = float4(AnyTruncated != 0u ? float3(1.0f, 0.0f, 1.0f) : DebugHeat((float)StepSum * Inv / (float)max(V.MaxSteps, 1u)), 0.0f);
+		if (ActiveMax == 0u) { Out = float4(0.0f, 0.0f, 0.0f, 0.0f); }
+	}
+	else if (DebugMode == 2u)
+	{
+		Out = float4(saturate((float)ActiveMax * 0.25f), saturate((float)SS * 0.125f), (float)AnyTruncated, 0.0f);
+	}
+	else if (DebugMode == 3u)
+	{
+		const float L = Uni_Luminance(B * Inv);
+		Out = float4(L > 0.0f ? DebugHeat((log10(L) - DebugLogLo) / 6.0f) : float3(0.0f, 0.0f, 0.0f), 0.0f);
+	}
+	else if (DebugMode == 4u)
+	{
+		const float Tl = Uni_Luminance(T * Inv);
+		Out = float4(Tl, Tl, Tl, 0.0f);
+	}
+	OutVolume[Id.xy] = Out;
+	for (uint K3 = 0u; K3 < UNI_VOL_SLICES; ++K3) { OutSlices[uint3(Id.x, Id.y, K3)] = Slice[K3] * Inv; }
+}
+
+#elif UNI_VOL_PASS == 1
+
+uint CubeSize;
+uint FaceBase;
+RWTexture2DArray<float4> OutCube;
+
+[numthreads(8, 8, 1)]
+void BackgroundCS(uint3 Id : SV_DispatchThreadID)
+{
+	if (Id.x >= CubeSize || Id.y >= CubeSize) { return; }
+	FUniVolumeView V = InVolumeView[0];
+	V.ThetaPixel = 2.0f / (float)CubeSize;   // the texel's footprint drives prefiltering
+	const uint Face = FaceBase + Id.z;
+	const float3 Dir = Uni_CubeTexelDir(Face, (float)Id.x + 0.5f, (float)Id.y + 0.5f, (float)CubeSize);
+	const FUniVolumeResult R = Uni_VolumeMarch(Dir, 3.0e38f, InCarriers, InParams, InLut, V);
+	OutCube[uint3(Id.x, Id.y, Face)] = float4(R.Radiance, 1.0f);
+}
+
+#else // UNI_VOL_PASS == 2: composite
+
+uint2 MarchSize;
+float4 OutRectMinSize;       // output view rect: min.xy, size.zw (pixels)
+float4 OutToDepthUV;         // output pixel -> scene-depth UV
+float3 SceneColourScale;     // exposure units -> scene colour (x pre-exposure)
+float FocalPx;               // output pixels per unit tan at the view centre
+uint CubeSize;
+uint bBackground;
+float BackgroundStartCm;
+float Pad1;
+uint DebugMode;
+float DebugScale;            // debug colours -> scene colour (1 / pre-exposure)
+Texture2D<float4> VolumeTexture;
+Texture2DArray<float4> CubeTexture;
+SamplerState LinearClampSampler;
+
+void CompositeVS(uint VertexId : SV_VertexID, out float4 OutPosition : SV_POSITION)
+{
+	// One full-screen triangle; the viewport is the output view rect.
+	const float2 Uv = float2((float)((VertexId << 1u) & 2u), (float)(VertexId & 2u));
+	OutPosition = float4(Uv * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), 0.0f, 1.0f);
+}
+
+void CompositePS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	const float2 P = SvPosition.xy - OutRectMinSize.xy;                  // pixel centre, view-relative
+	const float3 Dir = PixelDir(P, OutRectMinSize.zw);
+	const float CosF = dot(Dir, ViewForward);
+	const float DPix = SceneDistanceAtUV(SvPosition.xy * OutToDepthUV.xy + OutToDepthUV.zw, CosF);
+
+	// Depth-aware bilinear upsample: each of the four march texels is weighted by its bilinear
+	// weight and by how close its scene distance is to this pixel's (log ratio), so edges
+	// against promoted bodies stay crisp. Sky against sky is plain bilinear.
+	const float2 M = P * (float2((float)MarchSize.x, (float)MarchSize.y) / OutRectMinSize.zw) - 0.5f;
+	const int2 M0 = int2(floor(M));
+	const float2 Fr = M - float2(M0);
+	float4 Acc = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	float WSum = 0.0f;
+	const float LogP = log(max(DPix, 1.0f));
+	for (int Yo = 0; Yo < 2; ++Yo)
+	{
+		for (int Xo = 0; Xo < 2; ++Xo)
+		{
+			const int2 Q = clamp(M0 + int2(Xo, Yo), int2(0, 0), int2(MarchSize) - 1);
+			const float Wb = (Xo == 0 ? 1.0f - Fr.x : Fr.x) * (Yo == 0 ? 1.0f - Fr.y : Fr.y);
+			const float2 Qc = float2(Q) + 0.5f;
+			const float DQ = SceneDistanceAtUV(Qc * MarchToDepthUV.xy + MarchToDepthUV.zw, CosF);
+			const float Wd = 1.0f / (1.0f + 8.0f * abs(log(max(DQ, 1.0f)) - LogP));
+			const float W = Wb * Wd + 1.0e-6f;
+			Acc += VolumeTexture.Load(int3(Q, 0)) * W;
+			WSum += W;
+		}
+	}
+	const float4 Vol = Acc / WSum;
+	if (DebugMode != 0u)
+	{
+		// Debug views: false colour straight to scene colour, no solid angle, no background.
+		OutColor = float4(Vol.rgb * DebugScale, 0.0f);
+		return;
+	}
+	float3 B = Vol.rgb;
+	if (bBackground != 0u && DPix > BackgroundStartCm)
+	{
+		float X, Y;
+		const uint Face = Uni_CubeDirToFace(Dir, (float)CubeSize, X, Y);
+		const float3 Bg = CubeTexture.SampleLevel(LinearClampSampler, float3(X / (float)CubeSize, Y / (float)CubeSize, (float)Face), 0).rgb;
+		B += Vol.a * Bg;
+	}
+	// Solid angle of this pixel: cos^3 / f^2 (pinhole). Radiance x solid angle = the pixel's
+	// energy in the sprites' exposure units (D-128), so sprites + volume conserve light.
+	const float Omega = CosF * CosF * CosF / (FocalPx * FocalPx);
+	OutColor = float4(B * Omega * SceneColourScale, 0.0f);
+}
+
+#endif

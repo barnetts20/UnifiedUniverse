@@ -61,6 +61,7 @@ Roughly most likely first.
 | Wildly over- or under-bright | Uncalibrated (lesson #36) | `uu.Exposure ±3`; disable auto-exposure in an empty level |
 | Volume branch: NaN/white blow-up | Radiance overflow | Fixed (float32 targets). If it recurs: `uu.Volume 0` and report |
 | Volume branch: GPU hang / TDR (driver timeout) | Dense scene, supersampling × 512 steps | `uu.VolumeDivisor 4`, `uu.BackgroundFacesPerFrame 1` |
+| Volume branch: glow looks wrong (position, structure, brightness) | Varies | Debug views: `uu.VolumeDebug 1` (steps per ray; magenta = truncated), `2` (red = carriers hit, green = supersampling, blue = truncated), `3` (emission, log heat; shift it with `uu.VolumeDebugLogLo`), `4` (dust transmittance). `0` is off |
 
 ## 4. GPU parity (UE-4)
 

@@ -64,10 +64,10 @@
 - Reflected-light photometry matches the analytic phase curve.
 - Systems are deterministic per star (re-entering gives the same planets), and stars' content is unchanged (no reroll).
 
-**Questions for the owner before starting:**
-- On-rails orbits for v1, or do you want n-body (it would not be deterministic)?
-- How fast should the default clock run? Real time makes planets look static.
-- Do binaries and multiple stars come in v1?
+**Owner decisions (2026-11-01):**
+- **Orbits on rails** in v1: deterministic from the epoch, so a system is the same every time you return.
+- **Clock:** real time by default, configurable (a time-scale setting). Relativistic motion scaling may come later.
+- **Binary and multiple stars: not in v1.** When they come, they are generated at the star-system level, so that one galaxy-level star sprite stands in for the whole system and resolves into separate stars on approach, with the same conserved-light handoff as galaxy sprite → stars.
 
 ## B-003: Promote at the glare/physical-size crossover (owner question, 2026-11-01)
 
