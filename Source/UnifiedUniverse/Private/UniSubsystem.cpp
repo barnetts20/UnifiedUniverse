@@ -12,6 +12,7 @@
 #include "Camera/PlayerCameraManager.h"
 #include "HAL/IConsoleManager.h"
 #include "Kismet/GameplayStatics.h"
+#include "Async/Async.h"
 #include "InputCoreTypes.h"
 #include "UniScaleLadder.h"
 
@@ -70,6 +71,12 @@ void UUniSubsystem::EnableUniverse(const FString& Scene)
 	Generator = MakeUnique<UniCore::FRefGenerator>(*Model);
 	Backend = MakeUnique<FUniGpuGenBackend>();
 	Streamer = MakeUnique<UniCore::FUniStreamer>(*Generator, *Backend);
+	// D-140: normalising integrals (~0.2 s each, the first time a galaxy's stars are needed) run
+	// on the engine's background thread pool instead of hitching the game thread.
+	Streamer->RunJob = [](std::function<void()> InJob)
+	{
+		AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [Work = MoveTemp(InJob)]() { Work(); });
+	};
 
 	TArray<UniCore::FSliceGPU> Slices;
 	Slices.Append(Model->GpuSlices().data(), int32(Model->GpuSlices().size()));
@@ -340,6 +347,17 @@ void UUniSubsystem::LogStats() const
 		uint64(S.CellsReady), uint64(S.CellsPending), uint64(S.PoolUsed), Backend ? Backend->PoolCapacity() : 0u,
 		uint64(S.Batches), R.GenBatchesCompleted.load(), R.GenBatchesFailed.load(), uint64(S.Regenerations), uint64(S.MaxGather),
 		uint64(S.AllocFailures), uint64(S.MaxLatencyFrames), R.CellsLastFrame.load(), R.PromoteCandidatesLastFrame.load(), *Camera.ToHexString());
+	// Per level, coarse first (D-137/D-139): how full each window is, how wide, and whether
+	// velocity LOD has suspended it. "parents" is how many levels it waits for.
+	UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: generation latency %.1f frames (submit to ready)"), Streamer->LatencyFrames());
+	const std::vector<UniCore::FUniStreamer::FLevelState> Levels = Streamer->LevelStates();
+	for (auto It = Levels.rbegin(); It != Levels.rend(); ++It)
+	{
+		const UniCore::FUniStreamer::FLevelState& L = *It;
+		UE_LOG(LogUnifiedUniverse, Log, TEXT("  L%d (cells %s): ready %llu / %llu, half-width %d, fade %.2f%s, parents %llu"),
+			L.Level, UTF8_TO_TCHAR(UniCore::FormatDistance(UniCore::CellWidthCm(L.Level)).c_str()), uint64(L.ReadyCells), uint64(L.Cells),
+			L.HalfWidth, L.Fade, L.bSuspended ? TEXT(", SUSPENDED (velocity LOD)") : TEXT(""), uint64(L.Parents));
+	}
 }
 
 // ---------------------------------------------------------------------------------------------

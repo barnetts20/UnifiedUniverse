@@ -269,6 +269,7 @@ Decision: Not with L = ceil(log2(R / N)). A window lags the camera by one frame,
 Rationale: After D-116 and D-117, the flythrough still showed boundary pops at r/w ≈ 2.0. With N_eff it shows 0 pops and 0 entering objects with any non-zero intensity, over 2,400 frames and 545,902 entering objects. Cost: objects sit about 0.19 octave finer, which means slightly more cells per object, and residency rises about 1.5× (peak L69 55k → 83k).
 Reroll impact: **HIGH**. It changes level assignment, as D-010 warns. No content exists yet, so this is the moment to decide. The alternative is to keep N = 2 and accept fade-band pops. Owner decision (REVIEW_TONIGHT §4).
 Status: Provisional — needs owner decision
+Amended by D-139: the window lags by the generation latency (about 6 frames on the GPU), not one frame. Windows now widen with speed to keep the no-pop claim; N_eff and level assignment are unchanged.
 
 D-119 — θ_promote = 0.02 rad
 Question: The design names θ_promote without a value.
@@ -303,6 +304,7 @@ Question: Where does a new contributor's ∫all F (D-115) get computed at runtim
 Decision: On the game thread, inside BuildTask, through the shared field core: about 2.4M field evaluations, roughly 0.2 s, the first time a contributor's children are generated. It is cached on the contributor.
 Rationale: Simplest correct option today. It is the same field source as the GPU (no texture stand-in, lesson #1), and it only sizes counts.
 Known cost: a one-time hitch when the camera first enters a galaxy (REVIEW_TONIGHT §6). Move it to a worker task or a GPU reduction in M2.
+Amended by D-140: now computed on worker threads at runtime and cached by contributor id, so the hitch is gone.
 Reroll impact: None.
 Status: Provisional
 
@@ -331,4 +333,38 @@ Question: An independent review of the uncompiled UE code found build breakers. 
 Decision: Draw into a copy of scene colour (`OverrideOutput` or a new target). Use the unjittered projection, pre-exposed sprite radiance, and game views only. Keep per-phase request state, with timeouts that fail closed and are measured from render-thread execution. Release resources at engine pre-exit. The generator has no early return, and its loops are bounded and group-uniform. The full table is in REVIEW_TONIGHT §6.
 Rationale: Each item is a likely first-build or first-frame failure. The streamer's fail-closed path is verified offline by the new check T2.stream.fail_closed. The rest needs UE-1, UE-3 and UE-5.
 Reroll impact: None. Every change is render-path or protocol only. The generator emits the same objects (writes are gated by rank, and padding groups write nothing).
+Status: Provisional
+
+D-137 — A level waits for its parent levels only (amends the design's coarse-to-fine ordering)
+Question: Owner, first engine run: "galaxy movement level slow responsiveness at high speeds"; star pop-in inside the galaxy.
+Decision: A level builds its cells once the windows of its PARENT levels are Ready. A parent is a level that holds an archetype whose emitters place objects at this level. Levels fed only by root emitters (the web's galaxy levels) wait for nothing. Before, every level waited for every coarser level, so latency cascaded down the ladder.
+Rationale: Measured offline with a backend that takes 3 frames per phase, the GPU's order. Worst entering-to-ready latency went from 36 frames (web), 108 (galaxy) and 132 (flythrough) to 6 in all three. That is one probe plus one place round trip. The finest galaxy window during a 10 Mpc/s flight went from 58% to 83% Ready. Contributor completeness is unchanged, because contributors only come from parent levels. T2.stream.parity is unchanged (0 differences).
+Reroll impact: None. Order only; the settled content is identical.
+Status: Provisional
+
+D-138 — Contributor distances measured once per frame
+Question: The same run showed frame lag at speed.
+Decision: The streamer measured every registered contributor's distance from every level's window, every frame: about 2,500 galaxies × 24 levels in the web scene. It now measures each contributor's offset from the camera once per frame, sorted by distance. Each level's gather is a cut-off scan of that list, plus a conservative double-precision box test; the exact overlap test still decides tasks. A level re-checks its Ready cells for new contributors only when its gathered set changed.
+Rationale: Streamer bookkeeping in the web scene went from about 11 ms to about 1 ms per frame on the game thread (offline, -O2), with identical results.
+Reroll impact: None.
+Status: Provisional
+
+D-139 — Windows widen with speed to cover the generation latency (amends D-118)
+Question: D-118's no-pop rule assumes a window trails the camera by one frame. Does it hold on the GPU?
+Decision: No. A GPU fill takes about 6 frames, so at the velocity-LOD limit a cell entering at the window edge became Ready up to 1.5 cells closer, inside the visible radius N_eff. With velocity LOD on, each level's window half-width is now N ≥ N_eff·k + speed × (latency + 1), in its own cells, capped at 4 (9³ cells).
+- The latency is measured from probe submit to Ready, with fast attack and slow decay, clamped at 16 frames.
+- A level is suspended only when even N = 4 cannot cover the lead (slack 2.25 cells).
+- Widening goes through the D-126 resize path, which keeps cells, and stops above 70% pool use.
+- A window shrinks back one step per 30 slow frames.
+- Level assignment still uses N_eff, so nothing rerolls.
+Rationale: New check T2.stream.responsive: in steady flight, 0 visible cells not Ready over 5 runs (galaxy at 1 and 10 kpc/s, web at 10 and 30 Mpc/s, flythrough at 10 kpc/s). The only gaps are the first 8 frames after going from standstill to full speed in a single frame, which is the case B-001's warp streaks would use. Pool peak 1.29M of 2.1M, with 0 allocation failures. The suspension limit rises from 0.25 to about 0.32 cells per frame at 6 frames of latency.
+Cost: wider windows at speed. A level at N = 4 holds 5.8× the cells of N = 2, only while it moves that fast.
+Reroll impact: None.
+Status: Provisional
+
+D-140 — Normalising integrals: cached by contributor id, and computed on worker threads at runtime (amends D-123)
+Question: D-123 computes a contributor's field integral (about 2.4M field evaluations, about 0.2 s) on the game thread the first time its children are needed. Contributors are re-created whenever their parent's cell reloads, and that discarded the cached value.
+Decision: The generator also caches the integral by contributor id; the id fixes the parameters, so the value is the same. The runtime streamer computes missing integrals on worker threads, at most 4 at a time. The UE module supplies its thread pool (AsyncTask); offline builds use a std::thread. Cells that need a missing integral stay Waiting until it arrives, and nothing else waits. Offline checks that count frames compute it inline, as before.
+Rationale: Flying past galaxies hitched about 0.2 s for each new galaxy and again for each reloaded one, which plausibly explains the "chunky" movement between galaxies. New check T2.stream.async_integrals: 0 integrals computed on the calling thread, and the settled content is identical to the reference in all 3,000 cells.
+Reroll impact: None. Same function, same values.
 Status: Provisional
