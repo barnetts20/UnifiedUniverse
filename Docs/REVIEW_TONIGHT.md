@@ -37,6 +37,14 @@ Item IDs match `Tools/UniVerify/unverified.json` (the report checks they are all
    - Expect: no shader errors in the Output Log for `FUniGenProbeCS`, `FUniGenPlaceCS`, `FUniScatterCS`, `FUniProjectCS`, `FUniSpriteVS` or `FUniSpritePS`.
    - Failure looks like: "Failed to compile global shader …". Set `r.ShaderDevelopmentMode=1` in ConsoleVariables.ini to get the error text. Likeliest causes: relative `#include "Core/…"` resolution, and `StructuredBuffer` passed as a function parameter in `UniPlacement.ush` / `UniGenTask.ush`. If `FUniGenPlaceCS` fails with X4026 ("thread sync operation must be in non-varying flow control", FXC/SM5 only), delete the marked `if (GsBase >= Capacity) { break; }` line in `UniGen.usf`; results do not change.
 
+**Moving around (test controls).** The default pawn tops out around 12 m/s, which is useless at these scales. Use free flight:
+- `uu.Fly` toggles it. Steer with the mouse, move with W/S (forward/back), A/D (strafe), E/Q (up/down).
+- The mouse wheel doubles or halves the speed. `uu.Speed <cm/s>` sets it directly at any magnitude: `3e5` = 3 km/s, `3e10` ≈ c, `3e21` ≈ 1 kpc/s.
+- A cyan HUD line shows the speed in natural units (for example "1.2 kpc/s") and your distance from the demo origin (the galaxy's centre).
+- `uu.Fly` again returns to Local mode without a jump.
+- `uu.Cruise <cm/s>` now holds a straight-line velocity at any speed until you set it to 0. Before, anything under 1e8 cm/s was silently ignored by the D-008 threshold.
+- Velocity LOD reacts to whatever speed you choose: at extreme speeds the finer levels suspend (and, on the volume branch, show as glow).
+
 4. **See it (UE-5).** Create a new Empty Level with no sky or atmosphere, so stars are not drowned, and press Play. In the console run `uu.Enable galaxy`.
    - Expect: within about a second (levels fill coarse to fine, about 37 frames), a band of stars across the sky, as in `Verification/images/still_galaxy_towards_centre.png`. Look along −X for the galactic centre. Then run `uu.Stats`: cells ready > 2,000, `gpu done` > 0, `failed` 0, and "cells drawn" > 0.
    - Failure looks like: black. Read `uu.Stats`. If cells are ready but nothing is drawn, it's the sprite pass or the hook; capture a frame in RenderDoc and look for the "UnifiedUniverse" event scope. If batches failed (timeouts), the generation passes are not running. Brightness is uncalibrated (lesson #36), although the sprites now follow the view's pre-exposure: try `uu.Exposure -3` (brighter) or `+3`, and disable auto-exposure if the empty level blows it out.

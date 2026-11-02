@@ -4,8 +4,8 @@
 
 | | |
 | --- | --- |
-| Commit | `79eee9c` + uncommitted changes (branch `uu/prototype-day1`) |
-| Run | 2026-11-01 17:50 EST, 260 s |
+| Commit | `37f7d36` + uncommitted changes (branch `uu/prototype-day1`) |
+| Run | 2026-11-01 19:40 EST, 203 s |
 | Environment tier reached | Tier 3 offline (Tier 4 static only: no Unreal, no DXC here — see ENVIRONMENT.md) |
 | Checks | 42 run, 42 pass, **0 fail** |
 
@@ -13,11 +13,11 @@
 
 | Check | Result | Criterion | Measured |
 | --- | --- | --- | --- |
-| `T1.build.gcc` | PASS | Harness and UniCore build with g++, -Wall -Wextra -Werror, C++17 | built in 14 s |
+| `T1.build.gcc` | PASS | Harness and UniCore build with g++, -Wall -Wextra -Werror, C++17 | built in 0 s |
 | `T1.build.strict.gpp` | PASS | Every UniCore header as C++20 with -Wall -Wextra -Wshadow -Werror (g++), as the UE modules compile them | clean |
 | `T1.build.strict.clangpp` | PASS | Every UniCore header as C++20 with -Wall -Wextra -Wshadow -Werror (clang++), as the UE modules compile them | clean |
-| `T1.build.clang` | PASS | Harness and UniCore build with clang++, -Wall -Wextra -Werror, C++17 | built in 11 s |
-| `T1.coord.fuzz` | PASS | Coordinate fuzz: UniCoord.h vs UniCoord.ush (via shim) vs __int128, all ops | 1000000 cases x 3 axes, 0 mismatches (2.1 s) |
+| `T1.build.clang` | PASS | Harness and UniCore build with clang++, -Wall -Wextra -Werror, C++17 | built in 0 s |
+| `T1.coord.fuzz` | PASS | Coordinate fuzz: UniCoord.h vs UniCoord.ush (via shim) vs __int128, all ops | 1000000 cases x 3 axes, 0 mismatches (1.6 s) |
 | `T1.coord.edges` | PASS | Targeted edges: borrow chains, root wrap, max magnitude, zero, level shifts, extreme AddDisplacement, hex | 1079 targeted expectations, 0 failed |
 | `T1.coord.hilo` | PASS | ToHiLo relative error <= 2^-46 over the fuzz set | worst relative error 2^-49.00 over 1000000 cases x 3 axes (limit 2^-46), 0 over |
 | `T1.fr` | PASS | f(r) monotonic over 1..2^128 cm in log steps, C1 at r0, inverse exists (within float conditioning) | 12800 samples, 0 non-monotonic; continuous yes, C1 yes; inverse worst rel error 1.11e-05 = 0.67 of its float bound; 2^128 cm maps to 69.0 r0 |
@@ -26,11 +26,11 @@
 | `T1.seed.quality` | PASS | Chi-squared over 64 bins within the 99% band for sequential inputs (Avalanche/MixSeed/CellSeed/ObjectSeed/draws) | band [37.8, 95.7], 200k sequential inputs: MixSeed(root, PLACE)=72.5, MixSeedIdx(7, PLACE, i)=81.1, FRandomStream(MixSeed(root)).FRand=81.7, CellSeed(sequential x cells)=55.9, ObjectSeed(cell, i)=54.0, DrawUnit(root, PLACE, 0)=54.9, DrawUnit(seed, PLACE, k)=45.2. (Without Avalanche: 1.26e+07, ProcSeed lesson reproduced) |
 | `T1.seed.injective` | PASS | Object seeds injective in index (0 collisions over 300 cells x 2^15); cell seeds near birthday bound | object-seed collisions 0 (must be 0); cell-seed collisions over 64^3 cells 10 (birthday ~8) |
 | `T1.seed.stream_port` | PASS | FRandomStream port: FRand sequence, RandRange bounds, RollRange quantize/clamp | 16,000 FRand draws, 0 mismatches; RandRange(2,6) out of range 0, ends hit 1931/2020; quantized roll 5.0 |
-| `T1.window.bijection` | PASS | Toroidal slot bijection; residents keep their slot while sliding; correct entering/exiting diff (N = 1..6) | 648 windows, 5184 slides (393 seam rebuilds), 0 bijection / 0 stability / 0 diff violations; unit slide 25 in / 25 out: yes |
+| `T1.window.bijection` | PASS | Toroidal slot bijection; residents keep their slot while sliding; correct entering/exiting diff (N = 1..6) | 648 windows, 5184 slides (391 seam rebuilds), 0 bijection / 0 stability / 0 diff violations; unit slide 25 in / 25 out: yes |
 | `T1.window.velocity_lod` | PASS | Velocity LOD suspends above 1 cell per K = 4 frames, resumes below 0.8 of that | transitions as specified |
 | `T1.level.coverage` | PASS | L = ceil(log2(R/N_eff)), N_eff = N - 1/K: for random camera offsets in the centre cell, every object with distance <= R is inside its level's window | 240000 trials over N = 1..6 and R = 4 cm..2^123 cm, 0 violations; min N_eff*2^L / R = 1.000002 |
 | `T1.clang.coord_seed` | PASS | clang++ build passes every Tier 1 group (coord, seed, window, level, photometry; quick fuzz 10^5) | 12 checks, failing: none |
-| `T1.coord.oracle` | PASS | Coordinate fuzz vs Python big-int oracle: Sub, ToDouble, ToHiLo, CellOf, Neighbour, AddDisplacement, object-relative (shader core) | 1000000 cases x 3 axes vs Python big-int oracle, 0 mismatches (25 s) |
+| `T1.coord.oracle` | PASS | Coordinate fuzz vs Python big-int oracle: Sub, ToDouble, ToHiLo, CellOf, Neighbour, AddDisplacement, object-relative (shader core) | 1000000 cases x 3 axes vs Python big-int oracle, 0 mismatches (24 s) |
 | `T1.seed.oracle` | PASS | UniSeed vs Python oracle: Avalanche, HashCombine, MixSeed, FRandomStream, CellSeed, ObjectSeed, draws, ChannelId | 2007 cases vs Python oracle (fast HashCombine), 0 mismatches |
 
 ## Tier 2 — generation behaviour
@@ -54,7 +54,7 @@
 
 | Check | Result | Criterion | Measured |
 | --- | --- | --- | --- |
-| `T3.jitter` | PASS | Camera parked at 1e30 / 1e35 / 2^127 cm, 0.001 cm per frame for 100 frames: max screen error of static objects vs long-double reference < 0.01 px | 51300 samples (objects 10 cm .. 10^27 cm away, plus objects 10^9..10^14 cm away stored in L60/68/75 cells; 1920 px over 90 deg): worst error 2.63e-03 px, worst frame-to-frame jitter 1.11e-04 px. For the record, the design's hi/lo + float-offset form: 6.89e-05 px when cells match distance, 1.62e+04 px for near objects in coarse cells (D-104) |
+| `T3.jitter` | PASS | Camera parked at 1e30 / 1e35 / 2^127 cm, 0.001 cm per frame for 100 frames: max screen error of static objects vs long-double reference < 0.01 px | 51300 samples (objects 10 cm .. 10^27 cm away, plus objects 10^9..10^14 cm away stored in L60/68/75 cells; 1920 px over 90 deg): worst error 2.63e-03 px, worst frame-to-frame jitter 1.67e-04 px. For the record, the design's hi/lo + float-offset form: 6.26e-05 px when cells match distance, 1.62e+04 px for near objects in coarse cells (D-104) |
 | `T3.ordering` | PASS | Compressed render depth order equals true distance order for 10^5 random pairs; per-depth compression shown to fail on the same set | 100000 pairs: radial f(r) reverses 0 (float ties 0); per-depth z compression misorders 2284; fixed layer compositing misorders 7 |
 | `T3.occlusion` | PASS | Synthetic promoted occluder: backdrop objects behind it are culled, objects in front kept, for all test placements | 20000 placements (3386 behind, 550 in front on the disc, 16064 beside), 0 wrong |
 | `T3.frames` | PASS | Reference stills written for visual inspection (galaxy interior x2, cosmic web) | still_galaxy_towards_centre: 9904 visible of 367374 resident; still_galaxy_out_of_plane: 1967 visible of 367374 resident; web dm+5: 65 visible of 63829 resident |

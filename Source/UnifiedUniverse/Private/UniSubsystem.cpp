@@ -12,6 +12,8 @@
 #include "Camera/PlayerCameraManager.h"
 #include "HAL/IConsoleManager.h"
 #include "Kismet/GameplayStatics.h"
+#include "InputCoreTypes.h"
+#include "UniScaleLadder.h"
 
 namespace
 {
@@ -142,8 +144,58 @@ FVector UUniSubsystem::GetViewLocation(FRotator* OutRotation) const
 	return FVector::ZeroVector;
 }
 
+void UUniSubsystem::SetFreeFly(bool bOn, double CmPerSecond)
+{
+	if (CmPerSecond > 0.0) { SetFlySpeed(CmPerSecond); }
+	if (bOn == bFreeFly) { return; }
+	bFreeFly = bOn;
+	bFlying = false;
+	bCruiseLatched = false;
+	Velocity = FVector::ZeroVector;
+	if (bOn)
+	{
+		MotionMode = EUniMotionMode::Cruise;
+		UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: free flight on at %s/s (WASD/QE, mouse wheel x2 / x0.5, uu.Fly to stop)"), UTF8_TO_TCHAR(UniCore::FormatDistance(FlySpeed).c_str()));
+	}
+	else
+	{
+		// Back to Local without a jump: the anchor absorbs the pawn's current view location.
+		MotionMode = EUniMotionMode::Local;
+		UniCore::FCoord A = Camera.ToCore();
+		UniCore::FVec3f F{};
+		const FVector ViewLoc = GetViewLocation();
+		UniCore::AddDisplacement(A, F, UniCore::FVec3d{ -ViewLoc.X, -ViewLoc.Y, -ViewLoc.Z });
+		LocalAnchor = FUniCoord::Make(A);
+		CameraFraction = FVector3f::ZeroVector;
+		UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: free flight off (Local mode)"));
+	}
+}
+
+void UUniSubsystem::SetCruise(const FVector& CmPerSecond)
+{
+	bFreeFly = false;
+	bFlying = false;
+	Velocity = CmPerSecond;
+	bCruiseLatched = !CmPerSecond.IsNearlyZero();
+}
+
+void UUniSubsystem::DrawHud(double Speed) const
+{
+	if (!GEngine) { return; }
+	const UniCore::FDelta FromOrigin = UniCore::Sub(Camera.ToCore(), UniCore::FCoord::Origin());
+	const double R = UniCore::Length(UniCore::ToDouble(FromOrigin));
+	const FString Line = FString::Printf(TEXT("UU %s  speed %s/s (%.3g cm/s)%s  |  %s from the demo origin  |  dm %+.1f  exposure %+.1f"),
+		bFreeFly ? TEXT("FLY") : TEXT("CRUISE"),
+		UTF8_TO_TCHAR(UniCore::FormatDistance(Speed).c_str()), Speed,
+		bFreeFly ? TEXT("  [WASD/QE move, wheel x2 / x0.5]") : TEXT(""),
+		UTF8_TO_TCHAR(UniCore::FormatDistance(R).c_str()), DeltaMag, ExposureBias);
+	GEngine->AddOnScreenDebugMessage(int32(0x5EED0001), 0.0f, FColor(120, 220, 255), Line);
+}
+
 void UUniSubsystem::StartFlythrough(float Seconds)
 {
+	bFreeFly = false;
+	bCruiseLatched = false;
 	if (!bEnabled || SceneName != TEXT("flythrough")) { EnableUniverse(TEXT("flythrough")); }
 	// The target: the brightest star within 100 pc of the solar camera, resolved once on the CPU
 	// through the reference generator (the design's Resolve). The GPU generates the same star
@@ -198,6 +250,30 @@ void UUniSubsystem::Tick(float DeltaTime)
 		UniCore::AddDisplacement(C, Frac, UniCore::FVec3d{ D.X, D.Y, D.Z });
 		if (T >= 1.0) { bFlying = false; Velocity = FVector::ZeroVector; }   // ends in Cruise, parked 1 m above the star
 	}
+	else if (bFreeFly)
+	{
+		// Free flight: direction from WASD/QE in the view frame (no key held: no motion), speed
+		// from the wheel. Integrated straight into the universal coordinate at any magnitude.
+		APlayerController* PC = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr;
+		FVector Dir = FVector::ZeroVector;
+		if (PC)
+		{
+			const FRotationMatrix R(ViewRot);
+			if (PC->IsInputKeyDown(EKeys::W)) { Dir += R.GetUnitAxis(EAxis::X); }
+			if (PC->IsInputKeyDown(EKeys::S)) { Dir -= R.GetUnitAxis(EAxis::X); }
+			if (PC->IsInputKeyDown(EKeys::D)) { Dir += R.GetUnitAxis(EAxis::Y); }
+			if (PC->IsInputKeyDown(EKeys::A)) { Dir -= R.GetUnitAxis(EAxis::Y); }
+			if (PC->IsInputKeyDown(EKeys::E)) { Dir += FVector::UpVector; }
+			if (PC->IsInputKeyDown(EKeys::Q)) { Dir -= FVector::UpVector; }
+			if (PC->WasInputKeyJustPressed(EKeys::MouseScrollUp)) { SetFlySpeed(FlySpeed * 2.0); }
+			if (PC->WasInputKeyJustPressed(EKeys::MouseScrollDown)) { SetFlySpeed(FlySpeed * 0.5); }
+		}
+		Velocity = Dir.GetSafeNormal() * FlySpeed;
+		MotionMode = EUniMotionMode::Cruise;
+		const FVector Step = Velocity * double(DeltaTime);
+		UniCore::AddDisplacement(C, Frac, UniCore::FVec3d{ Step.X, Step.Y, Step.Z });
+		DrawHud(Velocity.Size());
+	}
 	else
 	{
 		// D-008 motion modes with hysteresis.
@@ -211,8 +287,11 @@ void UUniSubsystem::Tick(float DeltaTime)
 			UniCore::AddDisplacement(A, F, UniCore::FVec3d{ -ViewLoc.X, -ViewLoc.Y, -ViewLoc.Z });
 			return FUniCoord::Make(A);
 		};
-		if (MotionMode == EUniMotionMode::Local && Speed > kCruiseOn) { MotionMode = EUniMotionMode::Cruise; }
-		else if (MotionMode == EUniMotionMode::Cruise && Speed < kCruiseOff) { MotionMode = EUniMotionMode::Local; LocalAnchor = AnchorFor(Camera); }
+		// A latched uu.Cruise stays in Cruise at any non-zero speed (the D-008 threshold would
+		// otherwise ignore every speed below 1e8 cm/s).
+		if (MotionMode == EUniMotionMode::Local && (Speed > kCruiseOn || (bCruiseLatched && Speed > 0.0))) { MotionMode = EUniMotionMode::Cruise; }
+		else if (MotionMode == EUniMotionMode::Cruise && Speed < kCruiseOff && !(bCruiseLatched && Speed > 0.0)) { MotionMode = EUniMotionMode::Local; LocalAnchor = AnchorFor(Camera); }
+		if (bCruiseLatched) { DrawHud(Speed); }
 		if (MotionMode == EUniMotionMode::Cruise)
 		{
 			const FVector Step = Velocity * double(DeltaTime);
@@ -300,7 +379,22 @@ namespace
 			if (!S || !World) { return; }
 			FVector Dir = FVector::ForwardVector;
 			if (APlayerController* PC = World->GetFirstPlayerController()) { if (PC->PlayerCameraManager) { Dir = PC->PlayerCameraManager->GetCameraRotation().Vector(); } }
-			S->SetVelocity(Dir * (Args.Num() ? FCString::Atod(*Args[0]) : 0.0));
+			S->SetCruise(Dir * (Args.Num() ? FCString::Atod(*Args[0]) : 0.0));
+		}));
+
+	FAutoConsoleCommandWithWorldAndArgs CmdFreeFly(TEXT("uu.Fly"), TEXT("uu.Fly [cm/s]: toggle free flight (steer with the view, WASD/QE, mouse wheel x2 / x0.5). With a speed: on at that speed."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
+		{
+			UUniSubsystem* S = Sub(World);
+			if (!S) { return; }
+			if (Args.Num()) { S->SetFreeFly(true, FCString::Atod(*Args[0])); }
+			else { S->SetFreeFly(!S->IsFreeFlying()); }
+		}));
+
+	FAutoConsoleCommandWithWorldAndArgs CmdSpeed(TEXT("uu.Speed"), TEXT("uu.Speed <cm/s>: free-flight speed, any magnitude (e.g. 3e5 = 3 km/s, 3e10 = c, 3e21 = 1 kpc/s)."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
+		{
+			if (UUniSubsystem* S = Sub(World); S && Args.Num()) { S->SetFlySpeed(FCString::Atod(*Args[0])); }
 		}));
 
 	FAutoConsoleCommandWithWorldAndArgs CmdTeleport(TEXT("uu.Teleport"), TEXT("uu.Teleport <solar|void>"),

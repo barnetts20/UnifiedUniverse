@@ -39,3 +39,4 @@ Append only. One entry per step start, finish, block, or commit. Times in the ow
 | 17:48 | SAFE | note | uu.Shaders read-only cvar gates every shader's ShouldCompilePermutation; passes and batches skip and fail closed. UnifiedUniverse.Render.GpuParity (UE-4): GPU vs CPU streamer, cell by cell. Docs/BUILD_TRIAGE.md. GRHIGlobals guarded for < 5.3. Uncompiled |
 | 17:50 | SAFE | note | Log time for the 17:48 entry corrected to the clock (it had been stamped ahead) |
 | 17:58 | SAFE | note | Decision brief published (D-133, D-132, D-131, D-118 with offline renders); rendered by the volumetrics branch's UNI_BRIEF run |
+| 19:42 | CTRL | note | Owner: speed control is needed to test. Added uu.Fly (steerable free flight, WASD/QE, wheel x2/x0.5, any speed), uu.Speed, latched uu.Cruise (was ignored below 1e8 cm/s), HUD readout; InputCore dependency. Uncompiled |

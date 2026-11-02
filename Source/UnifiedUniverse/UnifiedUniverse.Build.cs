@@ -23,6 +23,7 @@ public class UnifiedUniverse : ModuleRules
 			"Core",
 			"CoreUObject",
 			"Engine",
+			"InputCore",            // EKeys for the free-flight test controls
 			"UnifiedUniverseCore",
 			"UnifiedUniverseRender",
 		});

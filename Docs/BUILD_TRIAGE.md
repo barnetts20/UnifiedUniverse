@@ -56,6 +56,8 @@ Roughly most likely first.
 | Cells ready, nothing drawn | The sprite pass or the hook | RenderDoc: look for the "UnifiedUniverse" event scope after MotionBlur. Check that `UniRenderHooks` logged "scene view extension registered" |
 | Stars drawn over meshes | Depth-UV mapping after TSR | Try `r.ScreenPercentage 100` |
 | Stars shimmer | The callback runs before TSR on your version | Tell me which version; the hook point moves |
+| Cannot get anywhere / `uu.Cruise` does nothing | The default pawn is ~12 m/s; old `uu.Cruise` ignored speeds < 1e8 cm/s | `uu.Fly`, then the mouse wheel or `uu.Speed <cm/s>` |
+| Free flight does not move | No key held (motion only while W/A/S/D/Q/E is down), or the console has focus | Close the console; hold W |
 | Wildly over- or under-bright | Uncalibrated (lesson #36) | `uu.Exposure ±3`; disable auto-exposure in an empty level |
 | Volume branch: NaN/white blow-up | Radiance overflow | Fixed (float32 targets). If it recurs: `uu.Volume 0` and report |
 | Volume branch: GPU hang / TDR (driver timeout) | Dense scene, supersampling × 512 steps | `uu.VolumeDivisor 4`, `uu.BackgroundFacesPerFrame 1` |
