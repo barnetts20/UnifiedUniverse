@@ -1,0 +1,13 @@
+# Unreal build products
+Binaries/
+Intermediate/
+# Offline verification harness: build output and scratch (Verification/REPORT.md and images/ are tracked)
+Tools/UniVerify/build/
+Verification/work/
+__pycache__/
+*.pyc
+# IDE
+.vs/
+.vscode/
+*.sln
+*.suo
