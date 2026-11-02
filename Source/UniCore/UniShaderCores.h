@@ -23,6 +23,7 @@ namespace UniHlsl
 #include "UniProject.ush"
 #include "UniGenTask.ush"
 #include "UniVolume.ush"
+#include "UniSystem.ush"
 }
 
 #include "UniCoord.h"

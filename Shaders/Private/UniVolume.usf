@@ -77,7 +77,7 @@ float SceneDistanceAtUV(float2 InUV, float InCosToForward)
 	if (DeviceZ <= 0.0f) { return 3.0e38f; }
 	const float ViewZ = DeviceZ * InvDeviceZToWorldZTransform[0] + InvDeviceZToWorldZTransform[1]
 		+ 1.0f / (DeviceZ * InvDeviceZToWorldZTransform[2] - InvDeviceZToWorldZTransform[3]);
-	return ViewZ / max(InCosToForward, 1.0e-3f);
+	return Uni_SceneTrueDistance(ViewZ / max(InCosToForward, 1.0e-3f));   // render space -> true distance (D-146)
 }
 
 #endif

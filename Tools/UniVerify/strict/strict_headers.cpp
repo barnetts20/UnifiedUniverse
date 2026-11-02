@@ -16,6 +16,10 @@
 #include "UniStreamer.h"
 #include "UniDemoScenes.h"
 #include "UniVolume.h"
+#include "UniSystem.h"
+#include "UniParallax.h"
+#include "UniPromotion.h"
+#include "UniLocalFrame.h"
 
 int main()
 {
@@ -27,5 +31,13 @@ int main()
 	S.Update(UniScenes::SolarCamera());
 	FVolumeBuilder VB(M, G);
 	const double Budget = LuminosityBudget(M, UniScenes::kGalaxy, -21.0);
-	return int(S.CellTable().size() > 1000000) + int(!(Budget < 0.0)) + int(VB.Table(UniScenes::kStar).Rows.empty());
+	FSystemManager Sys;
+	std::vector<FCellGPU> SysCells;
+	std::vector<FObjectGPU> SysRecs;
+	FPromotionManager Prom;
+	Prom.Update(Sys, UniScenes::SolarCamera(), 0.0, 0);
+	const std::set<u32> Culled = Prom.CulledSpriteIds();
+	Sys.Build(UniScenes::SolarCamera(), 0.0, 0u, 256u, SysCells, SysRecs, &Culled);
+	const FParallaxPlacement Pl = ParallaxPlace(UniScenes::SolarCamera(), 1.0e9, UniScenes::SolarCamera(), FVec3f{}, false);
+	return int(S.CellTable().size() > 1000000) + int(SysRecs.size() > 256u) + int(!Pl.bRealSpace) + int(!(Budget < 0.0)) + int(VB.Table(UniScenes::kStar).Rows.empty());
 }

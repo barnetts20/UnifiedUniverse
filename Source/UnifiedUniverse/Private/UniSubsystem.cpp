@@ -13,6 +13,13 @@
 #include "HAL/IConsoleManager.h"
 #include "Kismet/GameplayStatics.h"
 #include "Async/Async.h"
+#include "UniParallaxComponent.h"
+#include "UniBodyActor.h"
+#include "UniLocalFrame.h"
+#include "GameFramework/FloatingPawnMovement.h"
+#include "GameFramework/Pawn.h"
+#include "Engine/DirectionalLight.h"
+#include "Components/DirectionalLightComponent.h"
 #include "InputCoreTypes.h"
 #include "UniScaleLadder.h"
 
@@ -92,6 +99,21 @@ void UUniSubsystem::EnableUniverse(const FString& Scene)
 		AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [Work = MoveTemp(InJob)]() { Work(); });
 	};
 
+	// Star systems (D-142): which archetypes have them, and a fresh clock.
+	Systems = MakeUnique<UniCore::FSystemManager>();
+	SystemArchetypeMask = 0;
+	for (const UniCore::FArchetype& A : Model->Definition().Archetypes)
+	{
+		if (A.bSystems && A.Id < 32u) { SystemArchetypeMask |= 1u << A.Id; }
+	}
+	UniverseTime = 0.0;
+	CellKeysByFrame.Reset();
+	ActivationsUnmatched = 0;
+	{
+		TArray<FUniActivation> Stale;
+		FUniRenderer::Get().DrainActivations_GameThread(Stale);   // from a previous universe
+	}
+
 	TArray<UniCore::FSliceGPU> Slices;
 	Slices.Append(Model->GpuSlices().data(), int32(Model->GpuSlices().size()));
 	TArray<float> Lut;
@@ -112,6 +134,7 @@ void UUniSubsystem::EnableUniverse(const FString& Scene)
 void UUniSubsystem::DisableUniverse()
 {
 	if (!bEnabled) { return; }
+	if (bFreeFly) { SetPawnMovementSuppressed(false); bFreeFly = false; }
 	bEnabled = false;
 	bFlying = false;
 	UniRenderHooks::SetActive(false);
@@ -119,6 +142,9 @@ void UUniSubsystem::DisableUniverse()
 	Off.bEnabled = false;
 	FUniRenderer::Get().SetFrame_GameThread(MoveTemp(Off));
 	VolumeBuilder.Reset();
+	ClearPromotion();
+	Systems.Reset();
+	CellKeysByFrame.Reset();
 	Streamer.Reset();
 	Backend.Reset();       // flushes rendering commands: in-flight requests are released safely
 	Generator.Reset();
@@ -171,6 +197,7 @@ void UUniSubsystem::SetFreeFly(bool bOn, double CmPerSecond)
 	if (CmPerSecond > 0.0) { SetFlySpeed(CmPerSecond); }
 	if (bOn == bFreeFly) { return; }
 	bFreeFly = bOn;
+	SetPawnMovementSuppressed(bOn);   // free flight drives the pawn itself (D-149)
 	bFlying = false;
 	bCruiseLatched = false;
 	Velocity = FVector::ZeroVector;
@@ -195,6 +222,7 @@ void UUniSubsystem::SetFreeFly(bool bOn, double CmPerSecond)
 
 void UUniSubsystem::SetCruise(const FVector& CmPerSecond)
 {
+	if (bFreeFly) { SetPawnMovementSuppressed(false); }
 	bFreeFly = false;
 	bFlying = false;
 	Velocity = CmPerSecond;
@@ -206,16 +234,18 @@ void UUniSubsystem::DrawHud(double Speed) const
 	if (!GEngine) { return; }
 	const UniCore::FDelta FromOrigin = UniCore::Sub(Camera.ToCore(), UniCore::FCoord::Origin());
 	const double R = UniCore::Length(UniCore::ToDouble(FromOrigin));
-	const FString Line = FString::Printf(TEXT("UU %s  speed %s/s (%.3g cm/s)%s  |  %s from the demo origin  |  dm %+.1f  exposure %+.1f"),
-		bFreeFly ? TEXT("FLY") : TEXT("CRUISE"),
+	const FString Line = FString::Printf(TEXT("UU %s  speed %s/s (%.3g cm/s)%s  |  %s from the demo origin  |  dm %+.1f  exposure %+.1f  |  t %.4g s (x%.3g)  systems %d, planets %d, promoted %d"),
+		bFreeFly ? (MotionMode == EUniMotionMode::Local ? TEXT("FLY (local: real space, physics)") : TEXT("FLY (cruise)")) : TEXT("CRUISE"),
 		UTF8_TO_TCHAR(UniCore::FormatDistance(Speed).c_str()), Speed,
 		bFreeFly ? TEXT("  [WASD/QE move, wheel x2 / x0.5]") : TEXT(""),
-		UTF8_TO_TCHAR(UniCore::FormatDistance(R).c_str()), DeltaMag, ExposureBias);
+		UTF8_TO_TCHAR(UniCore::FormatDistance(R).c_str()), DeltaMag, ExposureBias,
+		UniverseTime, TimeScale, Systems ? int32(Systems->ActiveSystems().size()) : 0, Systems ? int32(Systems->PlanetCount()) : 0, int32(Promoter.Promoted().size()));
 	GEngine->AddOnScreenDebugMessage(int32(0x5EED0001), 0.0f, FColor(120, 220, 255), Line);
 }
 
 void UUniSubsystem::StartFlythrough(float Seconds)
 {
+	if (bFreeFly) { SetPawnMovementSuppressed(false); }
 	bFreeFly = false;
 	bCruiseLatched = false;
 	if (!bEnabled || SceneName != TEXT("flythrough")) { EnableUniverse(TEXT("flythrough")); }
@@ -257,7 +287,16 @@ void UUniSubsystem::Tick(float DeltaTime)
 	if (!bEnabled || !Streamer) { return; }
 	++FrameCounter;
 	FRotator ViewRot;
-	const FVector ViewLoc = GetViewLocation(&ViewRot);
+	FVector ViewLoc = GetViewLocation(&ViewRot);   // updated below if the pawn is moved or re-centred this frame
+	// Local mode computes camera = anchor + view location, so on entering Local the anchor is the
+	// camera MINUS the view location (else the camera jumps by the pawn offset).
+	auto AnchorFor = [&ViewLoc](const FUniCoord& Cam)
+	{
+		UniCore::FCoord A = Cam.ToCore();
+		UniCore::FVec3f F{};
+		UniCore::AddDisplacement(A, F, UniCore::FVec3d{ -ViewLoc.X, -ViewLoc.Y, -ViewLoc.Z });
+		return FUniCoord::Make(A);
+	};
 
 	UniCore::FCoord C = Camera.ToCore();
 	UniCore::FVec3f Frac{ CameraFraction.X, CameraFraction.Y, CameraFraction.Z };
@@ -291,24 +330,34 @@ void UUniSubsystem::Tick(float DeltaTime)
 			if (PC->WasInputKeyJustPressed(EKeys::MouseScrollDown)) { SetFlySpeed(FlySpeed * 0.5); }
 		}
 		Velocity = Dir.GetSafeNormal() * FlySpeed;
-		MotionMode = EUniMotionMode::Cruise;
 		const FVector Step = Velocity * double(DeltaTime);
-		UniCore::AddDisplacement(C, Frac, UniCore::FVec3d{ Step.X, Step.Y, Step.Z });
+		// D-149: one set of controls at every speed. Below 5e7 cm/s (and until 1e8 cm/s, the D-008
+		// hysteresis) the pawn really moves through the UE world (Local mode): nearby bodies are
+		// still in the world and physics is stable. Above, the universe moves past a pinned pawn
+		// (Cruise). The pawn's own movement is suppressed while free flight drives it.
+		APawn* Pawn = PC ? PC->GetPawn() : nullptr;
+		const bool bLocal = Pawn && (MotionMode == EUniMotionMode::Local ? FlySpeed < kCruiseOn : FlySpeed < kCruiseOff);
+		if (bLocal)
+		{
+			if (MotionMode != EUniMotionMode::Local) { LocalAnchor = AnchorFor(Camera); MotionMode = EUniMotionMode::Local; }
+			Pawn->SetActorLocation(Pawn->GetActorLocation() + Step, false, nullptr, ETeleportType::None);
+			ViewLoc += Step;
+			RecentreLocalIfNeeded(ViewLoc);
+			UniCore::FVec3f F{};
+			C = UniCore::LocalToUniversal(LocalAnchor.ToCore(), UniCore::FVec3d{ ViewLoc.X, ViewLoc.Y, ViewLoc.Z }, F);
+			Frac = F;
+		}
+		else
+		{
+			MotionMode = EUniMotionMode::Cruise;
+			UniCore::AddDisplacement(C, Frac, UniCore::FVec3d{ Step.X, Step.Y, Step.Z });
+		}
 		DrawHud(Velocity.Size());
 	}
 	else
 	{
 		// D-008 motion modes with hysteresis.
 		const double Speed = Velocity.Size();
-		// Local mode computes camera = anchor + view location, so on entering Local the anchor is
-		// the camera MINUS the view location (else the camera jumps by the pawn offset).
-		auto AnchorFor = [&ViewLoc](const FUniCoord& Cam)
-		{
-			UniCore::FCoord A = Cam.ToCore();
-			UniCore::FVec3f F{};
-			UniCore::AddDisplacement(A, F, UniCore::FVec3d{ -ViewLoc.X, -ViewLoc.Y, -ViewLoc.Z });
-			return FUniCoord::Make(A);
-		};
 		// A latched uu.Cruise stays in Cruise at any non-zero speed (the D-008 threshold would
 		// otherwise ignore every speed below 1e8 cm/s).
 		if (MotionMode == EUniMotionMode::Local && (Speed > kCruiseOn || (bCruiseLatched && Speed > 0.0))) { MotionMode = EUniMotionMode::Cruise; }
@@ -322,28 +371,57 @@ void UUniSubsystem::Tick(float DeltaTime)
 		else
 		{
 			// Local: camera = local anchor + view location (the pawn moves normally).
-			C = LocalAnchor.ToCore();
-			Frac = UniCore::FVec3f{};
-			UniCore::AddDisplacement(C, Frac, UniCore::FVec3d{ ViewLoc.X, ViewLoc.Y, ViewLoc.Z });
-			if (ViewLoc.Size() > kAnchorRecentre && (FrameCounter % 300) == 0)
-			{
-				UE_LOG(LogUnifiedUniverse, Verbose, TEXT("UnifiedUniverse: pawn is %.3g cm from the local anchor; anchor re-centring (shifting promoted actors) is M3 work."), ViewLoc.Size());
-			}
+			RecentreLocalIfNeeded(ViewLoc);
+			UniCore::FVec3f F{};
+			C = UniCore::LocalToUniversal(LocalAnchor.ToCore(), UniCore::FVec3d{ ViewLoc.X, ViewLoc.Y, ViewLoc.Z }, F);
+			Frac = F;
 		}
 	}
 	Camera = FUniCoord::Make(C);
 	CameraFraction = FVector3f(Frac.X, Frac.Y, Frac.Z);
 
 	Streamer->DeltaMag = DeltaMag;
+	UniverseTime += double(DeltaTime) * TimeScale;   // B-002: orbits are on rails at this clock
 	Streamer->Update(C);
+	// M3: bodies close enough become actors, and every parallax-placed actor follows the camera
+	// that just moved (same frame, same camera: no lag against the backdrop at any speed).
+	UpdatePromotion();
+	UpdateParallax(ViewLoc);
+	UpdateLightRig();
 	PushFrame();
 }
 
 void UUniSubsystem::PushFrame()
 {
 	FUniFrameData F;
-	const std::vector<UniCore::FCellGPU> Cells = Streamer->CellTable();
+	std::vector<UniCore::FCellKey> Keys;
+	const std::vector<UniCore::FCellGPU> Cells = Streamer->CellTable(&Keys);
 	F.Cells.Append(Cells.data(), int32(Cells.size()));
+
+	// Star systems (D-142, D-143). Activations name a cell by its index in the table of the
+	// frame that produced them (2-4 frames ago), so the last few tables' keys are kept.
+	if (Systems)
+	{
+		const UniCore::FCoord Cam = Camera.ToCore();
+		TArray<FUniActivation> Acts;
+		FUniRenderer::Get().DrainActivations_GameThread(Acts);
+		for (const FUniActivation& A : Acts)
+		{
+			const std::vector<UniCore::FCellKey>* Table = CellKeysByFrame.Find(A.FrameNumber);
+			if (!Table || A.CellIndex >= Table->size()) { ++ActivationsUnmatched; continue; }
+			Systems->Report((*Table)[A.CellIndex], A.Record, Cam, FrameCounter);
+		}
+		Systems->Update(Cam);
+		CellKeysByFrame.Add(FrameCounter, MoveTemp(Keys));
+		for (auto It = CellKeysByFrame.CreateIterator(); It; ++It) { if (It.Key() + 16 < FrameCounter) { It.RemoveCurrent(); } }
+		std::vector<UniCore::FCellGPU> SysCells;
+		std::vector<UniCore::FObjectGPU> SysRecords;
+		const std::set<UniCore::u32> Culled = Promoter.CulledSpriteIds();   // promoted planets: their actor draws them (D-147)
+		Systems->Build(Cam, UniverseTime, FUniRenderer::DynamicPoolBase(), FUniRenderer::DynamicPoolSlots(), SysCells, SysRecords, &Culled);
+		F.Cells.Append(SysCells.data(), int32(SysCells.size()));
+		F.DynamicRecords.Append(SysRecords.data(), int32(SysRecords.size()));
+		F.SystemArchetypeMask = SystemArchetypeMask;
+	}
 	F.CameraFraction = CameraFraction;
 	F.DeltaMag = DeltaMag;
 	F.ExposureBias = ExposureBias;
@@ -418,6 +496,269 @@ void UUniSubsystem::LogStats() const
 			L.Level, UTF8_TO_TCHAR(UniCore::FormatDistance(UniCore::CellWidthCm(L.Level)).c_str()), uint64(L.ReadyCells), uint64(L.Cells),
 			L.HalfWidth, L.Fade, L.bSuspended ? TEXT(", SUSPENDED (velocity LOD)") : TEXT(""), uint64(L.Parents));
 	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// Promotion and real space (M3, D-146, D-147)
+// ---------------------------------------------------------------------------------------------
+
+static TAutoConsoleVariable<int32> CVarUniLightRig(TEXT("uu.LightRig"), 1, TEXT("M3 placeholder: a movable directional light from the nearest active star, so promoted planets are lit (0 off)."));
+static TAutoConsoleVariable<float> CVarUniLightRigLux(TEXT("uu.LightRigLux"), 10.0f, TEXT("Intensity of the light rig, lux."));
+
+void UUniSubsystem::RegisterParallax(UUniParallaxComponent* C)
+{
+	if (C) { ParallaxComponents.AddUnique(C); }
+}
+
+void UUniSubsystem::UnregisterParallax(UUniParallaxComponent* C)
+{
+	ParallaxComponents.Remove(C);
+}
+
+void UUniSubsystem::ClearPromotion()
+{
+	// During world teardown the actors go with the world; only destroy them while it lives.
+	const UWorld* World = GetWorld();
+	const bool bLive = World && !World->bIsTearingDown;
+	for (auto& KV : Bodies) { if (AUniBodyActor* B = KV.Value.Get(); B && bLive) { B->Destroy(); } }
+	Bodies.Reset();
+	Promoter.Clear();
+	if (ADirectionalLight* L = LightRig.Get(); L && bLive) { L->Destroy(); }
+	LightRig.Reset();
+}
+
+void UUniSubsystem::SetPawnMovementSuppressed(bool bSuppress)
+{
+	APlayerController* PC = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr;
+	APawn* Pawn = PC ? PC->GetPawn() : nullptr;
+	UFloatingPawnMovement* M = Pawn ? Pawn->FindComponentByClass<UFloatingPawnMovement>() : nullptr;
+	if (!M) { return; }
+	if (bSuppress && SavedPawnMaxSpeed < 0.0f) { SavedPawnMaxSpeed = M->MaxSpeed; M->MaxSpeed = 0.0f; M->StopMovementImmediately(); }
+	else if (!bSuppress && SavedPawnMaxSpeed >= 0.0f) { M->MaxSpeed = SavedPawnMaxSpeed; SavedPawnMaxSpeed = -1.0f; }
+}
+
+void UUniSubsystem::RecentreLocalIfNeeded(FVector& InOutViewLoc)
+{
+	if (InOutViewLoc.Size() <= kAnchorRecentre) { return; }
+	APlayerController* PC = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr;
+	APawn* Pawn = PC ? PC->GetPawn() : nullptr;
+	if (!Pawn) { return; }
+	// Whole centimetres: anchor + world position is unchanged to the bit (UniLocalFrame.h).
+	const FVector PawnLoc = Pawn->GetActorLocation();
+	const UniCore::FVec3d S = UniCore::RecentreShift(UniCore::FVec3d{ PawnLoc.X, PawnLoc.Y, PawnLoc.Z });
+	UniCore::FCoord A = LocalAnchor.ToCore();
+	UniCore::ShiftAnchor(A, S);
+	LocalAnchor = FUniCoord::Make(A);
+	const FVector Shift(-S.X, -S.Y, -S.Z);
+	Pawn->SetActorLocation(PawnLoc + Shift, false, nullptr, ETeleportType::TeleportPhysics);
+	InOutViewLoc += Shift;
+	for (const TWeakObjectPtr<UUniParallaxComponent>& W : ParallaxComponents)
+	{
+		UUniParallaxComponent* C = W.Get();
+		if (C && C->Mode == EUniParallaxMode::Simulated && C->bRealSpace && C->GetOwner()) { C->GetOwner()->AddActorWorldOffset(Shift, false, nullptr, ETeleportType::TeleportPhysics); }
+	}
+	OnLocalRecentre.Broadcast(Shift);
+	// The camera cache is what this frame renders from: refresh it, or the view lags the shift by a frame.
+	if (PC->PlayerCameraManager) { PC->PlayerCameraManager->UpdateCamera(0.0f); }
+	++Recentres;
+	UE_LOG(LogUnifiedUniverse, Verbose, TEXT("UnifiedUniverse: Local frame re-centred by %s (re-centre %llu)"), *Shift.ToString(), Recentres);
+}
+
+void UUniSubsystem::UpdatePromotion()
+{
+	UWorld* World = GetWorld();
+	if (!Systems || !World) { return; }
+	Promoter.Update(*Systems, Camera.ToCore(), UniverseTime, FrameCounter);
+	const std::map<UniCore::u32, UniCore::FPromotedBody>& P = Promoter.Promoted();
+	// Demoted: destroy (pooling comes with real body actors).
+	for (auto It = Bodies.CreateIterator(); It; ++It)
+	{
+		if (P.count(It.Key()) == 0 || !It.Value().IsValid())
+		{
+			if (AUniBodyActor* B = It.Value().Get()) { B->Destroy(); }
+			It.RemoveCurrent();
+		}
+	}
+	// Promoted: spawn, then keep the coordinate current (planets move on their orbits).
+	for (const auto& KV : P)
+	{
+		const UniCore::FPromotedBody& Body = KV.second;
+		TWeakObjectPtr<AUniBodyActor>* Found = Bodies.Find(KV.first);
+		AUniBodyActor* Actor = Found ? Found->Get() : nullptr;
+		if (!Actor)
+		{
+			FActorSpawnParameters Params;
+			Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+			Params.ObjectFlags |= RF_Transient;
+			Actor = World->SpawnActor<AUniBodyActor>(AUniBodyActor::StaticClass(), FTransform::Identity, Params);
+			if (!Actor) { continue; }
+			Actor->InitBody(Body.bStar, Body.RadiusCm, FLinearColor(Body.Rgb[0], Body.Rgb[1], Body.Rgb[2]), KV.first);
+			Bodies.Add(KV.first, Actor);
+			UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: promoted %s %08x (radius %s) to an actor"),
+				Body.bStar ? TEXT("star") : TEXT("planet"), KV.first, UTF8_TO_TCHAR(UniCore::FormatDistance(Body.RadiusCm).c_str()));
+		}
+		Actor->Parallax->Coord = FUniCoord::Make(Body.Coord);
+	}
+}
+
+void UUniSubsystem::UpdateParallax(const FVector& ViewLoc)
+{
+	for (int32 I = ParallaxComponents.Num() - 1; I >= 0; --I)
+	{
+		UUniParallaxComponent* C = ParallaxComponents[I].Get();
+		if (!C) { ParallaxComponents.RemoveAtSwap(I); continue; }
+		if (MotionMode == EUniMotionMode::Local) { C->ApplyPlacementLocal(ViewLoc, Camera, CameraFraction, LocalAnchor); }
+		else { C->ApplyPlacement(ViewLoc, Camera, CameraFraction); }
+	}
+}
+
+void UUniSubsystem::UpdateLightRig()
+{
+	UWorld* World = GetWorld();
+	const bool bWant = CVarUniLightRig.GetValueOnGameThread() != 0 && Systems && !Systems->ActiveSystems().empty() && World;
+	if (!bWant)
+	{
+		if (ADirectionalLight* L = LightRig.Get()) { L->Destroy(); }
+		LightRig.Reset();
+		return;
+	}
+	// The nearest active star lights the scene; its light travels from the star towards the camera.
+	const UniCore::FCoord Cam = Camera.ToCore();
+	const UniCore::FActiveSystem* Near = nullptr;
+	double Best = 0.0;
+	for (const auto& KV : Systems->ActiveSystems())
+	{
+		const double D = UniCore::Length(UniCore::ToDouble(UniCore::Sub(KV.second.Star, Cam)));
+		if (!Near || D < Best) { Near = &KV.second; Best = D; }
+	}
+	ADirectionalLight* L = LightRig.Get();
+	if (!L)
+	{
+		FActorSpawnParameters Params;
+		Params.ObjectFlags |= RF_Transient;
+		L = World->SpawnActorDeferred<ADirectionalLight>(ADirectionalLight::StaticClass(), FTransform::Identity, nullptr, nullptr, ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
+		if (!L) { return; }
+		L->GetLightComponent()->SetMobility(EComponentMobility::Movable);
+		L->FinishSpawning(FTransform::Identity);
+		LightRig = L;
+	}
+	const UniCore::FVec3d D = UniCore::ToDouble(UniCore::Sub(Cam, Near->Star));
+	const FVector Dir = FVector(D.X, D.Y, D.Z).GetSafeNormal();
+	L->SetActorRotation(Dir.Rotation());
+	if (ULightComponent* C = L->GetLightComponent())
+	{
+		C->SetLightColor(FLinearColor(Near->Sys.StarRgb[0], Near->Sys.StarRgb[1], Near->Sys.StarRgb[2]));
+		C->SetIntensity(CVarUniLightRigLux.GetValueOnGameThread());
+	}
+}
+
+void UUniSubsystem::LogSystems() const
+{
+	if (!Systems) { UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: disabled")); return; }
+	UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: clock %.6g s (x%.3g) | %d active systems, %d planets | activations %llu, deactivations %llu, rejected %llu, unmatched readbacks %llu | last readback %u"),
+		UniverseTime, TimeScale, int32(Systems->ActiveSystems().size()), int32(Systems->PlanetCount()), uint64(Systems->Activations), uint64(Systems->Deactivations),
+		uint64(Systems->Rejected), ActivationsUnmatched, FUniRenderer::Get().Stats.ActivationsLastReadback.load());
+	const UniCore::FCoord Cam = Camera.ToCore();
+	UE_LOG(LogUnifiedUniverse, Log, TEXT("  promoted bodies: %d (promotions %llu, demotions %llu)"), int32(Promoter.Promoted().size()), uint64(Promoter.Promotions), uint64(Promoter.Demotions));
+	for (const auto& KV : Bodies)
+	{
+		if (const AUniBodyActor* B = KV.Value.Get())
+		{
+			UE_LOG(LogUnifiedUniverse, Log, TEXT("    %s %08x: %s away, %s, placement scale %.4g"), B->bStar ? TEXT("star  ") : TEXT("planet"), KV.Key,
+				UTF8_TO_TCHAR(UniCore::FormatDistance(B->Parallax->TrueDistanceCm).c_str()), B->Parallax->bRealSpace ? TEXT("REAL SPACE (unit scale)") : TEXT("compressed"), B->Parallax->PlacementScale);
+		}
+	}
+	for (const auto& KV : Systems->ActiveSystems())
+	{
+		const UniCore::FActiveSystem& A = KV.second;
+		const double D = UniCore::Length(UniCore::ToDouble(UniCore::Sub(A.Star, Cam)));
+		UE_LOG(LogUnifiedUniverse, Log, TEXT("  star %08x: M = %.2f, %.2f L_sun, %.2f M_sun, %s away (activation radius %s), %d planets"),
+			KV.first, A.Sys.StarAbsMag, A.Sys.LumSun, A.Sys.MassSun, UTF8_TO_TCHAR(UniCore::FormatDistance(D).c_str()),
+			UTF8_TO_TCHAR(UniCore::FormatDistance(A.Sys.ActivationCm).c_str()), int32(A.Sys.Planets.size()));
+		for (const UniCore::FPlanet& P : A.Sys.Planets)
+		{
+			const UniCore::FVec3d Off = UniCore::PlanetOffset(P, UniverseTime);
+			UniCore::FCoord Pc = A.Star;
+			UniCore::FVec3f Pf{};
+			UniCore::AddDisplacement(Pc, Pf, Off);
+			const UniCore::FPlanetPhotometry Ph = UniCore::PlanetPhotometry(P, double(A.Sys.StarAbsMag), Off, UniCore::ToDouble(UniCore::Sub(Cam, Pc)));
+			UE_LOG(LogUnifiedUniverse, Log, TEXT("    %s: a %.3f AU, e %.2f, R %.2f R_earth, period %.3g yr | %s away, phase %.0f deg, m = %.2f"),
+				P.Type == UniCore::EPlanetType::Rocky ? TEXT("rocky    ") : (P.Type == UniCore::EPlanetType::GasGiant ? TEXT("gas giant") : TEXT("ice giant")),
+				P.SemiMajorCm / UniCore::Units::Au, P.Ecc, P.RadiusCm / UniCore::SysConst::EarthRadius, P.PeriodS / 3.15576e7,
+				UTF8_TO_TCHAR(UniCore::FormatDistance(Ph.Delta).c_str()), FMath::RadiansToDegrees(Ph.Alpha), Ph.AppMag);
+		}
+	}
+}
+
+bool UUniSubsystem::GoToSystem(bool bToPlanet)
+{
+	if (!bEnabled || !Generator) { return false; }
+	// Resolve on the CPU through the reference generator (the same content the GPU makes, D-105),
+	// and pick the nearest star with a gas giant.
+	const UniCore::FCoord Here = Camera.ToCore();
+	UniCore::FRefPipeline Resolve(*Generator);
+	Resolve.bVelocityLod = false;
+	Resolve.Update(Here, UniCore::FVec3f{});
+	double Best = 100.0 * UniCore::Units::Pc;
+	UniCore::FCoord Star;
+	UniCore::FSystem Sys;
+	bool bFound = false;
+	Resolve.ForEachResident([&](const UniCore::FCellKey& K, const UniCore::FObjectGPU& O, float, UniCore::u64)
+	{
+		const UniCore::u32 Arch = O.A[3] & 0xFFFFu;
+		if (Arch >= 32u || ((SystemArchetypeMask >> Arch) & 1u) == 0u || ((O.A[3] >> 16) & UniHlsl::UNI_OBJ_FLAG_DELTA_HIDDEN)) { return; }
+		const UniCore::u32 Off[3] = { O.A[0], O.A[1], O.A[2] };
+		const UniCore::FCoord C = UniCore::ObjectCoord(K, Off);
+		const double D = UniCore::Length(UniCore::ToDouble(UniCore::Sub(C, Here)));
+		if (D >= Best) { return; }
+		UniCore::FSystem S = UniCore::BuildSystem(O);
+		bool bGiant = false;
+		for (const UniCore::FPlanet& P : S.Planets) { bGiant = bGiant || P.Type == UniCore::EPlanetType::GasGiant; }
+		if (!bGiant) { return; }
+		Best = D; Star = C; Sys = MoveTemp(S); bFound = true;
+	});
+	if (!bFound)
+	{
+		UE_LOG(LogUnifiedUniverse, Warning, TEXT("UnifiedUniverse: no star with a gas giant within 100 pc."));
+		return false;
+	}
+	if (bToPlanet)
+	{
+		// 30 radii out on the day side of the system's first gas giant, slightly above its orbit
+		// plane, facing it: it promotes on approach (at about 50 radii it is already a candidate,
+		// so it promotes within a frame or two of the system activating).
+		const UniCore::FPlanet* Giant = nullptr;
+		for (const UniCore::FPlanet& P : Sys.Planets) { if (P.Type == UniCore::EPlanetType::GasGiant) { Giant = &P; break; } }
+		const UniCore::FVec3d Off = UniCore::PlanetOffset(*Giant, UniverseTime);
+		const double Lo = UniCore::Length(Off);
+		const FVector Out = FVector(-Off.X / Lo, -Off.Y / Lo, 0.25).GetSafeNormal();
+		UniCore::FCoord To = Star;
+		UniCore::FVec3f Frac{};
+		UniCore::AddDisplacement(To, Frac, UniCore::FVec3d{ Off.X + Out.X * 30.0 * Giant->RadiusCm, Off.Y + Out.Y * 30.0 * Giant->RadiusCm, Off.Z + Out.Z * 30.0 * Giant->RadiusCm });
+		SetFreeFly(true, 2.0 * Giant->RadiusCm);
+		SetFlySpeed(2.0 * Giant->RadiusCm);   // 2 radii per second
+		SetCamera(FUniCoord::Make(To));
+		if (APlayerController* PC = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr) { PC->SetControlRotation((-Out).Rotation()); }
+		UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: jumped to 30 radii from a gas giant (R = %.1f R_earth, a = %.2f AU) of a star %s away. Fly in (W) to promote it to an actor; uu.Systems lists it."),
+			Giant->RadiusCm / UniCore::SysConst::EarthRadius, Giant->SemiMajorCm / UniCore::Units::Au, UTF8_TO_TCHAR(UniCore::FormatDistance(Best).c_str()));
+		return true;
+	}
+	// Above the system's plane, outside its widest orbit, looking at the star; moving at a speed
+	// that crosses the system in about 20 s.
+	const double Sp = FMath::Max(Sys.SpanCm, UniCore::Units::Au);
+	UniCore::FCoord To = Star;
+	UniCore::FVec3f Frac{};
+	UniCore::AddDisplacement(To, Frac, UniCore::FVec3d{ 0.25 * Sp, -0.9 * Sp, 0.7 * Sp });
+	SetFreeFly(true, 0.1 * Sp);
+	SetFlySpeed(0.1 * Sp);
+	SetCamera(FUniCoord::Make(To));
+	if (APlayerController* PC = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr)
+	{
+		PC->SetControlRotation(FVector(-0.25, 0.9, -0.7).GetSafeNormal().Rotation());
+	}
+	UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: jumped into the system of a star of M = %.2f, %s away (%d planets, widest orbit %s). It activates once its cell is drawn; uu.Systems lists it."),
+		Sys.StarAbsMag, UTF8_TO_TCHAR(UniCore::FormatDistance(Best).c_str()), int32(Sys.Planets.size()), UTF8_TO_TCHAR(UniCore::FormatDistance(Sys.SpanCm).c_str()));
+	return true;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -501,6 +842,30 @@ namespace
 		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
 		{
 			if (UUniSubsystem* S = Sub(World)) { S->SetExposureBias(Args.Num() ? FCString::Atof(*Args[0]) : 0.0f); }
+		}));
+
+	FAutoConsoleCommandWithWorldAndArgs CmdTimeScale(TEXT("uu.TimeScale"), TEXT("uu.TimeScale <x>: universe clock rate (1 = real time, 3.15e7 = a year per second, negative runs backwards)."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
+		{
+			if (UUniSubsystem* S = Sub(World); S && Args.Num()) { S->SetTimeScale(FCString::Atod(*Args[0])); }
+		}));
+
+	FAutoConsoleCommandWithWorldAndArgs CmdTime(TEXT("uu.Time"), TEXT("uu.Time <seconds>: set the universe clock."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
+		{
+			if (UUniSubsystem* S = Sub(World); S && Args.Num()) { S->SetUniverseTime(FCString::Atod(*Args[0])); }
+		}));
+
+	FAutoConsoleCommandWithWorldAndArgs CmdSystems(TEXT("uu.Systems"), TEXT("Log active star systems and their planets."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>&, UWorld* World)
+		{
+			if (UUniSubsystem* S = Sub(World)) { S->LogSystems(); }
+		}));
+
+	FAutoConsoleCommandWithWorldAndArgs CmdGotoSystem(TEXT("uu.GotoSystem"), TEXT("uu.GotoSystem [planet]: jump into the nearest star system with a gas giant (free flight); 'planet' jumps to 30 radii from the giant."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
+		{
+			if (UUniSubsystem* S = Sub(World)) { S->GoToSystem(Args.Num() > 0 && Args[0].Equals(TEXT("planet"), ESearchCase::IgnoreCase)); }
 		}));
 
 	FAutoConsoleCommandWithWorldAndArgs CmdStats(TEXT("uu.Stats"), TEXT("Log streaming and render statistics."),

@@ -34,6 +34,8 @@
 
 ## B-002: Star systems emitting planets (owner request, 2026-11-01)
 
+**Status (2026-11-01, 22:50):** v1 built on the volumetrics branch (D-142 to D-145). It covers activation, generation, Kepler orbits on rails, the clock, reflected-light photometry and drawing through the existing sprite path. It is verified offline (6 checks) and needs UE testing (REVIEW_TONIGHT §9). Still to do: lit discs and the promoted planet actor (M3, with B-003), moons, binaries (later, at the system level), and planets in the volume's light budget.
+
 **Milestone:** the next content level after M2/M3 (it needs the promotion path, M3). **Reroll impact:** new content only: new archetypes and new seed channels (CLAUDE.md rule 6). Existing stars and galaxies are unchanged.
 
 **What it adds:** a star archetype emits planets, and planets can later emit moons and rings the same way.
@@ -70,6 +72,10 @@
 - **Binary and multiple stars: not in v1.** When they come, they are generated at the star-system level, so that one galaxy-level star sprite stands in for the whole system and resolves into separate stars on approach, with the same conserved-light handoff as galaxy sprite → stars.
 
 ## B-003: Promote at the glare/physical-size crossover (owner question, 2026-11-01)
+
+**Done for bodies (2026-11-02, D-148).** Bodies (extended objects without children, which today means planets) ease their sprite from the glare footprint to the true size between ¼ θ_promote and θ_promote, and draw as a soft disc (plus a fading glare halo) once wider than 1.5 px. At the hand-off the sprite is exactly the body's size and shape (T2.parallax.promotion, T1.sprite.profile).
+- A correction: an earlier note here said a gas giant's sprite was 1.85× its body at the swap. That was measured on the wrong frame. At the swap it was already body-sized; a very bright body's was 1.39×.
+- Still open: per-object promotion exactly at the crossover (the fixed 0.02 rad is kept, and the blend makes it seamless); stars (their glare stays as a corona); handing glare to engine bloom once body actors are emissive.
 
 **Milestone:** M3 (promotion actor pool). Render and lifecycle only, no reroll.
 

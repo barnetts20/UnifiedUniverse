@@ -34,5 +34,13 @@
   {
     "id": "UE-9",
     "what": "The volume pass in the engine (Docs/VOLUMETRICS.md \u00a78) is written but has never been compiled: UniVolume.usf (MarchCS, BackgroundCS, CompositeVS/PS), the sprite transmittance lookup, RenderVolume_RenderThread and the subsystem's per-frame volume scene. It must compile, show the galaxy glow and the dust lane matching the reference stills, and stay within budget (uu.Volume 0/1 to compare)."
+  },
+  {
+    "id": "UE-10",
+    "what": "Star systems in the engine (D-142 to D-145): the activation append and readback ring in UniProject.usf / RenderBackdrop_RenderThread, the planet-record scatter into the reserved pool tail, the subsystem's clock and system manager. Planets must appear near uu.GotoSystem, move with uu.TimeScale, and activate/deactivate without flicker (REVIEW_TONIGHT \u00a79)."
+  },
+  {
+    "id": "UE-11",
+    "what": "M3 in the engine (D-146, D-147): UUniParallaxComponent placement (real space vs compressed, no jitter against the backdrop at any speed), AUniBodyActor placeholders spawned and destroyed on promotion, promoted planets' sprites culled, the light rig, and sprites hidden behind promoted bodies by the decoded depth test (REVIEW_TONIGHT \u00a710)."
   }
 ]

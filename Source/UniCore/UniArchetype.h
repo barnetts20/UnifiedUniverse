@@ -186,6 +186,7 @@ namespace UniCore
 		std::vector<FUniEmitter> Emitters;
 		bool bDefaultsOnly = false;          // lesson #16
 		FVolumeProfile Volume;               // render only
+		bool bSystems = false;               // D-142: its objects have star systems (planets), activated near the camera
 
 		double RadiusMaxCm(double M) const
 		{

@@ -79,3 +79,24 @@ It generates the solar-camera scene on the GPU and on the CPU side by side, then
   - Counts right but offsets wrong: the place pass's scan.
   - Only float parts differ: expected (D-105).
 - Run `uu.Disable` first: the test refuses to run while a universe is enabled, because it shares the GPU pool.
+
+## 5. Star systems (volumetrics branch, D-142 to D-145)
+
+| Symptom | Where | Fix |
+| --- | --- | --- |
+| `FCriticalSection` / `FScopeLock` undeclared | `UniRenderer.h` / `.cpp` | The includes `HAL/CriticalSection.h` and `Misc/ScopeLock.h` are added; if your version moved them, include `HAL/ThreadSafeCounter.h`, or replace with `FCriticalSection` from `CoreMinimal.h` |
+| `AddClearUAVPass`: no overload for a structured buffer UAV | `RenderBackdrop_RenderThread` (activation index and record clears) | Delete those two clears; the count clear is the one that matters (only `Count` entries are read). If RDG then complains that the copy reads an unwritten buffer, keep them and clear with `AddClearUAVPass(GraphBuilder, UAV, 0u)` on a `PF_R32_UINT` typed view instead |
+| Shader: `FUniObject` unknown in `UniProject.usf` | `RWStructuredBuffer<FUniObject> OutActivateRecord` | The struct comes from `Core/UniPlacement.ush` through `UniProject.ush`. Check the include order did not change |
+| Planets never activate | `uu.Systems`: last readback 0 | `SystemArchetypeMask` 0 (the archetype lacks `bSystems`), or the readback ring never completes. Check the `Uni.ProjectAndCull` pass in RenderDoc for the `UniActivate` buffers |
+
+## 6. M3 parallax and promotion (D-146, D-147)
+
+| Symptom | Where | Fix |
+| --- | --- | --- |
+| `/Engine/BasicShapes/Sphere` not found at runtime (no sphere, log warning) | `AUniBodyActor` constructor | Engine content missing from a packaged build: add `/Engine/BasicShapes` to "Additional asset directories to cook". In the editor it always exists |
+| `TObjectPtr` unknown | `UniBodyActor.h` | Engines before 5.0: use raw `UStaticMeshComponent*` with `UPROPERTY()` |
+| `SpawnActorDeferred` / `FinishSpawning` signature | `UUniSubsystem::UpdateLightRig` | Use `World->SpawnActor<ADirectionalLight>()` and set mobility after; a warning about changing mobility is harmless here |
+| Body actors destroyed right after spawning | World bounds check | Placements stay inside 7e10 cm (compressed) or 5e11 cm (real space). If your project shrank the world bounds, disable World Settings > Enable World Bounds Checks |
+| Sphere is black | No light | `uu.LightRig 1` (default) needs an active system; `uu.LightRigLux 50` if auto-exposure darkens it |
+| `UFloatingPawnMovement` unknown | `UniSubsystem.cpp` | Include `GameFramework/FloatingPawnMovement.h` (Engine module); it is present. With a custom pawn type it is simply not found and nothing is suppressed |
+| `OnLocalRecentre` UHT error on the delegate | `UniSubsystem.h` | The `DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam` must sit above the `UCLASS`; it does. If UHT complains about the parameter name, rename `WorldShift` |

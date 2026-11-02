@@ -22,6 +22,12 @@
 //   uu.Exposure <mag>                   exposure bias in magnitudes (negative = brighter)
 //   uu.Volume <0|1>                     the volume pass: unresolved glow, dust, background
 //   uu.Stats                            log streaming and render statistics
+//   uu.TimeScale <x>                    universe clock rate (1 = real time; orbits run on it)
+//   uu.Time <seconds>                   set the universe clock
+//   uu.Systems                          log active star systems and their planets
+//   uu.GotoSystem [planet]              jump into the nearest star system with a gas giant
+//                                       (planet: to 30 radii from the giant, to watch it promote)
+//   uu.LightRig <0|1>                   the directional light from the active star (M3 placeholder)
 //   uu.Disable
 
 #include "CoreMinimal.h"
@@ -32,6 +38,8 @@
 // UniSubsystem.gen.cpp, which sees only this header, and TUniquePtr must be able to delete them.
 #include "UniStreamer.h"
 #include "UniVolume.h"
+#include "UniSystem.h"
+#include "UniPromotion.h"
 #include "UniSubsystem.generated.h"
 
 UENUM(BlueprintType)
@@ -40,6 +48,11 @@ enum class EUniMotionMode : uint8
 	Local,    // the pawn moves in the main scene; camera = local anchor + view location
 	Cruise    // the pawn is pinned; velocity integrates into the universal coordinate
 };
+
+/** Broadcast when the Local-mode frame is re-centred (D-149): every actor in the UE world that is
+ *  not placed by the universe should move by WorldShift (Simulated parallax actors and the pawn
+ *  already have). Universal positions do not change. */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FUniOnLocalRecentre, FVector, WorldShift);
 
 UCLASS()
 class UNIFIEDUNIVERSE_API UUniSubsystem : public UWorldSubsystem, public FTickableGameObject
@@ -107,7 +120,30 @@ public:
 	/** uu.Cruise: a straight-line velocity that stays in Cruise until set to 0. */
 	void SetCruise(const FVector& CmPerSecond);
 
+	/** Universe clock (B-002): seconds since the epoch; orbits are evaluated at it. */
+	void SetTimeScale(double Scale) { TimeScale = Scale; }
+	double GetTimeScale() const { return TimeScale; }
+	void SetUniverseTime(double Seconds) { UniverseTime = Seconds; }
+	double GetUniverseTime() const { return UniverseTime; }
+	void LogSystems() const;
+	/** Resolve the nearest star (within 100 pc) whose system has a gas giant, and jump into it
+	 *  in free flight, facing the star. */
+	bool GoToSystem(bool bToPlanet = false);
+
+	/** M3 (D-146): actors placed by the parallax rule register here and are placed every frame
+	 *  right after the universal camera moves. */
+	void RegisterParallax(class UUniParallaxComponent* C);
+	void UnregisterParallax(class UUniParallaxComponent* C);
+
 	static UUniSubsystem* FindForConsole();
+
+	/** D-149: the Local-mode frame moved by WorldShift (integer cm); universal positions unchanged. */
+	UPROPERTY(BlueprintAssignable, Category = "Universe")
+	FUniOnLocalRecentre OnLocalRecentre;
+
+	/** The universal coordinate of the UE world origin in Local mode. */
+	UFUNCTION(BlueprintPure, Category = "Universe")
+	FUniCoord GetLocalAnchor() const { return LocalAnchor; }
 
 private:
 	void PushFrame();
@@ -124,6 +160,29 @@ private:
 	uint32 BackgroundVersion = 0;
 	UniCore::FCoord BackgroundAnchor;
 	TArray<FVector4f> BackgroundLutLast;
+
+	// Star systems (D-142..D-145)
+	TUniquePtr<UniCore::FSystemManager> Systems;
+	uint32 SystemArchetypeMask = 0;
+	double UniverseTime = 0.0;
+	double TimeScale = 1.0;
+	TMap<uint64, std::vector<UniCore::FCellKey>> CellKeysByFrame;   // the last few frames' cell tables, for activation readbacks
+	uint64 ActivationsUnmatched = 0;
+
+	// Promotion and real space (M3, D-146, D-147)
+	UniCore::FPromotionManager Promoter;
+	TMap<uint32, TWeakObjectPtr<class AUniBodyActor>> Bodies;
+	TArray<TWeakObjectPtr<class UUniParallaxComponent>> ParallaxComponents;
+	TWeakObjectPtr<class ADirectionalLight> LightRig;
+	uint64 Recentres = 0;
+	float SavedPawnMaxSpeed = -1.0f;   // the pawn's own movement speed, restored when free flight ends
+	void SetPawnMovementSuppressed(bool bSuppress);
+	/** D-149: re-centre the Local frame if the pawn is more than 1,000 km from the anchor. */
+	void RecentreLocalIfNeeded(FVector& InOutViewLoc);
+	void UpdatePromotion();
+	void UpdateParallax(const FVector& ViewLoc);
+	void UpdateLightRig();
+	void ClearPromotion();
 
 	FUniCoord Camera;
 	FUniCoord LocalAnchor;

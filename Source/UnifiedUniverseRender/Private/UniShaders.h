@@ -31,6 +31,9 @@ namespace UniGpuLayout
 	inline constexpr uint32 PoolCapacity = 2097152;                             // D-005: 64 MB
 	inline constexpr uint32 MaxSprites = 1u << 20;                              // 48 MB of sprites
 	inline constexpr uint32 MaxPromote = 256;
+	inline constexpr uint32 DynamicPoolSlots = 256;                             // D-143: planet records, rewritten every frame
+	inline constexpr uint32 DynamicPoolBase = PoolCapacity - DynamicPoolSlots;  // the streamer allocates below this
+	inline constexpr uint32 MaxActivate = 32;                                   // D-142: system activations per frame
 	inline constexpr uint32 GenThreads = 64;
 	inline constexpr double ReadbackTimeoutSeconds = 2.0;                       // lesson #24 safety valve
 	inline constexpr uint32 CarrierBytes = sizeof(UniCore::FCarrierGPU);        // 112
@@ -138,10 +141,15 @@ public:
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutDrawArgs)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint2>, OutPromote)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutPromoteCount)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint2>, OutActivate)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<FUniObject>, OutActivateRecord)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutActivateCount)
 		SHADER_PARAMETER(uint32, NumCells)
 		SHADER_PARAMETER(uint32, DispatchGroupsX)
 		SHADER_PARAMETER(uint32, MaxSprites)
 		SHADER_PARAMETER(uint32, MaxPromote)
+		SHADER_PARAMETER(uint32, MaxActivate)
+		SHADER_PARAMETER(uint32, SystemArchetypeMask)
 		SHADER_PARAMETER(FVector3f, ViewForward)
 		SHADER_PARAMETER(float, TanHalfFovX)
 		SHADER_PARAMETER(FVector3f, ViewRight)

@@ -1,0 +1,42 @@
+// UniSystem.ush
+// Star systems (B-002, D-142): the shared part of system activation. A star whose archetype
+// has a system is "activated" when the camera comes within its activation radius; the project
+// pass (UniProject.usf) appends such stars for a CPU readback, and the CPU reference does the
+// same test through this core. Everything else about systems (planets, orbits, photometry) is
+// CPU-side, in Source/UniCore/UniSystem.h: a handful of systems are active at once.
+
+#ifndef UNI_SYSTEM_USH
+#define UNI_SYSTEM_USH
+
+#include "UniCoreDefs.ush"
+
+static const float UNI_AU_CM = 1.495978707e13f;
+static const float UNI_SUN_ABS_MAG_V = 4.83f;
+static const float UNI_SYSTEM_RADIUS_AU = 100.0f;      // x sqrt(L / L_sun): beyond the outermost planet (60 sqrt(L) AU)
+static const float UNI_SYSTEM_RADIUS_MIN_AU = 30.0f;
+static const float UNI_SYSTEM_RADIUS_MAX_AU = 1.0e4f;  // 0.05 pc
+static const float UNI_SYSTEM_HYSTERESIS = 1.25f;      // deactivate (CPU, exact) beyond 1.25 x the radius
+static const uint UNI_ARCH_DYNAMIC_PLANET = 0xFFF0u;   // archetype id written into planet records
+
+/** sqrt(L / L_sun) from the V-band absolute magnitude (no bolometric correction in v1). */
+UNI_FN float Uni_SqrtLumSun(float InAbsMag)
+{
+	return pow(10.0f, -0.2f * (InAbsMag - UNI_SUN_ABS_MAG_V));
+}
+
+/** Activation radius in cm: 100 AU x sqrt(L), clamped to [30 AU, 1e4 AU]. */
+UNI_FN float Uni_SystemActivationRadius(float InAbsMag)
+{
+	const float Au = clamp(UNI_SYSTEM_RADIUS_AU * Uni_SqrtLumSun(InAbsMag), UNI_SYSTEM_RADIUS_MIN_AU, UNI_SYSTEM_RADIUS_MAX_AU);
+	return Au * UNI_AU_CM;
+}
+
+/** The activation test the project pass runs per object (archetype mask: bit per archetype id < 32). */
+UNI_FN bool Uni_SystemActivates(uint InArchetypeId, uint InSystemArchetypeMask, float InAbsMag, float InDistance)
+{
+	if (InArchetypeId >= 32u) { return false; }
+	if (((InSystemArchetypeMask >> InArchetypeId) & 1u) == 0u) { return false; }
+	return InDistance < Uni_SystemActivationRadius(InAbsMag);
+}
+
+#endif // UNI_SYSTEM_USH

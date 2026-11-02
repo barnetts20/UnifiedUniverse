@@ -268,7 +268,7 @@ Question: The design claims objects "stream in and out exactly where they are al
 Decision: Not with L = ceil(log2(R / N)). A window lags the camera by one frame, and an active level's camera moves up to w/K per frame, so an entering object can be up to w/K closer than N cells: up to 0.6 mag inside the fade band for N = 2, K = 4. Levels are therefore assigned with N_eff = N − 1/K = 1.75, and sensitivity windows are N_L = min(ceil(N_eff · k + 1/K), N_max), which is still 2 at Δm = 0.
 Rationale: After D-116 and D-117, the flythrough still showed boundary pops at r/w ≈ 2.0. With N_eff it shows 0 pops and 0 entering objects with any non-zero intensity, over 2,400 frames and 545,902 entering objects. Cost: objects sit about 0.19 octave finer, which means slightly more cells per object, and residency rises about 1.5× (peak L69 55k → 83k).
 Reroll impact: **HIGH**. It changes level assignment, as D-010 warns. No content exists yet, so this is the moment to decide. The alternative is to keep N = 2 and accept fade-band pops. Owner decision (REVIEW_TONIGHT §4).
-Status: Provisional — needs owner decision
+Status: Decided (owner, 2026-11-01): accept N_eff = 1.75. Frozen with D-010; D-139 builds on it.
 Amended by D-139: the window lags by the generation latency (about 6 frames on the GPU), not one frame. Windows now widen with speed to keep the no-pop claim; N_eff and level assignment are unchanged.
 
 D-119 — θ_promote = 0.02 rad
@@ -368,20 +368,20 @@ Question: An endless toroidal universe has an infinite background (Olbers): the 
 Decision: Every flux, sprite and volume alike, is multiplied by D(r) = (1 + r / r_H)^−2 with r_H = c / H₀ = 1.37e28 cm. Visibility, relevance and level assignment use undimmed magnitudes. The background marches 0.1 Mpc to 0.5 periods (50 Mpc), then adds an analytic mean tail.
 Rationale: T3.vol.background: 27.43 mag/arcsec², matching the analytic estimate; changing the march extent from 0.5 to 2 periods changes it by < 0.01%.
 Reroll impact: None.
-Status: Provisional (owner: value of r_H)
+Status: Decided (owner, 2026-11-01): r_H = c / H0 = 1.37e28 cm.
 
 D-132 — Dust and transmittance slices
 Question: How do dust lanes attenuate the glow and the sprites behind them?
 Decision: The archetype has a render-only FVolumeProfile. The dust field is the galaxy field with a thinner disc (0.5 h), no bulge, arms shifted −0.35 rad, normalised to a face-on τ (0.6 for the demo), with reddening (0.8, 1.0, 1.3). The march writes transmittance at 8 slices uniform in ln t over 1 pc – 100 kpc. Sprites read it at their true distance.
 Rationale: The interior still shows the dark lane across the band. T3.vol.march checks τ within 0.0013. Known gap: a dusty galaxy's sprite does not carry its internal extinction (v1.1).
 Reroll impact: None.
-Status: Provisional (owner: slices in v1 or v2)
+Status: Decided (owner, 2026-11-01): keep the transmittance slices in v1.
 
 D-133 — Luminosity budget validation
 Question: The volume makes a parent's own magnitude and its children's summed light visible side by side. Are they consistent?
 Decision: LuminosityBudget(model, archetype, M) computes the magnitude a parent's children add up to, and Validate should require agreement within 0.1 mag. Measured for the demo: 2e11 stars sum to M = −23.18, against the drawn −21.00 (7.4×). Fixing it is the owner's call: N_total = 2.69e10, a fainter stellar function, or NTotalRefMag. The checks use a corrected copy.
 Reroll impact: HIGH for the fix (star content). The check itself has no reroll impact.
-Status: Open (owner)
+Status: Decided (owner, 2026-11-01): option B. The demo's N_total is 2.69e10, so its stars sum to M = -21.00 (T3.vol.budget). Rerolls star counts in every galaxy (x 0.134). Re-derive N_total from LuminosityBudget whenever the stellar function changes (D-014).
 
 D-134 — The carrier's normalising integral
 Question: A carrier needs the contributor's ∫ρ before any child cell exists.
@@ -447,5 +447,154 @@ Decision:
 - The hold counts only cells within ceil(N_eff·k) of the window centre (Chebyshev), the only ones that can hold visible objects. At rest (N = 2) that is the whole window, the same as before.
 - The builder asks the streamer (FVolumeSource::IntegralReady). A missing integral starts the worker job and that carrier is skipped for those frames. The request comes at the start of the handoff ramp, where the carrier's weight is about 0. The reference pipeline still computes inline, so offline renders are unchanged.
 Rationale: T2.stream.volume_parity still holds: 0 hold violations, identical carriers and LUTs (at rest the rule is unchanged). The flight cases are covered by T2.stream.responsive.
+Reroll impact: None.
+Status: Provisional
+
+D-142 — Star systems: activated near the camera, generated on the CPU from the star's record
+Question: B-002 (owner request). How do planets come into being, given that star records never leave the GPU?
+Decision:
+- **Activation.** An archetype can have systems (`FArchetype::bSystems`; stars in the demo). The project pass tests every resident object of such an archetype against its activation radius: 100 AU × √(L/L☉), clamped to 30 AU–10⁴ AU, shared core `UniSystem.ush`. The test uses true distance, before culling. Matches are appended, with their records, to a 32-entry readback ring.
+- **Mapping back.** The game thread maps each readback to the star's cell through the last 16 frames' cell tables, then activates the system. A system is deactivated, with exact CPU distance, beyond 1.25× the radius.
+- **Generation (`UniSystem.h`).** The system is generated from the star's record alone:
+  - planet count: Poisson with a mean of 2.5–4 by mass, at most 10;
+  - semi-major axes: log-uniform over 0.04–60 AU × √L, sorted, with a minimum spacing ratio of 1.3;
+  - type: rocky inside the snow line (2.7 AU × √L); the first two beyond it are gas giants, then ice giants;
+  - radius, albedo, eccentricity and inclination are rolled by name; node, argument and phase are uniform.
+- **Seeds.** A new seed channel, SYSTEM. Every planet quantity keys its own named stream.
+- **Owner decisions (2026-11-01).**
+  - Orbits are on rails.
+  - The clock runs at real time by default and is configurable.
+  - Binaries are not in v1. When they come, they are generated at the system level, with one galaxy-level sprite resolving into its stars.
+Rationale:
+- Only a handful of systems are active at once, so CPU generation costs nothing.
+- The star record already carries everything a system needs.
+- Re-entering a system gives the same planets, because the system is a pure function of the record.
+- Checks: T2.system.determinism (20,000 real stars: identical on rebuild, distinct per star, all planets within limits, 3.2 planets per system, 75% with a gas giant) and T2.system.activation (200 paths, grazing to central, with camera wobble: exactly one activation and one deactivation each).
+Reroll impact: None for existing content. New content only.
+Status: Provisional
+
+D-143 — Planets are drawn through the existing project pass: dynamic pseudo-cells and a reserved pool tail
+Question: Planets move every frame. How do they reach the sprite path without a new renderer?
+Decision:
+- **Pool.** The last 256 pool slots are reserved for planet records and rewritten every frame by the scatter pass. The generation pool ends below them, at 2,096,896 slots.
+- **Pseudo-cell.** Each active system becomes one entry in the cell table. Its level is Lp + 1, where 2^Lp ≥ 4× the system's span. Its origin is half a level-Lp cell below the star, so every planet's integer offset fits the record's u32 for its whole orbit.
+- **Records.** Each frame the CPU writes each planet's exact offset: star coordinate plus the double-precision Kepler position, then an integer subtraction.
+- **Precision.** The camera-relative vector stays exact (D-104).
+Rationale: T2.system.pipeline runs 300 real systems with the camera inside, sampling 24 times over each outer orbit (27,624 records) through the GPU's own projection core:
+- worst direction error 6e-8 rad;
+- distance error 6e-8;
+- apparent magnitude within 0.016 of exact;
+- 0 saturated offsets.
+Reroll impact: None. Generation capacity drops by 256 of 2,097,152 slots.
+Status: Provisional
+
+D-144 — Planet photometry: reflected light, written as an effective absolute magnitude
+Question: The sprite path takes an absolute magnitude and applies the distance modulus itself. Planets shine by reflected light, which depends on three bodies.
+Decision:
+- **Brightness.** m = M★ − 2.5 log10(A_g · Φ(α) · R² · (10 pc)² / (r² Δ²)), with Φ the Lambert-sphere phase function.
+- **What the record carries.** The CPU writes M_eff = m − 5 log10(Δ / 10 pc) into each record every frame, so the GPU's distance modulus restores m exactly.
+- **Hiding.** A planet with M_eff > 60 is hidden; F16 keeps 0.03-mag steps up to there.
+- **Colour.** The star's colour × the planet type's tint.
+- **Appearance.** Planets are flagged extended, so they get the resolved-disc path when large.
+Rationale: T1.system.photometry:
+- Φ agrees with a numerical integral over a lit sphere to 6e-7.
+- The formula gives Jupiter −2.72 and Mars −2.08 at mean opposition. Literature values are about −2.7 and −2.0.
+Limitations: The disc is drawn flat. The lit crescent comes with the M3 sphere actor (B-003).
+Reroll impact: None.
+Status: Provisional
+
+D-145 — Universe clock
+Question: Orbits need a time.
+Decision: The subsystem has a double-precision clock in seconds since the epoch, starting at 0 when a universe is enabled.
+- It advances at the time scale, 1 by default: real time, as the owner decided.
+- `uu.TimeScale <x>` changes the rate (3.15e7 = one year per second); `uu.Time <s>` sets the clock.
+- Relativistic scaling may come later.
+- Positions are a pure function of t (on rails), so changing the time scale or jumping in time never accumulates error.
+Rationale: T1.system.kepler checks the solver, closure and speed:
+- worst Kepler residual 4e-16 rad over 200,000 solves;
+- closure after one period within 2e-10 of the semi-major axis;
+- vis-viva speed within 4e-5;
+- a 1 AU orbit takes 365.257 days.
+Reroll impact: None.
+Status: Provisional
+
+D-146 — Scene actors follow the parallax rule; the depth test reads render space back as true distance (M3)
+Question: How do UE actors (promoted bodies, the owner's planets, anything) coexist with the compressed backdrop? Owner: real space at unit scale, consistent movement at any speed, a generic parallax wrapper.
+Decision:
+- **The wrapper.** `UUniParallaxComponent` can be added to any actor. Given a universal coordinate, it places its owner every frame, right after the universal camera moves:
+  - while the owner's surface is inside r0 (and its centre within 5e11 cm, the engine's world bounds), at unit scale, at its true offset (real space);
+  - otherwise, scaled about the eye by s = f(d)/d, at s × its offset. That preserves direction, angular size and parallax exactly, so the actor and the backdrop sprites agree at any distance.
+- **Consistency.** The switch between the two is invisible on screen and has 1.25× hysteresis. Nothing placed this way moves by its own physics, so it moves in step with the backdrop at any camera speed.
+- **Depth.** The sprite and volume passes read scene depth as render space and convert it to true distance with f⁻¹ (`Uni_SceneTrueDistance`):
+  - exact inside r0;
+  - for a compressed body, nothing behind it shows, and what is in front shows unless it lies within (1 + ln(d / r0)) R of the near surface. That is the bound for a uniformly scaled body; only a moon close in front of a distant planet could fall inside it.
+- **Reference renderers.** Both now write render-space depth for their promoted spheres.
+Rationale:
+- T2.parallax.equivalence: 200,000 objects from 10 m to 10²⁷ cm, direction within 1e-7 rad of the sprite path, render distance within 2e-7, angular size exact to 4e-16.
+- T2.parallax.realspace: approach and departure from a Jupiter with wobble at the edge, 2 switches, no size jump.
+- T3.occlusion: exact for a real-space occluder, and the stated bound for a compressed one (0 wrong outside it).
+Reroll impact: None.
+Status: Provisional
+
+D-147 — Promotion of nearby stars and planets to placeholder actors (M3)
+Question: Which bodies become actors, when, and how does the sprite hand over?
+Decision:
+- **Which bodies.** The stars and planets of active systems (D-142) are promoted by the GPU's own test (`Uni_PromoteTest`: surface within r0 or angular radius above 0.02 rad, 1.25× hysteresis). Any body that can pass it is already inside an active system, so no new readback is needed.
+- **The actor.** A placeholder `AUniBodyActor`: the engine sphere at the body's true radius, engine materials only, collision off, placed by D-146.
+- **Hand-off.**
+  - A promoted planet's record carries UNI_OBJ_FLAG_PROMOTED on the same frame, so exactly one of sprite and actor is drawn.
+  - A star keeps its sprite. The sphere hides the sprite's centre by depth, and the glare outside reads as a corona until B-003.
+- **Light rig.** A movable directional light from the nearest active star, in its colour (`uu.LightRig`, `uu.LightRigLux`).
+- **Drawing change (D-143 amendment).** Each planet is drawn from its own level-34 cell, so its record is exact to 4 cm. A shared per-system cell quantised to about 21 km, which disagreed with the exact actor by 7e-6 rad at the swap.
+Rationale: T2.parallax.promotion, a gas giant from 300 radii to 1,000 km and back while it orbits:
+- 1 swap each way;
+- 0 frames with both representations and 0 with neither;
+- the actor within 2e-8 rad of where the sprite was.
+Known, corrected by D-148: the 1.85× sprite-to-body ratio first reported here was measured on the wrong frame (300 radii out on departure, not at the swap). At the swap, this gas giant's sprite was already body-sized; a very bright body's was 1.39×. The visible mismatch was mostly the profile, a Gaussian blob becoming a hard-edged sphere. D-148 removes both.
+Reroll impact: None.
+Status: Provisional (placeholder actor; the owner's planet replaces it)
+
+D-148 — Body sprites become their body before the hand-off (B-003, render-only)
+Question: B-003 (owner). Far away a sprite is drawn at its glare footprint; near promotion it should come back to the body's true size, and match the actor at the swap.
+Decision: Bodies are extended objects without children; today that means planets.
+- **Size.** A body's sprite size eases from max(glare, true size) to the true size between ¼ θ_promote and θ_promote: lerp by smoothstep, never below the true size. At the swap it is exactly the body.
+- **Shape.** A body wider than 1.5 px draws as a soft-edged uniform disc of its true radius. A Gaussian glare halo carries the rest of the energy and fades out as the size blend completes. The profile (`Uni_SpriteProfile`, shared by the pixel shader and the reference) sums to 1 over the pixels at any size, so flux is unchanged.
+- **Unchanged.** Stars keep their glare (point sources; the corona around a promoted star stays). Galaxies keep their Gaussian; they hand off to the volume at 4–8 px (D-129).
+Rationale:
+- T1.sprite.profile: energy within 1.84% over 295 profiles from 0.8 to 80 px, and the size exact at θ_promote. Without the blend, a bright body was 39% too large there.
+- T2.parallax.promotion: the sprite is the body's size (1.000) on the frame before the swap.
+Reroll impact: None.
+Status: Provisional. Its size rule is superseded by D-150; the disc profile stands.
+
+D-149 — Real space: flight drives the pawn locally below cruise speed; integer-cm re-centring; physics-driven actors (M3)
+Question: The M3 criterion is "physics stable in Local mode". The owner asked for consistent movement at every speed scale.
+Decision:
+- **One control scheme.** `uu.Fly` has the same controls at every speed. Below 5e7 cm/s (and until 1e8 cm/s, the D-008 hysteresis) it moves the pawn through the UE world in Local mode: camera = local anchor + view location. Promoted bodies are then fixed in the world, so physics near them is stable. Above that it is Cruise as before: the pawn is pinned and the universe moves. The pawn's own movement component is suppressed while free flight drives it, and restored when free flight ends.
+- **Re-centring.** When the pawn is more than 1,000 km from the anchor, the anchor moves by the pawn's whole-centimetre position (`UniLocalFrame.h`) and the pawn moves back by the same amount. So anchor + position, the universal camera and every universal position are unchanged to the bit.
+  - Simulated parallax actors shift with the pawn.
+  - `OnLocalRecentre(WorldShift)` tells everything else.
+  - The camera cache is refreshed in the same frame.
+- **Physics-driven actors.** `UUniParallaxComponent::Mode = Simulated`: while in real space in Local mode, physics owns the actor and its universal `Coord` is written back from its world position. Otherwise the universe places it.
+Rationale: T2.local.recentre, 200,000 frames of a wandering pawn with 164 re-centres: the camera stays within 1.5e-5 cm of the exactly accumulated path, moves 0 cm across a re-centre, and bodies shift by exactly the integer shift.
+Reroll impact: None.
+Status: Provisional (physics stability itself needs UE: UE-11)
+
+D-150 — Every brightness-boosted sprite arrives at its true size (owner, generalises D-148)
+Question: Owner: a star's sprite is enlarged with its brightness so it stays visible all the way in. By the time you are close enough to spawn its planets it should be back at its real perceived size, and the same goes for every sprite whose angular size is boosted for brightness.
+Decision:
+- **Arrival distance.** Each object has an arrival distance (`Uni_ArrivalDistance`):
+  - a star whose archetype has systems: its system activation radius (100 AU × √L, 30 AU–10⁴ AU), where its planets spawn;
+  - anything else: its promotion distance, R / θ_promote.
+- **The ramp.** Over the last 4× in distance before arrival, the sprite's footprint eases (smoothstep in log distance) from the brightness-boosted glare to the true perceived size: the physical angular radius, never below one pixel.
+- **Inside the ramp** the boost is frozen at its value at the ramp's start, so the footprint only shrinks on the way in.
+- **Unchanged.** Flux is unchanged (the profile is normalised), so a star at its system radius is a single very bright pixel, and the engine's bloom provides its glare. Bodies keep D-148's disc profile.
+- **Plumbing.** The view carries the system-archetype mask (`FUniView::SystemArchetypeMask`, which replaces its padding).
+Rationale: T1.sprite.arrival, a red dwarf to a supergiant approached from 10⁴× their arrival distance:
+- exactly the true size at arrival;
+- monotone over the ramp;
+- boosted 1.3–2.9× far out.
+
+The other checks are unchanged: T2.parallax.promotion still finds the sprite at the body's size at the swap, T3.flythrough 0 pops, and T3.vol.conservation unchanged (energy is not affected).
+Known: a promoted star's sprite is now a pixel inside its sphere, so the "corona" of D-147 is gone. With no emissive engine material, the placeholder star sphere is lit from behind and looks dark. It needs an emissive material (owner's asset) or B-003's bloom hand-off.
 Reroll impact: None.
 Status: Provisional

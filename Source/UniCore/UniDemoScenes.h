@@ -38,6 +38,7 @@ namespace UniScenes
 		A.RadiusModel[0] = 10.84f; A.RadiusModel[1] = -0.15f; A.RadiusModel[2] = 4.83f; A.RadiusModel[3] = 0.15f;
 		// log10 T = 3.76 - 0.05 (M - 4.83) +- 0.05.
 		A.ColourModel[0] = 3.76f; A.ColourModel[1] = -0.05f; A.ColourModel[2] = 4.83f; A.ColourModel[3] = 0.05f;
+		A.bSystems = true;   // B-002: every star has a system (possibly empty)
 		return A;
 	}
 
@@ -76,7 +77,10 @@ namespace UniScenes
 		E.ChildArchetypeId = kStar;
 		E.FieldId = H::UNI_FIELD_GALAXY;
 		E.Exemplar = GalaxyExemplar();
-		E.NTotal = 2.0e11;
+		// D-133 (owner, option B): 2.69e10 stars at M = -21, so the stars add up to the galaxy's own
+		// magnitude (the placeholder stellar function's budget; 2e11 summed to -23.18). Re-derive from
+		// LuminosityBudget whenever the stellar function changes (D-014).
+		E.NTotal = 2.69e10;
 		E.NTotalRefMag = -21.0;
 		E.InfluenceMul = 1.6;
 		E.Ranges = {

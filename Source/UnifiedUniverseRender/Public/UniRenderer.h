@@ -16,6 +16,7 @@
 // Render thread: everything named *_RenderThread.
 
 #include "CoreMinimal.h"
+#include "HAL/CriticalSection.h"
 #include "RenderGraphResources.h"
 #include "RendererInterface.h"   // IPooledRenderTarget
 #include "UniStreamer.h"
@@ -40,6 +41,12 @@ struct FUniFrameData
 	bool bEnabled = false;
 	uint64 FrameNumber = 0;
 
+	// Star systems (D-142, D-143). Planet records for the reserved pool tail
+	// (UniGpuLayout::DynamicPoolBase..), rewritten every frame, and the archetype mask the
+	// project pass tests for system activation. Their dynamic cells are appended to Cells.
+	TArray<UniCore::FObjectGPU> DynamicRecords;
+	uint32 SystemArchetypeMask = 0;
+
 	// Volume pass (Docs/VOLUMETRICS.md, UniCore::FVolumeBuilder). Local carriers are marched per
 	// pixel; background (periodic) carriers into the direction map whenever BackgroundVersion
 	// changes (D-136). Parameters and LUT are shared by both.
@@ -53,6 +60,16 @@ struct FUniFrameData
 	uint32 BackgroundVersion = 0;
 };
 
+/** A star the project pass found inside its system radius (D-142), as read back. CellIndex
+ *  indexes the cell table of frame FrameNumber. */
+struct FUniActivation
+{
+	uint64 FrameNumber = 0;
+	uint32 CellIndex = 0;
+	uint32 ObjectIndex = 0;
+	UniCore::FObjectGPU Record{};
+};
+
 struct FUniRenderStats
 {
 	std::atomic<uint32> SpritesLastFrame{ 0 };
@@ -62,6 +79,7 @@ struct FUniRenderStats
 	std::atomic<uint32> GenBatchesFailed{ 0 };
 	std::atomic<uint32> VolumeCarriersLastFrame{ 0 };
 	std::atomic<uint32> BackgroundFacesMarched{ 0 };
+	std::atomic<uint32> ActivationsLastReadback{ 0 };
 	/** The last rendered view's angular pixel size (rad): the game thread builds the next
 	 *  frame's carriers with it (one frame late, harmless: it only sets handoff weights). */
 	std::atomic<float> ThetaPixelLastFrame{ 1.0f / 960.0f };
@@ -82,6 +100,13 @@ public:
 
 	/** Game thread. Copies the payload to the render thread. */
 	void SetFrame_GameThread(FUniFrameData&& Data);
+
+	/** Game thread: system activations read back since the last call (D-142). */
+	void DrainActivations_GameThread(TArray<FUniActivation>& Out);
+
+	/** First pool slot of the planet records (D-143); the generation pool ends below it. */
+	static uint32 DynamicPoolBase();
+	static uint32 DynamicPoolSlots();
 
 	/** Game thread. Slice table and LUTs, once per universe definition. */
 	void SetTables_GameThread(TArray<UniCore::FSliceGPU> Slices, TArray<float> Lut);
@@ -124,6 +149,13 @@ private:
 	struct FPromoteReadback;
 	TArray<TSharedPtr<FPromoteReadback>> PromoteRing;
 	int32 PromoteRingNext = 0;
+
+	// System activations (D-142): a ring of readbacks, results handed to the game thread.
+	struct FActivateReadback;
+	TArray<TSharedPtr<FActivateReadback>> ActivateRing;
+	int32 ActivateRingNext = 0;
+	FCriticalSection ActivationLock;
+	TArray<FUniActivation> ActivationsReady;
 };
 
 /** GPU generation backend for UniCore::FUniStreamer. Game thread only. */

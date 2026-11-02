@@ -20,6 +20,7 @@
 #include "UniCoord.ush"
 #include "UniPhotometry.ush"
 #include "UniPlacement.ush"
+#include "UniSystem.ush"
 
 static const float UNI_THETA_PROMOTE = 0.02f;     // rad: angular size that promotes to an actor (D-119)
 static const float UNI_PROMOTE_HYSTERESIS = 1.25f;
@@ -27,6 +28,29 @@ static const float UNI_PROMOTE_HYSTERESIS = 1.25f;
 static const uint UNI_SPRITE_VISIBLE = 1u;
 static const uint UNI_SPRITE_PROMOTE_CANDIDATE = 2u;
 static const uint UNI_SPRITE_EXTENDED = 4u;
+static const uint UNI_SPRITE_BODY = 8u;           // D-148: a resolved body (extended, no children): disc profile
+static const float UNI_SPRITE_DISC_MIN_PX = 1.5f; // below this a body is drawn as a plain Gaussian
+static const float UNI_ARRIVAL_RANGE = 4.0f;      // D-150: the brightness boost fades over the last 4x in distance
+
+/** D-150: the distance at which an object's sprite must be back at its true perceived size.
+ *  A star whose archetype has systems: its activation radius, where its planets spawn. Anything
+ *  else: its promotion distance, where an actor replaces the sprite (R / theta_promote). */
+UNI_FN float Uni_ArrivalDistance(uint InArchetypeId, uint InSystemArchetypeMask, float InAbsMag, float InRadius)
+{
+	const float Promote = InRadius / UNI_THETA_PROMOTE;
+	if (InArchetypeId < 32u && ((InSystemArchetypeMask >> InArchetypeId) & 1u) != 0u)
+	{
+		return max(Uni_SystemActivationRadius(InAbsMag), Promote);
+	}
+	return Promote;
+}
+
+/** D-150: 0 far out (full brightness boost), 1 at and inside the arrival distance (true size),
+ *  smooth in log distance over the last UNI_ARRIVAL_RANGE. */
+UNI_FN float Uni_ArrivalWeight(float InDistance, float InArrival)
+{
+	return 1.0f - smoothstep(0.0f, 1.0f, log(max(InDistance, 1.0f) / max(InArrival, 1.0f)) / log(UNI_ARRIVAL_RANGE));
+}
 
 struct FUniView
 {
@@ -41,7 +65,7 @@ struct FUniView
 	float SurfaceLimit;       // mu_lim = mu_ref + dm
 	float ThetaPixel;         // angular radius of one pixel: minimum sprite footprint
 	float GlareGain;          // footprint growth with flux
-	float Pad;
+	uint SystemArchetypeMask; // D-150: archetypes whose objects arrive at their system radius (UniSystem.ush)
 };
 
 struct FUniSprite
@@ -93,7 +117,8 @@ UNI_FN float Uni_ObjectVisibility(FUniObject InObj, float InDistance, float InPh
  *  farther than the object's true distance. Both are true-scale distances (D-120). */
 UNI_FN bool Uni_SceneDepthKeep(float InTrueDistance, float InSceneDistance)
 {
-	return InTrueDistance < InSceneDistance;
+	// InSceneDistance is the render-space distance read from scene depth (D-146).
+	return InTrueDistance < Uni_SceneTrueDistance(InSceneDistance);
 }
 
 /** Project one object. Returns the sprite; Flags says whether it is visible and whether it is
@@ -149,11 +174,50 @@ UNI_FN FUniSprite Uni_ProjectObject(uint4 InCellDeltaX, uint4 InCellDeltaY, uint
 	S.NdcX = Nx;
 	S.NdcY = Ny;
 	S.RenderPos = Dir * Uni_Compress(R);
-	S.AngularRadius = max(S.PhysAngularRadius, InView.ThetaPixel * (1.0f + InView.GlareGain * log2(1.0f + Intensity)));
+
+	// D-150 (owner, generalising D-148): far away a sprite is enlarged with its brightness so it
+	// stays visible the whole way in; over the last 4x in distance before it "arrives" (a star:
+	// its system radius, where its planets spawn; anything else: its promotion distance) the boost
+	// fades to the object's true perceived size: its physical angular radius, never below one
+	// pixel. Flux is unchanged (the profile is normalised); only the footprint shrinks.
+	// Inside the ramp the boost is frozen at its value at the ramp's start (the brightness the
+	// object has at UNI_ARRIVAL_RANGE x its arrival distance), so the footprint only shrinks on the
+	// way in; the light itself keeps rising as 1 / r^2.
+	const bool bBody = bExtended && (ObjFlags & UNI_OBJ_FLAG_HAS_CONTRIBUTOR) == 0u;
+	const float Arrival = Uni_ArrivalDistance(Uni_ObjectArchetype(InObj), InView.SystemArchetypeMask, AbsMag, Radius);
+	const float RampStart = UNI_ARRIVAL_RANGE * Arrival;
+	const float GlareIntensity = (R < RampStart) ? Intensity * (R / RampStart) * (R / RampStart) : Intensity;
+	const float Glare = InView.ThetaPixel * (1.0f + InView.GlareGain * log2(1.0f + GlareIntensity));
+	const float TrueSize = max(S.PhysAngularRadius, InView.ThetaPixel);
+	const float ToTrue = Uni_ArrivalWeight(R, Arrival);
+	S.AngularRadius = max(TrueSize, lerp(max(Glare, TrueSize), TrueSize, ToTrue));
 	const float3 Col = Uni_UnpackColour(InObj.B.w);
 	S.Radiance = Col * (Intensity / max(Uni_Luminance(Col), 1.0e-3f));   // luminance = intensity (D-135)
-	S.Flags = S.Flags | UNI_SPRITE_VISIBLE | (bExtended ? UNI_SPRITE_EXTENDED : 0u);
+	S.Flags = S.Flags | UNI_SPRITE_VISIBLE | (bExtended ? UNI_SPRITE_EXTENDED : 0u) | (bBody ? UNI_SPRITE_BODY : 0u);
 	return S;
+}
+
+/** D-148: the disc fraction of a sprite, DiscFrac = PhysAngularRadius / AngularRadius for a
+ *  body wider than UNI_SPRITE_DISC_MIN_PX, else 0 (a plain Gaussian). */
+UNI_FN float Uni_SpriteDiscFrac(FUniSprite InS, float InPixelsPerRadian)
+{
+	if ((InS.Flags & UNI_SPRITE_BODY) == 0u) { return 0.0f; }
+	if (InS.PhysAngularRadius * InPixelsPerRadian < UNI_SPRITE_DISC_MIN_PX) { return 0.0f; }
+	return saturate(InS.PhysAngularRadius / max(InS.AngularRadius, 1.0e-30f));
+}
+
+/** D-148: the sprite's per-pixel weight at RPx pixels from its centre, normalised so it sums to
+ *  1 over the pixels (energy = Radiance at any size). SigmaPx: the Gaussian's sigma (the
+ *  sprite's angular radius in pixels). DiscFrac 0: the Gaussian alone. Otherwise a soft-edged
+ *  uniform disc of radius DiscFrac x SigmaPx carries DiscFrac of the energy and the Gaussian
+ *  (the remaining glare halo) the rest, so at DiscFrac = 1 it is the body's disc exactly. */
+UNI_FN float Uni_SpriteProfile(float InRPx, float InSigmaPx, float InDiscFrac)
+{
+	const float Gauss = exp(-0.5f * (InRPx * InRPx) / (InSigmaPx * InSigmaPx)) / (6.2831853f * InSigmaPx * InSigmaPx);
+	if (!(InDiscFrac > 0.0f)) { return Gauss; }
+	const float D = InDiscFrac * InSigmaPx;
+	const float Disc = saturate(D + 0.5f - InRPx) / (3.14159265f * D * D + 0.2617994f);   // pi D^2 + pi/12: the 1 px soft edge's area
+	return lerp(Gauss, Disc, InDiscFrac);
 }
 
 #endif // UNI_PROJECT_USH

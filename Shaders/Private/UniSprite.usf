@@ -44,6 +44,7 @@ struct FSpriteVSOut
 	nointerpolation float TrueDistance : TEXCOORD2;
 	nointerpolation float CosToForward : TEXCOORD3;
 	nointerpolation float SigmaPx : TEXCOORD4;
+	nointerpolation float DiscFrac : TEXCOORD5;   // D-148: body disc fraction (0: Gaussian only)
 };
 
 void MainVS(uint VertexId : SV_VertexID, uint InstanceId : SV_InstanceID, out FSpriteVSOut Out)
@@ -68,6 +69,7 @@ void MainVS(uint VertexId : SV_VertexID, uint InstanceId : SV_InstanceID, out FS
 	Out.TrueDistance = S.TrueDistance;
 	Out.CosToForward = max(dot(Dir, ViewForward), 1.0e-3);
 	Out.SigmaPx = max(S.AngularRadius * PixelsPerRadian, 0.5f);
+	Out.DiscFrac = Uni_SpriteDiscFrac(S, PixelsPerRadian);
 }
 
 float SceneDistance(float2 PixelPos, float CosToForward)
@@ -86,10 +88,10 @@ float SceneDistance(float2 PixelPos, float CosToForward)
 void MainPS(in FSpriteVSOut In, out float4 OutColor : SV_Target0)
 {
 	if (!Uni_SceneDepthKeep(In.TrueDistance, SceneDistance(In.Position.xy, In.CosToForward))) { discard; }
-	const float R2 = dot(In.Corner, In.Corner);
-	// Gaussian with sigma = 1 corner unit = SigmaPx pixels, normalised per PIXEL, so the energy
-	// summed over the covered pixels equals Radiance whatever the sprite's size.
-	const float W = exp(-0.5f * R2) / (6.2831853f * In.SigmaPx * In.SigmaPx);
+	// Corner units: 1 = the angular radius = SigmaPx pixels. Gaussian (or, for a resolved body,
+	// disc + fading glare halo, D-148), normalised per PIXEL so the energy summed over the
+	// covered pixels equals Radiance whatever the sprite's size.
+	const float W = Uni_SpriteProfile(length(In.Corner) * In.SigmaPx, In.SigmaPx, In.DiscFrac);
 	float T = 1.0f;
 	if (bVolume != 0u)
 	{

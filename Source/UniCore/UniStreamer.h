@@ -384,10 +384,13 @@ namespace UniCore
 			bFirstFrame = false;
 		}
 
-		/** Per-frame cell table for project-and-cull: Ready cells in windows (D-104 deltas). */
-		std::vector<FCellGPU> CellTable() const
+		/** Per-frame cell table for project-and-cull: Ready cells in windows (D-104 deltas).
+		 *  OutKeys, if given, receives each entry's cell key in the same order (D-142: a system
+		 *  activation read back from the GPU names its cell by index into this frame's table). */
+		std::vector<FCellGPU> CellTable(std::vector<FCellKey>* OutKeys = nullptr) const
 		{
 			std::vector<FCellGPU> Out;
+			if (OutKeys) { OutKeys->clear(); }
 			for (const auto& LKV : Levels)
 			{
 				const FLevel& Lv = LKV.second;
@@ -409,6 +412,7 @@ namespace UniCore
 					G.PoolCount = C.PoolCount;
 					G.Flags = (Lv.Lod.bSuspended ? 1u : 0u) | (Fade << 8);
 					Out.push_back(G);
+					if (OutKeys) { OutKeys->push_back(C.Key); }
 				}
 			}
 			return Out;

@@ -45,6 +45,19 @@ UNI_FN float Uni_CompressInverse(float InS)
 	return (InS <= UNI_R0_CM) ? InS : UNI_R0_CM * exp(InS / UNI_R0_CM - 1.0f);
 }
 
+/** D-146: the main scene is in render space. Real space (unit scale) inside r0, and promoted
+ *  actors beyond it are placed by the parallax rule: scaled about the eye by f(d)/d, d the
+ *  distance to their centre. A scene distance s along a ray is read back as true distance
+ *  f^-1(s). Exact inside r0. For a compressed body the result is never farther than the true
+ *  surface, so what is behind it is always hidden, and what is in front is kept unless it lies
+ *  within (1 + ln(d / r0)) R of the body's near surface (T3.occlusion). Sky (3e38) stays sky. */
+UNI_FN float Uni_SceneTrueDistance(float InSceneDistance)
+{
+	if (!(InSceneDistance < 1.0e37f)) { return 3.0e38f; }
+	// Above ~88 r0 the exponent overflows float: everything past it is beyond 2^128 cm anyway.
+	return (InSceneDistance < 88.0f * UNI_R0_CM) ? Uni_CompressInverse(InSceneDistance) : 3.0e38f;
+}
+
 /** df/dr, for tests and for screen-space size scaling diagnostics. */
 UNI_FN float Uni_CompressSlope(float InR)
 {

@@ -52,6 +52,7 @@ static const uint UNI_CH_ANCHOR = 0x97F56434u;      // ChannelId("ANCHOR")      
 static const uint UNI_CH_CONTRIBUTOR = 0x98C9F94Au; // ChannelId("CONTRIBUTOR") contributor id
 static const uint UNI_CH_SLICE = 0x4A3EBEB1u;       // ChannelId("SLICE")       reserved: slice-local draws
 static const uint UNI_CH_SHAPE = 0x458FA9C6u;       // ChannelId("SHAPE")       field shape params per contributor
+static const uint UNI_CH_SYSTEM = 0x3FBAD1DCu;      // ChannelId("SYSTEM")      star system (planets) per star (D-142)
 
 // ------------------------------------------------------------------------------------------
 // ProcSeed port

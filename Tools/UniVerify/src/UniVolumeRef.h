@@ -103,7 +103,7 @@ namespace UniRender
 				{
 					const FV3 D = PixelDir(Cam, Img.W, Img.H, X + 0.5, Y + 0.5);
 					const double Scene = Img.SceneDist[size_t(Y) * Img.W + X];
-					const float TScene = std::isfinite(Scene) ? float(Scene) : 3.0e38f;
+					const float TScene = std::isfinite(Scene) ? H::Uni_SceneTrueDistance(float(Scene)) : 3.0e38f;   // render space -> true (D-146)
 					const H::float3 Dc(float(D.X), float(D.Y), float(D.Z));
 					// Supersampling where a small carrier's finest feature is under half a pixel.
 					u32 SS = 1u;

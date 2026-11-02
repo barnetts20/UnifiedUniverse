@@ -9,6 +9,7 @@
 #include "UniGenRef.h"
 #include "UniScaleLadder.h"
 #include "UniShaderCores.h"
+#include "UniParallax.h"
 
 #include <cmath>
 #include <cstdio>
@@ -38,6 +39,7 @@ namespace UniRender
 		double FovX = 1.5707963267948966;   // 90 degrees
 		int Width = 960, Height = 540;
 		double DeltaMag = 0.0;
+		u32 SystemArchetypeMask = 1u << 1;   // the demo's star archetype (UniDemoScenes kStar) has systems (D-150)
 
 		void LookAlong(FV3 F, FV3 WorldUp = { 0, 0, 1 })
 		{
@@ -64,7 +66,7 @@ namespace UniRender
 			V.ExposureMag = V.LimitingMag - 1.0f;
 			V.ThetaPixel = float(1.0 / FocalPx());
 			V.GlareGain = 0.35f;
-			V.Pad = 0.0f;
+			V.SystemArchetypeMask = SystemArchetypeMask;
 			return V;
 		}
 	};
@@ -80,7 +82,7 @@ namespace UniRender
 	{
 		int W = 0, H = 0;
 		std::vector<float> Rgb;          // HDR, exposure units
-		std::vector<double> SceneDist;   // main-pass true distance per pixel (inf = sky)
+		std::vector<double> SceneDist;   // main-pass RENDER-space distance per pixel (inf = sky), as the engine's depth buffer holds it (D-146)
 		FImage(int InW, int InH) : W(InW), H(InH), Rgb(size_t(InW) * InH * 3, 0.0f), SceneDist(size_t(InW) * InH, std::numeric_limits<double>::infinity()) {}
 
 		void Add(int X, int Y, float R, float G, float B)
@@ -125,11 +127,12 @@ namespace UniRender
 		const double Px = (double(S.NdcX) * 0.5 + 0.5) * Img.W;
 		const double Py = (0.5 - double(S.NdcY) * 0.5) * Img.H;
 		const double Sigma = std::max(0.6, double(S.AngularRadius) * Cam.FocalPx() * 0.5);
+		const float DiscFrac = H::Uni_SpriteDiscFrac(S, float(Cam.FocalPx() * 0.5));   // D-148, in this renderer's pixel convention
 		// Kernel radius: out to where the Gaussian tail falls below 1e-3 exposure units, so a
 		// saturated bright star is not truncated into a square. Capped at 160 px.
 		const double Peak = double(std::max(S.Radiance.x, std::max(S.Radiance.y, S.Radiance.z))) / (6.283185307179586 * Sigma * Sigma);
 		const double Reach = Sigma * std::sqrt(2.0 * std::log(std::max(Peak / 1.0e-3, 2.0)));
-		const int Rad = int(std::min(160.0, std::ceil(std::max(3.0 * Sigma, Reach))));
+		const int Rad = int(std::min(160.0, std::ceil(std::max({ 3.0 * Sigma, Reach, double(DiscFrac) * Sigma + 2.0 }))));
 		const int Cx = int(std::floor(Px)), Cy = int(std::floor(Py));
 		// Scene-depth test at the sprite centre pixel, as the pixel shader does per pixel.
 		bool bAnyKept = false;
@@ -137,7 +140,7 @@ namespace UniRender
 		for (int Dy = -Rad; Dy <= Rad; ++Dy) for (int Dx = -Rad; Dx <= Rad; ++Dx)
 		{
 			const double Ex = (Cx + Dx + 0.5) - Px, Ey = (Cy + Dy + 0.5) - Py;
-			Norm += std::exp(-(Ex * Ex + Ey * Ey) / (2 * Sigma * Sigma));
+			Norm += double(H::Uni_SpriteProfile(float(std::sqrt(Ex * Ex + Ey * Ey)), float(Sigma), DiscFrac));
 		}
 		for (int Dy = -Rad; Dy <= Rad; ++Dy) for (int Dx = -Rad; Dx <= Rad; ++Dx)
 		{
@@ -145,7 +148,7 @@ namespace UniRender
 			if (X < 0 || Y < 0 || X >= Img.W || Y >= Img.H) { continue; }
 			if (!H::Uni_SceneDepthKeep(S.TrueDistance, float(std::min(Img.SceneDist[size_t(Y) * Img.W + X], 3.0e38)))) { continue; }
 			const double Ex = (X + 0.5) - Px, Ey = (Y + 0.5) - Py;
-			const double Wt = std::exp(-(Ex * Ex + Ey * Ey) / (2 * Sigma * Sigma)) / Norm;
+			const double Wt = double(H::Uni_SpriteProfile(float(std::sqrt(Ex * Ex + Ey * Ey)), float(Sigma), DiscFrac)) / Norm;
 			Img.Add(X, Y, float(S.Radiance.x * Wt), float(S.Radiance.y * Wt), float(S.Radiance.z * Wt));
 			bAnyKept = true;
 		}
@@ -175,7 +178,12 @@ namespace UniRender
 			const double C = Dot(Centre, Centre) - Radius * Radius;
 			const double Disc = B * B - C;
 			if (Disc < 0.0 || B <= 0.0) { continue; }
-			const double T = B - std::sqrt(Disc);
+			// Placed as the parallax component places an actor (D-146): real space while its surface
+			// is inside r0, otherwise scaled about the eye by f(d)/d. The depth buffer holds the
+			// render-space distance.
+			const double Dc = std::sqrt(Dot(Centre, Centre));
+			const double Scale = ((Dc - Radius) < double(H::UNI_R0_CM) && Dc < UniCore::ParallaxMaxRealSpaceCm) ? 1.0 : UniCore::CompressD(Dc) / Dc;
+			const double T = (B - std::sqrt(Disc)) * Scale;
 			double& Sd = Img.SceneDist[size_t(Y) * Img.W + X];
 			if (T < Sd)
 			{

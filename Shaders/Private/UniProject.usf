@@ -11,6 +11,7 @@
 
 #include "/Engine/Public/Platform.ush"
 #include "Core/UniProject.ush"
+#include "Core/UniSystem.ush"
 
 struct FUniCellGPU   // GPU-MIRROR: UniCore::FCellGPU (64 bytes)
 {
@@ -29,11 +30,16 @@ RWStructuredBuffer<FUniSprite> OutSprites;
 RWBuffer<uint> OutDrawArgs;          // {VertexCountPerInstance, InstanceCount, StartVertex, StartInstance}
 RWStructuredBuffer<uint2> OutPromote;
 RWBuffer<uint> OutPromoteCount;
+RWStructuredBuffer<uint2> OutActivate;          // D-142: (cell index, object index) of stars inside their system radius
+RWStructuredBuffer<FUniObject> OutActivateRecord; // and their records, for the CPU (star records otherwise never leave the GPU)
+RWBuffer<uint> OutActivateCount;
 
 uint NumCells;
 uint DispatchGroupsX;
 uint MaxSprites;
 uint MaxPromote;
+uint MaxActivate;
+uint SystemArchetypeMask;                        // bit per archetype id < 32 whose objects have systems
 
 float3 ViewForward;
 float TanHalfFovX;
@@ -67,7 +73,7 @@ void MainCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
 	V.SurfaceLimit = SurfaceLimit;
 	V.ThetaPixel = ThetaPixel;
 	V.GlareGain = GlareGain;
-	V.Pad = 0.0f;
+	V.SystemArchetypeMask = SystemArchetypeMask;
 
 	const float LevelFade = (float)((Cell.Flags >> 8u) & 255u) / 255.0f;
 	for (uint I = GroupIndex; I < Cell.PoolCount; I += 64)
@@ -75,6 +81,14 @@ void MainCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
 		const FUniObject O = InPool[Cell.PoolStart + I];
 		const FUniSprite S = Uni_ProjectObject(Cell.DeltaX, Cell.DeltaY, Cell.DeltaZ, Cell.Level, LevelFade, O, V,
 			(Uni_ObjectFlags(O) & UNI_OBJ_FLAG_PROMOTED) != 0u);
+		// System activation: by true distance, before any culling (a system behind the camera
+		// still activates). Dynamic planet records carry an archetype id >= 32 and never match.
+		if (SystemArchetypeMask != 0u && (Uni_ObjectFlags(O) & UNI_OBJ_FLAG_DELTA_HIDDEN) == 0u && Uni_SystemActivates(Uni_ObjectArchetype(O), SystemArchetypeMask, Uni_ObjectAbsMag(O), S.TrueDistance))
+		{
+			uint A;
+			InterlockedAdd(OutActivateCount[0], 1u, A);
+			if (A < MaxActivate) { OutActivate[A] = uint2(CellIndex, I); OutActivateRecord[A] = O; }
+		}
 		if ((S.Flags & UNI_SPRITE_PROMOTE_CANDIDATE) != 0u)
 		{
 			uint P;

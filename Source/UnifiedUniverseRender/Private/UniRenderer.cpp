@@ -16,6 +16,7 @@
 #include "HAL/IConsoleManager.h"
 #include "Misc/EngineVersionComparison.h"
 #include "HAL/PlatformProcess.h"
+#include "Misc/ScopeLock.h"
 
 static TAutoConsoleVariable<float> CVarUniSpriteExtent(TEXT("uu.SpriteExtent"), 3.0f, TEXT("Sprite quad half size in Gaussian sigmas."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<float> CVarUniGlare(TEXT("uu.GlareGain"), 0.35f, TEXT("Sprite footprint growth with flux."), ECVF_RenderThreadSafe);
@@ -61,6 +62,26 @@ struct FUniRenderer::FPromoteReadback
 	TUniquePtr<FRHIGPUBufferReadback> Count;
 	bool bPending = false;
 };
+
+struct FUniRenderer::FActivateReadback
+{
+	TUniquePtr<FRHIGPUBufferReadback> Count;
+	TUniquePtr<FRHIGPUBufferReadback> Index;
+	TUniquePtr<FRHIGPUBufferReadback> Records;
+	uint64 FrameNumber = 0;
+	bool bPending = false;
+};
+
+uint32 FUniRenderer::DynamicPoolBase() { return UniGpuLayout::DynamicPoolBase; }
+uint32 FUniRenderer::DynamicPoolSlots() { return UniGpuLayout::DynamicPoolSlots; }
+
+void FUniRenderer::DrainActivations_GameThread(TArray<FUniActivation>& Out)
+{
+	check(IsInGameThread());
+	FScopeLock Lock(&ActivationLock);
+	Out.Append(ActivationsReady);
+	ActivationsReady.Reset();
+}
 
 FUniRenderer& FUniRenderer::Get()
 {
@@ -180,6 +201,11 @@ void FUniRenderer::Release_RenderThread()
 	SlicesBuffer.SafeRelease();
 	LutBuffer.SafeRelease();
 	PromoteRing.Empty();
+	ActivateRing.Empty();
+	{
+		FScopeLock Lock(&ActivationLock);
+		ActivationsReady.Reset();
+	}
 	BackgroundCube.SafeRelease();
 	BackgroundVersionRT = ~0u;
 	BackgroundDirtyFaces = 0x3Fu;
@@ -367,6 +393,39 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 	AddClearUAVPass(GraphBuilder, ArgsUAV, 0u);          // the shader writes args[0] = 6
 	AddClearUAVPass(GraphBuilder, PromoteCountUAV, 0u);
 
+	// System activations (D-142): indices, records and a count, read back through a ring.
+	FRDGBufferDesc ActIndexDesc = FRDGBufferDesc::CreateStructuredDesc(sizeof(FUintVector2), UniGpuLayout::MaxActivate);
+	ActIndexDesc.Usage |= EBufferUsageFlags::SourceCopy;
+	FRDGBufferRef ActIndexBuf = GraphBuilder.CreateBuffer(ActIndexDesc, TEXT("UniActivate"));
+	FRDGBufferDesc ActRecordDesc = FRDGBufferDesc::CreateStructuredDesc(UniGpuLayout::ObjectBytes, UniGpuLayout::MaxActivate);
+	ActRecordDesc.Usage |= EBufferUsageFlags::SourceCopy;
+	FRDGBufferRef ActRecordBuf = GraphBuilder.CreateBuffer(ActRecordDesc, TEXT("UniActivateRecord"));
+	FRDGBufferDesc ActCountDesc = FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), 1);
+	ActCountDesc.Usage |= EBufferUsageFlags::SourceCopy;
+	FRDGBufferRef ActCountBuf = GraphBuilder.CreateBuffer(ActCountDesc, TEXT("UniActivateCount"));
+	FRDGBufferUAVRef ActCountUAV = GraphBuilder.CreateUAV(ActCountBuf, PF_R32_UINT);
+	AddClearUAVPass(GraphBuilder, ActCountUAV, 0u);
+	AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(ActIndexBuf), 0u);
+	AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(ActRecordBuf), 0u);
+
+	// Planet records (D-143) into the reserved pool tail, before the project pass reads them.
+	if (F.DynamicRecords.Num() > 0)
+	{
+		const int32 N = FMath::Min(F.DynamicRecords.Num(), int32(UniGpuLayout::DynamicPoolSlots));
+		TArray<uint32> Index;
+		TArray<UniCore::FObjectGPU> Records;
+		Index.SetNumUninitialized(N);
+		Records.Append(F.DynamicRecords.GetData(), N);
+		for (int32 I = 0; I < N; ++I) { Index[I] = UniGpuLayout::DynamicPoolBase + uint32(I); }
+		FUniScatterCS::FParameters* P = GraphBuilder.AllocParameters<FUniScatterCS::FParameters>();
+		P->InScatterIndex = GraphBuilder.CreateSRV(UploadStructured(GraphBuilder, TEXT("UniDynamicIndex"), Index));
+		P->InScatterRecord = GraphBuilder.CreateSRV(UploadStructured(GraphBuilder, TEXT("UniDynamicRecord"), Records));
+		P->OutPool = GraphBuilder.CreateUAV(PoolBuf);
+		P->NumWrites = uint32(N);
+		TShaderMapRef<FUniScatterCS> CS(GetGlobalShaderMap(View.GetFeatureLevel()));
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Systems.PlanetRecords %d", N), CS, P, FIntVector(FMath::DivideAndRoundUp(N, 64), 1, 1));
+	}
+
 	// View basis and projection from the engine view. Universe axes are UE world axes (cm), and
 	// camera-relative render positions are translated-world positions (PreViewTranslation = -origin).
 	const FVector3f Forward(View.GetViewDirection());
@@ -389,9 +448,14 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 		P->OutDrawArgs = ArgsUAV;
 		P->OutPromote = GraphBuilder.CreateUAV(PromoteBuf);
 		P->OutPromoteCount = PromoteCountUAV;
+		P->OutActivate = GraphBuilder.CreateUAV(ActIndexBuf);
+		P->OutActivateRecord = GraphBuilder.CreateUAV(ActRecordBuf);
+		P->OutActivateCount = ActCountUAV;
 		P->NumCells = uint32(F.Cells.Num());
 		P->MaxSprites = UniGpuLayout::MaxSprites;
 		P->MaxPromote = UniGpuLayout::MaxPromote;
+		P->MaxActivate = UniGpuLayout::MaxActivate;
+		P->SystemArchetypeMask = F.SystemArchetypeMask;
 		P->ViewForward = Forward; P->ViewRight = Right; P->ViewUp = Up;
 		P->TanHalfFovX = TanX; P->TanHalfFovY = TanY;
 		P->LimitingMag = LimitingMag;
@@ -427,6 +491,58 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 			AddEnqueueCopyPass(GraphBuilder, R->Count.Get(), PromoteCountBuf, sizeof(uint32));
 			R->bPending = true;
 			PromoteRingNext = (PromoteRingNext + 1) % PromoteRing.Num();
+		}
+	}
+
+	// System activations: collect finished readbacks (never waited on), then enqueue this frame's.
+	if (ActivateRing.Num() == 0) { for (int32 I = 0; I < 4; ++I) { ActivateRing.Add(MakeShared<FActivateReadback>()); } }
+	for (const TSharedPtr<FActivateReadback>& R : ActivateRing)
+	{
+		if (!R->bPending || !R->Count->IsReady() || !R->Index->IsReady() || !R->Records->IsReady()) { continue; }
+		const uint32* CountPtr = static_cast<const uint32*>(R->Count->Lock(sizeof(uint32)));   // render thread only (lesson #24)
+		const uint32 Count = FMath::Min(CountPtr ? *CountPtr : 0u, UniGpuLayout::MaxActivate);
+		R->Count->Unlock();
+		Stats.ActivationsLastReadback = Count;
+		if (Count > 0)
+		{
+			const FUintVector2* Idx = static_cast<const FUintVector2*>(R->Index->Lock(Count * sizeof(FUintVector2)));
+			TArray<FUintVector2> IdxCopy;
+			IdxCopy.Append(Idx, int32(Count));
+			R->Index->Unlock();
+			const UniCore::FObjectGPU* Rec = static_cast<const UniCore::FObjectGPU*>(R->Records->Lock(Count * UniGpuLayout::ObjectBytes));
+			FScopeLock Lock(&ActivationLock);
+			for (uint32 I = 0; I < Count; ++I)
+			{
+				FUniActivation A;
+				A.FrameNumber = R->FrameNumber;
+				A.CellIndex = IdxCopy[int32(I)].X;
+				A.ObjectIndex = IdxCopy[int32(I)].Y;
+				A.Record = Rec[I];
+				ActivationsReady.Add(A);
+			}
+			R->Records->Unlock();
+			// Bounded: the game thread drains every frame; if it stops (paused), keep the newest.
+			if (ActivationsReady.Num() > 1024) { ActivationsReady.RemoveAt(0, ActivationsReady.Num() - 1024); }
+		}
+		R->bPending = false;
+	}
+	if (F.SystemArchetypeMask != 0u)
+	{
+		TSharedPtr<FActivateReadback>& R = ActivateRing[ActivateRingNext];
+		if (!R->bPending)
+		{
+			if (!R->Count.IsValid())
+			{
+				R->Count = MakeUnique<FRHIGPUBufferReadback>(TEXT("UniActivateCountReadback"));
+				R->Index = MakeUnique<FRHIGPUBufferReadback>(TEXT("UniActivateIndexReadback"));
+				R->Records = MakeUnique<FRHIGPUBufferReadback>(TEXT("UniActivateRecordReadback"));
+			}
+			AddEnqueueCopyPass(GraphBuilder, R->Count.Get(), ActCountBuf, sizeof(uint32));
+			AddEnqueueCopyPass(GraphBuilder, R->Index.Get(), ActIndexBuf, UniGpuLayout::MaxActivate * sizeof(FUintVector2));
+			AddEnqueueCopyPass(GraphBuilder, R->Records.Get(), ActRecordBuf, UniGpuLayout::MaxActivate * UniGpuLayout::ObjectBytes);
+			R->FrameNumber = F.FrameNumber;
+			R->bPending = true;
+			ActivateRingNext = (ActivateRingNext + 1) % ActivateRing.Num();
 		}
 	}
 
@@ -525,7 +641,8 @@ FUniGpuGenBackend::~FUniGpuGenBackend()
 	FlushRenderingCommands();
 }
 
-UniCore::u32 FUniGpuGenBackend::PoolCapacity() const { return UniGpuLayout::PoolCapacity; }
+// The streamer allocates below the planet records' reserved tail (D-143).
+UniCore::u32 FUniGpuGenBackend::PoolCapacity() const { return UniGpuLayout::DynamicPoolBase; }
 
 void FUniGpuGenBackend::SubmitProbe(std::shared_ptr<UniCore::FGenBatch> Batch)
 {

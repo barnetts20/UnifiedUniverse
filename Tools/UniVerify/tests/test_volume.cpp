@@ -300,20 +300,19 @@ namespace
 
 UNI_TEST(volume, budget)
 {
-	// D-133: what the demo galaxy's stars add up to, against its drawn magnitude. Reported for the
-	// owner's decision; the check passes when the validator measures it and the corrected model
-	// closes it.
+	// D-133 (owner: option B, N_total = 2.69e10): the demo galaxy's stars must add up to its drawn
+	// magnitude within 0.01 mag, and the budget-rescaled model must agree with the demo.
 	FUniverseModel M(UniScenes::GalaxyToStar());
 	const double Mb = LuminosityBudget(M, UniScenes::kGalaxy, -21.0);
 	double Mb0 = 0;
 	FUniverseModel Mc(BudgetConsistent(UniScenes::GalaxyToStar(), &Mb0));
 	const double Mc2 = LuminosityBudget(Mc, UniScenes::kGalaxy, -21.0);
 	const double Ncons = Mc.Definition().Arch(UniScenes::kGalaxy).Emitters[0].NTotal;
-	Uni::Check(3, "T3.vol.budget", "Luminosity budget (D-133): the demo galaxy's children vs its drawn magnitude (reported); a rescaled N_total closes it to < 0.01 mag")
+	Uni::Check(3, "T3.vol.budget", "Luminosity budget (D-133, option B): the demo galaxy's stars add up to its drawn magnitude within 0.01 mag")
 		.Metric("children_mag", Mb).Metric("drawn_mag", -21.0).Metric("mismatch_mag", Mb + 21.0).Metric("consistent_ntotal", Ncons)
-		.Pass(std::isfinite(Mb) && std::fabs(Mc2 + 21.0) < 0.01,
-			Uni::Fmt("2e11 stars from the placeholder stellar function sum to M = %.2f; the galaxy is drawn at M = -21.00 (mismatch %.2f mag, %.1fx). N_total = %.3g would close it (corrected model: M = %.3f). Owner decision (D-133).",
-				Mb, Mb + 21.0, std::pow(10.0, -0.4 * (Mb + 21.0)), Ncons, Mc2));
+		.Pass(std::isfinite(Mb) && std::fabs(Mb + 21.0) < 0.01 && std::fabs(Mc2 + 21.0) < 0.01,
+			Uni::Fmt("N_total = %.3g stars from the placeholder stellar function sum to M = %.3f; the galaxy is drawn at M = -21.00 (mismatch %.3f mag). Exactly consistent N_total: %.4g.",
+				M.Definition().Arch(UniScenes::kGalaxy).Emitters[0].NTotal, Mb, Mb + 21.0, Ncons));
 }
 
 UNI_TEST(volume, handoff)

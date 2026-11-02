@@ -235,59 +235,73 @@ UNI_TEST(render, ordering)
 
 UNI_TEST(render, occlusion)
 {
-	// A promoted Earth-sized occluder 5e9 cm ahead. Backdrop objects in front of it, behind it
-	// and beside it; the sprite's scene-depth test must keep exactly the visible ones.
-	FCamera Cam;
-	Cam.Width = 480; Cam.Height = 270;
-	Cam.Coord = FCoord::Origin();
-	Cam.LookAlong({ 1, 0, 0 });
-	FImage Img(Cam.Width, Cam.Height);
-	const double OccDist = 5.0e9, OccR = 6.4e8;
-	DrawPromotedSphere(Img, Cam, { OccDist, 0, 0 }, OccR, H::float3(0.3f, 0.5f, 1.0f));
-	const H::FUniView V = Cam.View();
-	Uni::FTestRng R(0x0CC1ull);
-	long long Placements = 0, Wrong = 0, Behind = 0, Front = 0, Beside = 0;
-	for (int I = 0; I < 20000; ++I)
+	// Promoted occluders placed as the parallax component places actors (D-146), with backdrop
+	// objects in front, behind and beside. The sprite's scene-depth test reads the render-space
+	// depth back as true distance (Uni_SceneTrueDistance).
+	//   - Real space (an Earth whose surface is inside r0, unit scale): exact.
+	//   - Compressed (an Earth 5e9 cm out, scaled about the eye): nothing behind it may show, and
+	//     everything in front must show unless it lies within (1 + ln(d / r0)) R of the near
+	//     surface, the bound the decoding guarantees for a uniformly scaled body.
+	struct FCase { const char* Name; double Dist; };
+	const FCase Cases[] = { { "real space", 1.2e9 }, { "compressed", 5.0e9 } };
+	const double OccR = 6.4e8;
+	long long Placements = 0, Wrong = 0, Behind = 0, Front = 0, Beside = 0, InBand = 0, BandHidden = 0;
+	std::string Detail;
+	for (const FCase& Cs : Cases)
 	{
-		const double Ang = (R.Unit() - 0.5) * 2.0 * std::asin(OccR / OccDist) * 2.0;
-		const double Ang2 = (R.Unit() - 0.5) * 2.0 * std::asin(OccR / OccDist) * 2.0;
-		const FV3 Dir = Norm({ 1.0, std::tan(Ang), std::tan(Ang2) });
-		const double Dist = std::exp(std::log(1.0e9) + R.Unit() * (std::log(1.0e14) - std::log(1.0e9)));
-		// Exact geometric truth: does the ray hit the sphere before Dist?
-		const double B = Dir.X * OccDist;
-		const double Disc = B * B - (OccDist * OccDist - OccR * OccR);
-		const double THit = Disc >= 0 ? B - std::sqrt(Disc) : std::numeric_limits<double>::infinity();
-		if (std::fabs(Dist - THit) < 1e-4 * Dist) { continue; }   // grazing the surface within float precision
-		if (Disc >= 0 && std::sqrt(Disc) < 1e-3 * OccR) { continue; } // at the silhouette, where pixel sampling decides
-		const bool Visible = Dist < THit;
-		// Through the core: the object's projected sprite against the scene distance at its pixel.
-		const FCoord P = Moved(Cam.Coord, Dir * Dist);
-		const int L = LevelForRelevance(Dist * 1.5);
-		const FCellKey K = CellOf(P, L);
-		const FCoord O = CellOrigin(K);
-		u32 Off[3];
-		for (int A = 0; A < 3; ++A) { const FU128 Rl = Sub(P.Axis(A), O.Axis(A)); Off[A] = L >= 32 ? Shr(Rl, L - 32).L[3] : Shl(Rl, 32 - L).L[3]; }
-		H::uint4 D[3];
-		CellDelta(K, Cam.Coord, D);
-		const H::FUniObject HO = H::Uni_MakeObject(H::uint3(Off[0], Off[1], Off[2]), UniScenes::kStar, 0u, 1u, 30.0f, -15.0f, 0.0f, H::float3(1, 1, 1));
-		const H::FUniSprite S = H::Uni_ProjectObject(D[0], D[1], D[2], u32(L), 1.0f, HO, V, false);
-		if (!(S.Flags & H::UNI_SPRITE_VISIBLE)) { continue; }
-		const int Px = int(std::floor((double(S.NdcX) * 0.5 + 0.5) * Img.W)), Py = int(std::floor((0.5 - double(S.NdcY) * 0.5) * Img.H));
-		if (Px < 0 || Py < 0 || Px >= Img.W || Py >= Img.H) { continue; }
-		// The pixel's scene distance is for the pixel centre ray; use the object's own ray for the
-		// truth to avoid testing pixel quantisation, by recasting at the sprite direction.
-		const double Bs = double(S.RenderPos.x) / H::Uni_Compress(S.TrueDistance) * OccDist;
-		const double Ds = Bs * Bs - (OccDist * OccDist - OccR * OccR);
-		const double SceneAtRay = Ds >= 0 && Bs > 0 ? Bs - std::sqrt(Ds) : std::numeric_limits<double>::infinity();
-		const bool Kept = H::Uni_SceneDepthKeep(S.TrueDistance, float(std::min(SceneAtRay, 3.0e38)));
-		++Placements;
-		if (Kept != Visible) { ++Wrong; }
-		if (!Visible) { ++Behind; } else if (Disc >= 0) { ++Front; } else { ++Beside; }
+		const double OccDist = Cs.Dist;
+		FCamera Cam;
+		Cam.Width = 480; Cam.Height = 270;
+		Cam.Coord = FCoord::Origin();
+		Cam.LookAlong({ 1, 0, 0 });
+		const H::FUniView V = Cam.View();
+		const bool bReal = (OccDist - OccR) < double(H::UNI_R0_CM);
+		const double Scale = bReal ? 1.0 : CompressD(OccDist) / OccDist;
+		const double Band = bReal ? 0.0 : (1.0 + std::log(OccDist / double(H::UNI_R0_CM))) * OccR;
+		Uni::FTestRng R(0x0CC1ull);
+		long long CaseWrong = 0, CaseBand = 0;
+		for (int I = 0; I < 20000; ++I)
+		{
+			const double Ang = (R.Unit() - 0.5) * 2.0 * std::asin(OccR / OccDist) * 2.0;
+			const double Ang2 = (R.Unit() - 0.5) * 2.0 * std::asin(OccR / OccDist) * 2.0;
+			const FV3 Dir = Norm({ 1.0, std::tan(Ang), std::tan(Ang2) });
+			const double Dist = std::exp(std::log(1.0e8) + R.Unit() * (std::log(1.0e14) - std::log(1.0e8)));
+			const double B = Dir.X * OccDist;
+			const double Disc = B * B - (OccDist * OccDist - OccR * OccR);
+			const double THit = Disc >= 0 ? B - std::sqrt(Disc) : std::numeric_limits<double>::infinity();
+			if (std::fabs(Dist - THit) < 1e-4 * Dist) { continue; }
+			if (Disc >= 0 && std::sqrt(Disc) < 1e-3 * OccR) { continue; }
+			const bool Visible = Dist < THit;
+			const FCoord P = Moved(Cam.Coord, Dir * Dist);
+			const int L = LevelForRelevance(Dist * 1.5);
+			const FCellKey K = CellOf(P, L);
+			const FCoord O = CellOrigin(K);
+			u32 Off[3];
+			for (int A = 0; A < 3; ++A) { const FU128 Rl = Sub(P.Axis(A), O.Axis(A)); Off[A] = L >= 32 ? Shr(Rl, L - 32).L[3] : Shl(Rl, 32 - L).L[3]; }
+			H::uint4 D[3];
+			CellDelta(K, Cam.Coord, D);
+			const H::FUniObject HO = H::Uni_MakeObject(H::uint3(Off[0], Off[1], Off[2]), UniScenes::kStar, 0u, 1u, 30.0f, -15.0f, 0.0f, H::float3(1, 1, 1));
+			const H::FUniSprite S = H::Uni_ProjectObject(D[0], D[1], D[2], u32(L), 1.0f, HO, V, false);
+			if (!(S.Flags & H::UNI_SPRITE_VISIBLE)) { continue; }
+			// The occluder along the sprite's own ray, in render space (what the depth buffer holds).
+			const double Bs = double(S.RenderPos.x) / H::Uni_Compress(S.TrueDistance) * OccDist;
+			const double Ds = Bs * Bs - (OccDist * OccDist - OccR * OccR);
+			const double SceneAtRay = Ds >= 0 && Bs > 0 ? (Bs - std::sqrt(Ds)) * Scale : std::numeric_limits<double>::infinity();
+			const bool Kept = H::Uni_SceneDepthKeep(S.TrueDistance, float(std::min(SceneAtRay, 3.0e38)));
+			++Placements;
+			const bool bBand = Visible && Disc >= 0 && Dist > THit - Band;   // in front, inside the guarantee band
+			if (bBand) { ++InBand; ++CaseBand; if (!Kept) { ++BandHidden; } continue; }
+			if (Kept != Visible) { ++Wrong; ++CaseWrong; }
+			if (!Visible) { ++Behind; } else if (Disc >= 0) { ++Front; } else { ++Beside; }
+		}
+		Detail += Uni::Fmt("%s%s (centre %.2g cm, scale %.3g): %lld wrong, %lld in the band", Detail.empty() ? "" : "; ", Cs.Name, OccDist, Scale, CaseWrong, CaseBand);
 	}
-	Uni::Check(3, "T3.occlusion", "Synthetic promoted occluder: backdrop objects behind it are culled, objects in front kept, for all test placements")
+	Uni::Check(3, "T3.occlusion", "Promoted occluders placed by the parallax rule (D-146): exact in real space; compressed: nothing behind shows, everything in front shows outside the (1 + ln(d/r0)) R band")
 		.Metric("placements", double(Placements)).Metric("wrong", double(Wrong)).Metric("behind", double(Behind)).Metric("front", double(Front)).Metric("beside", double(Beside))
+		.Metric("band", double(InBand)).Metric("band_hidden", double(BandHidden))
 		.Pass(Wrong == 0 && Behind > 1000 && Front > 100,
-			Uni::Fmt("%lld placements (%lld behind, %lld in front on the disc, %lld beside), %lld wrong", Placements, Behind, Front, Beside, Wrong));
+			Uni::Fmt("%lld placements (%lld behind, %lld in front on the disc, %lld beside), %lld wrong; %s; in the band %lld of %lld were hidden (allowed)",
+				Placements, Behind, Front, Beside, Wrong, Detail.c_str(), BandHidden, InBand));
 }
 
 UNI_TEST(render, frames)
