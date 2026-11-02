@@ -138,9 +138,9 @@ namespace UniCore
 	// Archetypes and emitters
 	// ======================================================================================
 
-	enum class EVisibility { Point, Extended };
+	enum class EUniVisibility { Point, Extended };
 
-	struct FEmitter
+	struct FUniEmitter
 	{
 		u32 ChildArchetypeId = 0;
 		u32 FieldId = 0;                      // UNI_FIELD_*
@@ -168,12 +168,12 @@ namespace UniCore
 	{
 		u32 Id = 0;                           // stable, never reused
 		std::string Name;
-		EVisibility Visibility = EVisibility::Point;
+		EUniVisibility Visibility = EUniVisibility::Point;
 		FMagnitudeLut AbsMag;
 		float RadiusModel[4] = { 0, 0, 0, 0 };   // log10 R_cm = x + y (M - z) + w (2u - 1)
 		float ColourModel[4] = { 3.76f, 0, 0, 0 }; // log10 T = x + y (M - z) + w (2u - 1)
 		double ThetaMin = UniHlsl::UNI_THETA_MIN;
-		std::vector<FEmitter> Emitters;
+		std::vector<FUniEmitter> Emitters;
 		bool bDefaultsOnly = false;          // lesson #16
 
 		double RadiusMaxCm(double M) const
@@ -238,7 +238,7 @@ namespace UniCore
 	{
 		u32 Seed = 69;
 		std::vector<FArchetype> Archetypes;     // index = Id
-		std::vector<FEmitter> RootEmitters;     // the root archetype: no position, covers everything
+		std::vector<FUniEmitter> RootEmitters;     // the root archetype: no position, covers everything
 		std::vector<FAnchor> Anchors;
 		std::vector<FSuppressor> Suppressors;
 
@@ -262,7 +262,7 @@ namespace UniCore
 		{
 			const FArchetype& A = Def.Arch(ArchId);
 			double R = RelevanceFlux(M);
-			if (A.Visibility == EVisibility::Extended) { R = std::max(R, RelevanceAngular(A.RadiusMaxCm(M), A.ThetaMin)); }
+			if (A.Visibility == EUniVisibility::Extended) { R = std::max(R, RelevanceAngular(A.RadiusMaxCm(M), A.ThetaMin)); }
 			R = std::max(R, InfluenceRelevance(ArchId, M));
 			return R;
 		}
@@ -274,7 +274,7 @@ namespace UniCore
 		{
 			const FArchetype& A = Def.Arch(ArchId);
 			double R = 0.0;
-			for (const FEmitter& E : A.Emitters)
+			for (const FUniEmitter& E : A.Emitters)
 			{
 				const FSliceTable& T = Slices.at(E.ChildArchetypeId);
 				if (T.LMax < 0) { continue; }
@@ -302,7 +302,7 @@ namespace UniCore
 			std::vector<std::string> P;
 			for (const FArchetype& A : Def.Archetypes)
 			{
-				for (const FEmitter& E : A.Emitters)
+				for (const FUniEmitter& E : A.Emitters)
 				{
 					for (const FParamRange& R : E.Ranges)
 					{
@@ -337,7 +337,7 @@ namespace UniCore
 			for (const auto& KV : Slices)
 			{
 				const FArchetype& A = Def.Arch(KV.first);
-				const u32 Flags = (A.Visibility == EVisibility::Extended ? UniHlsl::UNI_OBJ_FLAG_EXTENDED : 0u) | (A.Emitters.empty() ? 0u : UniHlsl::UNI_OBJ_FLAG_HAS_CONTRIBUTOR);
+				const u32 Flags = (A.Visibility == EUniVisibility::Extended ? UniHlsl::UNI_OBJ_FLAG_EXTENDED : 0u) | (A.Emitters.empty() ? 0u : UniHlsl::UNI_OBJ_FLAG_HAS_CONTRIBUTOR);
 				for (const FSlice& S : KV.second.Slices)
 				{
 					FSliceGPU G{};
@@ -357,7 +357,7 @@ namespace UniCore
 		{
 			if (Slices.count(Id) || Depth > 16) { return; }
 			const FArchetype& A = Def.Arch(Id);
-			for (const FEmitter& E : A.Emitters) { BuildSlices(E.ChildArchetypeId, Depth + 1); }
+			for (const FUniEmitter& E : A.Emitters) { BuildSlices(E.ChildArchetypeId, Depth + 1); }
 
 			FSliceTable T;
 			if (A.AbsMag.Pdf.empty()) { Slices[Id] = T; return; }
@@ -427,7 +427,7 @@ namespace UniCore
 		double RelevanceNoCache(const FArchetype& A, double M) const
 		{
 			double R = RelevanceFlux(M);
-			if (A.Visibility == EVisibility::Extended) { R = std::max(R, RelevanceAngular(A.RadiusMaxCm(M), A.ThetaMin)); }
+			if (A.Visibility == EUniVisibility::Extended) { R = std::max(R, RelevanceAngular(A.RadiusMaxCm(M), A.ThetaMin)); }
 			R = std::max(R, InfluenceRelevance(A.Id, M));
 			return R;
 		}

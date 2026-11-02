@@ -27,7 +27,7 @@ namespace UniScenes
 		FArchetype A;
 		A.Id = kStar;
 		A.Name = "Star";
-		A.Visibility = EVisibility::Point;
+		A.Visibility = EUniVisibility::Point;
 		// Placeholder V-band stellar luminosity function, stars / pc^3 / mag (log10), shaped
 		// after the solar-neighbourhood function: rising to M ~ +12, then falling (D-014).
 		A.AbsMag = FMagnitudeLut::FromLogControlPoints({
@@ -65,14 +65,14 @@ namespace UniScenes
 		FArchetype A;
 		A.Id = kGalaxy;
 		A.Name = "Galaxy";
-		A.Visibility = EVisibility::Extended;
+		A.Visibility = EUniVisibility::Extended;
 		// Placeholder Schechter-shaped function, M* = -21, alpha = -1.1, over -23.5..-16 (D-014).
 		A.AbsMag = FMagnitudeLut::Schechter(-21.0, -1.1, -23.5, -16.0);
 		// log10 R_cm = 22.67 - 0.2 (M + 21) +- 0.1: 15 kpc at M*, R ~ L^0.5.
 		A.RadiusModel[0] = 22.67f; A.RadiusModel[1] = -0.2f; A.RadiusModel[2] = -21.0f; A.RadiusModel[3] = 0.1f;
 		A.ColourModel[0] = 3.75f; A.ColourModel[1] = 0.02f; A.ColourModel[2] = -21.0f; A.ColourModel[3] = 0.08f;
 
-		FEmitter E;
+		FUniEmitter E;
 		E.ChildArchetypeId = kStar;
 		E.FieldId = H::UNI_FIELD_GALAXY;
 		E.Exemplar = GalaxyExemplar();
@@ -91,9 +91,9 @@ namespace UniScenes
 		return A;
 	}
 
-	inline FEmitter WebEmitter()
+	inline FUniEmitter WebEmitter()
 	{
-		FEmitter E;
+		FUniEmitter E;
 		E.ChildArchetypeId = kGalaxy;
 		E.FieldId = H::UNI_FIELD_WEB;
 		E.bDensityMode = true;

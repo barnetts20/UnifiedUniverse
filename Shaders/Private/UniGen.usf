@@ -127,7 +127,9 @@ void MainCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
 		const uint Rank = Base + GsScan[GroupIndex] - (bAccepted ? 1u : 0u);
 		if (bAccepted && Rank < Capacity)
 		{
-			OutPool[T.PoolBase + Rank] = Uni_TaskSuppressed(T, Offset) ? Uni_BlankObject() : Uni_TaskMakeObject(T, S, InLut, Rank, Offset);
+			// if/else, not ?: (HLSL 2021 / DXC: the conditional operator takes numeric types only).
+			if (Uni_TaskSuppressed(T, Offset)) { OutPool[T.PoolBase + Rank] = Uni_BlankObject(); }
+			else { OutPool[T.PoolBase + Rank] = Uni_TaskMakeObject(T, S, InLut, Rank, Offset); }
 		}
 		const uint ChunkTotal = GsScan[UNI_GEN_THREADS - 1];
 		GroupMemoryBarrierWithGroupSync();

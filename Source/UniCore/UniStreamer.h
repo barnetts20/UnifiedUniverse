@@ -154,14 +154,14 @@ namespace UniCore
 			auto AddArch = [&](u32 Arch, auto&& Self, int Depth) -> void
 			{
 				if (Depth > 8) { return; }
-				for (const FEmitter& E : D.Arch(Arch).Emitters)
+				for (const FUniEmitter& E : D.Arch(Arch).Emitters)
 				{
 					const FSliceTable& T = Gen.ModelRef().SlicesOf(E.ChildArchetypeId);
 					for (int L = T.LMin; L <= T.LMax; ++L) { Ls.insert(L); }
 					Self(E.ChildArchetypeId, Self, Depth + 1);
 				}
 			};
-			for (const FEmitter& E : D.RootEmitters)
+			for (const FUniEmitter& E : D.RootEmitters)
 			{
 				const FSliceTable& T = Gen.ModelRef().SlicesOf(E.ChildArchetypeId);
 				for (int L = T.LMin; L <= T.LMax; ++L) { Ls.insert(L); }
