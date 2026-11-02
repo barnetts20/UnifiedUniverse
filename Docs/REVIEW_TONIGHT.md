@@ -46,7 +46,7 @@ Item IDs match `Tools/UniVerify/unverified.json` (the report checks they are all
 - Velocity LOD reacts to whatever speed you choose: at extreme speeds the finer levels suspend (and, on the volume branch, show as glow).
 
 4. **See it (UE-5).** Create a new Empty Level with no sky or atmosphere, so stars are not drowned, and press Play. In the console run `uu.Enable galaxy`.
-   - Expect: within about a second (levels fill coarse to fine, about 37 frames), a band of stars across the sky, as in `Verification/images/still_galaxy_towards_centre.png`. Look along −X for the galactic centre. Then run `uu.Stats`: cells ready > 2,000, `gpu done` > 0, `failed` 0, and "cells drawn" > 0.
+   - Expect: within a fraction of a second, a band of stars. Levels now fill in parallel once their parent level is ready (D-137): about 12 frames, where it used to be 37 or more across the sky, as in `Verification/images/still_galaxy_towards_centre.png`. Look along −X for the galactic centre. Then run `uu.Stats`: cells ready > 2,000, `gpu done` > 0, `failed` 0, and "cells drawn" > 0.
    - Failure looks like: black. Read `uu.Stats`. If cells are ready but nothing is drawn, it's the sprite pass or the hook; capture a frame in RenderDoc and look for the "UnifiedUniverse" event scope. If batches failed (timeouts), the generation passes are not running. Brightness is uncalibrated (lesson #36), although the sprites now follow the view's pre-exposure: try `uu.Exposure -3` (brighter) or `+3`, and disable auto-exposure if the empty level blows it out.
 
 5. **Occlusion (UE-5).** Place a large sphere mesh in front of the camera.
@@ -60,6 +60,13 @@ Item IDs match `Tools/UniVerify/unverified.json` (the report checks they are all
 7. **Promotion glare (UE-7).** At the end of the flythrough, judge how the target's sprite glare reads with real bloom. There is no promotion actor pool yet, so it never becomes a mesh.
 
 8. **Cost (UE-8).** Run `stat gpu` and `profilegpu` during the flythrough and note `Uni.Gen.*`, `Uni.ProjectAndCull` and `Uni.Sprites`. Expect a one-time hitch of about 0.2 s when the camera first enters the galaxy (D-123).
+
+8b. **Fast flight (D-137 to D-140, after the first engine run).** These are fixes for "slow responsiveness at high speeds", "chunky" movement between galaxies, and frame lag. Use `uu.Enable web`, then `uu.Fly` and the mouse wheel up to Mpc/s. Then try `uu.Enable galaxy` at 1–100 kpc/s.
+   - Expect: the game thread no longer stalls about 0.2 s each time you pass a new galaxy. Its star integral now runs on a background thread, and the stars arrive a moment later instead.
+   - Expect: no steady frame lag from the streamer. It spent about 10 ms per frame in the web scene; it should be about 1 ms now. Check with `stat game` or Unreal Insights.
+   - Expect: the window edge keeps up at speed. Run `uu.Stats` while moving. It prints the measured generation latency (expect about 4–8 frames on the GPU) and, per level, how full the window is, its half-width (3–4 while fast, 2 at rest) and whether velocity LOD has suspended it.
+   - Still expected: a brief gap in the first few frames after a standing start or a ×2 wheel step. B-001's warp streaks are for exactly this.
+   - Failure looks like: `alloc failures` rising in `uu.Stats` (the wider windows are running out of pool), or half-widths stuck at 4 after you stop. Windows step back down one width per 30 slow frames.
 
 9. **GPU parity (UE-4).** Run `uu.Disable`, then the Automation test `UnifiedUniverse.Render.GpuParity`, **without** `-nullrhi`.
    - What it does: generates the solar-camera scene on the GPU and on the CPU side by side, and compares every ready cell object by object.
