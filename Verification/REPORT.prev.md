@@ -4,8 +4,8 @@
 
 | | |
 | --- | --- |
-| Commit | `11226c4` + uncommitted changes (branch `uu/volumetrics`) |
-| Run | 2026-11-01 17:17 EST, 567 s |
+| Commit | `2845e50` + uncommitted changes (branch `uu/volumetrics`) |
+| Run | 2026-11-01 18:00 EST, 551 s |
 | Environment tier reached | Tier 3 offline (Tier 4 static only: no Unreal, no DXC here — see ENVIRONMENT.md) |
 | Checks | 53 run, 53 pass, **0 fail** |
 
@@ -13,7 +13,7 @@
 
 | Check | Result | Criterion | Measured |
 | --- | --- | --- | --- |
-| `T1.build.gcc` | PASS | Harness and UniCore build with g++, -Wall -Wextra -Werror, C++17 | built in 16 s |
+| `T1.build.gcc` | PASS | Harness and UniCore build with g++, -Wall -Wextra -Werror, C++17 | built in 0 s |
 | `T1.build.strict.gpp` | PASS | Every UniCore header as C++20 with -Wall -Wextra -Wshadow -Werror (g++), as the UE modules compile them | clean |
 | `T1.build.strict.clangpp` | PASS | Every UniCore header as C++20 with -Wall -Wextra -Wshadow -Werror (clang++), as the UE modules compile them | clean |
 | `T1.build.clang` | PASS | Harness and UniCore build with clang++, -Wall -Wextra -Werror, C++17 | built in 13 s |
