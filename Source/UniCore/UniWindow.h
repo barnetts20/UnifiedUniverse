@@ -238,5 +238,16 @@ namespace UniCore
 			else if (bSuspended && CellsPerFrame < 0.8 * Limit) { bSuspended = false; }
 			return bSuspended;
 		}
+
+		/** Latency-aware form (D-139, the runtime streamer): LeadCells is how far the camera moves,
+		 *  in this level's cells, while an entering cell is generated (speed x latency). Suspend
+		 *  when that exceeds the slack between the widest window motion may use and the visible
+		 *  radius, resume below 0.8 of it. */
+		bool UpdateLead(double LeadCells, double SlackCells)
+		{
+			if (!bSuspended && LeadCells > SlackCells) { bSuspended = true; }
+			else if (bSuspended && LeadCells < 0.8 * SlackCells) { bSuspended = false; }
+			return bSuspended;
+		}
 	};
 }

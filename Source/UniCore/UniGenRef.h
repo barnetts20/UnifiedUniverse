@@ -223,6 +223,29 @@ namespace UniCore
 		double IntegralAll(const FContributor& C) const
 		{
 			if (C.IntegralAll >= 0.0) { return C.IntegralAll; }
+			// D-140: also cached by contributor id. A contributor is re-created from its parent
+			// object every time the parent's cell reloads (the record above starts at -1 again),
+			// but its id fixes its parameters, so the value is the same.
+			auto It = IntegralCache.find(C.Id);
+			if (It != IntegralCache.end()) { C.IntegralAll = It->second; return C.IntegralAll; }
+			C.IntegralAll = ComputeIntegral(C);
+			IntegralCache[C.Id] = C.IntegralAll;
+			++InlineIntegrals;
+			return C.IntegralAll;
+		}
+
+		/** D-140: integrals computed inline (on the calling thread), for the checks. */
+		mutable size_t InlineIntegrals = 0;
+
+		/** D-140: is the integral known without computing it? */
+		bool HasIntegral(const FContributor& C) const { return C.IntegralAll >= 0.0 || IntegralCache.count(C.Id) != 0; }
+		/** D-140: store a value computed elsewhere (the streamer's worker), by id. */
+		void StoreIntegral(u32 Id, double Value) const { IntegralCache[Id] = Value; }
+
+		/** The integral itself: pure (reads only the contributor and the shared field core), so
+		 *  it can run on a worker thread. About 2.4M field evaluations for a local field (D-123). */
+		static double ComputeIntegral(const FContributor& C)
+		{
 			const bool bPeriodic = C.Emitter->bDensityMode || C.bRoot;
 			const H::FUniFieldParams P = C.Params.ToHlsl();
 			const int G = 32;
@@ -247,8 +270,7 @@ namespace UniCore
 				}
 				Sum += S / double(H::UNI_PROBES_PER_CELL) * double(Cell) * double(Cell) * double(Cell);
 			}
-			C.IntegralAll = Sum;   // periodic: period volume is 1, so this is the mean
-			return C.IntegralAll;
+			return Sum;   // periodic: period volume is 1, so this is the mean
 		}
 
 		/** lambda per unit of probe mean, for cell K and contributor C (slice already chosen). */
@@ -474,6 +496,7 @@ namespace UniCore
 		const std::vector<FCellKey>& AnchorCellList() const { return AnchorCells; }
 
 	private:
+		mutable std::unordered_map<u32, double> IntegralCache;   // D-140: by contributor id
 		/** Uniform random rotation (quaternion from three uniforms, Shoemake). Rows into M. */
 		static void RandomRotation(u32 Seed, float M[9])
 		{
