@@ -11,3 +11,7 @@ __pycache__/
 .vscode/
 *.sln
 *.suo
+
+# D-165: generated noise textures and their raw data (recreated by the noise project, not tracked)
+Data/Noise/
+Content/Noise/

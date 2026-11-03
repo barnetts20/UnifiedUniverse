@@ -31,9 +31,12 @@
 // (D-105).
 //
 // RESOURCES: StructuredBuffer<T> is a read-only view over a C++ array, so a core can take a
-// LUT as a parameter. There are no textures here. Baked fields are sampled through the
-// UniVol path in UniCore, which owns the data (D-007), never through a stub that returns a
-// neutral value (lesson #1).
+// LUT as a parameter. Textures stay outside the shared subset with one exception (D-164): the
+// web density texture, which cores reach only through the macro UNI_WEB_TEX_SAMPLE(P, Mip).
+// In HLSL it expands to a SampleLevel on the global declared in Shaders/Private/
+// UniWebTexture.ush; here, to UniWebTexSample below: the same wrap / trilinear / linear-mip
+// filter over the CPU copy of the same texels (UniCore::FWebTexture binds it). Unbound, it
+// returns NaN, never a neutral value (lesson #1): placement then accepts nothing.
 
 #include <cmath>
 #include <cstdint>
@@ -228,4 +231,105 @@ namespace UniHlsl
 	inline float3 min(const float3& A, const float3& B) { return float3(min(A.x, B.x), min(A.y, B.y), min(A.z, B.z)); }
 	inline float3 max(const float3& A, const float3& B) { return float3(max(A.x, B.x), max(A.y, B.y), max(A.z, B.z)); }
 
+	// -------------------------------------------------------------------------------------
+	// WEB TEXTURE (D-164). The CPU twin of Texture3D<float4>.SampleLevel with an address-wrap,
+	// min/mag/mip-linear sampler: texel centres at (i + 0.5) / size, wrap on every axis,
+	// trilinear within a mip, linear between mips, mip clamped to [0, mips - 1].
+	// -------------------------------------------------------------------------------------
+
+	/** IEEE binary16 to float, exact (denormals, infinities and NaN included). */
+	inline float UniHalfToFloatSlow(uint16_t H)
+	{
+		const uint32_t Sign = uint32_t(H & 0x8000u) << 16;
+		const uint32_t Exp = (H >> 10) & 0x1Fu;
+		uint32_t Man = H & 0x3FFu;
+		uint32_t X;
+		if (Exp == 0u)
+		{
+			if (Man == 0u) { X = Sign; }
+			else
+			{
+				int E = -1;
+				do { ++E; Man <<= 1; } while ((Man & 0x400u) == 0u);
+				X = Sign | (uint32_t(127 - 15 - E) << 23) | ((Man & 0x3FFu) << 13);
+			}
+		}
+		else if (Exp == 31u) { X = Sign | 0x7F800000u | (Man << 13); }
+		else { X = Sign | ((Exp + 127u - 15u) << 23) | (Man << 13); }
+		float F; std::memcpy(&F, &X, 4);
+		return F;
+	}
+
+	/** The same through a 64K-entry table (built once, thread-safe): the CPU sampler decodes 32
+	 *  halves per trilinear-between-mips sample. */
+	inline float UniHalfToFloat(uint16_t H)
+	{
+		struct FTable { float V[65536]; FTable() { for (uint32_t I = 0; I < 65536u; ++I) { V[I] = UniHalfToFloatSlow(uint16_t(I)); } } };
+		static const FTable T;
+		return T.V[H];
+	}
+
+	struct FWebTexView
+	{
+		const uint16_t* const* Mips = nullptr;   // Mips[m]: (Size >> m)^3 RGBA16F texels (4 halves), x fastest
+		uint Size = 0u;
+		uint NumMips = 0u;
+	};
+
+	/** Bound by UniCore::BindWebTexture before any core samples it; read-only afterwards. */
+	inline FWebTexView UniWebTextureView;
+
+	inline float4 UniWebTexTrilinear(const FWebTexView& V, uint Mip, const float3& P)
+	{
+		const int S = int(V.Size >> Mip);
+		const uint16_t* D = V.Mips[Mip];
+		const float X = P.x * float(S) - 0.5f, Y = P.y * float(S) - 0.5f, Z = P.z * float(S) - 0.5f;
+		const float Fx = std::floor(X), Fy = std::floor(Y), Fz = std::floor(Z);
+		const float Ax = X - Fx, Ay = Y - Fy, Az = Z - Fz;
+		auto Wrap = [S](int I) { const int R = I % S; return R < 0 ? R + S : R; };
+		const int X0 = Wrap(int(Fx)), Y0 = Wrap(int(Fy)), Z0 = Wrap(int(Fz));
+		const int X1 = Wrap(X0 + 1), Y1 = Wrap(Y0 + 1), Z1 = Wrap(Z0 + 1);
+		auto At = [&](int I, int J, int K)
+		{
+			const uint16_t* H = D + ((size_t(K) * size_t(S) + size_t(J)) * size_t(S) + size_t(I)) * 4u;
+			return float4(UniHalfToFloat(H[0]), UniHalfToFloat(H[1]), UniHalfToFloat(H[2]), UniHalfToFloat(H[3]));
+		};
+		auto Lerp4 = [](const float4& A, const float4& B, float T) { return float4(A.x + (B.x - A.x) * T, A.y + (B.y - A.y) * T, A.z + (B.z - A.z) * T, A.w + (B.w - A.w) * T); };
+		const float4 C00 = Lerp4(At(X0, Y0, Z0), At(X1, Y0, Z0), Ax);
+		const float4 C10 = Lerp4(At(X0, Y1, Z0), At(X1, Y1, Z0), Ax);
+		const float4 C01 = Lerp4(At(X0, Y0, Z1), At(X1, Y0, Z1), Ax);
+		const float4 C11 = Lerp4(At(X0, Y1, Z1), At(X1, Y1, Z1), Ax);
+		return Lerp4(Lerp4(C00, C10, Ay), Lerp4(C01, C11, Ay), Az);
+	}
+
+	inline float4 UniWebTexSample(const float3& P, float Mip)
+	{
+		const FWebTexView& V = UniWebTextureView;
+		if (!V.Mips || V.NumMips == 0u)
+		{
+			const float N = std::nanf("");
+			return float4(N, N, N, N);
+		}
+		const float M = clamp(Mip, 0.0f, float(V.NumMips - 1u));
+		const uint M0 = uint(M);
+		const float T = M - float(M0);
+		const float4 A = UniWebTexTrilinear(V, M0, P);
+		if (T <= 0.0f || M0 + 1u >= V.NumMips) { return A; }
+		const float4 B = UniWebTexTrilinear(V, M0 + 1u, P);
+		return float4(A.x + (B.x - A.x) * T, A.y + (B.y - A.y) * T, A.z + (B.z - A.z) * T, A.w + (B.w - A.w) * T);
+	}
+
+	/** D-165: the bound texture's channel means over the tile (its last mip's texel; the exact
+	 *  mean of the trilinear field, which preserves texel means over a period). CPU only: the
+	 *  normalising integral of a linear textured web. NaN when unbound. */
+	inline float4 UniWebTexMean()
+	{
+		const FWebTexView& V = UniWebTextureView;
+		if (!V.Mips || V.NumMips == 0u) { const float N = std::nanf(""); return float4(N, N, N, N); }
+		const uint16_t* H = V.Mips[V.NumMips - 1u];
+		return float4(UniHalfToFloat(H[0]), UniHalfToFloat(H[1]), UniHalfToFloat(H[2]), UniHalfToFloat(H[3]));
+	}
+
 } // namespace UniHlsl
+
+#define UNI_WEB_TEX_SAMPLE(P, Mip) UniWebTexSample(P, Mip)

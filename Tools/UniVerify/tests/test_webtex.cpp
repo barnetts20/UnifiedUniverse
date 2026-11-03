@@ -1,0 +1,906 @@
+// test_webtex.cpp
+// D-164: the cosmic web as a baked texture (UniWebTexture.h, UniField_WebTex).
+//
+//   T1.webtex.format      half rounding, bake = channels at texel centres, mips = exact means,
+//                         the CPU sampler (texel centres, linear between, wrap, mip blend),
+//                         cache round trip, channels regroup the procedural web exactly
+//   T2.webtex.field       the stand-in (128^3, 2^3 samples per texel) against the procedural web:
+//                         mean, correlation, bake time
+//   T2.webtex.census      placement on the textured web: galaxy and cluster densities match their
+//                         emitters, clusters on denser web than field galaxies
+//   T3.webtex.background  the background map marched through the texture vs the procedural web:
+//                         light, per-pixel agreement, steps and time per texel; stills of both
+
+#include "../src/UniTest.h"
+#include "../src/UniVerifyCommon.h"
+#include "../src/UniVolumeRef.h"
+#include "../scenes/UniScenes.h"
+#include "UniStreamer.h"
+#include "UniTravel.h"
+#include "UniWebTexture.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <unordered_map>
+#include <sys/stat.h>
+
+using namespace UniCore;
+using namespace UniRender;
+namespace H = UniHlsl;
+
+namespace
+{
+	std::string RenderDir()
+	{
+		const std::string D = UniVerify::Options().OutDir + "/render";
+		for (size_t I = 1; I < D.size(); ++I) { if (D[I] == '/') { ::mkdir(D.substr(0, I).c_str(), 0755); } }
+		::mkdir(D.c_str(), 0755);
+		return D;
+	}
+
+	void WriteFrame(const FImage& Img, const std::string& Name, const std::vector<std::string>& Hud)
+	{
+		const std::string Base = RenderDir() + "/" + Name;
+		Img.WritePpm(Base + ".ppm");
+		FILE* F = std::fopen((Base + ".hud.json").c_str(), "wb");
+		if (!F) { return; }
+		std::fprintf(F, "{\"lines\":[");
+		for (size_t I = 0; I < Hud.size(); ++I) { std::fprintf(F, "%s\"%s\"", I ? "," : "", Hud[I].c_str()); }
+		std::fprintf(F, "]}\n");
+		std::fclose(F);
+	}
+
+	double Lum3(const double* Rgb) { return 0.2126 * Rgb[0] + 0.7152 * Rgb[1] + 0.0722 * Rgb[2]; }
+
+	/** The web scene's bake key (its galaxy web), at the stand-in resolution. */
+	FWebBakeKey SceneKey(uint32_t Size = 128u, uint32_t SS = 2u)
+	{
+		const FUniverseDef D = UniScenes::WebToGalaxy();
+		FWebBakeKey K;
+		FindWebKey(D, Size, SS, K);
+		return K;
+	}
+
+	/** The stand-in, baked once per run (and its bake time). */
+	const FWebTexture& StandIn(double* OutSeconds = nullptr)
+	{
+		static double Seconds = 0.0;
+		static const FWebTexture T = [&]()
+		{
+			const auto T0 = std::chrono::steady_clock::now();
+			FWebTexture R = FWebTexture::Bake(SceneKey());
+			Seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - T0).count();
+			return R;
+		}();
+		if (OutSeconds) { *OutSeconds = Seconds; }
+		return T;
+	}
+
+	struct FBindScope
+	{
+		explicit FBindScope(const FWebTexture& T) { BindWebTexture(&T); }
+		~FBindScope() { BindWebTexture(nullptr); }
+	};
+
+	H::FUniFieldParams Textured(H::FUniFieldParams P, uint32_t Size) { P.C.z = 1.0f; P.C.w = float(Size); return P; }
+}
+
+UNI_TEST(webtex, format)
+{
+	std::string Bad;
+	// Half rounding: within half an ulp (2^-11 relative) over the normal range; exact for halves.
+	Uni::FTestRng Rng(0x4A1Full);
+	int HalfBad = 0;
+	for (int I = 0; I < 200000; ++I)
+	{
+		const float X = float(std::ldexp(Rng.Unit() * 2.0 - 1.0, int(Rng.Unit() * 30.0) - 14));
+		if (std::fabs(X) < std::ldexp(1.0f, -14)) { continue; }   // normals only (denormals: absolute 2^-25)
+		const float R = RoundToHalf(X);
+		if (std::fabs(R - X) > std::ldexp(std::fabs(double(X)), -11) * 1.0000001 + 1e-30) { ++HalfBad; }
+		if (RoundToHalf(R) != R) { ++HalfBad; }
+	}
+	if (HalfBad) { Bad += Uni::Fmt("half rounding: %d; ", HalfBad); }
+
+	// Small bake, one sample per texel: texel = channels at its centre, half-rounded.
+	FWebBakeKey K = SceneKey(32u, 1u);
+	const FWebTexture T = FWebTexture::Bake(K, 2u);
+	const H::FUniFieldParams Bp = K.BakeParams();
+	int TexBad = 0;
+	for (int I = 0; I < 2000; ++I)
+	{
+		const uint32_t X = uint32_t(Rng.Unit() * 32.0) % 32u, Y = uint32_t(Rng.Unit() * 32.0) % 32u, Z = uint32_t(Rng.Unit() * 32.0) % 32u;
+		const H::float4 C = H::Uni_WebChannels(H::float3((X + 0.5f) / 32.0f, (Y + 0.5f) / 32.0f, (Z + 0.5f) / 32.0f), Bp);
+		const H::float4& V = T.Texel(0, X, Y, Z);
+		if (V.x != RoundToHalf(C.x) || V.y != RoundToHalf(C.y) || V.z != RoundToHalf(C.z) || V.w != 0.0f) { ++TexBad; }
+	}
+	if (TexBad) { Bad += Uni::Fmt("bake texels: %d; ", TexBad); }
+
+	// Mips: every texel the half-rounded mean of its 8 children; the last mip is 1^3.
+	int MipBad = 0;
+	for (uint32_t M = 1; M < T.NumMips(); ++M)
+	{
+		const uint32_t S = T.MipSize(M);
+		for (uint32_t Z = 0; Z < S; ++Z) for (uint32_t Y = 0; Y < S; ++Y) for (uint32_t X = 0; X < S; ++X)
+		{
+			double A = 0.0;
+			for (int C = 0; C < 8; ++C) { A += T.Texel(M - 1, 2 * X + (C & 1), 2 * Y + ((C >> 1) & 1), 2 * Z + ((C >> 2) & 1)).y; }
+			if (T.Texel(M, X, Y, Z).y != RoundToHalf(float(A / 8.0))) { ++MipBad; }
+		}
+	}
+	if (MipBad || T.MipSize(T.NumMips() - 1) != 1u || T.NumMips() != 6u) { Bad += Uni::Fmt("mips: %d bad, %u levels; ", MipBad, T.NumMips()); }
+
+	// Sampler: texel centres exact, midpoints the mean, wrap, linear across mips.
+	FBindScope Bind(T);
+	int SampBad = 0;
+	for (int I = 0; I < 2000; ++I)
+	{
+		const uint32_t X = uint32_t(Rng.Unit() * 32.0) % 32u, Y = uint32_t(Rng.Unit() * 32.0) % 32u, Z = uint32_t(Rng.Unit() * 32.0) % 32u;
+		const H::float3 Pc((X + 0.5f) / 32.0f, (Y + 0.5f) / 32.0f, (Z + 0.5f) / 32.0f);
+		const H::float4 S0 = H::UniWebTexSample(Pc, 0.0f);
+		if (std::fabs(S0.y - T.Texel(0, X, Y, Z).y) > 1e-6f) { ++SampBad; }
+		const H::float4 Sm = H::UniWebTexSample(H::float3(Pc.x + 0.5f / 32.0f, Pc.y, Pc.z), 0.0f);
+		const float Want = 0.5f * (T.Texel(0, X, Y, Z).y + T.Texel(0, (X + 1) % 32u, Y, Z).y);
+		if (std::fabs(Sm.y - Want) > 1e-5f) { ++SampBad; }
+		const H::float3 Pr(float(Rng.Unit()), float(Rng.Unit()), float(Rng.Unit()));
+		const H::float4 A = H::UniWebTexSample(Pr, 0.0f), B = H::UniWebTexSample(H::float3(Pr.x + 1.0f, Pr.y - 1.0f, Pr.z + 2.0f), 0.0f);
+		if (std::fabs(A.x - B.x) > 1e-4f || std::fabs(A.y - B.y) > 1e-4f) { ++SampBad; }
+		const H::float4 M1 = H::UniWebTexSample(Pr, 1.0f), M2 = H::UniWebTexSample(Pr, 2.0f), M15 = H::UniWebTexSample(Pr, 1.5f);
+		if (std::fabs(M15.y - 0.5f * (M1.y + M2.y)) > 1e-5f) { ++SampBad; }
+	}
+	// Across the tile boundary the sample is continuous: no seam.
+	double Seam = 0.0, Interior = 0.0;
+	for (int I = 0; I < 2000; ++I)
+	{
+		const float Y = float(Rng.Unit()), Z = float(Rng.Unit()), E = 0.25f / 32.0f;
+		Seam = std::max(Seam, double(std::fabs(H::UniWebTexSample(H::float3(1.0f - E, Y, Z), 0.0f).y - H::UniWebTexSample(H::float3(E, Y, Z), 0.0f).y)));
+		const float Xi = float(Rng.Unit()) * 0.9f + 0.05f;
+		Interior = std::max(Interior, double(std::fabs(H::UniWebTexSample(H::float3(Xi - E, Y, Z), 0.0f).y - H::UniWebTexSample(H::float3(Xi + E, Y, Z), 0.0f).y)));
+	}
+	if (Seam > Interior * 1.05 + 1e-6) { ++SampBad; }
+	if (SampBad) { Bad += Uni::Fmt("sampler: %d; ", SampBad); }
+
+	// Cache round trip.
+	const std::string Path = RenderDir() + "/webtex_test.uweb";
+	FWebTexture L;
+	const bool bRound = T.Save(Path) && FWebTexture::Load(Path, K, L) && L.NumMips() == T.NumMips() && L.Mips[0].size() == T.Mips[0].size()
+		&& L.Mips == T.Mips;
+	FWebBakeKey K2 = K; K2.Seed ^= 1u;
+	FWebTexture L2;
+	const bool bRejects = !FWebTexture::Load(Path, K2, L2);
+	if (!bRound || !bRejects) { Bad += "cache round trip; "; }
+
+	// The channels regroup the procedural web: galaxy web and cluster web (power, nodes).
+	const FUniverseDef D = UniScenes::WebToGalaxy();
+	double Worst = 0.0;
+	for (const FUniEmitter& E : D.RootEmitters)
+	{
+		const H::FUniFieldParams P = E.Exemplar.ToHlsl();
+		for (int I = 0; I < 5000; ++I)
+		{
+			const H::float3 Pt(float(Rng.Unit()), float(Rng.Unit()), float(Rng.Unit()));
+			const H::float4 C = H::Uni_WebChannels(Pt, P);
+			double Dn = double(P.A.w) * C.x + double(P.B.x) * C.y + (P.C.y > 0.0f ? double(P.C.y) * C.z : 0.0);
+			if (P.C.x > 0.0f && P.C.x != 1.0f) { Dn = std::pow(std::max(Dn, 0.0), double(P.C.x)); }
+			const double Want = H::UniField_Web(Pt, P);
+			Worst = std::max(Worst, std::fabs(double(P.A.z) + Dn - Want) / std::max(std::fabs(Want), 1e-3));
+		}
+	}
+	if (Worst > 1e-5) { Bad += Uni::Fmt("channels vs procedural: %.2g; ", Worst); }
+
+	// Unbound, the textured field is NaN (fails closed), never a neutral value.
+	BindWebTexture(nullptr);
+	const bool bNan = std::isnan(H::UniField_Web(H::float3(0.3f, 0.4f, 0.5f), Textured(D.RootEmitters[0].Exemplar.ToHlsl(), 32u)));
+	if (!bNan) { Bad += "unbound texture not NaN; "; }
+
+	Uni::Check(1, "T1.webtex.format", "D-164 web texture: half rounding, bake = channels at texel centres, mips = exact means, sampler (centres, midpoints, wrap, no seam, mip blend), cache round trip, channels = procedural web, unbound fails closed")
+		.Metric("channel_err", Worst).Metric("seam", Seam).Metric("interior", Interior)
+		.Pass(Bad.empty(), Bad.empty() ? Uni::Fmt("32^3 bake, %u mips; channels match the procedural web to %.1g; seam step %.3g vs interior %.3g", T.NumMips(), Worst, Seam, Interior) : Bad);
+}
+
+UNI_TEST(webtex, field)
+{
+	double Secs = 0.0;
+	const FWebTexture& T = StandIn(&Secs);
+	FBindScope Bind(T);
+	const FUniverseDef D = UniScenes::WebToGalaxy();
+	Uni::FTestRng Rng(0x5EEDull);
+	std::string Detail;
+	bool bOk = true;
+	for (size_t E = 0; E < D.RootEmitters.size(); ++E)
+	{
+		const H::FUniFieldParams Pp = D.RootEmitters[E].Exemplar.ToHlsl();
+		const H::FUniFieldParams Pt = Textured(Pp, T.Size);
+		double Sa = 0, Sb = 0, Saa = 0, Sbb = 0, Sab = 0;
+		const int N = 200000;
+		for (int I = 0; I < N; ++I)
+		{
+			const H::float3 P(float(Rng.Unit()), float(Rng.Unit()), float(Rng.Unit()));
+			const double A = H::UniField_Web(P, Pp), B = H::UniField_Web(P, Pt);
+			Sa += A; Sb += B; Saa += A * A; Sbb += B * B; Sab += A * B;
+		}
+		const double Ma = Sa / N, Mb = Sb / N;
+		const double Corr = (Sab / N - Ma * Mb) / std::sqrt(std::max((Saa / N - Ma * Ma) * (Sbb / N - Mb * Mb), 1e-300));
+		const double MeanErr = Mb / Ma - 1.0;
+		const double CorrMin = E == 0 ? 0.9 : 0.8;
+		const double MeanTol = E == 0 ? 0.01 : 0.15;   // the cluster web's power acts after filtering
+		bOk = bOk && Corr > CorrMin && std::fabs(MeanErr) < MeanTol;
+		Detail += Uni::Fmt("%s: mean %+.2f%%, correlation %.3f; ", E == 0 ? "galaxy web" : "cluster web", 100.0 * MeanErr, Corr);
+	}
+	Uni::Check(2, "T2.webtex.field", "D-164 stand-in web texture (128^3, 8 samples per texel) vs the procedural web at random points: galaxy web mean within 1%, correlation > 0.9; cluster web (power after filtering) mean within 15%, correlation > 0.8")
+		.Metric("bake_seconds", Secs).Pass(bOk, Detail + Uni::Fmt("bake %.1f s (%u^3, %u mips)", Secs, T.Size, T.NumMips()));
+}
+
+UNI_TEST(webtex, census)
+{
+	const FWebTexture& T = StandIn();
+	FBindScope Bind(T);
+	const UniScenes::FClusterTuning Tun;
+	FUniverseDef Def = UniScenes::WebToGalaxy(Tun);
+	const int Switched = EnableWebTexture(Def, T.Key);
+	FUniverseModel M(Def);
+	FRefGenerator G(M);
+	FRefPipeline P(G);
+	P.bVelocityLod = false;
+	P.Update(UniScenes::VoidCamera(), FVec3f{});
+	const FUniverseDef& D = M.Definition();
+	const FUniEmitter& Field = D.RootEmitters[0];
+	const FUniEmitter& Clu = D.RootEmitters[1];
+	const H::FUniFieldParams Wp = Field.Exemplar.ToHlsl();
+	const double Period = std::ldexp(1.0, Field.PeriodBits);
+	auto WebAt = [&](const FCoord& C)
+	{
+		float Pf[3];
+		for (int Ax = 0; Ax < 3; ++Ax) { Pf[Ax] = float(U128ToDouble(MaskLow(C.Axis(Ax), Field.PeriodBits)) / Period); }
+		return double(H::Uni_FieldSample(H::UNI_FIELD_WEB, H::float3(Pf[0], Pf[1], Pf[2]), Wp));
+	};
+	const int LClu = M.LevelOf(UniScenes::kCluster, -26.0);
+	long long Clusters = 0, FieldGal = 0;
+	double WebC = 0.0, WebF = 0.0, ClusterVolume = 0.0;
+	std::map<int, std::pair<long long, double>> GalByLevel;   // galaxies placed by the web, per level: count, volume
+	for (const auto& KV : P.CacheRef())
+	{
+		long long WebGal = 0;
+		for (size_t I = 0; I < KV.second.Objects.size(); ++I)
+		{
+			const FObjectGPU& O = KV.second.Objects[I];
+			if ((O.A[3] >> 16) & H::UNI_OBJ_FLAG_DELTA_HIDDEN) { continue; }
+			const u32 Arch = O.A[3] & 0xFFFFu;
+			const u32 Off[3] = { O.A[0], O.A[1], O.A[2] };
+			if (Arch == UniScenes::kCluster) { ++Clusters; WebC += WebAt(ObjectCoord(KV.first, Off)); }
+			else if (Arch == UniScenes::kGalaxy)
+			{
+				const auto It = P.Contributors().find(KV.second.ObjectContributor[I]);
+				const bool bMember = It != P.Contributors().end() && It->second.ParentArchetypeId == UniScenes::kCluster;
+				if (!bMember)
+				{
+					++WebGal;
+					if (FieldGal < 200000) { ++FieldGal; WebF += WebAt(ObjectCoord(KV.first, Off)); }
+				}
+			}
+		}
+		const double W = CellWidthCm(KV.first.Level) / Units::Mpc;
+		if (KV.first.Level == LClu) { ClusterVolume += W * W * W; }
+		GalByLevel[KV.first.Level].first += WebGal;
+		GalByLevel[KV.first.Level].second += W * W * W;
+	}
+	Uni::FTestRng Rng(0xBEEFull);
+	double WebR = 0.0;
+	const int NR = 20000;
+	for (int I = 0; I < NR; ++I) { WebR += double(H::Uni_FieldSample(H::UNI_FIELD_WEB, H::float3(float(Rng.Unit()), float(Rng.Unit()), float(Rng.Unit())), Wp)); }
+	WebR /= NR;
+	const double Density = ClusterVolume > 0.0 ? double(Clusters) / ClusterVolume : 0.0;
+	const double Want = Clu.NTotal * std::pow(Units::Mpc, 3.0);
+	const double Sig = std::sqrt(std::max(double(Clusters), 1.0)) / std::max(ClusterVolume, 1e-300);
+	const double BiasC = Clusters ? WebC / double(Clusters) / WebR : 0.0;
+	const double BiasF = FieldGal ? WebF / double(FieldGal) / WebR : 0.0;
+	// Field galaxies: the slice with the most galaxies, against its expected density.
+	int LBest = 0; long long NBest = 0; double VBest = 0.0;
+	for (const auto& KV : GalByLevel) { if (KV.second.first > NBest) { NBest = KV.second.first; VBest = KV.second.second; LBest = KV.first; } }
+	const FSlice* Sl = M.SlicesOf(UniScenes::kGalaxy).ForLevel(LBest);
+	const double WantGal = Sl ? Field.NTotal * Sl->P * std::pow(Units::Mpc, 3.0) : 0.0;
+	const double GotGal = VBest > 0.0 ? double(NBest) / VBest : 0.0;
+	const double SigGal = std::sqrt(std::max(double(NBest), 1.0)) / std::max(VBest, 1e-300);
+	const bool bGal = Sl && std::abs(GotGal - WantGal) < 4.0 * SigGal + 0.02 * WantGal;
+	Uni::Check(2, "T2.webtex.census", "D-164 placement on the textured web (web scene with clusters): cluster density matches the emitter (4 sigma + 2%), the busiest galaxy slice matches its share, clusters on denser web than field galaxies")
+		.Metric("switched", Switched).Metric("clusters", double(Clusters)).Metric("density", Density).Metric("density_expected", Want).Metric("bias_clusters", BiasC).Metric("bias_field", BiasF)
+		.Metric("galaxies", double(NBest)).Metric("galaxy_density", GotGal).Metric("galaxy_density_expected", WantGal)
+		.Pass(Switched == 2 && Clusters > 1000 && std::abs(Density - Want) < 4.0 * Sig + 0.02 * Want && BiasC > 1.5 * BiasF && bGal,
+			Uni::Fmt("%d web emitters textured; %lld clusters: %.3g per Mpc^3 (emitter %.3g); L%d galaxies %lld: %.3g per Mpc^3 (expected %.3g); web density at clusters %.2fx the mean, at field galaxies %.2fx",
+				Switched, Clusters, Density, Want, LBest, NBest, GotGal, WantGal, BiasC, BiasF));
+}
+
+UNI_TEST(webtex, background)
+{
+	// The web scene from intergalactic space: the background map (6 x 96^2) and a 480 x 270 view
+	// of the background alone, marched through the procedural web and through the texture.
+	const FWebTexture& T = StandIn();
+	FBindScope Bind(T);
+	const FCoord Cam = UniScenes::VoidCamera();
+	FCamera Cm; Cm.Coord = Cam; Cm.Width = 480; Cm.Height = 270; Cm.LookAlong({ 1, 0.3, 0.1 });
+	struct FRun { FBackgroundCube Cube; double CubeSec = 0.0; FImage Img{ 1, 1 }; FVolumeStats St; double ImgSec = 0.0; };
+	FRun Runs[2];
+	double TailShare = 0.0;   // the textured view's light with the tail (then: the tail's share)
+	for (int K = 0; K < 2; ++K)
+	{
+		FUniverseDef Def = UniScenes::WebToGalaxy();
+		if (K == 1) { EnableWebTexture(Def, T.Key); }
+		FUniverseModel M(Def);
+		FRefGenerator G(M);
+		FVolumeBuilder VB(M, G);
+		FRefPipeline P(G);
+		P.Update(Cam, FVec3f{});
+		FVolumeScene Bg = VB.Build(P, Cam, FVec3f{}, Cm.View()).Subset(true);
+		// The marched part only: past the march extent both are the same analytic mean (the tail),
+		// which is most of the light and would hide any difference in structure.
+		if (K == 1)
+		{
+			FVolumeScene Tail = Bg;
+			FImage Ti(Cm.Width, Cm.Height);
+			TailShare = Lum3(RenderVolume(Tail, Cm, Ti, nullptr, 2).Flux);
+		}
+		for (FCarrierGPU& C : Bg.Carriers) { C.Flags &= ~H::UNI_CARRIER_TAIL; }
+		auto T0 = std::chrono::steady_clock::now();
+		Runs[K].Cube = RenderBackgroundCube(Bg, 96);
+		Runs[K].CubeSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - T0).count();
+		Runs[K].Img = FImage(Cm.Width, Cm.Height);
+		T0 = std::chrono::steady_clock::now();
+		Runs[K].St = RenderVolume(Bg, Cm, Runs[K].Img, nullptr, 2);
+		Runs[K].ImgSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - T0).count();
+	}
+	// Cube: total light and per-texel agreement (the texture is the procedural web averaged over
+	// texels, so single texels differ where the web's walls are thinner than a texel).
+	double Sa = 0, Sb = 0;
+	std::vector<double> Errs;
+	const auto& A = Runs[0].Cube.Tex; const auto& B = Runs[1].Cube.Tex;
+	double Saa = 0, Sbb = 0, Sab = 0;
+	for (size_t I = 0; I < A.size(); ++I)
+	{
+		const double La = 0.2126 * A[I].x + 0.7152 * A[I].y + 0.0722 * A[I].z, Lb = 0.2126 * B[I].x + 0.7152 * B[I].y + 0.0722 * B[I].z;
+		Sa += La; Sb += Lb; Saa += La * La; Sbb += Lb * Lb; Sab += La * Lb;
+		if (La > 0.0) { Errs.push_back(std::fabs(Lb - La) / La); }
+	}
+	std::sort(Errs.begin(), Errs.end());
+	const double N = double(A.size());
+	const double Corr = (Sab / N - Sa / N * Sb / N) / std::sqrt(std::max((Saa / N - Sa * Sa / (N * N)) * (Sbb / N - Sb * Sb / (N * N)), 1e-300));
+	const double Total = Sb / Sa - 1.0;
+	const double Median = Errs.empty() ? 0.0 : Errs[Errs.size() / 2];
+	const double StepsA = double(Runs[0].Cube.Steps) / N, StepsB = double(Runs[1].Cube.Steps) / N;
+	const double Speed = Runs[0].CubeSec / std::max(Runs[1].CubeSec, 1e-9);
+	const double ImgTotal = Lum3(Runs[1].St.Flux) / std::max(Lum3(Runs[0].St.Flux), 1e-300) - 1.0;
+	TailShare = TailShare > 0.0 ? 1.0 - Lum3(Runs[1].St.Flux) / TailShare : 0.0;
+	// Stills with one display gain (the procedural one's 99.5th percentile).
+	{
+		std::vector<float> L;
+		for (size_t I = 0; I + 2 < Runs[0].Img.Rgb.size(); I += 3) { L.push_back(0.2126f * Runs[0].Img.Rgb[I] + 0.7152f * Runs[0].Img.Rgb[I + 1] + 0.0722f * Runs[0].Img.Rgb[I + 2]); }
+		std::sort(L.begin(), L.end());
+		const float Ref = L.empty() ? 1.0f : std::max(L[size_t(double(L.size() - 1) * 0.995)], 1e-30f);
+		const char* Names[2] = { "still_webtex_procedural", "still_webtex_texture" };
+		for (int K = 0; K < 2; ++K)
+		{
+			FImage I = Runs[K].Img;
+			for (float& V : I.Rgb) { V = V / Ref * 0.8f; }
+			WriteFrame(I, Names[K], { K == 0 ? "Background web, procedural (D-136)" : "Background web, 128^3 texture (D-164)",
+				Uni::Fmt("%.0f steps per ray, %.2f s for 480 x 270 on the reference", double(Runs[K].St.Steps) / std::max<double>(double(Runs[K].St.Rays), 1.0), Runs[K].ImgSec) });
+		}
+	}
+	const bool bOk = std::fabs(Total) < 0.03 && Corr > 0.9 && Runs[1].Cube.Truncated == 0 && Speed > 3.0 && std::fabs(ImgTotal) < 0.03;
+	Uni::Check(3, "T3.webtex.background", "D-164 background marched through the web texture vs the procedural web: marched part (no tail): cube light within 3%, texel correlation > 0.9, view light within 3%, no truncation, and at least 3x faster per texel")
+		.Metric("total_err", Total).Metric("correlation", Corr).Metric("median_texel_err", Median).Metric("steps_procedural", StepsA).Metric("steps_texture", StepsB)
+		.Metric("seconds_procedural", Runs[0].CubeSec).Metric("seconds_texture", Runs[1].CubeSec).Metric("speedup", Speed).Metric("view_total_err", ImgTotal).Metric("tail_share", TailShare)
+		.Pass(bOk, Uni::Fmt("marched part (0.1-50 Mpc; the analytic tail beyond is %.0f%% of the view's light and identical): cube 6 x 96^2 light %+.2f%%, texel correlation %.3f, median texel %.1f%%; %.0f -> %.0f steps per texel, %.2f -> %.2f s (%.1fx); view light %+.2f%%",
+			100.0 * TailShare, 100.0 * Total, Corr, 100.0 * Median, StepsA, StepsB, Runs[0].CubeSec, Runs[1].CubeSec, Speed, 100.0 * ImgTotal));
+}
+
+// ==========================================================================================
+// D-165: the texture project's adhesion web (Data/Noise, not tracked: regenerate with
+// NoiseVolumeTileCli --set web_adhesion_density_mid). The checks fail, not skip, without it.
+// ==========================================================================================
+
+namespace
+{
+	const char* kDeliveredDir = "Data/Noise";
+	const char* kDeliveredName = "web_adhesion_density_mid";
+
+	/** The delivered texture, loaded once per run (empty, with the reason, if missing). */
+	const FWebTexture& Delivered(std::string* OutErr = nullptr)
+	{
+		static std::string Err;
+		static const FWebTexture T = []()
+		{
+			FWebTexture R;
+			FWebTexture::LoadDelivered(kDeliveredDir, kDeliveredName, R, &Err);
+			return R;
+		}();
+		if (OutErr) { *OutErr = Err; }
+		return T;
+	}
+
+	float CameraGainStill(FImage& Img)
+	{
+		std::vector<float> L;
+		for (size_t I = 0; I + 2 < Img.Rgb.size(); I += 3) { L.push_back(0.2126f * Img.Rgb[I] + 0.7152f * Img.Rgb[I + 1] + 0.0722f * Img.Rgb[I + 2]); }
+		std::sort(L.begin(), L.end());
+		const float P = L.empty() ? 0.0f : L[size_t(double(L.size() - 1) * 0.995)];
+		const float G = P > 0.0f ? 1.5f / P : 1.0f;
+		for (float& V : Img.Rgb) { V *= G; }
+		return G;
+	}
+}
+
+UNI_TEST(webtex, delivered)
+{
+	std::string Err;
+	const FWebTexture& T = Delivered(&Err);
+	if (!T.IsValid())
+	{
+		Uni::Check(1, "T1.webtex.delivered", "D-165 the delivered adhesion web texture loads (Data/Noise/web_adhesion_density_mid, any power-of-two size): full mip chain, channel means as its sidecar states, mips = box means, periodic")
+			.Pass(false, "not loaded: " + Err + " (regenerate it with the noise project: NoiseVolumeTileCli --set web_adhesion_density_mid)");
+		return;
+	}
+	std::string Bad;
+	// Channel means of mip 0 against the sidecar (<name>.json, each channel's "mean"), read from
+	// it so a re-bake (another size or seed) is checked against its own numbers.
+	double Want[4] = { -1, -1, -1, -1 };
+	{
+		std::string Text;
+		if (FILE* F = std::fopen((std::string(kDeliveredDir) + "/" + kDeliveredName + ".json").c_str(), "rb"))
+		{
+			char Buf[65536];
+			for (size_t N; (N = std::fread(Buf, 1, sizeof(Buf), F)) > 0;) { Text.append(Buf, N); }
+			std::fclose(F);
+		}
+		const char* Names[4] = { "\"channel\": \"R\"", "\"channel\": \"G\"", "\"channel\": \"B\"", "\"channel\": \"A\"" };
+		for (int C = 0; C < 4; ++C)
+		{
+			const size_t At = Text.find(Names[C]);
+			const size_t Mn = At == std::string::npos ? std::string::npos : Text.find("\"mean\":", At);
+			if (Mn != std::string::npos) { Want[C] = std::strtod(Text.c_str() + Mn + 7, nullptr); }
+		}
+		if (Want[0] < 0 || Want[1] < 0 || Want[2] < 0 || Want[3] < 0) { Bad += "sidecar means not found; "; }
+	}
+	double Sum[4] = { 0, 0, 0, 0 };
+	for (size_t I = 0; I < T.TexelCount(0); ++I) { const H::float4 V = T.TexelAt(0, I); Sum[0] += V.x; Sum[1] += V.y; Sum[2] += V.z; Sum[3] += V.w; }
+	double WorstMean = 0.0;
+	for (int C = 0; C < 4; ++C) { WorstMean = std::max(WorstMean, std::fabs(Sum[C] / double(T.TexelCount(0)) - Want[C]) / Want[C]); }
+	if (WorstMean > 1e-5) { Bad += Uni::Fmt("channel means off by %.2g; ", WorstMean); }
+	const H::float4 Top = T.Mean();
+	const double Total = double(Top.x) + Top.y + Top.z + Top.w;
+	if (std::fabs(Total - 1.0) > 2e-3) { Bad += Uni::Fmt("top mip total %.5f (should be 1); ", Total); }
+	// Mips: each texel the mean of its children, to within the two roundings (the generator
+	// cascades in double from mip 0 and rounds once per level).
+	size_t MipBad = 0, MipCount = 0;
+	for (uint32_t M = 1; M < T.NumMips(); ++M)
+	{
+		const uint32_t S = T.MipSize(M);
+		for (uint32_t Z = 0; Z < S; ++Z) for (uint32_t Y = 0; Y < S; ++Y) for (uint32_t X = 0; X < S; ++X)
+		{
+			double A[4] = { 0, 0, 0, 0 };
+			for (int C = 0; C < 8; ++C)
+			{
+				const H::float4& V = T.Texel(M - 1, 2 * X + (C & 1), 2 * Y + ((C >> 1) & 1), 2 * Z + ((C >> 2) & 1));
+				A[0] += V.x; A[1] += V.y; A[2] += V.z; A[3] += V.w;
+			}
+			const H::float4& P = T.Texel(M, X, Y, Z);
+			const double Got[4] = { P.x, P.y, P.z, P.w };
+			for (int C = 0; C < 4; ++C) { if (std::fabs(Got[C] - A[C] / 8.0) > 2e-3 * std::fabs(A[C] / 8.0) + 1e-4) { ++MipBad; } }
+			++MipCount;
+		}
+	}
+	if (MipBad) { Bad += Uni::Fmt("%zu mip texel channels off; ", MipBad); }
+	// Periodic: across the tile edge the sampled field steps no more than inside.
+	FBindScope Bind(T);
+	Uni::FTestRng Rng(0xADE5ull);
+	double Seam = 0.0, Interior = 0.0;
+	const float E = 0.25f / float(T.Size);
+	for (int I = 0; I < 4000; ++I)
+	{
+		const float Y = float(Rng.Unit()), Z = float(Rng.Unit());
+		auto Tot = [](const H::float4& V) { return double(V.x) + V.y + V.z + V.w; };
+		Seam = std::max(Seam, std::fabs(Tot(H::UniWebTexSample(H::float3(1.0f - E, Y, Z), 0.0f)) - Tot(H::UniWebTexSample(H::float3(E, Y, Z), 0.0f))));
+		const float Xi = float(Rng.Unit()) * 0.9f + 0.05f;
+		Interior = std::max(Interior, std::fabs(Tot(H::UniWebTexSample(H::float3(Xi - E, Y, Z), 0.0f)) - Tot(H::UniWebTexSample(H::float3(Xi + E, Y, Z), 0.0f))));
+	}
+	if (Seam > Interior * 1.5 + 1e-3) { Bad += Uni::Fmt("seam step %.3g vs interior %.3g; ", Seam, Interior); }
+	Uni::Check(1, "T1.webtex.delivered", "D-165 the delivered adhesion web texture loads (Data/Noise/web_adhesion_density_mid, any power-of-two size): full mip chain, channel means as its sidecar states, mips = box means, periodic")
+		.Metric("size", T.Size).Metric("mips", T.NumMips()).Metric("mean_err", WorstMean).Metric("node_share", Top.z / Total).Metric("seam", Seam).Metric("interior", Interior)
+		.Pass(Bad.empty() && T.Size >= 32u && (T.Size & (T.Size - 1u)) == 0u && T.MipSize(T.NumMips() - 1u) == 1u, Bad.empty() ? Uni::Fmt("%u^3, %u mips; channel means match the sidecar to %.1g; matter: walls %.3f, filaments %.3f, nodes %.3f, void %.3f (total %.5f); %zu mip texels within rounding of their children's mean; seam step %.3g vs interior %.3g",
+			T.Size, T.NumMips(), WorstMean, Top.x, Top.y, Top.z, Top.w, Total, MipCount, Seam, Interior) : Bad);
+}
+
+UNI_TEST(webtex, adhesion_census)
+{
+	// The web scene on the adhesion web, from intergalactic space: clusters and field galaxies at
+	// their emitters' densities, clusters on the node matter, field galaxies on denser matter.
+	std::string Err;
+	const FWebTexture& T = Delivered(&Err);
+	if (!T.IsValid()) { Uni::Check(2, "T2.webtex.adhesion_census", "D-165 placement on the adhesion web").Pass(false, "texture not loaded: " + Err); return; }
+	FBindScope Bind(T);
+	const UniScenes::FClusterTuning Tun;
+	FUniverseDef Def = UniScenes::WebToGalaxy(Tun);
+	const H::float4 Mean = T.Mean();
+	const double Share = Mean.z / (double(Mean.x) + Mean.y + Mean.z + Mean.w);
+	const int Switched = UniScenes::UseDeliveredWeb(Def, Tun, T.Size, Share);
+	FUniverseModel M(Def);
+	FRefGenerator G(M);
+	FRefPipeline P(G);
+	P.bVelocityLod = false;
+	P.Update(UniScenes::VoidCamera(), FVec3f{});
+	const FUniverseDef& D = M.Definition();
+	const FUniEmitter& Field = D.RootEmitters[0];
+	const FUniEmitter& Clu = D.RootEmitters[1];
+	const double Period = std::ldexp(1.0, Field.PeriodBits);
+	auto TexAt = [&](const FCoord& C)
+	{
+		float Pf[3];
+		for (int Ax = 0; Ax < 3; ++Ax) { Pf[Ax] = float(U128ToDouble(MaskLow(C.Axis(Ax), Field.PeriodBits)) / Period); }
+		return H::UniWebTexSample(H::float3(Pf[0], Pf[1], Pf[2]), 0.0f);
+	};
+	const int LClu = M.LevelOf(UniScenes::kCluster, -26.0);
+	long long Clusters = 0, FieldGal = 0;
+	double NodeAtC = 0.0, MatterAtF = 0.0, ClusterVolume = 0.0;
+	std::map<int, std::pair<long long, double>> GalByLevel;
+	for (const auto& KV : P.CacheRef())
+	{
+		long long WebGal = 0;
+		for (size_t I = 0; I < KV.second.Objects.size(); ++I)
+		{
+			const FObjectGPU& O = KV.second.Objects[I];
+			if ((O.A[3] >> 16) & H::UNI_OBJ_FLAG_DELTA_HIDDEN) { continue; }
+			const u32 Arch = O.A[3] & 0xFFFFu;
+			const u32 Off[3] = { O.A[0], O.A[1], O.A[2] };
+			if (Arch == UniScenes::kCluster) { ++Clusters; NodeAtC += TexAt(ObjectCoord(KV.first, Off)).z; }
+			else if (Arch == UniScenes::kGalaxy)
+			{
+				const auto It = P.Contributors().find(KV.second.ObjectContributor[I]);
+				const bool bMember = It != P.Contributors().end() && It->second.ParentArchetypeId == UniScenes::kCluster;
+				if (!bMember)
+				{
+					++WebGal;
+					if (FieldGal < 200000) { ++FieldGal; const H::float4 V = TexAt(ObjectCoord(KV.first, Off)); MatterAtF += double(V.x) + V.y + V.w; }
+				}
+			}
+		}
+		const double W = CellWidthCm(KV.first.Level) / Units::Mpc;
+		if (KV.first.Level == LClu) { ClusterVolume += W * W * W; }
+		GalByLevel[KV.first.Level].first += WebGal;
+		GalByLevel[KV.first.Level].second += W * W * W;
+	}
+	const double Density = ClusterVolume > 0.0 ? double(Clusters) / ClusterVolume : 0.0;
+	const double WantC = Clu.NTotal * std::pow(Units::Mpc, 3.0);
+	const double SigC = std::sqrt(std::max(double(Clusters), 1.0)) / std::max(ClusterVolume, 1e-300);
+	const double NodeBias = Clusters ? NodeAtC / double(Clusters) / Mean.z : 0.0;   // node matter at clusters / its mean
+	const double FieldMean = double(Mean.x) + Mean.y + Mean.w;
+	const double FieldBias = FieldGal ? MatterAtF / double(FieldGal) / FieldMean : 0.0;
+	int LBest = 0; long long NBest = 0; double VBest = 0.0;
+	for (const auto& KV : GalByLevel) { if (KV.second.first > NBest) { NBest = KV.second.first; VBest = KV.second.second; LBest = KV.first; } }
+	const FSlice* Sl = M.SlicesOf(UniScenes::kGalaxy).ForLevel(LBest);
+	const double WantGal = Sl ? Field.NTotal * Sl->P * std::pow(Units::Mpc, 3.0) : 0.0;
+	const double GotGal = VBest > 0.0 ? double(NBest) / VBest : 0.0;
+	const double SigGal = std::sqrt(std::max(double(NBest), 1.0)) / std::max(VBest, 1e-300);
+	const bool bGal = Sl && std::abs(GotGal - WantGal) < 4.0 * SigGal + 0.02 * WantGal;
+	const bool bClu = Clusters > 300 && std::abs(Density - WantC) < 4.0 * SigC + 0.02 * WantC;
+	Uni::Check(2, "T2.webtex.adhesion_census", "D-165 placement on the adhesion web (web scene, 200 Mpc tile): cluster density matches its emitter (4 sigma + 2%), the busiest galaxy slice matches its share, clusters on node matter (> 5x its mean), field galaxies on denser matter than average (> 1.2x)")
+		.Metric("switched", Switched).Metric("node_share", Share).Metric("clusters", double(Clusters)).Metric("density", Density).Metric("density_expected", WantC)
+		.Metric("node_bias", NodeBias).Metric("field_bias", FieldBias).Metric("galaxies", double(NBest)).Metric("galaxy_density", GotGal).Metric("galaxy_density_expected", WantGal)
+		.Pass(Switched == 2 && bClu && bGal && NodeBias > 5.0 && FieldBias > 1.2,
+			Uni::Fmt("%d web emitters on %s; members %.1f%% of galaxies (the node matter's share); %lld clusters: %.3g per Mpc^3 (emitter %.3g), node matter at clusters %.1fx its mean; L%d galaxies %lld: %.3g per Mpc^3 (expected %.3g), matter at field galaxies %.2fx its mean",
+				Switched, T.Name.c_str(), 100.0 * Share, Clusters, Density, WantC, NodeBias, LBest, NBest, GotGal, WantGal, FieldBias));
+}
+
+UNI_TEST(webtex, adhesion_stills)
+{
+	// Stills of the adhesion web: the background alone (the marched part, no tail), and the full
+	// frame (galaxies, clusters and volume) from intergalactic space.
+	std::string Err;
+	const FWebTexture& T = Delivered(&Err);
+	if (!T.IsValid()) { Uni::Check(3, "T3.webtex.adhesion_stills", "D-165 stills of the adhesion web").Pass(false, "texture not loaded: " + Err); return; }
+	FBindScope Bind(T);
+	const UniScenes::FClusterTuning Tun;
+	FUniverseDef Def = UniScenes::WebToGalaxy(Tun);
+	const H::float4 Mean = T.Mean();
+	UniScenes::UseDeliveredWeb(Def, Tun, T.Size, Mean.z / (double(Mean.x) + Mean.y + Mean.z + Mean.w));
+	FUniverseModel M(Def);
+	FRefGenerator G(M);
+	FVolumeBuilder VB(M, G);
+	FRefPipeline P(G);
+	P.bVelocityLod = false;
+	const FCoord Cam = UniScenes::VoidCamera();
+	P.Update(Cam, FVec3f{});
+	FCamera Cm; Cm.Coord = Cam; Cm.Width = 480; Cm.Height = 270; Cm.LookAlong({ 1, 0.3, 0.1 });
+	FVolumeScene Bg = VB.Build(P, Cam, FVec3f{}, Cm.View()).Subset(true);
+	for (FCarrierGPU& C : Bg.Carriers) { C.Flags &= ~H::UNI_CARRIER_TAIL; }
+	FImage Bi(Cm.Width, Cm.Height);
+	const auto T0 = std::chrono::steady_clock::now();
+	const FVolumeStats Bs = RenderVolume(Bg, Cm, Bi, nullptr, 2);
+	const double Secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - T0).count();
+	CameraGainStill(Bi);
+	WriteFrame(Bi, "still_web_adhesion_background", { "Adhesion web (mid), background 0.1-100 Mpc (no tail), 200 Mpc tile (D-165)",
+		Uni::Fmt("%.0f steps per ray, %.2f s for 480 x 270 on the reference", double(Bs.Steps) / std::max(double(Bs.Rays), 1.0), Secs) });
+	const FVolumeScene All = VB.Build(P, Cam, FVec3f{}, Cm.View());
+	FImage Fi(Cm.Width, Cm.Height);
+	FVolumeStats Fs;
+	const FFrameStats St = RenderFrameWithVolume(P, All, Cm, Fi, &Fs);
+	const float Gain = CameraGainStill(Fi);
+	WriteFrame(Fi, "still_web_adhesion_frame", { "Adhesion web (mid): galaxies, clusters and volume from intergalactic space (D-165)",
+		Uni::Fmt("visible %zu of %zu resident; carriers %zu; display gain %.3g", St.Visible, St.Resident, All.Carriers.size(), Gain) });
+	Uni::Check(3, "T3.webtex.adhesion_stills", "D-165 reference stills of the adhesion web (background alone; full frame), no truncated rays")
+		.Metric("steps_per_ray", double(Bs.Steps) / std::max(double(Bs.Rays), 1.0)).Metric("visible", double(St.Visible)).Metric("truncated", double(Bs.Truncated + Fs.Truncated))
+		.Pass(Bs.Truncated == 0 && Fs.Truncated == 0 && St.Visible > 0 && Lum3(Bs.Flux) > 0.0,
+			Uni::Fmt("background %.0f steps per ray (%.2f s); frame: %zu of %zu resident visible", double(Bs.Steps) / std::max(double(Bs.Rays), 1.0), Secs, St.Visible, St.Resident));
+}
+
+UNI_TEST(webtex, nodes)
+{
+	// D-167: clusters from the node list (rank-mapped to the cluster LF): every resident cluster is
+	// a catalogue entry at its exact tile position and magnitude, the heaviest node is the
+	// brightest cluster, cluster density = K per tile, field galaxies at their density, and a
+	// regenerated cell is identical.
+	std::string Err;
+	const FWebTexture& T = Delivered(&Err);
+	std::vector<FWebNode> Nodes;
+	std::string NErr;
+	const bool bNodes = LoadWebNodes(kDeliveredDir, kDeliveredName, Nodes, &NErr);
+	if (!T.IsValid() || !bNodes) { Uni::Check(2, "T2.webtex.nodes", "D-167 clusters from the adhesion node list").Pass(false, "not loaded: " + Err + NErr); return; }
+	FBindScope Bind(T);
+	const UniScenes::FClusterTuning Tun;
+	FUniverseDef Def = UniScenes::WebToGalaxy(Tun);
+	const H::float4 Mean = T.Mean();
+	const double Share = Mean.z / (double(Mean.x) + Mean.y + Mean.z + Mean.w);
+	const int Switched = UniScenes::UseDeliveredWeb(Def, Tun, T.Size, Share, &Nodes);
+	FUniverseModel M(Def);
+	FRefGenerator G(M);
+	FRefPipeline P(G);
+	P.bVelocityLod = false;
+	P.Update(UniScenes::VoidCamera(), FVec3f{});
+	const FUniverseDef& D = M.Definition();
+	const FCatalogue& Cat = D.Catalogues.at(0);
+	const size_t K = Cat.Entries.size();
+	const double Tile = std::ldexp(1.0, Cat.PeriodBits);
+	// Entries by level.
+	std::map<int, std::vector<size_t>> ByLevel;
+	for (size_t I = 0; I < K; ++I) { ByLevel[M.LevelOf(UniScenes::kCluster, Cat.Entries[I].AbsMag)].push_back(I); }
+	long long Clusters = 0, Matched = 0, FieldGal = 0;
+	double ClusterVolTiles = 0.0;
+	std::map<int, double> LevelVolTiles;
+	std::map<int, long long> LevelClusters;
+	double MatterAtF = 0.0;
+	const FUniEmitter& Field = D.RootEmitters[0];
+	std::map<int, std::pair<long long, double>> GalByLevel;
+	for (const auto& KV : P.CacheRef())
+	{
+		const double W = CellWidthCm(KV.first.Level);
+		LevelVolTiles[KV.first.Level] += std::pow(W / Tile, 3.0);
+		long long WebGal = 0;
+		for (size_t I = 0; I < KV.second.Objects.size(); ++I)
+		{
+			const FObjectGPU& O = KV.second.Objects[I];
+			if ((O.A[3] >> 16) & H::UNI_OBJ_FLAG_DELTA_HIDDEN) { continue; }
+			const u32 Arch = O.A[3] & 0xFFFFu;
+			const u32 Off[3] = { O.A[0], O.A[1], O.A[2] };
+			const FCoord C = ObjectCoord(KV.first, Off);
+			if (Arch == UniScenes::kCluster)
+			{
+				++Clusters; ++LevelClusters[KV.first.Level];
+				// Its tile position and magnitude are an entry's.
+				double Pt[3];
+				for (int Ax = 0; Ax < 3; ++Ax) { Pt[Ax] = U128ToDouble(MaskLow(C.Axis(Ax), Cat.PeriodBits)) / Tile; }
+				const float Mg = H::Uni_ObjectAbsMag(UniCore::ToHlsl(O));
+				for (size_t E : ByLevel[KV.first.Level])
+				{
+					double D2 = 0.0;
+					for (int Ax = 0; Ax < 3; ++Ax) { double Dd = std::fabs(Pt[Ax] - Cat.Entries[E].Pos[Ax]); Dd = std::min(Dd, 1.0 - Dd); D2 += Dd * Dd; }
+					if (D2 < 1e-18 && Mg == RoundToHalf(Cat.Entries[E].AbsMag)) { ++Matched; break; }   // objects store AbsMag as a half
+				}
+			}
+			else if (Arch == UniScenes::kGalaxy)
+			{
+				const auto It = P.Contributors().find(KV.second.ObjectContributor[I]);
+				const bool bMember = It != P.Contributors().end() && It->second.ParentArchetypeId == UniScenes::kCluster;
+				if (!bMember)
+				{
+					++WebGal;
+					if (FieldGal < 200000)
+					{
+						++FieldGal;
+						float Pf[3];
+						for (int Ax = 0; Ax < 3; ++Ax) { Pf[Ax] = float(U128ToDouble(MaskLow(C.Axis(Ax), Field.PeriodBits)) / std::ldexp(1.0, Field.PeriodBits)); }
+						const H::float4 V = H::UniWebTexSample(H::float3(Pf[0], Pf[1], Pf[2]), 0.0f);
+						MatterAtF += double(V.x) + V.y + V.z + V.w;
+					}
+				}
+			}
+		}
+		GalByLevel[KV.first.Level].first += WebGal;
+		GalByLevel[KV.first.Level].second += std::pow(W / Units::Mpc, 3.0);
+	}
+	// Clusters per tile, level by level (each level's cells hold its entries).
+	double Expected = 0.0;
+	for (const auto& KV : ByLevel) { Expected += double(KV.second.size()) * LevelVolTiles[KV.first]; ClusterVolTiles += LevelVolTiles[KV.first]; }
+	const double CountRatio = Expected > 0.0 ? double(Clusters) / Expected : 0.0;
+	// Regenerate one cluster cell: identical.
+	bool bSame = true;
+	for (const auto& KV : P.CacheRef())
+	{
+		if (!ByLevel.count(KV.first.Level)) { continue; }
+		FCellContent Again;
+		G.GenerateCell(KV.first, {}, Again);
+		size_t Cl = 0;
+		for (const FObjectGPU& O : KV.second.Objects) { if ((O.A[3] & 0xFFFFu) == UniScenes::kCluster) { ++Cl; } }
+		size_t Cl2 = 0;
+		for (size_t I = 0; I < Again.Objects.size(); ++I)
+		{
+			if ((Again.Objects[I].A[3] & 0xFFFFu) != UniScenes::kCluster) { continue; }
+			++Cl2;
+			bool bFound = false;
+			for (const FObjectGPU& O : KV.second.Objects) { bFound = bFound || std::memcmp(&O, &Again.Objects[I], sizeof(O)) == 0; }
+			bSame = bSame && bFound;
+		}
+		bSame = bSame && Cl == Cl2;
+		break;
+	}
+	int LBest = 0; long long NBest = 0; double VBest = 0.0;
+	for (const auto& KV : GalByLevel) { if (KV.second.first > NBest) { NBest = KV.second.first; VBest = KV.second.second; LBest = KV.first; } }
+	const FSlice* Sl = M.SlicesOf(UniScenes::kGalaxy).ForLevel(LBest);
+	const double WantGal = Sl ? Field.NTotal * Sl->P * std::pow(Units::Mpc, 3.0) : 0.0;
+	const double GotGal = VBest > 0.0 ? double(NBest) / VBest : 0.0;
+	const double SigGal = std::sqrt(std::max(double(NBest), 1.0)) / std::max(VBest, 1e-300);
+	const bool bGal = Sl && std::abs(GotGal - WantGal) < 4.0 * SigGal + 0.02 * WantGal;
+	const double FieldBias = FieldGal ? MatterAtF / double(FieldGal) : 0.0;   // total matter at field galaxies / its mean (1)
+	const bool bRank = K > 1 && Cat.Entries[0].AbsMag < Cat.Entries[K - 1].AbsMag && Nodes[0].Mass >= Nodes[K - 1].Mass;
+	Uni::Check(2, "T2.webtex.nodes", "D-167 clusters from the adhesion node list, rank-mapped to the cluster LF: every resident cluster is a catalogue entry (exact position, magnitude), counts = entries x tiles covered (within 15%), brightest = heaviest, a regenerated cell is identical; field galaxies at their density, on denser matter")
+		.Metric("entries", double(K)).Metric("clusters", double(Clusters)).Metric("matched", double(Matched)).Metric("count_ratio", CountRatio)
+		.Metric("galaxy_density", GotGal).Metric("galaxy_density_expected", WantGal).Metric("field_bias", FieldBias)
+		.Pass(Switched == 1 && Clusters > 50 && Matched == Clusters && std::fabs(CountRatio - 1.0) < 0.15 && bRank && bSame && bGal && FieldBias > 1.2,
+			Uni::Fmt("%zu of %zu nodes are clusters (M %.2f .. %.2f, heaviest brightest); %lld clusters resident, %lld at their entry's exact position and magnitude, %.3f of entries x tiles covered (%.2f tiles over %zu levels); regenerated cell %s; L%d field galaxies %.3g per Mpc^3 (expected %.3g), matter at field galaxies %.2fx the mean",
+				K, Nodes.size(), Cat.Entries.empty() ? 0.0 : Cat.Entries[0].AbsMag, Cat.Entries.empty() ? 0.0 : Cat.Entries[K - 1].AbsMag, Clusters, Matched, CountRatio, ClusterVolTiles, ByLevel.size(), bSame ? "identical" : "DIFFERENT", LBest, GotGal, WantGal, FieldBias));
+}
+
+namespace
+{
+	/** CPU backend with GPU-like latency (as test_stream.cpp's), timing its own generation so the
+	 *  streamer's bookkeeping can be told apart from it (the GPU does that part in the engine). */
+	class FLagBackend : public IGenBackend
+	{
+	public:
+		FLagBackend(FCpuGenBackend& In, int InLat) : Inner(In), Lat(InLat) {}
+		void SubmitProbe(std::shared_ptr<FGenBatch> B) override { const auto T0 = Clock::now(); Inner.SubmitProbe(B); GenMs += Ms(T0); ProbeAt[B->Ticket] = Frame; }
+		bool PollProbe(const FGenBatch& B) override { return Frame - ProbeAt[B.Ticket] >= Lat; }
+		void SubmitPlace(std::shared_ptr<FGenBatch> B) override { const auto T0 = Clock::now(); Inner.SubmitPlace(B); GenMs += Ms(T0); PlaceAt[B->Ticket] = Frame; }
+		bool PollPlace(const FGenBatch& B) override { return Frame - PlaceAt[B.Ticket] >= Lat; }
+		u32 PoolCapacity() const override { return Inner.PoolCapacity(); }
+		long Frame = 0;
+		double GenMs = 0.0;
+	private:
+		using Clock = std::chrono::steady_clock;
+		static double Ms(Clock::time_point T0) { return std::chrono::duration<double, std::milli>(Clock::now() - T0).count(); }
+		FCpuGenBackend& Inner;
+		int Lat;
+		std::map<u64, long> ProbeAt, PlaceAt;
+	};
+}
+
+UNI_TEST(webtex, travel)
+{
+	// D-168: the owner's intergalactic-speed hitches (game thread 50-700 ms per frame: Measure
+	// 150 ms every frame over ~330k contributors, Register/Window 100-300 ms when a coarse window
+	// shifted). The adhesion web with its node list, flown at 100 Mpc/s through the streamer
+	// (3-frame latency), every emitter object registered at once (before) and woken by distance
+	// (D-168). The streamer's bookkeeping (everything but the CPU backend's generation) per frame.
+	std::string Err;
+	const FWebTexture& T = Delivered(&Err);
+	std::vector<FWebNode> Nodes;
+	if (!T.IsValid() || !LoadWebNodes(kDeliveredDir, kDeliveredName, Nodes, &Err)) { Uni::Check(2, "T2.webtex.travel", "D-168 bookkeeping at intergalactic speed").Pass(false, "not loaded: " + Err); return; }
+	FBindScope Bind(T);
+	const UniScenes::FClusterTuning Tun;
+	FUniverseDef Def = UniScenes::Flythrough(Tun);   // the owner's scene: web, galaxies, stars
+	const H::float4 Mean = T.Mean();
+	UniScenes::UseDeliveredWeb(Def, Tun, T.Size, Mean.z / (double(Mean.x) + Mean.y + Mean.z + Mean.w), &Nodes);
+	FUniverseModel M(Def);
+	FRefGenerator G(M);
+	struct FOut { double MeanMs = 0, WorstMs = 0, MeasureWorst = 0; size_t PeakAwake = 0, PeakAll = 0; double PhMean[int(EStreamPhase::Count)] = {}; FStreamProfile Worst; double GenMean = 0, WorstGen = 0; };
+	FOut Out[2];
+	// D-168's claim: an object sleeps only while its influence cannot reach any window, so the
+	// streamer generates exactly what it did with everything registered. Ready cells' objects at
+	// a few frames of the flight, by cell key, compared between the two runs.
+	using FSnap = std::unordered_map<FCellKey, std::vector<FObjectGPU>, FCellKeyHasher>;
+	std::vector<FSnap> Snaps[2];
+	auto Snapshot = [](FUniStreamer& S, const FCpuGenBackend& Cpu)
+	{
+		FSnap Out;
+		std::vector<FCellKey> Keys;
+		const std::vector<FCellGPU> Table = S.CellTable(&Keys);
+		for (size_t I = 0; I < Table.size(); ++I)
+		{
+			std::vector<FObjectGPU>& V = Out[Keys[I]];
+			V.assign(Cpu.PoolData().begin() + Table[I].PoolStart, Cpu.PoolData().begin() + Table[I].PoolStart + Table[I].PoolCount);
+		}
+		return Out;
+	};
+	const char* Only = std::getenv("UNI_TRAVEL_ONLY");   // profiling: "0" eager, "1" lazy
+	for (int K = 0; K < 2; ++K)
+	{
+		if (Only && *Only - '0' != K) { continue; }
+		FCpuGenBackend Cpu(G, 8388608u);
+		FLagBackend Be(Cpu, 3);
+		FUniStreamer S(G, Be);
+		S.bAsyncIntegrals = false;
+		S.bLazyWake = K == 1;
+		FCoord C = UniScenes::SolarCamera();
+		FVec3f F{};
+		S.Update(C); ++Be.Frame;
+		for (int I = 0; I < 300 && !S.AllReady(); ++I) { S.Update(C); ++Be.Frame; }
+		// From rest in the Milky Way, accelerating x1.15 per frame (1 kpc/s to ~100 Mpc/s in 80
+		// frames), then cruising: the flight in the owner's log.
+		const int Frames = 140;
+		double Speed = 1.0 * Units::Kpc;
+		FTravelSensitivity Travel;   // D-154 as the engine drives it: up to +2.5 mag at speed
+		for (int Fr = 0; Fr < Frames; ++Fr)
+		{
+			Speed = std::min(Speed * 1.15, 100.0 * Units::Mpc);
+			const double Step = Speed / 60.0;
+			S.DeltaMag = float(Travel.Update(Speed, 1.0 / 60.0));
+			AddDisplacement(C, F, FVec3d{ Step, 0.37 * Step, 0.11 * Step });
+			Be.GenMs = 0.0;
+			S.Update(C); ++Be.Frame;
+			const double Ms = std::max(S.Profile.Ms[int(EStreamPhase::Update)] - Be.GenMs, 0.0);
+			Out[K].MeanMs += Ms / Frames;
+			for (int P = 0; P < int(EStreamPhase::Count); ++P) { Out[K].PhMean[P] += S.Profile.Ms[P] / Frames; }
+			Out[K].GenMean += Be.GenMs / Frames;
+			if (std::getenv("UNI_TRAVEL_DUMP") && Ms > 25.0)
+			{
+				std::printf("    %s frame %d (%.2g Mpc/s, +%.2f mag): %.1f ms bookkeeping, gen %.1f |", K ? "lazy" : "eager", Fr, Speed / Units::Mpc, S.DeltaMag, Ms, Be.GenMs);
+				for (int P = 0; P < int(EStreamPhase::Count); ++P) { if (S.Profile.Ms[P] > 0.5) { std::printf(" %s %.1f", StreamPhaseName(EStreamPhase(P)) + 11, S.Profile.Ms[P]); } }
+				std::printf(" | woke %u slept %u awake %u, +%u -%u, cells %u\n", unsigned(S.Profile.Woken), unsigned(S.Profile.Slept), unsigned(S.Profile.Awake), unsigned(S.Profile.ContributorsAdded), unsigned(S.Profile.ContributorsRemoved), unsigned(S.Profile.CellsSubmitted));
+			}
+			if (Ms > Out[K].WorstMs) { Out[K].Worst = S.Profile; Out[K].WorstGen = Be.GenMs; }
+			Out[K].WorstMs = std::max(Out[K].WorstMs, Ms);
+			Out[K].MeasureWorst = std::max(Out[K].MeasureWorst, S.Profile.Ms[int(EStreamPhase::Measure)]);
+			Out[K].PeakAwake = std::max<size_t>(Out[K].PeakAwake, S.Contributors().size());
+			if (Fr % 35 == 34) { Snaps[K].push_back(Snapshot(S, Cpu)); }
+			Out[K].PeakAll = std::max<size_t>(Out[K].PeakAll, size_t(S.Profile.Awake + S.Profile.Asleep));
+		}
+	}
+	const double Gain = Out[0].MeanMs / std::max(Out[1].MeanMs, 1e-6);
+	const double GainMin = 2.5, WorstMax = 90.0;   // on the reference container (2 slow cores)
+	size_t Cells = 0, Objects = 0, Differ = 0;
+	if (!Only)
+	{
+		for (size_t I = 0; I < Snaps[0].size() && I < Snaps[1].size(); ++I)
+		{
+			const FSnap& A = Snaps[0][I];
+			const FSnap& B = Snaps[1][I];
+			if (A.size() != B.size()) { Differ += std::max(A.size(), B.size()) - std::min(A.size(), B.size()); }
+			for (const auto& KV : A)
+			{
+				++Cells;
+				Objects += KV.second.size();
+				auto It = B.find(KV.first);
+				if (It == B.end() || It->second.size() != KV.second.size()
+					|| (!KV.second.empty() && std::memcmp(It->second.data(), KV.second.data(), KV.second.size() * sizeof(FObjectGPU)) != 0)) { ++Differ; }
+			}
+		}
+	}
+	if (std::getenv("UNI_TRAVEL_DUMP"))
+	{
+		for (int K = 0; K < 2; ++K)
+		{
+			std::printf("    %s mean:", K ? "lazy" : "eager");
+			for (int P = 0; P < int(EStreamPhase::Count); ++P) { if (Out[K].PhMean[P] > 0.05) { std::printf(" %s %.2f", StreamPhaseName(EStreamPhase(P)), Out[K].PhMean[P]); } }
+			std::printf("\n    %s worst:", K ? "lazy" : "eager");
+			for (int P = 0; P < int(EStreamPhase::Count); ++P) { if (Out[K].Worst.Ms[P] > 0.05) { std::printf(" %s %.2f", StreamPhaseName(EStreamPhase(P)), Out[K].Worst.Ms[P]); } }
+			std::printf(" | gen %.2f mean, %.2f in the worst | woke %u slept %u awake %u asleep %u\n", Out[K].GenMean, Out[K].WorstGen, unsigned(Out[K].Worst.Woken), unsigned(Out[K].Worst.Slept), unsigned(Out[K].Worst.Awake), unsigned(Out[K].Worst.Asleep));
+		}
+	}
+	Uni::Check(2, "T2.webtex.travel", "D-168 streamer bookkeeping on the flythrough scene (adhesion web, galaxies, stars) from rest to 100 Mpc/s (the whole update less the CPU backend's generation, which the GPU does in the engine): contributors woken by distance cut the mean cost at least 5x against registering every emitter object, the worst frame under 30 ms on the reference")
+		.Metric("mean_ms_eager", Out[0].MeanMs).Metric("mean_ms_lazy", Out[1].MeanMs).Metric("worst_ms_eager", Out[0].WorstMs).Metric("worst_ms_lazy", Out[1].WorstMs)
+		.Metric("awake_peak", double(Out[1].PeakAwake)).Metric("registered_peak_eager", double(Out[0].PeakAwake))
+		.Metric("cells_differ", double(Differ))
+		.Pass(Gain >= GainMin && Out[1].WorstMs < WorstMax && Differ == 0 && Cells > 0,
+			Uni::Fmt("%zu cells / %zu objects at 4 frames of the flight compared, %zu differ; everything registered: %.1f ms mean, %.1f worst (measure up to %.1f), %zu contributors; woken by distance: %.2f ms mean, %.1f worst (measure up to %.2f), %zu awake of %zu emitter objects (%.1fx less per frame)",
+				Cells, Objects, Differ, Out[0].MeanMs, Out[0].WorstMs, Out[0].MeasureWorst, Out[0].PeakAwake, Out[1].MeanMs, Out[1].WorstMs, Out[1].MeasureWorst, Out[1].PeakAwake, Out[1].PeakAll, Gain));
+}

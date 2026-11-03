@@ -42,5 +42,21 @@
   {
     "id": "UE-11",
     "what": "M3 in the engine (D-146, D-147): UUniParallaxComponent placement (real space vs compressed, no jitter against the backdrop at any speed), AUniBodyActor placeholders spawned and destroyed on promotion, promoted planets' sprites culled, the light rig, and sprites hidden behind promoted bodies by the decoded depth test (REVIEW_TONIGHT \u00a710)."
+  },
+  {
+    "id": "UE-12",
+    "what": "Galaxy clusters and travel sensitivity in the engine (D-151 to D-154): the 208-byte task struct with sampling boxes and the cluster envelope bound on the GPU, uu.Cluster.* tuning, uu.Clusters / uu.GotoCluster, residency (~14k clusters) and game-thread cost, and the speed-driven sensitivity (REVIEW_TONIGHT \u00a711)."
+  },
+  {
+    "id": "UE-13",
+    "what": "Sprite style, instrumentation and volume cost in the engine (D-156, D-157): the 64-byte sprite with core + halo, uu.Sprite.* handles, uu.Perf / uu.PerfHud / uu.PerfHitchMs and the Insights scopes, the cluster step hint's GPU cost, the volume quality CVars (REVIEW_TONIGHT \u00a712)."
+  },
+  {
+    "id": "UE-14",
+    "what": "The web texture in the engine (D-164): the include of UniWebTexture.ush in every .usf, the Texture3D + wrap/trilinear sampler bound to the generation probe/place passes and the volume passes, the upload compute pass (UniWebTexUpload.usf), the bake/cache in Saved/UnifiedUniverse, uu.WebSource / uu.WebTexSize, and the GPU cost of Uni.Volume.Background with it (REVIEW_TONIGHT \u00a713)."
+  },
+  {
+    "id": "UE-15",
+    "what": "Contributors woken by distance at intergalactic speed in the engine (D-168): game-thread cost with uu.Enable flythrough from rest to ~100 Mpc/s with travel sensitivity (Measure, Wake, Register, Window in the hitch line), WakeTheta from the renderer's pixel angle, no missing stars or glow while moving (REVIEW_TONIGHT \u00a713e)."
   }
 ]

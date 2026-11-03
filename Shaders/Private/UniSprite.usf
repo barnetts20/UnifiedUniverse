@@ -11,6 +11,7 @@
 // Uni_SliceTransmittance). Without it, the slice texture is a 1 x 1 dummy and bVolume = 0.
 
 #include "/Engine/Public/Platform.ush"
+#include "UniWebTexture.ush"   // D-164: before any core (UniFields.ush samples it)
 #include "Core/UniProject.ush"
 #include "Core/UniVolume.ush"
 
@@ -45,6 +46,10 @@ struct FSpriteVSOut
 	nointerpolation float CosToForward : TEXCOORD3;
 	nointerpolation float SigmaPx : TEXCOORD4;
 	nointerpolation float DiscFrac : TEXCOORD5;   // D-148: body disc fraction (0: Gaussian only)
+	nointerpolation float FootPx : TEXCOORD6;     // D-156: pixels per corner unit (the quad's footprint)
+	nointerpolation float HaloPx : TEXCOORD7;     // D-156: halo sigma, pixels (0: none)
+	nointerpolation float HaloRatio : TEXCOORD8;  // D-156: halo energy / core energy
+	nointerpolation float CoreWeight : TEXCOORD9; // D-158: 0 for a promoted star (its actor draws the disc)
 };
 
 void MainVS(uint VertexId : SV_VertexID, uint InstanceId : SV_InstanceID, out FSpriteVSOut Out)
@@ -61,7 +66,10 @@ void MainVS(uint VertexId : SV_VertexID, uint InstanceId : SV_InstanceID, out FS
 	// compression: render size = angular radius * f(r) (parallax-exact by construction).
 	const float3 Side = normalize(cross(Dir, ViewUp + ViewRight * 1.0e-3));
 	const float3 Up = cross(Side, Dir);
-	const float HalfSize = S.AngularRadius * R * SpriteExtent;
+	// D-156: the quad covers the footprint (the halo's sigma when the sprite has one; most
+	// sprites have none and stay a few pixels across).
+	const float Foot = Uni_SpriteFootprint(S);
+	const float HalfSize = Foot * R * SpriteExtent;
 	const float3 P = S.RenderPos + (Side * C.x + Up * C.y) * HalfSize;
 	Out.Position = mul(float4(P, 1.0f), TranslatedWorldToClip);
 	Out.Corner = C * SpriteExtent;
@@ -70,6 +78,10 @@ void MainVS(uint VertexId : SV_VertexID, uint InstanceId : SV_InstanceID, out FS
 	Out.CosToForward = max(dot(Dir, ViewForward), 1.0e-3);
 	Out.SigmaPx = max(S.AngularRadius * PixelsPerRadian, 0.5f);
 	Out.DiscFrac = Uni_SpriteDiscFrac(S, PixelsPerRadian);
+	Out.FootPx = max(Foot * PixelsPerRadian, 0.5f);
+	Out.HaloPx = S.HaloRatio > 0.0f ? max(S.HaloRadius * PixelsPerRadian, 0.5f) : 0.0f;
+	Out.HaloRatio = S.HaloRatio;
+	Out.CoreWeight = Uni_SpriteCoreWeight(S);
 }
 
 float SceneDistance(float2 PixelPos, float CosToForward)
@@ -88,10 +100,11 @@ float SceneDistance(float2 PixelPos, float CosToForward)
 void MainPS(in FSpriteVSOut In, out float4 OutColor : SV_Target0)
 {
 	if (!Uni_SceneDepthKeep(In.TrueDistance, SceneDistance(In.Position.xy, In.CosToForward))) { discard; }
-	// Corner units: 1 = the angular radius = SigmaPx pixels. Gaussian (or, for a resolved body,
-	// disc + fading glare halo, D-148), normalised per PIXEL so the energy summed over the
-	// covered pixels equals Radiance whatever the sprite's size.
-	const float W = Uni_SpriteProfile(length(In.Corner) * In.SigmaPx, In.SigmaPx, In.DiscFrac);
+	// Corner units: 1 = the footprint = FootPx pixels. The core is a Gaussian (or, for a resolved
+	// body, disc + fading glare halo, D-148) and the D-156 halo a wider Gaussian; normalised per
+	// PIXEL so the energy summed over the covered pixels is Radiance x (1 + HaloRatio) whatever
+	// the sprite's size.
+	const float W = Uni_SpriteProfileHalo(length(In.Corner) * In.FootPx, In.SigmaPx, In.DiscFrac, In.HaloPx, In.HaloRatio, In.CoreWeight);
 	float T = 1.0f;
 	if (bVolume != 0u)
 	{

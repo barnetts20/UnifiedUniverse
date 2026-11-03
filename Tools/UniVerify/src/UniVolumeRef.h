@@ -111,8 +111,10 @@ namespace UniRender
 					{
 						const H::FUniCarrier Ca = Cb[C];
 						float T0, T1;
-						if (Ca.Weight > 0.0f && H::Uni_CarrierInterval(Ca, H::Uni_CarrierLocalDir(Ca, Dc), TScene, T0, T1)) { SS = std::max(SS, H::Uni_CarrierSubsamples(Ca, V.ThetaPixel)); }
+						const H::float3 Ld = H::Uni_CarrierLocalDir(Ca, Dc);
+						if (Ca.Weight > 0.0f && H::Uni_CarrierInterval(Ca, Ld, TScene, T0, T1)) { SS = std::max(SS, H::Uni_CarrierSubsamplesRay(Ca, V.ThetaPixel)); }   // D-160, D-163
 					}
+					SS = H::Uni_ClampSubsamples(SS, V);   // D-157
 					H::FUniVolumeResult R;
 					if (SS == 1u)
 					{

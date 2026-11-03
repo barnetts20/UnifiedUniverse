@@ -85,9 +85,10 @@ UNI_TEST(photometry, magnitudes)
 		if (Ref >= MLim && IGot != 0.0) { ++FadeBad; }                  // invisible at and past m_lim
 		if (Ref <= MLim - 0.5 && H::Uni_MagFade(float(Ref), float(MLim)) != 1.0f) { ++FadeBad; }
 	}
-	// Window growth: N_L = min(ceil(N_eff k + 1/K), N_max): exactly N at dm = 0, N_max at dm = +5.
-	const bool Win = H::Uni_WindowHalfWidth(0.0f) == 2 && H::Uni_WindowHalfWidth(5.0f) == 6 && H::Uni_WindowHalfWidth(1.0f) == 4
-		&& H::Uni_WindowHalfWidth(-5.0f) == 1;
+	// Window growth (D-162): reach = min(N_eff k + 1/K, N_max) cells, 2 at dm = 0 (a 5^3 window);
+	// bounding half-width ceil(reach): 2 at dm 0, 4 at +1, N_max (6) at +5, 1 at -5.
+	const bool Win = std::fabs(H::Uni_WindowReach(0.0f) - 2.0f) < 1e-5f && H::Uni_WindowHalfWidth(0.0f) == 2 && H::Uni_WindowHalfWidth(5.0f) == 6
+		&& H::Uni_WindowHalfWidth(1.0f) == 4 && H::Uni_WindowHalfWidth(-5.0f) == 1;
 	// Relevance and level inverse: AbsMagForRelevance(RelevanceFlux(M)) == M.
 	double WorstRel = 0.0;
 	for (double M = -30; M < 30; M += 0.37) { WorstRel = std::max(WorstRel, std::fabs(AbsMagForRelevance(RelevanceFlux(M)) - M)); }

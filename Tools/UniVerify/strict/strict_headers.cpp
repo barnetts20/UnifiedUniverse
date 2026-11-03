@@ -20,6 +20,9 @@
 #include "UniParallax.h"
 #include "UniPromotion.h"
 #include "UniLocalFrame.h"
+#include "UniTravel.h"
+#include "UniProfile.h"
+#include "UniWebTexture.h"
 
 int main()
 {

@@ -25,6 +25,7 @@
 // mirroring a C++ layout). Each is mirrored in UniCore/UniVolume.h with a static_assert.
 
 #include "/Engine/Public/Platform.ush"
+#include "UniWebTexture.ush"   // D-164: before any core (UniFields.ush samples it)
 #include "Core/UniVolume.ush"
 
 #ifndef UNI_VOL_PASS
@@ -106,8 +107,10 @@ void MarchCS(uint3 Id : SV_DispatchThreadID)
 	{
 		const FUniCarrier Ca = InCarriers[C];
 		float T0, T1;
-		if (Ca.Weight > 0.0f && Uni_CarrierInterval(Ca, Uni_CarrierLocalDir(Ca, Dir), TScene, T0, T1)) { SS = max(SS, Uni_CarrierSubsamples(Ca, V.ThetaPixel)); }
+		const float3 Ld = Uni_CarrierLocalDir(Ca, Dir);
+		if (Ca.Weight > 0.0f && Uni_CarrierInterval(Ca, Ld, TScene, T0, T1)) { SS = max(SS, Uni_CarrierSubsamplesRay(Ca, V.ThetaPixel)); }   // D-160, D-163
 	}
+	SS = Uni_ClampSubsamples(SS, V);   // D-157
 
 	float3 B = float3(0.0f, 0.0f, 0.0f);
 	float3 T = float3(0.0f, 0.0f, 0.0f);
@@ -183,11 +186,12 @@ float FocalPx;               // output pixels per unit tan at the view centre
 uint CubeSize;
 uint bBackground;
 float BackgroundStartCm;
-float Pad1;
+float BackgroundBlend;       // D-159: 0 = the previous background map, 1 = the current one
 uint DebugMode;
 float DebugScale;            // debug colours -> scene colour (1 / pre-exposure)
 Texture2D<float4> VolumeTexture;
 Texture2DArray<float4> CubeTexture;
+Texture2DArray<float4> CubePrevTexture;
 SamplerState LinearClampSampler;
 
 void CompositeVS(uint VertexId : SV_VertexID, out float4 OutPosition : SV_POSITION)
@@ -239,7 +243,10 @@ void CompositePS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Targe
 	{
 		float X, Y;
 		const uint Face = Uni_CubeDirToFace(Dir, (float)CubeSize, X, Y);
-		const float3 Bg = CubeTexture.SampleLevel(LinearClampSampler, float3(X / (float)CubeSize, Y / (float)CubeSize, (float)Face), 0).rgb;
+		const float3 Uvw = float3(X / (float)CubeSize, Y / (float)CubeSize, (float)Face);
+		const float3 BgCur = CubeTexture.SampleLevel(LinearClampSampler, Uvw, 0).rgb;
+		const float3 BgPrev = CubePrevTexture.SampleLevel(LinearClampSampler, Uvw, 0).rgb;
+		const float3 Bg = lerp(BgPrev, BgCur, BackgroundBlend);   // D-159: cross-fade between whole, consistent maps
 		B += Vol.a * Bg;
 	}
 	// Solid angle of this pixel: cos^3 / f^2 (pinhole). Radiance x solid angle = the pixel's

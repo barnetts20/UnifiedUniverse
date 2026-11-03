@@ -261,6 +261,7 @@ UNI_TEST(stream, responsive)
 	};
 	const double NEff = double(UniHlsl::UNI_WINDOW_N_EFF);
 	size_t WorstLatency = 0;
+	long long LatencyOver = -1000;
 	double WorstVisible = 1.0, WorstMs = 0.0;
 	long long Holes = 0, AccelHoles = 0;
 	size_t WorstPool = 0, Failures = 0;
@@ -281,13 +282,16 @@ UNI_TEST(stream, responsive)
 		const int Frames = 240;
 		int VisibleOk = 0, MaxN = 0, Suspended = 0;
 		size_t PoolPeak = 0;
-		double SumMs = 0.0;
+		double SumMs = 0.0, MaxMs = 0.0;
+		FStreamProfile WorstProf;
 		for (int Fr = 0; Fr < Frames; ++Fr)
 		{
 			AddDisplacement(C, F, FVec3d{ R.CmPerFrame, 0.31 * R.CmPerFrame, 0.07 * R.CmPerFrame });
 			const auto T0 = std::chrono::steady_clock::now();
 			S.Update(C);
-			SumMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - T0).count();
+			const double FrMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - T0).count();
+			SumMs += FrMs;
+			if (FrMs > MaxMs) { MaxMs = FrMs; WorstProf = S.Profile; }
 			++Be.Frame;
 			PoolPeak = std::max(PoolPeak, S.Stats().PoolUsed);
 			// Ready cells inside the visible radius, per level: Chebyshev distance from the camera
@@ -333,18 +337,26 @@ UNI_TEST(stream, responsive)
 		}
 		const double Vis = double(VisibleOk) / Frames;   // acceleration frames count as OK here; their holes are in AccelHoles
 		const double Ms = SumMs / Frames;
+		// D-151/D-155: a cell waits for a parent cell that is filling at the same time and can
+		// reach it, so the bound is one fill (2 x Lat) per depth of the parent chain: galaxy ->
+		// stars is one deep; the web scenes are two deep (clusters -> galaxies -> stars).
+		const size_t Depth = R.Scene == 0 ? 1u : 2u;
+		LatencyOver = std::max<long long>(LatencyOver, (long long)S.Stats().MaxLatencyFrames - (long long)(2 * Lat * Depth));
 		WorstLatency = std::max(WorstLatency, S.Stats().MaxLatencyFrames);
 		WorstVisible = std::min(WorstVisible, Vis);
 		WorstMs = std::max(WorstMs, Ms);
-		Detail += Uni::Fmt("%s%s: latency <= %zu frames (measured %.1f), visible cells all Ready on %.1f%% of frames, widest window N = %d, %.1f levels suspended per frame, Update %.2f ms, pool peak %zu, alloc failures %zu",
-			Detail.empty() ? "" : "; ", R.Name, S.Stats().MaxLatencyFrames, S.LatencyFrames(), 100.0 * Vis, MaxN, double(Suspended) / Frames, Ms, PoolPeak, S.Stats().AllocFailures);
+		// D-157/D-161: the worst frame and where it went (the CPU backend's generation is in Batches/Submit).
+		std::string Worst;
+		for (int Ph = 0; Ph < int(EStreamPhase::Count); ++Ph) { if (WorstProf.Ms[Ph] >= 0.5) { Worst += Uni::Fmt("%s%s %.1f", Worst.empty() ? "" : " ", StreamPhaseName(EStreamPhase(Ph)) + 11, WorstProf.Ms[Ph]); } }
+		Detail += Uni::Fmt("%s%s: latency <= %zu frames (measured %.1f), visible cells all Ready on %.1f%% of frames, widest window N = %d, %.1f levels suspended per frame, Update %.2f ms (worst %.1f: %s; %llu overlap tests), pool peak %zu, alloc failures %zu",
+			Detail.empty() ? "" : "; ", R.Name, S.Stats().MaxLatencyFrames, S.LatencyFrames(), 100.0 * Vis, MaxN, double(Suspended) / Frames, Ms, MaxMs, Worst.c_str(), (unsigned long long)WorstProf.OverlapTests, PoolPeak, S.Stats().AllocFailures);
 		WorstPool = std::max(WorstPool, PoolPeak);
 		Failures += S.Stats().AllocFailures;
 	}
 	Detail += Uni::Fmt("; steady-flight holes %lld; holes in the %d frames after a standing start %lld (reported, not required)", Holes, AccelFrames, AccelHoles);
-	Uni::Check(2, "T2.stream.responsive", "In flight with 3-frame backend phases: every cell Ready within 6 frames of entering; in steady flight every cell inside N_eff of an active level is Ready on every frame")
+	Uni::Check(2, "T2.stream.responsive", "In flight with 3-frame backend phases: every cell Ready within 6 frames of entering per depth of its parent chain (1 for galaxy -> stars, 2 with clusters); in steady flight every cell inside N_eff of an active level is Ready on every frame")
 		.Metric("worst_latency_frames", double(WorstLatency)).Metric("worst_visible_ready", WorstVisible).Metric("visible_holes", double(Holes)).Metric("accel_holes", double(AccelHoles)).Metric("update_ms_upper_bound", WorstMs).Metric("pool_peak", double(WorstPool))
-		.Pass(WorstLatency <= size_t(2 * Lat) && Holes == 0 && Failures == 0, Detail);
+		.Pass(LatencyOver <= 0 && Holes == 0 && Failures == 0, Detail);
 }
 
 UNI_TEST(stream, async_integrals)

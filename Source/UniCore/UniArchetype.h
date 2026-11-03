@@ -162,6 +162,11 @@ namespace UniCore
 		 *  and is the field's unit ball. */
 		double InfluenceMul = 1.0;
 		bool bRandomOrientation = true;
+		/** D-153: probe and place only inside the part of a cell its influence sphere overlaps.
+		 *  Needed when the influence sphere is much smaller than a child level's cells (galaxy
+		 *  clusters: 2-5 Mpc inside 50 Mpc cells, where 128 probes of the whole cell usually all
+		 *  miss it). Off by default: turning it on for an existing emitter changes its content. */
+		bool bSampleBox = false;
 	};
 
 	/** Render-only volume appearance of an archetype (Docs/VOLUMETRICS.md, D-132). Never read by
@@ -205,6 +210,25 @@ namespace UniCore
 		u32 Seed = 0;
 	};
 
+	/** D-167: one authored object of a periodic catalogue: its position in tile units [0, 1)^3
+	 *  and its absolute magnitude. */
+	struct FCatalogueEntry
+	{
+		double Pos[3] = { 0.0, 0.0, 0.0 };
+		float AbsMag = 0.0f;
+	};
+
+	/** D-167: objects at fixed positions repeated every 2^PeriodBits cm (the texture project's
+	 *  node list: one cluster per heavy node). Generated on the CPU like anchors (authored, at
+	 *  reserved indices); each copy gets its own seed, so copies differ in everything but
+	 *  position and magnitude. */
+	struct FCatalogue
+	{
+		u32 ArchetypeId = 0;
+		int PeriodBits = 89;
+		std::vector<FCatalogueEntry> Entries;
+	};
+
 	struct FSuppressor
 	{
 		FCoord Centre;
@@ -246,6 +270,9 @@ namespace UniCore
 	};
 
 	/** The whole content definition: archetypes, root emitters, anchors, suppressors. */
+	/** D-152: parents are resident wherever their children are visible up to this sensitivity. */
+	constexpr double kParentCoverDeltaMag = 2.5;
+
 	struct FUniverseDef
 	{
 		u32 Seed = 69;
@@ -253,6 +280,7 @@ namespace UniCore
 		std::vector<FUniEmitter> RootEmitters;     // the root archetype: no position, covers everything
 		std::vector<FAnchor> Anchors;
 		std::vector<FSuppressor> Suppressors;
+		std::vector<FCatalogue> Catalogues;        // D-167
 
 		const FArchetype& Arch(u32 Id) const { return Archetypes[Id]; }
 	};
@@ -279,18 +307,38 @@ namespace UniCore
 			return R;
 		}
 
-		/** D-101: an object with emitters must be resident wherever its children's windows can
-		 *  touch its influence sphere: influence radius plus the reach of the coarsest child
-		 *  level's largest window, sqrt(3) (N_max + 1) 2^Lmax. */
+		/** D-101, amended by D-152: an object with emitters must be resident wherever any of its
+		 *  children could be VISIBLE (at the widest sensitivity, dm = +5), so the child cells
+		 *  that hold them were generated with it. A child cell that overlaps its influence sphere
+		 *  and was generated without it is regenerated when it arrives; that is invisible as long
+		 *  as every object in the cell is beyond the children's visible radius then. So the reach
+		 *  is, per child level L: (the largest child relevance at L) x K(dm cover), at most the
+		 *  window cap (N_max + 1) 2^L, + the cell diagonal sqrt(3) 2^L, plus the influence
+		 *  radius. dm cover = +2.5: above it, at the coarsest child levels only, a member can
+		 *  appear when its parent arrives (D-152 records where). The original bound, the farthest
+		 *  corner of the widest window sqrt(3) (N_max + 1) 2^L, was about twice as far (8x the
+		 *  volume): for galaxy clusters, parents of galaxies whose coarsest level is 50 Mpc, it
+		 *  kept a million clusters resident. It never decided a level before D-151 (every
+		 *  parent's own relevance was larger; T2.cluster.no_reroll checks that nothing moved). */
 		double InfluenceRelevance(u32 ArchId, double M) const
 		{
 			const FArchetype& A = Def.Arch(ArchId);
+			const double KCover = double(UniHlsl::Uni_SensitivityScale(float(kParentCoverDeltaMag)));
 			double R = 0.0;
 			for (const FUniEmitter& E : A.Emitters)
 			{
 				const FSliceTable& T = Slices.at(E.ChildArchetypeId);
 				if (T.LMax < 0) { continue; }
-				const double Reach = std::sqrt(3.0) * double(UniHlsl::UNI_WINDOW_N_MAX + 1) * std::ldexp(1.0, T.LMax);
+				const FArchetype& Child = Def.Arch(E.ChildArchetypeId);
+				double Reach = 0.0;
+				for (const FSlice& S : T.Slices)
+				{
+					if (!(S.P > 0.0)) { continue; }
+					// Visible radius at dm = kParentCoverDeltaMag, and never beyond the window cap.
+					const double W = std::ldexp(1.0, S.Level);
+					const double Visible = std::min(RelevanceNoCache(Child, S.BrightM) * KCover, double(UniHlsl::UNI_WINDOW_N_MAX + 1) * W);
+					Reach = std::max(Reach, Visible + std::sqrt(3.0) * W);
+				}
 				R = std::max(R, E.InfluenceMul * A.RadiusMaxCm(M) + Reach);
 			}
 			return R;

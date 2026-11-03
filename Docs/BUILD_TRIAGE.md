@@ -100,3 +100,13 @@ It generates the solar-camera scene on the GPU and on the CPU side by side, then
 | Sphere is black | No light | `uu.LightRig 1` (default) needs an active system; `uu.LightRigLux 50` if auto-exposure darkens it |
 | `UFloatingPawnMovement` unknown | `UniSubsystem.cpp` | Include `GameFramework/FloatingPawnMovement.h` (Engine module); it is present. With a custom pawn type it is simply not found and nothing is suppressed |
 | `OnLocalRecentre` UHT error on the delegate | `UniSubsystem.h` | The `DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam` must sit above the `UCLASS`; it does. If UHT complains about the parameter name, rename `WorldShift` |
+
+## 7. Galaxy clusters (D-151 to D-154)
+
+| Symptom | Where | Fix |
+| --- | --- | --- |
+| Automation `FGenTaskGPU` size test fails (176 vs 208) | `UniCoreAutomationTests.cpp` | Updated to 208. If it still says 176, the module was not rebuilt (stale binaries) |
+| Shader: `Uni_MulHi32` / `Uni_BoxOffset` undeclared in UniGen.usf | `Core/UniPlacement.ush`, `Core/UniGenTask.ush` | `UniGenTask.ush` includes `UniPlacement.ush`; check the include order did not change |
+| Shader: `UNI_CH_CLUMP` undeclared | `Core/UniSeed.ush` | New channel constant (0x2CEDF020); `UniFields.ush` includes `UniSeed.ush` |
+| `UniScenes::FClusterTuning` unknown in UniSubsystem.h | `UniSubsystem.h` | It includes `UniDemoScenes.h`; that header now includes `UniVolume.h` (for the galaxy luminosity budget) |
+| Clusters never appear | `uu.Clusters` shows 0 | `uu.Cluster.Enable` was 0 or Fraction 0 when `uu.Enable` ran; tuning applies on the next `uu.Enable` |

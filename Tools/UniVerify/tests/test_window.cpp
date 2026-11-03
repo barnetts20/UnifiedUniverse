@@ -137,6 +137,88 @@ UNI_TEST(window, bijection)
 				Windows, Slides, Rebuilds, BadBijection, BadStable, BadDiff, Face ? "yes" : "NO"));
 }
 
+UNI_TEST(window, boxes)
+{
+	// D-162: even and stretched boxes (4^3, 4 x 6 x 4, 5 x 4 x 7 ...), over plain, seam and
+	// covered levels: slots are a bijection, residents keep their slot as the box slides (centre
+	// and placement both move, shape fixed), and the diff is consistent. Plus the placement rule:
+	// the box always covers [Fr - Back, Fr + Fwd] and only moves when it must.
+	Uni::FTestRng R(0xB0E5ull);
+	struct FShape { int Lo[3], Hi[3]; };
+	const FShape Shapes[] = { { { -2, -2, -2 }, { 1, 1, 1 } }, { { -1, -2, -1 }, { 2, 1, 2 } }, { { -2, -1, -2 }, { 1, 4, 1 } }, { { -4, -2, -1 }, { 0, 1, 5 } }, { { 0, 0, 0 }, { 3, 3, 3 } } };
+	const int Levels[] = { 0, 20, 64, 100, 124, 125, 126, 127, 128 };
+	long long Windows = 0, BadBijection = 0, BadStable = 0, BadDiff = 0, Slides = 0;
+	for (const FShape& Sh : Shapes) for (int L : Levels) for (int Trial = 0; Trial < 6; ++Trial)
+	{
+		FWindowGeometry G;
+		G.Level = L;
+		for (int A = 0; A < 3; ++A) { G.Lo[A] = Sh.Lo[A]; G.Hi[A] = Sh.Hi[A]; }
+		FLevelWindow W(G);
+		G.Centre = RandomCentre(R, L);
+		const FWindowDiff D0 = W.Recentre(G);
+		++Windows;
+		auto Bij = [&]()
+		{
+			std::set<int> Slots; std::set<std::string> Keys;
+			const std::vector<FWindowCell> Cells = W.Geometry().Cells();
+			for (const FWindowCell& C : Cells) { Slots.insert(C.Slot); Keys.insert(KeyStr(C.Key)); }
+			return Slots.size() == Keys.size() && Keys.size() == Cells.size() && Cells.size() == size_t(W.Geometry().NumSlots());
+		};
+		if (!Bij() || D0.Entering.size() != W.Geometry().Cells().size()) { ++BadBijection; }
+		for (int S = 0; S < 8; ++S)
+		{
+			std::map<std::string, int> Before;
+			for (size_t I = 0; I < W.SlotTable().size(); ++I) { if (W.SlotTable()[I].bOccupied) { Before[KeyStr(W.SlotTable()[I].Key)] = int(I); } }
+			FWindowGeometry Nx = W.Geometry();
+			Nx.Centre = Neighbour(Nx.Centre, int(R.U32() % 3u) - 1, int(R.U32() % 3u) - 1, int(R.U32() % 5u) - 2);
+			const int Shift = int(R.U32() % 3u) - 1;   // placement moves too, shape fixed
+			Nx.Lo[1] += Shift; Nx.Hi[1] += Shift;
+			const FWindowDiff D = W.Recentre(Nx);
+			++Slides;
+			if (!Bij()) { ++BadBijection; }
+			if (D.bRebuilt) { continue; }
+			for (size_t I = 0; I < W.SlotTable().size(); ++I)
+			{
+				const FSlot& Sl = W.SlotTable()[I];
+				if (!Sl.bOccupied) { continue; }
+				auto It = Before.find(KeyStr(Sl.Key));
+				if (It != Before.end() && It->second != int(I)) { ++BadStable; }
+			}
+			std::set<std::string> Now;
+			for (const FWindowCell& C : W.Geometry().Cells()) { Now.insert(KeyStr(C.Key)); }
+			size_t Staying = 0;
+			for (const auto& P : Before) { Staying += Now.count(P.first); }
+			if (Staying + D.Entering.size() != W.Geometry().Cells().size() || D.Exiting.size() != Before.size() - Staying) { ++BadDiff; }
+		}
+	}
+	// Placement: random positions and reaches; coverage always, and a still camera never moves it.
+	long long BadCover = 0, Moves = 0, Placements = 0;
+	for (int I = 0; I < 20000; ++I)
+	{
+		const double Back = 0.5 + 3.0 * R.Unit(), Fwd = 0.5 + 3.0 * R.Unit(), Fr = R.Unit();
+		const int Side = WindowSide(Back, Fwd);
+		const int Lo0 = PlaceWindowAxis(Fr, Back, Fwd, Side, false, 0);
+		const int Lo1 = PlaceWindowAxis(Fr, Back, Fwd, Side, true, Lo0);
+		const double Fr2 = std::min(0.999999, std::max(0.0, Fr + 0.2 * (R.Unit() - 0.5)));
+		const int Lo2 = PlaceWindowAxis(Fr2, Back, Fwd, Side, true, Lo0);
+		for (int Lo : { Lo0, Lo2 })
+		{
+			const double F = Lo == Lo0 ? Fr : Fr2;
+			if (!(double(Lo) <= std::floor(F - Back) && double(Lo + Side - 1) >= std::floor(F + Fwd))) { ++BadCover; }
+		}
+		Moves += Lo1 != Lo0 ? 1 : 0;
+		++Placements;
+	}
+	// 4^3 at rest: reach 1.5 each way needs exactly 4 cells.
+	const bool Four = WindowSide(1.5, 1.5) == 4;
+	Uni::Check(1, "T1.window.boxes", "D-162 window boxes (even, asymmetric, stretched): slot bijection, residents keep slots, consistent diffs; placement always covers the reach and does not move without cause; a 1.5-cell reach is a 4^3 window")
+		.Metric("windows", double(Windows)).Metric("slides", double(Slides)).Metric("bad_bijection", double(BadBijection)).Metric("bad_stable", double(BadStable)).Metric("bad_diff", double(BadDiff))
+		.Metric("bad_cover", double(BadCover)).Metric("spurious_moves", double(Moves))
+		.Pass(BadBijection == 0 && BadStable == 0 && BadDiff == 0 && BadCover == 0 && Moves == 0 && Four,
+			Uni::Fmt("%lld windows, %lld slides: %lld bijection / %lld stability / %lld diff violations; %lld placements: %lld uncovered, %lld moved without cause; 1.5-cell reach -> %d cells",
+				Windows, Slides, BadBijection, BadStable, BadDiff, Placements, BadCover, Moves, WindowSide(1.5, 1.5)));
+}
+
 UNI_TEST(window, velocity_lod)
 {
 	FVelocityLod V;

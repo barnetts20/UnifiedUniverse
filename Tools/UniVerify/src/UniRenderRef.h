@@ -65,9 +65,8 @@ namespace UniRender
 			V.CameraFraction = H::float3(Frac.X, Frac.Y, Frac.Z);
 			V.ExposureMag = V.LimitingMag - 1.0f;
 			V.ThetaPixel = float(1.0 / FocalPx());
-			V.GlareGain = 0.35f;
 			V.SystemArchetypeMask = SystemArchetypeMask;
-			return V;
+			return H::Uni_SpriteDefaults(V);   // D-156 sprite style
 		}
 	};
 
@@ -120,19 +119,30 @@ namespace UniRender
 		double BrightestMag = 99.0;
 	};
 
-	/** Sprite splat: a normalised Gaussian whose sigma is the sprite's angular radius in pixels
-	 *  (at least ~0.6 px), so the total deposited equals the sprite's radiance. */
+	/** Sprite splat: the core, a normalised Gaussian whose sigma is the sprite's angular radius
+	 *  in pixels (at least ~0.6 px), plus the D-156 halo, so the total deposited equals the
+	 *  sprite's radiance x (1 + HaloRatio). */
 	inline bool Splat(FImage& Img, const FCamera& Cam, const H::FUniSprite& S)
 	{
 		const double Px = (double(S.NdcX) * 0.5 + 0.5) * Img.W;
 		const double Py = (0.5 - double(S.NdcY) * 0.5) * Img.H;
 		const double Sigma = std::max(0.6, double(S.AngularRadius) * Cam.FocalPx() * 0.5);
 		const float DiscFrac = H::Uni_SpriteDiscFrac(S, float(Cam.FocalPx() * 0.5));   // D-148, in this renderer's pixel convention
-		// Kernel radius: out to where the Gaussian tail falls below 1e-3 exposure units, so a
-		// saturated bright star is not truncated into a square. Capped at 160 px.
-		const double Peak = double(std::max(S.Radiance.x, std::max(S.Radiance.y, S.Radiance.z))) / (6.283185307179586 * Sigma * Sigma);
-		const double Reach = Sigma * std::sqrt(2.0 * std::log(std::max(Peak / 1.0e-3, 2.0)));
-		const int Rad = int(std::min(160.0, std::ceil(std::max({ 3.0 * Sigma, Reach, double(DiscFrac) * Sigma + 2.0 }))));
+		const double HaloRatio = double(S.HaloRatio);
+		const double HaloSigma = HaloRatio > 0.0 ? std::max(Sigma, double(S.HaloRadius) * Cam.FocalPx() * 0.5) : 0.0;
+		// Kernel radius: out to where the tails fall below 1e-3 exposure units, so a saturated
+		// bright star is not truncated into a square. Capped at 160 px.
+		const double Lum = double(std::max(S.Radiance.x, std::max(S.Radiance.y, S.Radiance.z)));
+		const double Peak = Lum / (6.283185307179586 * Sigma * Sigma);
+		double Reach = Sigma * std::sqrt(2.0 * std::log(std::max(Peak / 1.0e-3, 2.0)));
+		if (HaloSigma > 0.0)
+		{
+			const double HPeak = Lum * HaloRatio / (6.283185307179586 * HaloSigma * HaloSigma);
+			Reach = std::max(Reach, HaloSigma * std::sqrt(2.0 * std::log(std::max(HPeak / 1.0e-3, 2.0))));
+		}
+		const int Rad = int(std::min(160.0, std::ceil(std::max({ 3.0 * Sigma, 3.0 * HaloSigma, Reach, double(DiscFrac) * Sigma + 2.0 }))));
+		const float CoreW = H::Uni_SpriteCoreWeight(S);   // D-158: 0 for a promoted star's glare
+		auto Profile = [&](double R) { return double(H::Uni_SpriteProfileHalo(float(R), float(Sigma), DiscFrac, float(HaloSigma), float(HaloRatio), CoreW)); };
 		const int Cx = int(std::floor(Px)), Cy = int(std::floor(Py));
 		// Scene-depth test at the sprite centre pixel, as the pixel shader does per pixel.
 		bool bAnyKept = false;
@@ -140,7 +150,7 @@ namespace UniRender
 		for (int Dy = -Rad; Dy <= Rad; ++Dy) for (int Dx = -Rad; Dx <= Rad; ++Dx)
 		{
 			const double Ex = (Cx + Dx + 0.5) - Px, Ey = (Cy + Dy + 0.5) - Py;
-			Norm += double(H::Uni_SpriteProfile(float(std::sqrt(Ex * Ex + Ey * Ey)), float(Sigma), DiscFrac));
+			Norm += Profile(std::sqrt(Ex * Ex + Ey * Ey));
 		}
 		for (int Dy = -Rad; Dy <= Rad; ++Dy) for (int Dx = -Rad; Dx <= Rad; ++Dx)
 		{
@@ -148,7 +158,7 @@ namespace UniRender
 			if (X < 0 || Y < 0 || X >= Img.W || Y >= Img.H) { continue; }
 			if (!H::Uni_SceneDepthKeep(S.TrueDistance, float(std::min(Img.SceneDist[size_t(Y) * Img.W + X], 3.0e38)))) { continue; }
 			const double Ex = (X + 0.5) - Px, Ey = (Y + 0.5) - Py;
-			const double Wt = double(H::Uni_SpriteProfile(float(std::sqrt(Ex * Ex + Ey * Ey)), float(Sigma), DiscFrac)) / Norm;
+			const double Wt = Profile(std::sqrt(Ex * Ex + Ey * Ey)) / Norm * (double(CoreW) + HaloRatio);
 			Img.Add(X, Y, float(S.Radiance.x * Wt), float(S.Radiance.y * Wt), float(S.Radiance.z * Wt));
 			bAnyKept = true;
 		}
@@ -218,6 +228,11 @@ namespace UniRender
 					const FVec3d Rel = ToDouble(Sub(ObjectCoord(K, Off), Cam.Coord));
 					const FV3 C{ Rel.X - Cam.Frac.X, Rel.Y - Cam.Frac.Y, Rel.Z - Cam.Frac.Z };
 					DrawPromotedSphere(Img, Cam, C, std::exp2(double(H::Uni_ObjectRadiusLog2(UniCore::ToHlsl(O)))), H::Uni_UnpackColour(O.B[3]));
+					// D-158: a promoted point source keeps its glare around the actor.
+					FObjectGPU Op = O;
+					Op.A[3] |= (H::UNI_OBJ_FLAG_PROMOTED << 16);
+					const H::FUniSprite Sg = H::Uni_ProjectObject(D[0], D[1], D[2], u32(K.Level), Fade, UniCore::ToHlsl(Op), V, true);
+					if (Sg.Flags & H::UNI_SPRITE_VISIBLE) { Sprites.push_back({ Sg, K.Level }); }
 				}
 				++St.Promoted;
 				return;

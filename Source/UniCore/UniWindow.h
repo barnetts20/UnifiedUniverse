@@ -28,6 +28,8 @@
 
 #include "UniCoord.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <vector>
@@ -42,33 +44,64 @@ namespace UniCore
 		int Slot = -1;
 	};
 
-	/** Window geometry for one level. Pure functions of (centre, N); no streaming state. */
+	/** Window geometry for one level. Pure functions of (centre, box); no streaming state.
+	 *  D-162: the window is a box of cell offsets [Lo[a], Hi[a]] from the centre cell on each axis
+	 *  (any size, even or odd, asymmetric), not only the symmetric (2N+1)^3: an even 4^3 window
+	 *  placed by the camera's position in its cell, stretched forward along the direction of
+	 *  travel. N stays the bounding half-width (max |offset|) for code that only needs a bound.
+	 *  The slot rules generalise per axis: Side = Hi - Lo + 1; an axis is covered when it has at
+	 *  most 2 (Side + N) cells; in seam mode cells within Side - 1 + N of zero read as
+	 *  c + 2^(128-L) (a no-op when Side divides 2^(128-L), e.g. 4). */
 	struct FWindowGeometry
 	{
 		int Level = 0;
 		int N = 2;
 		FCellKey Centre;
+		int Lo[3] = { -2, -2, -2 };
+		int Hi[3] = { 2, 2, 2 };
 
-		int Side() const { return 2 * N + 1; }
+		static FWindowGeometry Symmetric(int InLevel, int InN)
+		{
+			FWindowGeometry G;
+			G.Level = InLevel;
+			G.N = InN;
+			for (int A = 0; A < 3; ++A) { G.Lo[A] = -InN; G.Hi[A] = InN; }
+			return G;
+		}
+
+		void UpdateBound() { N = 0; for (int A = 0; A < 3; ++A) { N = std::max(N, std::max(-Lo[A], Hi[A])); } }
+		/** Same slot table: the same Side and the same covered state on every axis. */
+		bool SameShape(const FWindowGeometry& O) const { for (int A = 0; A < 3; ++A) { if (Side(A) != O.Side(A) || AxisCovered(A) != O.AxisCovered(A)) { return false; } } return true; }
+		bool SameBox(const FWindowGeometry& O) const { for (int A = 0; A < 3; ++A) { if (Lo[A] != O.Lo[A] || Hi[A] != O.Hi[A]) { return false; } } return Centre == O.Centre; }
+
+		int Side(int I) const { return Hi[I] - Lo[I] + 1; }
+		int Side() const { return Side(0); }
 		int AxisBits() const { return 128 - Level; }
 
-		/** The axis has at most 4N + 2 cells, so the window covers all of it (case 1). */
-		bool AxisCovered() const { return AxisBits() < 63 && (int64_t(1) << AxisBits()) <= int64_t(4 * N + 2); }
+		/** The axis has at most 2 (Side + N) cells, so the window covers all of it (case 1). The
+		 *  margin keeps the seam rule's two ends apart for any box, even one not containing the
+		 *  centre cell. */
+		bool AxisCovered(int I) const { return AxisBits() < 63 && (int64_t(1) << AxisBits()) <= int64_t(2 * (Side(I) + N)); }
+		bool AxisCovered() const { return AxisCovered(0) || AxisCovered(1) || AxisCovered(2); }
 
 		/** Slots per axis: Side, or the whole axis when covered. */
-		int Span() const { return AxisCovered() ? int(int64_t(1) << AxisBits()) : Side(); }
-		int NumSlots() const { return Span() * Span() * Span(); }
+		int Span(int I) const { return AxisCovered(I) ? int(int64_t(1) << AxisBits()) : Side(I); }
+		int Span() const { return Span(0); }
+		int NumSlots() const { return Span(0) * Span(1) * Span(2); }
 
 		/** The window's run of cells crosses the level seam on axis I. */
 		bool StraddlesSeam(int I) const
 		{
-			if (AxisCovered()) { return false; }
+			if (AxisCovered(I)) { return false; }
 			const FU128& C = Centre.C[I];
-			// c < N, or c > 2^k - 1 - N.
-			const FU128 NB = FU128::FromU64(u64(N));
-			if (FU128::Compare(C, NB) < 0) { return true; }
-			const FU128 Top = Sub(MaskLow(FU128::Make(~0u, ~0u, ~0u, ~0u), AxisBits()), NB); // 2^k - 1 - N
-			return FU128::Compare(C, Top) > 0;
+			// c + Lo < 0, or c + Hi > 2^k - 1.
+			if (Lo[I] < 0 && FU128::Compare(C, FU128::FromU64(u64(-Lo[I]))) < 0) { return true; }
+			if (Hi[I] > 0)
+			{
+				const FU128 Top = Sub(MaskLow(FU128::Make(~0u, ~0u, ~0u, ~0u), AxisBits()), FU128::FromU64(u64(Hi[I])));   // 2^k - 1 - Hi
+				return FU128::Compare(C, Top) > 0;
+			}
+			return false;
 		}
 
 		bool SeamMode() const { return SeamMask() != 0; }
@@ -80,12 +113,11 @@ namespace UniCore
 		/** Residue of a window cell's coordinate on axis I, in [0, Span). */
 		int Residue(const FU128& Cell, int I) const
 		{
-			if (AxisCovered()) { return int(Cell.L[3]); }
-			const u32 S = u32(Side());
+			if (AxisCovered(I)) { return int(Cell.L[3]); }
+			const u32 S = u32(Side(I));
 			u32 R = ModSmall(Cell, S);
-			if (StraddlesSeam(I) && FU128::Compare(Cell, FU128::FromU64(u64(2 * N))) <= 0)
+			if (StraddlesSeam(I) && FU128::Compare(Cell, FU128::FromU64(u64(Side(I) - 1 + N))) <= 0)
 			{
-				// Just past the seam: read as c + 2^k, with 2^k mod S computed exactly.
 				const u32 TwoK = AxisBits() >= 128 ? u32((u64(ModSmall(FU128::Make(~0u, ~0u, ~0u, ~0u), S)) + 1u) % S)
 				                                   : ModSmall(FU128::Pow2(AxisBits()), S);
 				R = (R + TwoK) % S;
@@ -95,33 +127,36 @@ namespace UniCore
 
 		int SlotOf(const FCellKey& K) const
 		{
-			const int S = Span();
-			return (Residue(K.C[0], 0) * S + Residue(K.C[1], 1)) * S + Residue(K.C[2], 2);
+			return (Residue(K.C[0], 0) * Span(1) + Residue(K.C[1], 1)) * Span(2) + Residue(K.C[2], 2);
 		}
 
-		/** Every distinct cell in the window, with its slot: Span^3 cells. */
+		/** Every distinct cell in the window, with its slot: Span(0) Span(1) Span(2) cells. */
 		std::vector<FWindowCell> Cells() const
 		{
 			std::vector<FWindowCell> Out;
 			Out.reserve(size_t(NumSlots()));
-			const int Lo = AxisCovered() ? 0 : -N;
-			const int Hi = AxisCovered() ? int((int64_t(1) << AxisBits()) - 1) : N;
-			for (int Dx = Lo; Dx <= Hi; ++Dx)
+			std::vector<FU128> Axis[3];
+			for (int A = 0; A < 3; ++A)
 			{
-				for (int Dy = Lo; Dy <= Hi; ++Dy)
+				if (AxisCovered(A))
 				{
-					for (int Dz = Lo; Dz <= Hi; ++Dz)
+					const int64_t Len = int64_t(1) << AxisBits();
+					for (int64_t D = 0; D < Len; ++D) { Axis[A].push_back(FU128::FromU64(u64(D))); }
+				}
+				else
+				{
+					for (int D = Lo[A]; D <= Hi[A]; ++D) { Axis[A].push_back(MaskLow(Add(Centre.C[A], FU128::FromI64(D)), AxisBits())); }
+				}
+			}
+			for (const FU128& X : Axis[0])
+			{
+				for (const FU128& Y : Axis[1])
+				{
+					for (const FU128& Z : Axis[2])
 					{
 						FWindowCell C;
-						if (AxisCovered())
-						{
-							C.Key.Level = Level;
-							C.Key.C[0] = FU128::FromU64(u64(Dx)); C.Key.C[1] = FU128::FromU64(u64(Dy)); C.Key.C[2] = FU128::FromU64(u64(Dz));
-						}
-						else
-						{
-							C.Key = Neighbour(Centre, Dx, Dy, Dz);
-						}
+						C.Key.Level = Level;
+						C.Key.C[0] = X; C.Key.C[1] = Y; C.Key.C[2] = Z;
 						C.Slot = SlotOf(C.Key);
 						Out.push_back(C);
 					}
@@ -130,6 +165,25 @@ namespace UniCore
 			return Out;
 		}
 	};
+
+	/** D-162: placement of a window box on one axis. The window must cover the camera's
+	 *  surroundings from Back cells behind to Fwd cells ahead of its position Fr in [0, 1) within
+	 *  its cell: Side = ceil(Back + Fwd) + 1 cells, the first at offset Lo with
+	 *  Lo <= floor(Fr - Back) and Lo + Side - 1 >= floor(Fr + Fwd). PrevLo (the previous window's
+	 *  first offset, re-expressed from the new centre cell) is kept when it is still valid, and
+	 *  otherwise moved the least, so a window only shifts when it must. */
+	inline int WindowSide(double Back, double Fwd) { return int(std::ceil(Back + Fwd - 1.0e-9)) + 1; }
+
+	inline int PlaceWindowAxis(double Fr, double Back, double Fwd, int Side, bool bHasPrev, int64_t PrevLo)
+	{
+		const int Max = int(std::floor(Fr - Back));             // Lo may not exceed this
+		const int Min = int(std::floor(Fr + Fwd)) - Side + 1;   // nor be below this
+		if (Min > Max) { return Max; }                          // Side too small (cannot happen with WindowSide)
+		if (!bHasPrev) { return Max; }
+		if (PrevLo > int64_t(Max)) { return Max; }
+		if (PrevLo < int64_t(Min)) { return Min; }
+		return int(PrevLo);
+	}
 
 	enum class ESlotStatus : uint8_t { Empty, Pending, Generated, Cached };
 
@@ -153,7 +207,9 @@ namespace UniCore
 	{
 	public:
 		FLevelWindow() = default;
-		FLevelWindow(int InLevel, int InN) { Geo.Level = InLevel; Geo.N = InN; Slots.resize(size_t(Geo.NumSlots())); }
+		FLevelWindow(int InLevel, int InN) { Geo = FWindowGeometry::Symmetric(InLevel, InN); Slots.resize(size_t(Geo.NumSlots())); }
+		/** D-162: a window of this shape (Lo/Hi per axis; the centre is set by Recentre). */
+		explicit FLevelWindow(const FWindowGeometry& Shape) { Geo = Shape; Geo.UpdateBound(); Slots.resize(size_t(Geo.NumSlots())); }
 
 		/** Number of distinct cells the window holds. */
 		size_t NumCells() const { return size_t(Geo.NumSlots()); }
@@ -166,11 +222,33 @@ namespace UniCore
 		/** Re-centre on the camera's cell at this level. Returns entering/exiting cells. */
 		FWindowDiff Recentre(const FCellKey& NewCentre)
 		{
-			FWindowDiff D;
 			FWindowGeometry NewGeo = Geo;
 			NewGeo.Centre = NewCentre;
+			return Recentre(NewGeo);
+		}
+
+		/** D-162: move to a new box of the same shape (same Side per axis; a shape change is a
+		 *  new window). Resident cells keep their slots: a contiguous run of Side cells has
+		 *  distinct residues wherever it starts. */
+		FWindowDiff Recentre(FWindowGeometry NewGeo)
+		{
+			FWindowDiff D;
+			NewGeo.Level = Geo.Level;
+			NewGeo.UpdateBound();
+			if (!NewGeo.SameShape(Geo))
+			{
+				// A new shape is a new slot table: everything resident exits, everything enters.
+				std::vector<FCellKey> Old;
+				for (const FSlot& Sl : Slots) { if (Sl.bOccupied) { Old.push_back(Sl.Key); } }
+				Geo = NewGeo;
+				Slots.assign(size_t(Geo.NumSlots()), FSlot());
+				bValid = false;
+				FWindowDiff R = Recentre(NewGeo);
+				R.Exiting = Old;
+				return R;
+			}
 			const bool bSeamChange = bValid && (NewGeo.SeamMask() != Geo.SeamMask());
-			if (bValid && !bSeamChange && NewCentre == Geo.Centre) { return D; }
+			if (bValid && !bSeamChange && NewGeo.SameBox(Geo)) { return D; }
 
 			const std::vector<FWindowCell> Cells = NewGeo.Cells();
 			std::vector<char> Used(Slots.size(), 0);
@@ -250,4 +328,46 @@ namespace UniCore
 			return bSuspended;
 		}
 	};
+
+	/** D-162: the window a level should have this frame. Reach (cells) on every side, plus a
+	 *  forward stretch along the direction of travel: LeadPos[a] cells more ahead on axes the
+	 *  camera moves along +a, LeadNeg[a] on -a. Side per axis is at least MinSide (the caller's
+	 *  shrink hysteresis). Placement keeps the previous window's position whenever it still covers
+	 *  the reach (same shape only), so the window shifts only when it must. */
+	inline FWindowGeometry PlanWindow(int L, const FCoord& Cam, double Reach, const double LeadPos[3], const double LeadNeg[3], const int MinSide[3], const FLevelWindow* Prev)
+	{
+		FWindowGeometry G;
+		G.Level = L;
+		G.Centre = CellOf(Cam, L);
+		const double W = std::ldexp(1.0, L);
+		const FVec3d InCell = ToDouble(Sub(Cam, CellOrigin(G.Centre)));
+		const double Fr[3] = { std::clamp(InCell.X / W, 0.0, 1.0 - 1.0e-12), std::clamp(InCell.Y / W, 0.0, 1.0 - 1.0e-12), std::clamp(InCell.Z / W, 0.0, 1.0 - 1.0e-12) };
+		int Side[3];
+		for (int A = 0; A < 3; ++A) { Side[A] = std::max(WindowSide(Reach + LeadNeg[A], Reach + LeadPos[A]), MinSide[A]); }
+		bool bPrev = Prev && Prev->IsValid();
+		int64_t PrevLo[3] = { 0, 0, 0 };
+		if (bPrev)
+		{
+			const FWindowGeometry& P = Prev->Geometry();
+			for (int A = 0; A < 3; ++A)
+			{
+				if (P.Side(A) != Side[A]) { bPrev = false; break; }
+				// The previous first cell, as an offset from the new centre (small, or no previous).
+				const FU128 D = MaskLow(Sub(Add(P.Centre.C[A], FU128::FromI64(P.Lo[A])), G.Centre.C[A]), G.AxisBits());
+				const FU128 Nd = MaskLow(Sub(G.Centre.C[A], Add(P.Centre.C[A], FU128::FromI64(P.Lo[A]))), G.AxisBits());
+				const bool bNeg = FU128::Compare(Nd, D) < 0;
+				const FU128& M = bNeg ? Nd : D;
+				if ((M.L[0] | M.L[1] | M.L[2]) != 0u || M.L[3] > 1024u) { bPrev = false; break; }
+				PrevLo[A] = bNeg ? -int64_t(M.L[3]) : int64_t(M.L[3]);
+			}
+		}
+		for (int A = 0; A < 3; ++A)
+		{
+			G.Lo[A] = PlaceWindowAxis(Fr[A], Reach + LeadNeg[A], Reach + LeadPos[A], Side[A], bPrev, PrevLo[A]);
+			G.Hi[A] = G.Lo[A] + Side[A] - 1;
+		}
+		G.UpdateBound();
+		return G;
+	}
 }
+

@@ -93,7 +93,7 @@ def lint_cores(results):
         for kw in ("Texture3D", "SamplerState", "RWStructuredBuffer", "groupshared"):
             if re.search(r"\b" + kw + r"\b", src):
                 problems.append(f"{f}: resource/keyword '{kw}' not in the shared subset")
-    add(results, 4, "T4.static.core_subset", "Shader cores stay in the shared C++/HLSL subset (no swizzles, UNI_FN, f-suffixed literals, no textures)",
+    add(results, 4, "T4.static.core_subset", "Shader cores stay in the shared C++/HLSL subset (no swizzles, UNI_FN, f-suffixed literals, no textures: the web texture only through UNI_WEB_TEX_SAMPLE, D-164)",
         not problems, f"{len(files)} cores, {len(problems)} problems" + ("" if not problems else ": " + "; ".join(problems[:6])),
         {"files": len(files), "problems": len(problems)})
 

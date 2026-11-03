@@ -23,11 +23,19 @@
 #include "UniCoreDefs.ush"
 #include "UniSeed.ush"
 
+// D-164: the web texture is reached only through UNI_WEB_TEX_SAMPLE (UniWebTexture.ush in HLSL,
+// UniHlslShim.h in C++).
+#ifndef UNI_WEB_TEX_SAMPLE
+#error "Include UniWebTexture.ush (HLSL) or UniHlslShim.h (C++) before the cores"
+#endif
+
 static const uint UNI_FIELD_NONE = 0u;
 static const uint UNI_FIELD_WEB = 1u;      // periodic cellular cosmic web
 static const uint UNI_FIELD_GALAXY = 2u;   // disc + bulge + log-spiral arms, unit-ball cut
 static const uint UNI_FIELD_BALL = 3u;     // 1 inside the unit ball (tests)
 static const uint UNI_FIELD_CONST = 4u;    // 1 everywhere, periodic (tests)
+static const uint UNI_FIELD_CLUSTER = 5u;  // galaxy cluster: triaxial beta model + Plummer sub-clumps, unit-ball cut (D-151)
+static const uint UNI_CLUSTER_MAX_CLUMPS = 4u;
 
 struct FUniFieldParams
 {
@@ -108,15 +116,121 @@ UNI_FN void Uni_WebLattice(float3 InP, int InG, uint InSeed, UNI_OUT(float) OutF
 	OutF1 = F1; OutF2 = F2; OutF3 = F3;
 }
 
+/** Uni_WebLattice plus the fourth-nearest distance (D-151: web nodes, where four sites are
+ *  equidistant). F1..F3 are computed by exactly the same comparisons as Uni_WebLattice. */
+UNI_FN void Uni_WebLattice4(float3 InP, int InG, uint InSeed, UNI_OUT(float) OutF1, UNI_OUT(float) OutF2, UNI_OUT(float) OutF3, UNI_OUT(float) OutF4)
+{
+	const float G = (float)InG;
+	const float3 Q = InP * G;
+	const int CX = (int)floor(Q.x), CY = (int)floor(Q.y), CZ = (int)floor(Q.z);
+	float F1 = 1.0e9f, F2 = 1.0e9f, F3 = 1.0e9f, F4 = 1.0e9f;
+	for (int DX = -1; DX <= 1; ++DX)
+	{
+		for (int DY = -1; DY <= 1; ++DY)
+		{
+			for (int DZ = -1; DZ <= 1; ++DZ)
+			{
+				const int NX = CX + DX, NY = CY + DY, NZ = CZ + DZ;
+				const float3 J = Uni_LatticeJitter(InSeed, Uni_PosModInt(NX, InG), Uni_PosModInt(NY, InG), Uni_PosModInt(NZ, InG));
+				const float3 FP = float3((float)NX + J.x, (float)NY + J.y, (float)NZ + J.z);
+				const float3 Dv = Q - FP;
+				const float D = sqrt(dot(Dv, Dv));
+				if (D < F1) { F4 = F3; F3 = F2; F2 = F1; F1 = D; }
+				else if (D < F2) { F4 = F3; F3 = F2; F2 = D; }
+				else if (D < F3) { F4 = F3; F3 = D; }
+				else if (D < F4) { F4 = D; }
+			}
+		}
+	}
+	OutF1 = F1; OutF2 = F2; OutF3 = F3; OutF4 = F4;
+}
+
 // ------------------------------------------------------------------------------------------
 // Fields
 // ------------------------------------------------------------------------------------------
 
+/** D-164: the web's structure channels at p, procedurally: R walls and G filaments, each mixed
+ *  over the two lattices with weight2 ((1 - W2) first + W2 second), B nodes (first lattice only;
+ *  0 when node weight is 0), A unused. The web's density is then Floor + WallW R + FilW G +
+ *  NodeW B, raised to the bias power: the same terms as UniField_Web, regrouped (linear, so the
+ *  texture's mips average them exactly; only the power is applied after filtering). This is
+ *  what UniCore::FWebTexture bakes. Width, G, G2, W2 and the seed are baked in; the weights,
+ *  floor and power stay live. */
+UNI_FN float4 Uni_WebChannels(float3 InP, FUniFieldParams InPar)
+{
+	const int G = max((int)InPar.A.x, 1);
+	const float Width = max(InPar.A.y, 1.0e-4f);
+	const int G2 = (int)InPar.B.y;
+	const float W2 = InPar.B.z;
+	const uint Seed = asuint(InPar.B.w);
+	float F1, F2, F3;
+	Uni_WebLattice(InP, G, Seed, F1, F2, F3);
+	const float E12 = (F2 - F1) / Width;
+	const float E13 = (F3 - F1) / Width;
+	float Wall = exp(-E12 * E12);
+	float Fil = exp(-E13 * E13);
+	if (W2 > 0.0f && G2 > 0)
+	{
+		float S1, S2, S3;
+		Uni_WebLattice(InP, G2, Uni_Avalanche(Seed ^ 0x9E3779B9u), S1, S2, S3);
+		const float T12 = (S2 - S1) / Width;
+		const float T13 = (S3 - S1) / Width;
+		Wall = (1.0f - W2) * Wall + W2 * exp(-T12 * T12);
+		Fil = (1.0f - W2) * Fil + W2 * exp(-T13 * T13);
+	}
+	float Node = 0.0f;
+	if (InPar.C.y > 0.0f)
+	{
+		float N1, N2, N3, N4;
+		Uni_WebLattice4(InP, G, Seed, N1, N2, N3, N4);
+		const float E14 = (N4 - N1) / Width;
+		Node = exp(-E14 * E14);
+	}
+	return float4(Wall, Fil, Node, 0.0f);
+}
+
+/** D-164: is this web textured? C.z = 1: sample the web texture (C.w texels per period) instead
+ *  of evaluating the lattices. Set on every web emitter of a universe together (UniCore::
+ *  EnableWebTexture), with the texture bound; placement and rendering then read the same texels. */
+UNI_FN bool Uni_WebIsTextured(FUniFieldParams InPar)
+{
+	return InPar.C.z > 0.5f;
+}
+
+/** The mip whose texels match a footprint (field units): log2(footprint x texels per period),
+ *  0 below one texel. */
+UNI_FN float Uni_WebTexMip(FUniFieldParams InPar, float InFoot)
+{
+	const float N = max(InPar.C.w, 1.0f);
+	return log2(max(InFoot * N, 1.0f));
+}
+
+/** The textured web at p and mip: the channels combined as Uni_WebChannels describes, plus D.x
+ *  times the A channel (D-165: delivered textures carry a fourth matter class there). */
+UNI_FN float UniField_WebTex(float3 InP, FUniFieldParams InPar, float InMip)
+{
+	const float4 T = UNI_WEB_TEX_SAMPLE(InP, InMip);
+	float D = InPar.A.w * T.x + InPar.B.x * T.y;
+	const float NodeW = InPar.C.y;
+	if (NodeW > 0.0f) { D = D + NodeW * T.z; }
+	const float VoidW = InPar.D.x;   // D-165: a delivered texture's A channel (the adhesion web's uncollapsed matter); the stand-in's A is 0
+	if (VoidW > 0.0f) { D = D + VoidW * T.w; }
+	const float Pow = InPar.C.x;
+	if (Pow > 0.0f && Pow != 1.0f) { D = pow(max(D, 0.0f), Pow); }
+	return InPar.A.z + D;
+}
+
 /** Cosmic web. A = (G, width, void floor, wall weight), B = (filament weight, G2, weight2,
- *  seed bits). Walls where the two nearest sites are equidistant, filaments where three are.
- *  G and G2 must be coprime integers (lesson #6). */
+ *  seed bits), C = (bias power, node weight, textured (D-164), texels per period), D = (void
+ *  weight: textured only, D-165; unused, unused, unused). Walls where the two nearest
+ *  sites are equidistant, filaments where three are, nodes where four are. G and G2 must be
+ *  coprime integers (lesson #6).
+ *  D-151: C is zero for the galaxy web, which then takes exactly the code path it always did
+ *  (no reroll). Clusters use the same lattice (same G, seed) with a node term and a power > 1,
+ *  so they sit on the galaxies' filaments and nodes, more sharply. */
 UNI_FN float UniField_Web(float3 InP, FUniFieldParams InPar)
 {
+	if (Uni_WebIsTextured(InPar)) { return UniField_WebTex(InP, InPar, 0.0f); }   // D-164: mip 0
 	const int G = max((int)InPar.A.x, 1);
 	const float Width = max(InPar.A.y, 1.0e-4f);
 	const float Floor = InPar.A.z;
@@ -142,7 +256,97 @@ UNI_FN float UniField_Web(float3 InP, FUniFieldParams InPar)
 		const float D2 = WallW * exp(-T12 * T12) + FilW * exp(-T13 * T13);
 		D = (1.0f - W2) * D + W2 * D2;
 	}
+	// D-151: nodes and bias. Each early-outs at its zero default (lesson #13).
+	const float NodeW = InPar.C.y;
+	if (NodeW > 0.0f)
+	{
+		float N1, N2, N3, N4;
+		Uni_WebLattice4(InP, G, Seed, N1, N2, N3, N4);
+		const float E14 = (N4 - N1) / Width;
+		D = D + NodeW * exp(-E14 * E14);
+	}
+	const float Pow = InPar.C.x;
+	if (Pow > 0.0f && Pow != 1.0f) { D = pow(max(D, 0.0f), Pow); }
 	return Floor + D;
+}
+
+/** Galaxy cluster (D-151) in its local frame, unit = influence radius.
+ *  A = (core radius rc, axis ratio b/a, axis ratio c/a, cut radius)
+ *  B = (clump count 0..4, clump weight, clump radius a, clump seed (integer-valued float))
+ *  Main body: an isothermal beta model (beta = 1) on the ellipsoidal radius
+ *  s^2 = x^2 + (y / q1)^2 + (z / q2)^2, rho = (1 + s^2 / rc^2)^-1.5, cut at s = Cut (so |p| < 1
+ *  for q <= 1). Sub-clumps (infalling groups, substructure): Plummer spheres
+ *  w (1 + d^2 / a^2)^-2.5 at seeded positions within 0.55 of the centre. The body tapers
+ *  smoothly over the outer 35% of the cut, the clumps over the outer 5%. Its integral is analytic
+ *  (UniCore::ClusterFieldIntegral), so a cluster needs no sampled normaliser. */
+UNI_FN float3 Uni_ClusterClumpCentre(uint InSeed, uint InK)
+{
+	const float U1 = Uni_DrawUnit(InSeed, UNI_CH_CLUMP, InK * 3u + 0u);
+	const float U2 = Uni_DrawUnit(InSeed, UNI_CH_CLUMP, InK * 3u + 1u);
+	const float U3 = Uni_DrawUnit(InSeed, UNI_CH_CLUMP, InK * 3u + 2u);
+	const float Ct = 2.0f * U1 - 1.0f;
+	const float St = sqrt(max(1.0f - Ct * Ct, 0.0f));
+	const float Ph = 6.2831853f * U2;
+	const float R = 0.15f + 0.4f * U3;   // 0.15..0.55: off-centre, well inside the cut
+	return float3(R * St * cos(Ph), R * St * sin(Ph), R * Ct);
+}
+
+/** The cluster body's outer taper: smoothstep from 1 at 0.65 Cut to 0 at Cut, so the halo fades
+ *  out instead of ending at an edge (visible in the volume glow at high gain). */
+UNI_FN float Uni_ClusterTaper(float InS, float InCut)
+{
+	const float T = saturate((InCut - InS) / (0.35f * InCut));
+	return T * T * (3.0f - 2.0f * T);
+}
+
+/** D-160: the cluster field with its clump centres given (Uni_ClusterClumpCentre for k < N),
+ *  so a ray marching through one cluster computes them once instead of at every sample and
+ *  step hint. UniField_Cluster computes them and calls this: one source, the same arithmetic. */
+UNI_FN float UniField_ClusterC(float3 InP, FUniFieldParams InPar, float3 InC0, float3 InC1, float3 InC2, float3 InC3)
+{
+	const float Cut = InPar.A.w;
+	const float R2 = dot(InP, InP);
+	if (R2 >= Cut * Cut) { return 0.0f; }
+	const float Rc = max(InPar.A.x, 1.0e-4f);
+	const float Q1 = max(InPar.A.y, 0.05f);
+	const float Q2 = max(InPar.A.z, 0.05f);
+	const float Sy = InP.y / Q1, Sz = InP.z / Q2;
+	const float S2 = InP.x * InP.x + Sy * Sy + Sz * Sz;
+	float Rho = 0.0f;
+	if (S2 < Cut * Cut)
+	{
+		const float X = 1.0f + S2 / (Rc * Rc);
+		const float S = sqrt(S2);
+		Rho = Uni_ClusterTaper(S, Cut) / (X * sqrt(X));
+	}
+	const uint NClumps = min((uint)max(InPar.B.x, 0.0f), UNI_CLUSTER_MAX_CLUMPS);
+	const float Wc = InPar.B.y;
+	if (NClumps > 0u && Wc > 0.0f)
+	{
+		const float A = max(InPar.B.z, 1.0e-4f);
+		const float Edge = saturate((Cut - sqrt(R2)) / (0.05f * Cut));
+		for (uint K = 0u; K < NClumps; ++K)
+		{
+			const float3 C = K == 0u ? InC0 : (K == 1u ? InC1 : (K == 2u ? InC2 : InC3));
+			const float3 Dv = InP - C;
+			const float Y = 1.0f + dot(Dv, Dv) / (A * A);
+			Rho += Wc * Edge / (Y * Y * sqrt(Y));
+		}
+	}
+	return Rho;
+}
+
+/** The clump centres of a cluster's parameters (zero past its clump count). */
+UNI_FN float3 Uni_ClusterCentre(FUniFieldParams InPar, uint InK)
+{
+	const uint NClumps = min((uint)max(InPar.B.x, 0.0f), UNI_CLUSTER_MAX_CLUMPS);
+	if (InK >= NClumps || !(InPar.B.y > 0.0f)) { return float3(0.0f, 0.0f, 0.0f); }
+	return Uni_ClusterClumpCentre((uint)max(InPar.B.w, 0.0f), InK);
+}
+
+UNI_FN float UniField_Cluster(float3 InP, FUniFieldParams InPar)
+{
+	return UniField_ClusterC(InP, InPar, Uni_ClusterCentre(InPar, 0u), Uni_ClusterCentre(InPar, 1u), Uni_ClusterCentre(InPar, 2u), Uni_ClusterCentre(InPar, 3u));
 }
 
 /** Galaxy in its local frame, unit = influence radius, disc in the xy plane.
@@ -152,7 +356,24 @@ UNI_FN float UniField_Web(float3 InP, FUniFieldParams InPar)
  *  D = (cut radius, unused, unused, unused)
  *  Zero outside the cut radius, so no child is ever placed outside its contributor's
  *  influence (T2 contributor coverage). Each layer early-outs when its weight is zero. */
-UNI_FN float UniField_Galaxy(float3 InP, FUniFieldParams InPar)
+/** D-160: the galaxy field prefiltered over a footprint (field units; the volume passes the
+ *  pixel's transverse footprint at the sample). Foot = 0 is UniField_Galaxy exactly (placement
+ *  never filters, so nothing rerolls). With a footprint:
+ *  - the disc's vertical profile is broadened, exp(-|z| / H) -> (H / He) exp(-|z| / He) with
+ *    He = sqrt(H^2 + (Foot / 2)^2): its column through the disc is unchanged;
+ *  - the spiral arms blend to their azimuthal mean as the footprint passes the local arm scale
+ *    (1 / phase gradient), as periodic fields blend to their mean (D-130): the integral over
+ *    azimuth is unchanged.
+ *  So a galaxy a few pixels across needs no supersampling for its thin disc or its arms (it
+ *  cost up to 8 x 8 rays per pixel over its whole footprint), and its light is preserved. */
+UNI_FN float Uni_GalaxyArmMean(float InSharpness)
+{
+	// Mean over phase of ((1 + cos) / 2)^s = Gamma(s + 1/2) / (sqrt(pi) Gamma(s + 1)) ~ 1 / sqrt(pi (s + 1/4))
+	// (0.15% at s = 3, the demo's sharpness; 2% at s = 1).
+	return rsqrt(3.14159265f * (max(InSharpness, 0.1f) + 0.25f));
+}
+
+UNI_FN float UniField_GalaxyFiltered(float3 InP, FUniFieldParams InPar, float InFoot)
 {
 	const float Cut = InPar.D.x;
 	const float R2 = dot(InP, InP);
@@ -165,13 +386,35 @@ UNI_FN float UniField_Galaxy(float3 InP, FUniFieldParams InPar)
 	const float DiscW = InPar.A.z;
 	if (DiscW > 0.0f)
 	{
-		float Disc = DiscW * exp(-Rcyl / max(InPar.A.x, 1.0e-5f)) * exp(-Z / max(InPar.A.y, 1.0e-6f));
+		float Disc;
+		if (InFoot > 0.0f)
+		{
+			const float H = max(InPar.A.y, 1.0e-6f);
+			const float He = sqrt(H * H + 0.25f * InFoot * InFoot);
+			Disc = DiscW * exp(-Rcyl / max(InPar.A.x, 1.0e-5f)) * exp(-Z / He) * (H / He);
+		}
+		else
+		{
+			Disc = DiscW * exp(-Rcyl / max(InPar.A.x, 1.0e-5f)) * exp(-Z / max(InPar.A.y, 1.0e-6f));
+		}
 		const float ArmAmp = InPar.C.x;
 		if (ArmAmp > 0.0f && InPar.B.z > 0.0f)
 		{
-			const float Theta = atan2(InP.y, InP.x);
-			const float Phi = InPar.B.z * (Theta - log(max(Rcyl, 1.0e-4f)) / max(InPar.B.w, 1.0e-3f) + InPar.C.z);
-			const float Wave = pow(0.5f + 0.5f * cos(Phi), max(InPar.C.y, 0.1f));
+			float Blend = 0.0f;
+			if (InFoot > 0.0f)
+			{
+				const float TanP = max(InPar.B.w, 1.0e-3f);
+				const float Grad = InPar.B.z / max(Rcyl, 0.5f * max(InPar.A.x, 1.0e-4f)) * sqrt(1.0f + 1.0f / (TanP * TanP));
+				Blend = saturate((InFoot * Grad - 1.0f) * (1.0f / 3.0f));   // footprint / arm scale, past 1: toward the mean by 4
+			}
+			float Wave = 0.0f;
+			if (Blend < 1.0f)
+			{
+				const float Theta = atan2(InP.y, InP.x);
+				const float Phi = InPar.B.z * (Theta - log(max(Rcyl, 1.0e-4f)) / max(InPar.B.w, 1.0e-3f) + InPar.C.z);
+				Wave = pow(0.5f + 0.5f * cos(Phi), max(InPar.C.y, 0.1f));
+			}
+			if (Blend > 0.0f) { Wave = Wave + (Uni_GalaxyArmMean(InPar.C.y) - Wave) * Blend; }
 			Disc = Disc * ((1.0f - ArmAmp) + ArmAmp * Wave * (1.0f + InPar.C.y));
 		}
 		Rho += Disc;
@@ -181,16 +424,32 @@ UNI_FN float UniField_Galaxy(float3 InP, FUniFieldParams InPar)
 	if (BulgeW > 0.0f)
 	{
 		const float Q = max(InPar.B.x, 0.05f);
-		const float Re = max(InPar.A.w, 1.0e-5f);
+		float Re = max(InPar.A.w, 1.0e-5f);
+		float Amp = BulgeW;
+		if (InFoot > 0.0f)
+		{
+			// D-163: a bulge smaller than the footprint is widened to it, keeping its light (the
+			// profile's integral goes as r_e^3), so one ray per pixel sees its light wherever the
+			// pixel falls, without supersampling every carrier on that pixel.
+			const float Rf = sqrt(Re * Re + InFoot * InFoot);
+			const float S = Re / Rf;
+			Amp = Amp * (S * S * S);
+			Re = Rf;
+		}
 		const float R3 = sqrt(Rcyl * Rcyl + (Z / Q) * (Z / Q));
 		// Sersic-like, n = 2: exp(-b ((r / re)^(1/2) - 1)), b = 3.67.
-		Rho += BulgeW * exp(-3.67f * (sqrt(R3 / Re) - 1.0f));
+		Rho += Amp * exp(-3.67f * (sqrt(R3 / Re) - 1.0f));
 	}
 
 	// Soft edge over the outer 5% of the cut, so the field (and so the placed count) has no
 	// hard shell at the influence radius.
 	const float R = sqrt(R2);
 	return Rho * saturate((Cut - R) / (0.05f * Cut));
+}
+
+UNI_FN float UniField_Galaxy(float3 InP, FUniFieldParams InPar)
+{
+	return UniField_GalaxyFiltered(InP, InPar, 0.0f);
 }
 
 UNI_FN float UniField_Ball(float3 InP)
@@ -209,7 +468,40 @@ UNI_FN float Uni_FieldSample(uint InFieldId, float3 InP, FUniFieldParams InPar)
 	if (InFieldId == UNI_FIELD_GALAXY) { return UniField_Galaxy(InP, InPar); }
 	if (InFieldId == UNI_FIELD_BALL) { return UniField_Ball(InP); }
 	if (InFieldId == UNI_FIELD_CONST) { return 1.0f; }
+	if (InFieldId == UNI_FIELD_CLUSTER) { return UniField_Cluster(InP, InPar); }
 	return 0.0f; // unknown id: no content, never a fallback field (fail closed)
+}
+
+/** D-160: Uni_FieldSample prefiltered over a footprint (field units) where the field supports
+ *  it (the galaxy); every other field is sampled exactly. Volume only. */
+UNI_FN float Uni_FieldSampleFoot(uint InFieldId, float3 InP, FUniFieldParams InPar, float InFoot)
+{
+	if (InFieldId == UNI_FIELD_GALAXY) { return UniField_GalaxyFiltered(InP, InPar, InFoot); }
+	if (InFieldId == UNI_FIELD_WEB && Uni_WebIsTextured(InPar)) { return UniField_WebTex(InP, InPar, Uni_WebTexMip(InPar, InFoot)); }   // D-164: the mip is the prefilter
+	return Uni_FieldSample(InFieldId, InP, InPar);
+}
+
+/** D-153: an upper bound of the field anywhere at least InDist (field units) from the
+ *  contributor's centre, for fields whose features can be smaller than the probe spacing (the
+ *  cluster core is ~0.1 of the influence radius, inside boxes up to 2 wide: 128 probes miss its
+ *  peak and the rejection envelope would cap the core). 0: no bound (probes decide), which keeps
+ *  every other field's placement exactly as it was. */
+UNI_FN float Uni_FieldBoundBeyond(uint InFieldId, float InDist, FUniFieldParams InPar)
+{
+	if (InFieldId != UNI_FIELD_CLUSTER) { return 0.0f; }
+	const float Rc = max(InPar.A.x, 1.0e-4f);
+	const float X = 1.0f + InDist * InDist / (Rc * Rc);   // s >= |p| >= InDist for axis ratios <= 1
+	float B = 1.0f / (X * sqrt(X));
+	const float NClumps = min(floor(max(InPar.B.x, 0.0f)), (float)UNI_CLUSTER_MAX_CLUMPS);
+	if (NClumps > 0.0f && InPar.B.y > 0.0f)
+	{
+		// Clump centres lie within 0.55 of the centre: the nearest is at least InDist - 0.55 away.
+		const float A = max(InPar.B.z, 1.0e-4f);
+		const float D = max(InDist - 0.55f, 0.0f);
+		const float Y = 1.0f + D * D / (A * A);
+		B += NClumps * InPar.B.y / (Y * Y * sqrt(Y));
+	}
+	return B;
 }
 
 // ------------------------------------------------------------------------------------------
@@ -229,9 +521,12 @@ UNI_FN float Uni_FieldSample(uint InFieldId, float3 InP, FUniFieldParams InPar)
  *    bulge           0.3 of its log-slope length 2 sqrt(r r_e) / 3.67 (the n = 2 cusp),
  *                    inside 6 r_e.
  *  T3.vol.march measures the result against a brute-force march. */
-UNI_FN float Uni_GalaxyStepHint(float3 InP, float3 InD, FUniFieldParams InPar)
+/** Step hint; InFoot > 0: for UniField_GalaxyFiltered at that footprint (D-160): the slab is
+ *  the broadened one and the arms need no resolving once blended away. */
+UNI_FN float Uni_GalaxyStepHintFiltered(float3 InP, float3 InD, FUniFieldParams InPar, float InFoot)
 {
-	const float H = max(InPar.A.y, 1.0e-6f);
+	const float H0 = max(InPar.A.y, 1.0e-6f);
+	const float H = InFoot > 0.0f ? sqrt(H0 * H0 + 0.25f * InFoot * InFoot) : H0;
 	const float Slab = 4.0f * H;
 	const float Rcyl = sqrt(InP.x * InP.x + InP.y * InP.y);
 	const float Dz = max(abs(InD.z), 1.0e-3f);
@@ -249,7 +544,7 @@ UNI_FN float Uni_GalaxyStepHint(float3 InP, float3 InD, FUniFieldParams InPar)
 				// Inside half a scale length the phase winds without limit (log R): the pattern is
 				// averaged there, not resolved, or the step collapses on the axis.
 				const float Grad = InPar.B.z / max(Rcyl, 0.5f * max(InPar.A.x, 1.0e-4f)) * sqrt(1.0f + 1.0f / (TanP * TanP));
-				S = min(S, 0.25f / Grad);
+				if (!(InFoot * Grad >= 4.0f)) { S = min(S, 0.25f / Grad); }   // fully blended (D-160): nothing to resolve
 			}
 		}
 		else
@@ -260,7 +555,8 @@ UNI_FN float Uni_GalaxyStepHint(float3 InP, float3 InD, FUniFieldParams InPar)
 	}
 	if (InPar.B.y > 0.0f)
 	{
-		const float Re = max(InPar.A.w, 1.0e-5f);
+		const float Re0 = max(InPar.A.w, 1.0e-5f);
+		const float Re = InFoot > 0.0f ? sqrt(Re0 * Re0 + InFoot * InFoot) : Re0;   // D-163: the widened bulge
 		const float Q = max(InPar.B.x, 0.05f);
 		const float R3 = sqrt(Rcyl * Rcyl + (Z / Q) * (Z / Q));
 		// Only where the bulge matters: beyond 6 r_e it is < 1% of its value at r_e.
@@ -269,12 +565,18 @@ UNI_FN float Uni_GalaxyStepHint(float3 InP, float3 InD, FUniFieldParams InPar)
 	return max(S, 1.0e-6f);
 }
 
+UNI_FN float Uni_GalaxyStepHint(float3 InP, float3 InD, FUniFieldParams InPar)
+{
+	return Uni_GalaxyStepHintFiltered(InP, InD, InPar, 0.0f);
+}
+
 /** Smallest structure (field units) for prefiltered sampling: a step whose footprint is several
  *  times this samples the field's mean instead (mips are integrals). 0 = never prefilter. */
 UNI_FN float Uni_FieldFeatureScale(uint InFieldId, FUniFieldParams InPar)
 {
 	if (InFieldId == UNI_FIELD_WEB)
 	{
+		if (Uni_WebIsTextured(InPar)) { return 0.0f; }   // D-164: the mips prefilter; never blend to the mean
 		const int G = max((int)InPar.A.x, 1);
 		const int G2 = (int)InPar.B.y;
 		const int Gmax = (InPar.B.z > 0.0f && G2 > G) ? G2 : G;
@@ -295,15 +597,83 @@ UNI_FN float Uni_FieldResolveScale(uint InFieldId, FUniFieldParams InPar)
 		if (InPar.B.y > 0.0f) { S = min(S, 0.5f * max(InPar.A.w, 1.0e-5f)); }
 		return S;
 	}
+	if (InFieldId == UNI_FIELD_CLUSTER)
+	{
+		// The core, and the clumps if any.
+		float S = 0.5f * max(InPar.A.x, 1.0e-4f);
+		if (InPar.B.x > 0.0f && InPar.B.y > 0.0f) { S = min(S, 0.5f * max(InPar.B.z, 1.0e-4f)); }
+		return S;
+	}
 	return Uni_FieldFeatureScale(InFieldId, InPar);
+}
+
+/** D-164: the textured web's step: UNI_WEB_TEX_STEP texels of the mip the footprint selects
+ *  (the field is trilinear between texel centres, so a texel-sized midpoint step integrates it
+ *  to within the texel's own error). */
+static const float UNI_WEB_TEX_STEP = 1.0f;
+
+UNI_FN float Uni_WebTexStepHint(FUniFieldParams InPar, float InFoot)
+{
+	const float N = max(InPar.C.w, 1.0f);
+	return UNI_WEB_TEX_STEP * max(1.0f / N, InFoot);
 }
 
 /** Largest safe step (field units) for any field. */
 UNI_FN float Uni_FieldStepHint(uint InFieldId, float3 InP, float3 InD, FUniFieldParams InPar)
 {
 	if (InFieldId == UNI_FIELD_GALAXY) { return Uni_GalaxyStepHint(InP, InD, InPar); }
+	if (InFieldId == UNI_FIELD_WEB && Uni_WebIsTextured(InPar)) { return Uni_WebTexStepHint(InPar, 0.0f); }
 	if (InFieldId == UNI_FIELD_WEB) { return 0.5f * Uni_FieldFeatureScale(InFieldId, InPar); }
+	if (InFieldId == UNI_FIELD_CLUSTER)
+	{
+		// 0.3 of the local log-density length: max(r, core) for the body; for each clump, a
+		// quarter of max(distance to its centre, its radius) (a Plummer's log-density length is
+		// about d / 5 far out, a near it). D-157: before, every step inside 0.7 of the centre was
+		// capped at 0.3 clump radii (0.008..0.018 field units), 80..190 steps per ray across a
+		// cluster, the volume pass's main cost when facing one; now the steps shrink only near
+		// a clump.
+		const float R = sqrt(dot(InP, InP));
+		float S = 0.3f * max(R, max(InPar.A.x, 1.0e-4f)) * min(max(InPar.A.z, 0.05f), max(InPar.A.y, 0.05f));
+		const uint NClumps = min((uint)max(InPar.B.x, 0.0f), UNI_CLUSTER_MAX_CLUMPS);
+		if (NClumps > 0u && InPar.B.y > 0.0f && R < 0.7f)
+		{
+			const float A = max(InPar.B.z, 1.0e-4f);
+			const uint Seed = (uint)max(InPar.B.w, 0.0f);
+			for (uint K = 0u; K < NClumps; ++K)
+			{
+				const float3 Dv = InP - Uni_ClusterClumpCentre(Seed, K);
+				S = min(S, 0.25f * max(sqrt(dot(Dv, Dv)), A));
+			}
+		}
+		return min(max(S, 1.0e-4f), 0.1f);
+	}
 	return 0.25f;
+}
+
+/** D-160: the cluster step hint with its clump centres given (as UniField_ClusterC). */
+UNI_FN float Uni_ClusterStepHintC(float3 InP, FUniFieldParams InPar, float3 InC0, float3 InC1, float3 InC2, float3 InC3)
+{
+	const float R = sqrt(dot(InP, InP));
+	float S = 0.3f * max(R, max(InPar.A.x, 1.0e-4f)) * min(max(InPar.A.z, 0.05f), max(InPar.A.y, 0.05f));
+	const uint NClumps = min((uint)max(InPar.B.x, 0.0f), UNI_CLUSTER_MAX_CLUMPS);
+	if (NClumps > 0u && InPar.B.y > 0.0f && R < 0.7f)
+	{
+		const float A = max(InPar.B.z, 1.0e-4f);
+		for (uint K = 0u; K < NClumps; ++K)
+		{
+			const float3 Dv = InP - (K == 0u ? InC0 : (K == 1u ? InC1 : (K == 2u ? InC2 : InC3)));
+			S = min(S, 0.25f * max(sqrt(dot(Dv, Dv)), A));
+		}
+	}
+	return min(max(S, 1.0e-4f), 0.1f);
+}
+
+/** D-160: the step hint for Uni_FieldSampleFoot. */
+UNI_FN float Uni_FieldStepHintFoot(uint InFieldId, float3 InP, float3 InD, FUniFieldParams InPar, float InFoot)
+{
+	if (InFieldId == UNI_FIELD_GALAXY) { return Uni_GalaxyStepHintFiltered(InP, InD, InPar, InFoot); }
+	if (InFieldId == UNI_FIELD_WEB && Uni_WebIsTextured(InPar)) { return Uni_WebTexStepHint(InPar, InFoot); }
+	return Uni_FieldStepHint(InFieldId, InP, InD, InPar);
 }
 
 #endif // UNI_FIELDS_USH

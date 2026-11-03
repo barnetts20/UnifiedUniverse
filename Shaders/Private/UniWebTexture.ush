@@ -1,0 +1,21 @@
+// UniWebTexture.ush
+// D-164: the web density texture, the one texture the shared cores may sample. Every .usf that
+// includes a core includes this first (after Platform.ush). Cores never name the texture; they
+// call UNI_WEB_TEX_SAMPLE(P, Mip), which the C++ shim (UniHlslShim.h) defines as the same
+// filter over the CPU copy of the same texels, so placement and rendering stay one source.
+//
+// Texture: RGBA16F, cubic, full mip chain, texel (i + 0.5) / N per period. Channels: R walls,
+// G filaments (both mixed over the two lattices), B nodes, A unused (UniCore::FWebTexture).
+// Sampler: wrap on all axes, trilinear with linear mip filtering (UniRenderer binds
+// TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Wrap>). Shaders that never sample a
+// field strip both, so they need no binding.
+
+#ifndef UNI_WEB_TEXTURE_USH
+#define UNI_WEB_TEXTURE_USH
+
+Texture3D<float4> UniWebTexture;
+SamplerState UniWebSampler;
+
+#define UNI_WEB_TEX_SAMPLE(P, Mip) UniWebTexture.SampleLevel(UniWebSampler, (P), (Mip))
+
+#endif // UNI_WEB_TEXTURE_USH

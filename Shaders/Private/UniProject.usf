@@ -10,6 +10,7 @@
 // constant buffer). The cell table carries exact 128-bit deltas (D-104).
 
 #include "/Engine/Public/Platform.ush"
+#include "UniWebTexture.ush"   // D-164: before any core (UniFields.ush samples it)
 #include "Core/UniProject.ush"
 #include "Core/UniSystem.ush"
 
@@ -51,7 +52,11 @@ float3 CameraFraction;
 float ExposureMag;
 float SurfaceLimit;
 float ThetaPixel;
-float GlareGain;
+float SpriteCorePx;       // D-156 sprite style (uu.Sprite.*)
+float SpriteCoreSat;
+float SpriteHaloGain;
+float SpriteHaloGrowthPx;
+float SpriteHaloMaxPx;
 
 [numthreads(64, 1, 1)]
 void MainCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
@@ -72,7 +77,11 @@ void MainCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
 	V.ExposureMag = ExposureMag;
 	V.SurfaceLimit = SurfaceLimit;
 	V.ThetaPixel = ThetaPixel;
-	V.GlareGain = GlareGain;
+	V.CorePx = SpriteCorePx;
+	V.CoreSat = SpriteCoreSat;
+	V.HaloGain = SpriteHaloGain;
+	V.HaloGrowthPx = SpriteHaloGrowthPx;
+	V.HaloMaxPx = SpriteHaloMaxPx;
 	V.SystemArchetypeMask = SystemArchetypeMask;
 
 	const float LevelFade = (float)((Cell.Flags >> 8u) & 255u) / 255.0f;

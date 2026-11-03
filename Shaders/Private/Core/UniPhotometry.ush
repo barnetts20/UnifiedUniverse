@@ -86,15 +86,23 @@ UNI_FN float Uni_LimitingMag(float InDeltaMag)
  *  so an entering cell can be up to w / K closer than N cells. Assigning levels with N - 1/K
  *  makes entering objects lie beyond their relevance radius anyway: they stream in where they
  *  are already invisible, which is the design's no-pop claim, now actually true. */
-static const float UNI_WINDOW_N_EFF = 1.75f;   // UNI_WINDOW_N - 1 / UNI_VELOCITY_LOD_K
+static const float UNI_WINDOW_N_EFF = 1.75f;   // D-162: 5^3 at rest (reach 2 cells = N_eff + 1/K). 4^3 (1.25) measured 3.5-4x the resident objects: see D-162
 
-/** N_L = min(ceil(N_eff * k + 1/K), N_max): equals N at dm = 0 and keeps the same motion slack
- *  when sensitivity scales every relevance radius by k. */
-UNI_FN int Uni_WindowHalfWidth(float InDeltaMag)
+/** D-162: the reach a level's window must cover around the camera, in its cells: the visible
+ *  radius N_eff k plus one frame of motion (1/K). At dm = 0 it is 2 cells: a 5^3 window placed
+ *  by the camera's position in its cell (UniWindow.h, PlaceWindowAxis). Capped at N_max.
+ *  Smaller windows are not cheaper here: levels are octaves, so a smaller N_eff moves each slice
+ *  up to cells twice as wide (D-162 measurement: 4^3 held 3.5-4x the objects of 5^3). */
+UNI_FN float Uni_WindowReach(float InDeltaMag)
 {
 	const float K = Uni_SensitivityScale(InDeltaMag);
-	const float Need = UNI_WINDOW_N_EFF * K + 1.0f / (float)UNI_VELOCITY_LOD_K;
-	return min((int)ceil(Need - 1.0e-5f), UNI_WINDOW_N_MAX);
+	return min(UNI_WINDOW_N_EFF * K + 1.0f / (float)UNI_VELOCITY_LOD_K, (float)UNI_WINDOW_N_MAX);
+}
+
+/** The bounding half-width of a window of that reach: ceil(reach), at most N_max. */
+UNI_FN int Uni_WindowHalfWidth(float InDeltaMag)
+{
+	return min((int)ceil(Uni_WindowReach(InDeltaMag) - 1.0e-5f), UNI_WINDOW_N_MAX);
 }
 
 /** Render-only visibility fade: 1 at m <= m_lim - band, 0 at m >= m_lim (lesson #12). */

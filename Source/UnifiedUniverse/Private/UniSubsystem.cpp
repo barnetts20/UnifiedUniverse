@@ -22,6 +22,75 @@
 #include "Components/DirectionalLightComponent.h"
 #include "InputCoreTypes.h"
 #include "UniScaleLadder.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
+#include "HAL/PlatformTime.h"
+#include "Misc/Paths.h"
+#include "HAL/FileManager.h"
+#include "Interfaces/IPluginManager.h"
+
+#include <algorithm>
+#include <string>
+
+using namespace UniPerf;   // D-157 phase names
+
+// D-151: cluster tuning handles (UniScenes::FClusterTuning). They are a content definition, so they
+// apply when a universe is enabled (uu.Enable), not live. Defaults are the realistic distribution.
+namespace UniClusterCVars
+{
+	const UniScenes::FClusterTuning Defaults;
+	TAutoConsoleVariable<int32> Enable(TEXT("uu.Cluster.Enable"), 1, TEXT("Galaxy clusters in the web scenes (0: field galaxies only, the pre-D-151 universe)."));
+	TAutoConsoleVariable<float> Fraction(TEXT("uu.Cluster.Fraction"), float(Defaults.Fraction), TEXT("Fraction of all galaxies that are cluster members (realistic 0.10-0.15)."));
+	TAutoConsoleVariable<float> MStar(TEXT("uu.Cluster.MStar"), float(Defaults.MStar), TEXT("Cluster luminosity function: characteristic magnitude (brighter: more rich clusters)."));
+	TAutoConsoleVariable<float> Alpha(TEXT("uu.Cluster.Alpha"), float(Defaults.Alpha), TEXT("Cluster luminosity function: slope (more negative: more poor clusters)."));
+	TAutoConsoleVariable<float> BrightMag(TEXT("uu.Cluster.BrightMag"), float(Defaults.BrightMag), TEXT("Magnitude of the richest clusters."));
+	TAutoConsoleVariable<float> FaintMag(TEXT("uu.Cluster.FaintMag"), float(Defaults.FaintMag), TEXT("Magnitude of the poorest clusters. Fainter admits groups, at a residency cost (D-152)."));
+	TAutoConsoleVariable<float> BiasPower(TEXT("uu.Cluster.BiasPower"), float(Defaults.BiasPower), TEXT("Power on the web density for cluster placement (higher: more on filaments)."));
+	TAutoConsoleVariable<float> NodeWeight(TEXT("uu.Cluster.NodeWeight"), float(Defaults.NodeWeight), TEXT("Weight of web nodes (where filaments meet) for cluster placement."));
+	TAutoConsoleVariable<float> RadiusScale(TEXT("uu.Cluster.RadiusScale"), float(Defaults.RadiusScale), TEXT("Multiplies cluster radii."));
+	TAutoConsoleVariable<float> CoreMin(TEXT("uu.Cluster.CoreMin"), float(Defaults.CoreMin), TEXT("Smallest core radius, as a fraction of the influence radius."));
+	TAutoConsoleVariable<float> CoreMax(TEXT("uu.Cluster.CoreMax"), float(Defaults.CoreMax), TEXT("Largest core radius, as a fraction of the influence radius."));
+	TAutoConsoleVariable<int32> MaxClumps(TEXT("uu.Cluster.MaxClumps"), Defaults.MaxClumps, TEXT("Most sub-clumps per cluster (0..4)."));
+	TAutoConsoleVariable<float> ClumpWeight(TEXT("uu.Cluster.ClumpWeight"), float(Defaults.ClumpWeight), TEXT("Largest sub-clump weight."));
+
+	UniScenes::FClusterTuning Read()
+	{
+		UniScenes::FClusterTuning T;
+		T.bEnabled = Enable.GetValueOnGameThread() != 0;
+		T.Fraction = FMath::Clamp(double(Fraction.GetValueOnGameThread()), 0.0, 0.95);
+		T.MStar = MStar.GetValueOnGameThread();
+		T.Alpha = Alpha.GetValueOnGameThread();
+		T.BrightMag = BrightMag.GetValueOnGameThread();
+		T.FaintMag = FMath::Max(double(FaintMag.GetValueOnGameThread()), T.BrightMag + 0.5);
+		T.BiasPower = FMath::Max(double(BiasPower.GetValueOnGameThread()), 0.0);
+		T.NodeWeight = FMath::Max(double(NodeWeight.GetValueOnGameThread()), 0.0);
+		T.RadiusScale = FMath::Clamp(double(RadiusScale.GetValueOnGameThread()), 0.1, 10.0);
+		T.CoreMin = FMath::Clamp(double(CoreMin.GetValueOnGameThread()), 0.01, 0.5);
+		T.CoreMax = FMath::Clamp(double(CoreMax.GetValueOnGameThread()), T.CoreMin, 0.5);
+		T.MaxClumps = FMath::Clamp(MaxClumps.GetValueOnGameThread(), 0, int32(UniHlsl::UNI_CLUSTER_MAX_CLUMPS));
+		T.ClumpWeight = FMath::Max(double(ClumpWeight.GetValueOnGameThread()), 0.0);
+		return T;
+	}
+}
+
+// D-154: travel sensitivity. Speeds in cm/s (100 kpc/s = 3.09e23, 10 Mpc/s = 3.09e25).
+static TAutoConsoleVariable<float> CVarUniTravelSensitivity(TEXT("uu.TravelSensitivity"), 2.5f, TEXT("Most sensitivity (mag) added while travelling fast (0: off). D-154."));
+static TAutoConsoleVariable<float> CVarUniTravelStart(TEXT("uu.TravelStart"), 3.0857e23f, TEXT("Speed (cm/s) where travel sensitivity starts (default 100 kpc/s)."));
+static TAutoConsoleVariable<float> CVarUniTravelFull(TEXT("uu.TravelFull"), 3.0857e25f, TEXT("Speed (cm/s) where travel sensitivity is full (default 10 Mpc/s)."));
+
+// D-157: instrumentation and volume march quality.
+static TAutoConsoleVariable<int32> CVarUniPerfHud(TEXT("uu.PerfHud"), 0, TEXT("Show the universe's per-phase cost on screen (D-157)."));
+static TAutoConsoleVariable<float> CVarUniPerfHitchMs(TEXT("uu.PerfHitchMs"), 50.0f, TEXT("Log the breakdown of any frame whose universe work on the game thread exceeds this many ms (0: off)."));
+static TAutoConsoleVariable<int32> CVarUniVolumeMaxSteps(TEXT("uu.VolumeMaxSteps"), 512, TEXT("Volume march step budget per ray (fewer: faster, a long ray may stop short; uu.VolumeDebug 1 shows truncation in magenta)."));
+static TAutoConsoleVariable<float> CVarUniVolumeStepRatio(TEXT("uu.VolumeStepRatio"), 0.08f, TEXT("Volume march step as a fraction of the distance along the ray, before each field's own step limit (larger: faster, coarser)."));
+static TAutoConsoleVariable<int32> CVarUniVolumePrefilter(TEXT("uu.VolumePrefilter"), 1, TEXT("D-160: march galaxies prefiltered over the pixel footprint (thin disc and arms averaged, no supersampling for them). 0: the D-130 supersampling."));
+static TAutoConsoleVariable<int32> CVarUniVolumeLutStart(TEXT("uu.VolumeLutStart"), 1, TEXT("D-160: emission-only carriers start marching where their unresolved light becomes significant, not at 1 pc. 0: from 1 pc."));
+// D-164: the cosmic web from a baked texture.
+static TAutoConsoleVariable<int32> CVarUniWebSource(TEXT("uu.WebSource"), 1, TEXT("D-164: the cosmic web's density. 1: a 3D texture with mips (uu.WebTexture) (placement and the volume read the same texels; much cheaper to march). 0: the procedural lattices (D-012). Applies at uu.Enable; switching rerolls the web's galaxies."));
+static TAutoConsoleVariable<FString> CVarUniWebTexture(TEXT("uu.WebTexture"), TEXT("web_adhesion_density_mid"), TEXT("D-165: which web texture uu.WebSource 1 uses: a texture delivered by the noise project in Plugins/UnifiedUniverse/Data/Noise (web_adhesion_density_young / _mid / _old), or standin (the procedural web baked here). Applies at uu.Enable; rerolls the web."));
+static TAutoConsoleVariable<int32> CVarUniWebTexSize(TEXT("uu.WebTexSize"), 128, TEXT("D-164: stand-in web texture texels per period (power of two, 32..512). 128: 0.78 Mpc texels for the demo's 100 Mpc period."));
+static TAutoConsoleVariable<int32> CVarUniWebTexSupersample(TEXT("uu.WebTexSupersample"), 2, TEXT("D-164: samples per texel axis when baking the stand-in web texture (1..4)."));
+
+static TAutoConsoleVariable<int32> CVarUniVolumeMaxSubsamples(TEXT("uu.VolumeMaxSubsamples"), 8, TEXT("Most rays per pixel axis where a small carrier is supersampled (1: never supersample; 8: up to 64 rays)."));
 
 namespace
 {
@@ -30,6 +99,15 @@ namespace
 	constexpr double kAnchorRecentre = 1.0e8;
 
 	TWeakObjectPtr<UUniSubsystem> GLastSubsystem;
+
+	/** D-157: adds the scope's wall time (ms) to a slot. */
+	struct FPerfTimer
+	{
+		double& Out;
+		uint64 Start;
+		explicit FPerfTimer(double& InOut) : Out(InOut), Start(FPlatformTime::Cycles64()) {}
+		~FPerfTimer() { Out += FPlatformTime::ToMilliseconds64(FPlatformTime::Cycles64() - Start); }
+	};
 }
 
 bool UUniSubsystem::ShouldCreateSubsystem(UObject* Outer) const
@@ -69,7 +147,11 @@ void UUniSubsystem::EnableUniverse(const FString& Scene)
 		return;
 	}
 	SceneName = Scene.IsEmpty() ? TEXT("galaxy") : Scene.ToLower();
-	UniCore::FUniverseDef Def = SceneName == TEXT("web") ? UniScenes::WebToGalaxy() : (SceneName == TEXT("flythrough") ? UniScenes::Flythrough() : UniScenes::GalaxyToStar());
+	ClusterTuning = UniClusterCVars::Read();
+	Travel.Current = 0.0;
+	bCameraJumped = true;
+	UniCore::FUniverseDef Def = SceneName == TEXT("web") ? UniScenes::WebToGalaxy(ClusterTuning) : (SceneName == TEXT("flythrough") ? UniScenes::Flythrough(ClusterTuning) : UniScenes::GalaxyToStar());
+	SetupWebTexture(Def);   // D-164: before the model, which bakes the definition's parameters
 	Model = MakeUnique<UniCore::FUniverseModel>(MoveTemp(Def));
 	for (const std::string& Problem : Model->Validate())
 	{
@@ -149,10 +231,103 @@ void UUniSubsystem::DisableUniverse()
 	Backend.Reset();       // flushes rendering commands: in-flight requests are released safely
 	Generator.Reset();
 	Model.Reset();
+	UniCore::BindWebTexture(nullptr);   // D-164: after everything that samples it on the CPU
+	WebTexture.Reset();
+}
+
+void UUniSubsystem::SetupWebTexture(UniCore::FUniverseDef& Def)
+{
+	// D-164 / D-165: a universe with a cosmic web gets its texture, and its web emitters switch to
+	// it. Placement on the CPU (normalising integrals) and on the GPU, and the volume, then all
+	// read the same texels. uu.WebTexture names a texture delivered by the noise project
+	// (Plugins/UnifiedUniverse/Data/Noise/<name>.bin + <name>_mips.bin, not tracked in git), or
+	// "standin" for the procedural web baked here (cached in Saved/).
+	UniCore::BindWebTexture(nullptr);
+	WebTexture.Reset();
+	UniCore::FWebBakeKey Key;
+	if (CVarUniWebSource.GetValueOnGameThread() == 0 || !UniCore::FindWebKey(Def, 128u, 1u, Key))
+	{
+		FUniRenderer::Get().SetWebTexture_GameThread(0u, {});
+		return;
+	}
+	TUniquePtr<UniCore::FWebTexture> T = MakeUnique<UniCore::FWebTexture>();
+	const FString Name = CVarUniWebTexture.GetValueOnGameThread().TrimStartAndEnd();
+	const double T0 = FPlatformTime::Seconds();
+	int32 Switched = 0;
+	if (!Name.Equals(TEXT("standin"), ESearchCase::IgnoreCase))
+	{
+		// D-165: a delivered texture. Missing, the universe has no web emitters at all: no web
+		// galaxies and no web glow (fail closed), with this error, never the procedural web in its
+		// place.
+		const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("UnifiedUniverse"));
+		const FString Dir = FPaths::ConvertRelativePathToFull((Plugin.IsValid() ? Plugin->GetBaseDir() : FPaths::ProjectPluginsDir() / TEXT("UnifiedUniverse")) / TEXT("Data") / TEXT("Noise"));
+		std::string Err;
+		if (!UniCore::FWebTexture::LoadDelivered(TCHAR_TO_UTF8(*Dir), TCHAR_TO_UTF8(*Name), *T, &Err))
+		{
+			UE_LOG(LogUnifiedUniverse, Error, TEXT("UnifiedUniverse: web texture '%s' not loaded (%s). The web shows nothing until it is there: regenerate it with the noise project (NoiseVolumeTileCli --set %s) into %s, or set uu.WebTexture standin / uu.WebSource 0."),
+				*Name, UTF8_TO_TCHAR(Err.c_str()), *Name, *Dir);
+			Def.RootEmitters.erase(std::remove_if(Def.RootEmitters.begin(), Def.RootEmitters.end(),
+				[](const UniCore::FUniEmitter& E) { return E.FieldId == UniHlsl::UNI_FIELD_WEB; }), Def.RootEmitters.end());
+			FUniRenderer::Get().SetWebTexture_GameThread(0u, {});
+			return;
+		}
+		const UniHlsl::float4 Mean = T->Mean();
+		const double Total = double(Mean.x) + Mean.y + Mean.z + Mean.w;
+		const double NodeShare = Total > 0.0 ? double(Mean.z) / Total : 0.0;
+		// D-167: clusters from the node list when it is there (else from the node channel).
+		std::vector<UniCore::FWebNode> Nodes;
+		std::string NodeErr;
+		const bool bNodes = UniCore::LoadWebNodes(TCHAR_TO_UTF8(*Dir), TCHAR_TO_UTF8(*Name), Nodes, &NodeErr);
+		Switched = UniScenes::UseDeliveredWeb(Def, ClusterTuning, T->Size, NodeShare, bNodes ? &Nodes : nullptr);
+		UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: web texture '%s' %u^3 loaded (%.2f s); matter: walls %.3f, filaments %.3f, nodes %.3f, void %.3f; 200 Mpc tile"),
+			*Name, T->Size, FPlatformTime::Seconds() - T0, Mean.x, Mean.y, Mean.z, Mean.w);
+		if (bNodes && !Def.Catalogues.empty())
+		{
+			UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: clusters: the %d heaviest of %d nodes per tile (rank-mapped to the cluster luminosity function; members uu.Cluster.Fraction of galaxies)"), int32(Def.Catalogues[0].Entries.size()), int32(Nodes.size()));
+		}
+		else
+		{
+			UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: clusters from the node matter channel (%s); members %.1f%% of galaxies (the node share)"), bNodes ? TEXT("clusters disabled") : UTF8_TO_TCHAR(NodeErr.c_str()), 100.0 * NodeShare);
+		}
+	}
+	else
+	{
+		const int32 Size = int32(FMath::RoundUpToPowerOfTwo(uint32(FMath::Clamp(CVarUniWebTexSize.GetValueOnGameThread(), 32, 512))));
+		const int32 SS = FMath::Clamp(CVarUniWebTexSupersample.GetValueOnGameThread(), 1, 4);
+		UniCore::FindWebKey(Def, uint32(Size), uint32(SS), Key);
+		const FString Dir = FPaths::ProjectSavedDir() / TEXT("UnifiedUniverse");
+		IFileManager::Get().MakeDirectory(*Dir, true);
+		const FString Path = Dir / FString::Printf(TEXT("WebTexture_%016llx.uweb"), (unsigned long long)Key.Hash());
+		const std::string PathUtf8 = TCHAR_TO_UTF8(*Path);
+		if (UniCore::FWebTexture::Load(PathUtf8, Key, *T))
+		{
+			UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: stand-in web texture %d^3 loaded from %s (%.2f s)"), Size, *Path, FPlatformTime::Seconds() - T0);
+		}
+		else
+		{
+			*T = UniCore::FWebTexture::Bake(Key);
+			const bool bSaved = T->Save(PathUtf8);
+			UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: stand-in web texture %d^3 baked in %.1f s (%d samples per texel)%s"), Size, FPlatformTime::Seconds() - T0, SS * SS * SS,
+				bSaved ? *FString::Printf(TEXT(", cached at %s"), *Path) : TEXT(", NOT cached"));
+		}
+		Switched = UniCore::EnableWebTexture(Def, Key);
+	}
+	TArray<TArray<FUintVector2>> Mips;
+	for (uint32 M = 0; M < T->NumMips(); ++M)
+	{
+		TArray<FUintVector2>& A = Mips.AddDefaulted_GetRef();
+		A.SetNumUninitialized(int32(T->TexelCount(M)));
+		FMemory::Memcpy(A.GetData(), T->Mips[M].data(), T->Mips[M].size() * sizeof(uint16));   // RGBA16F: two halves per uint, little endian
+	}
+	FUniRenderer::Get().SetWebTexture_GameThread(T->Size, MoveTemp(Mips));
+	WebTexture = MoveTemp(T);
+	UniCore::BindWebTexture(WebTexture.Get());
+	UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: %d web emitter(s) use the web texture (uu.WebSource 0: procedural)"), Switched);
 }
 
 void UUniSubsystem::SetCamera(const FUniCoord& Coord)
 {
+	bCameraJumped = true;   // D-154: a jump is not travel speed
 	Camera = Coord;
 	CameraFraction = FVector3f::ZeroVector;
 }
@@ -176,7 +351,8 @@ void UUniSubsystem::SetVelocity(const FVector& CmPerSecond)
 void UUniSubsystem::SetSensitivity(float InDeltaMag)
 {
 	DeltaMag = FMath::Clamp(InDeltaMag, -5.0f, 5.0f);
-	if (Streamer) { Streamer->DeltaMag = DeltaMag; }
+	EffectiveDeltaMag = FMath::Clamp(DeltaMag + float(Travel.Current), -5.0f, 5.0f);
+	if (Streamer) { Streamer->DeltaMag = EffectiveDeltaMag; }
 }
 
 FVector UUniSubsystem::GetViewLocation(FRotator* OutRotation) const
@@ -234,11 +410,11 @@ void UUniSubsystem::DrawHud(double Speed) const
 	if (!GEngine) { return; }
 	const UniCore::FDelta FromOrigin = UniCore::Sub(Camera.ToCore(), UniCore::FCoord::Origin());
 	const double R = UniCore::Length(UniCore::ToDouble(FromOrigin));
-	const FString Line = FString::Printf(TEXT("UU %s  speed %s/s (%.3g cm/s)%s  |  %s from the demo origin  |  dm %+.1f  exposure %+.1f  |  t %.4g s (x%.3g)  systems %d, planets %d, promoted %d"),
+	const FString Line = FString::Printf(TEXT("UU %s  speed %s/s (%.3g cm/s)%s  |  %s from the demo origin  |  dm %+.1f (travel %+.1f)  exposure %+.1f  |  t %.4g s (x%.3g)  systems %d, planets %d, promoted %d"),
 		bFreeFly ? (MotionMode == EUniMotionMode::Local ? TEXT("FLY (local: real space, physics)") : TEXT("FLY (cruise)")) : TEXT("CRUISE"),
 		UTF8_TO_TCHAR(UniCore::FormatDistance(Speed).c_str()), Speed,
 		bFreeFly ? TEXT("  [WASD/QE move, wheel x2 / x0.5]") : TEXT(""),
-		UTF8_TO_TCHAR(UniCore::FormatDistance(R).c_str()), DeltaMag, ExposureBias,
+		UTF8_TO_TCHAR(UniCore::FormatDistance(R).c_str()), EffectiveDeltaMag, Travel.Current, ExposureBias,
 		UniverseTime, TimeScale, Systems ? int32(Systems->ActiveSystems().size()) : 0, Systems ? int32(Systems->PlanetCount()) : 0, int32(Promoter.Promoted().size()));
 	GEngine->AddOnScreenDebugMessage(int32(0x5EED0001), 0.0f, FColor(120, 220, 255), Line);
 }
@@ -285,6 +461,10 @@ void UUniSubsystem::StartFlythrough(float Seconds)
 void UUniSubsystem::Tick(float DeltaTime)
 {
 	if (!bEnabled || !Streamer) { return; }
+	TRACE_CPUPROFILER_EVENT_SCOPE(Uni_Tick);
+	for (double& M : PerfMs) { M = 0.0; }
+	{
+	FPerfTimer TickTimer(PerfMs[PerfTick]);
 	++FrameCounter;
 	FRotator ViewRot;
 	FVector ViewLoc = GetViewLocation(&ViewRot);   // updated below if the pawn is moved or re-centred this frame
@@ -380,15 +560,138 @@ void UUniSubsystem::Tick(float DeltaTime)
 	Camera = FUniCoord::Make(C);
 	CameraFraction = FVector3f(Frac.X, Frac.Y, Frac.Z);
 
-	Streamer->DeltaMag = DeltaMag;
+	// D-154: travel sensitivity from the camera's actual speed this frame (any motion mode; jumps
+	// excluded), added to the owner's sensitivity and applied everywhere sensitivity is.
+	{
+		const double Dt = FMath::Max(double(DeltaTime), 1.0e-4);
+		const double Speed = bCameraJumped ? 0.0 : UniCore::Length(UniCore::ToDouble(UniCore::Sub(C, PrevCamera.ToCore()))) / Dt;
+		Travel.MaxDeltaMag = FMath::Clamp(double(CVarUniTravelSensitivity.GetValueOnGameThread()), 0.0, 5.0);
+		Travel.StartCmPerS = FMath::Max(double(CVarUniTravelStart.GetValueOnGameThread()), 1.0);
+		Travel.FullCmPerS = FMath::Max(double(CVarUniTravelFull.GetValueOnGameThread()), Travel.StartCmPerS * 1.01);
+		Travel.Update(Speed, Dt);
+		EffectiveDeltaMag = FMath::Clamp(DeltaMag + float(Travel.Current), -5.0f, 5.0f);
+		PrevCamera = Camera;
+		bCameraJumped = false;
+	}
+	Streamer->DeltaMag = EffectiveDeltaMag;
+	{
+		// D-168: contributors the volume builder will ask for (above its reject angle) stay awake:
+		// half that angle, from last frame's pixel size (as the builder uses).
+		const double ThetaPx = double(FUniRenderer::Get().Stats.ThetaPixelLastFrame.load());
+		const double Reject = 0.5 * FMath::Min(double(UniHlsl::UNI_VOL_HANDOFF_PX) * ThetaPx, double(UniHlsl::UNI_THETA_PROMOTE));
+		Streamer->WakeTheta = FMath::Max(0.5 * Reject, 1.0e-6);
+	}
 	UniverseTime += double(DeltaTime) * TimeScale;   // B-002: orbits are on rails at this clock
-	Streamer->Update(C);
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(Uni_StreamerUpdate);
+		FPerfTimer T(PerfMs[PerfStreamer]);
+		Streamer->Update(C);
+	}
 	// M3: bodies close enough become actors, and every parallax-placed actor follows the camera
 	// that just moved (same frame, same camera: no lag against the backdrop at any speed).
-	UpdatePromotion();
-	UpdateParallax(ViewLoc);
-	UpdateLightRig();
-	PushFrame();
+	{ TRACE_CPUPROFILER_EVENT_SCOPE(Uni_Promotion); FPerfTimer T(PerfMs[PerfPromotion]); UpdatePromotion(); }
+	{ TRACE_CPUPROFILER_EVENT_SCOPE(Uni_Parallax); FPerfTimer T(PerfMs[PerfParallax]); UpdateParallax(ViewLoc); }
+	{ TRACE_CPUPROFILER_EVENT_SCOPE(Uni_LightRig); FPerfTimer T(PerfMs[PerfLightRig]); UpdateLightRig(); }
+	{ TRACE_CPUPROFILER_EVENT_SCOPE(Uni_PushFrame); FPerfTimer T(PerfMs[PerfPushFrame]); PushFrame(); }
+	}
+	RecordPerf();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Instrumentation (D-157)
+// ---------------------------------------------------------------------------------------------
+
+const TCHAR* UUniSubsystem::PerfPhaseName(int32 Phase)
+{
+	switch (Phase)
+	{
+	case PerfTick: return TEXT("tick (all)");
+	case PerfStreamer: return TEXT("streamer");
+	case PerfPromotion: return TEXT("promotion");
+	case PerfParallax: return TEXT("parallax");
+	case PerfLightRig: return TEXT("light rig");
+	case PerfPushFrame: return TEXT("push frame");
+	case PerfSystems: return TEXT("  systems");
+	case PerfVolumeBuild: return TEXT("  volume build");
+	default: return TEXT("?");
+	}
+}
+
+FString UUniSubsystem::StreamBreakdown(const UniCore::FStreamProfile& P) const
+{
+	FString S;
+	for (int32 I = 0; I < int32(UniCore::EStreamPhase::Count); ++I)
+	{
+		if (P.Ms[I] < 0.05) { continue; }
+		const char* Name = UniCore::StreamPhaseName(UniCore::EStreamPhase(I));
+		S += FString::Printf(TEXT("%s%s %.1f"), S.IsEmpty() ? TEXT("") : TEXT(", "), UTF8_TO_TCHAR(Name + 11), P.Ms[I]);   // drop "Uni.Stream."
+	}
+	S += FString::Printf(TEXT(" | cells submitted %llu (tasks %llu), overlap tests %llu, growth checks %llu, read back %llu objects, contributors +%llu -%llu (awake %llu, asleep %llu; woke %llu, slept %llu), gathered %llu, batch-cell scans %llu, cell table %llu"),
+		P.CellsSubmitted, P.TasksSubmitted, P.OverlapTests, P.GrowthChecks, P.ObjectsReadBack, P.ContributorsAdded, P.ContributorsRemoved, P.Awake, P.Asleep, P.Woken, P.Slept, P.Gathered, P.BatchCellScans, P.CellTableEntries);
+	return S;
+}
+
+void UUniSubsystem::RecordPerf()
+{
+	if (!Streamer) { return; }
+	StreamLast = Streamer->Profile;
+	const double A = PerfFrames == 0 ? 1.0 : 0.05;   // ~20-frame average
+	for (int32 I = 0; I < PerfCount; ++I)
+	{
+		PerfAvg[I] += A * (PerfMs[I] - PerfAvg[I]);
+		PerfPeak[I] = FMath::Max(PerfPeak[I], PerfMs[I]);
+	}
+	for (int32 I = 0; I < int32(UniCore::EStreamPhase::Count); ++I) { StreamAvg[I] += A * (StreamLast.Ms[I] - StreamAvg[I]); }
+	if (PerfMs[PerfTick] >= StreamWorstTickMs) { StreamWorstTickMs = PerfMs[PerfTick]; StreamWorst = StreamLast; }
+	++PerfFrames;
+	const float Hitch = CVarUniPerfHitchMs.GetValueOnGameThread();
+	if (Hitch > 0.0f && PerfMs[PerfTick] > double(Hitch))
+	{
+		++PerfHitches;
+		UE_LOG(LogUnifiedUniverse, Warning, TEXT("UnifiedUniverse: hitch %.1f ms on the game thread (streamer %.1f, push frame %.1f [systems %.1f, volume build %.1f], promotion %.1f) | streamer: %s"),
+			PerfMs[PerfTick], PerfMs[PerfStreamer], PerfMs[PerfPushFrame], PerfMs[PerfSystems], PerfMs[PerfVolumeBuild], PerfMs[PerfPromotion], *StreamBreakdown(StreamLast));
+	}
+	if (CVarUniPerfHud.GetValueOnGameThread() != 0) { DrawPerfHud(); }
+}
+
+void UUniSubsystem::DrawPerfHud() const
+{
+	if (!GEngine) { return; }
+	const FUniRenderStats& R = FUniRenderer::Get().Stats;
+	FString L1 = TEXT("UU perf (ms, avg / peak since uu.Perf):");
+	for (int32 I = 0; I < PerfCount; ++I) { L1 += FString::Printf(TEXT("  %s %.1f/%.1f"), PerfPhaseName(I), PerfAvg[I], PerfPeak[I]); }
+	FString L2 = TEXT("UU streamer avg:");
+	for (int32 I = 0; I < int32(UniCore::EStreamPhase::Count); ++I)
+	{
+		if (StreamAvg[I] < 0.05) { continue; }
+		L2 += FString::Printf(TEXT("  %s %.1f"), UTF8_TO_TCHAR(UniCore::StreamPhaseName(UniCore::EStreamPhase(I)) + 11), StreamAvg[I]);
+	}
+	const UniCore::FStreamProfile& P = StreamLast;
+	const FString L3 = FString::Printf(TEXT("UU work: sprites %u, cells drawn %u, carriers %u, contributors %llu | this frame: submitted %llu cells / %llu tasks, %llu overlap tests, read back %llu, +%llu -%llu contributors | hitches %llu"),
+		R.SpritesLastFrame.load(), R.CellsLastFrame.load(), R.VolumeCarriersLastFrame.load(), uint64(Streamer ? Streamer->Contributors().size() : 0),
+		P.CellsSubmitted, P.TasksSubmitted, P.OverlapTests, P.ObjectsReadBack, P.ContributorsAdded, P.ContributorsRemoved, PerfHitches);
+	GEngine->AddOnScreenDebugMessage(int32(0x5EED0011), 0.0f, FColor(255, 210, 120), L1);
+	GEngine->AddOnScreenDebugMessage(int32(0x5EED0012), 0.0f, FColor(255, 210, 120), L2);
+	GEngine->AddOnScreenDebugMessage(int32(0x5EED0013), 0.0f, FColor(255, 210, 120), L3);
+}
+
+void UUniSubsystem::LogPerf()
+{
+	if (!Streamer) { UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: disabled")); return; }
+	const FUniRenderStats& R = FUniRenderer::Get().Stats;
+	UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse perf over %llu frames (game thread, ms; avg ~20 frames / peak since the last uu.Perf), %llu hitches over uu.PerfHitchMs:"), PerfFrames, PerfHitches);
+	for (int32 I = 0; I < PerfCount; ++I) { UE_LOG(LogUnifiedUniverse, Log, TEXT("  %-14s %7.2f / %7.2f"), PerfPhaseName(I), PerfAvg[I], PerfPeak[I]); }
+	FString Avg;
+	for (int32 I = 0; I < int32(UniCore::EStreamPhase::Count); ++I) { Avg += FString::Printf(TEXT("%s%s %.2f"), Avg.IsEmpty() ? TEXT("") : TEXT(", "), UTF8_TO_TCHAR(UniCore::StreamPhaseName(UniCore::EStreamPhase(I)) + 11), StreamAvg[I]); }
+	UE_LOG(LogUnifiedUniverse, Log, TEXT("  streamer avg: %s"), *Avg);
+	UE_LOG(LogUnifiedUniverse, Log, TEXT("  worst frame (%.1f ms) streamer: %s"), StreamWorstTickMs, *StreamBreakdown(StreamWorst));
+	UE_LOG(LogUnifiedUniverse, Log, TEXT("  last frame streamer: %s"), *StreamBreakdown(StreamLast));
+	UE_LOG(LogUnifiedUniverse, Log, TEXT("  render: %u sprites, %u cells drawn, %u volume carriers, %u background faces marched so far; %llu contributors registered. GPU pass times: ProfileGPU (Ctrl+Shift+,)"),
+		R.SpritesLastFrame.load(), R.CellsLastFrame.load(), R.VolumeCarriersLastFrame.load(), R.BackgroundFacesMarched.load(), uint64(Streamer->Contributors().size()));
+	for (double& Pk : PerfPeak) { Pk = 0.0; }
+	StreamWorstTickMs = 0.0;
+	StreamWorst = UniCore::FStreamProfile();
+	PerfHitches = 0;
 }
 
 void UUniSubsystem::PushFrame()
@@ -402,6 +705,8 @@ void UUniSubsystem::PushFrame()
 	// frame that produced them (2-4 frames ago), so the last few tables' keys are kept.
 	if (Systems)
 	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(Uni_Systems);
+		FPerfTimer SysTimer(PerfMs[PerfSystems]);
 		const UniCore::FCoord Cam = Camera.ToCore();
 		TArray<FUniActivation> Acts;
 		FUniRenderer::Get().DrainActivations_GameThread(Acts);
@@ -423,20 +728,27 @@ void UUniSubsystem::PushFrame()
 		F.SystemArchetypeMask = SystemArchetypeMask;
 	}
 	F.CameraFraction = CameraFraction;
-	F.DeltaMag = DeltaMag;
+	F.DeltaMag = EffectiveDeltaMag;   // D-154: owner sensitivity + travel boost
 	F.ExposureBias = ExposureBias;
 	F.bEnabled = true;
 	F.FrameNumber = FrameCounter;
 	if (bVolume && VolumeBuilder)
 	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(Uni_VolumeBuild);
+		FPerfTimer VolTimer(PerfMs[PerfVolumeBuild]);
 		// The carriers' handoff weights use the same view quantities as project-and-cull.
 		UniHlsl::FUniView V{};
-		V.LimitingMag = UniHlsl::Uni_LimitingMag(DeltaMag);
-		V.SurfaceLimit = UniHlsl::UNI_MU_REF + FMath::Clamp(DeltaMag, -5.0f, 5.0f);
+		V.LimitingMag = UniHlsl::Uni_LimitingMag(EffectiveDeltaMag);
+		V.SurfaceLimit = UniHlsl::UNI_MU_REF + FMath::Clamp(EffectiveDeltaMag, -5.0f, 5.0f);
 		V.ExposureMag = V.LimitingMag - 1.0f + ExposureBias;
 		V.ThetaPixel = FUniRenderer::Get().Stats.ThetaPixelLastFrame.load();
 		const UniCore::FCoord Cam = Camera.ToCore();
-		const UniCore::FVolumeSettings Settings;
+		UniCore::FVolumeSettings Settings;   // D-157: march quality from the console
+		Settings.MaxSteps = UniCore::u32(FMath::Clamp(CVarUniVolumeMaxSteps.GetValueOnGameThread(), 16, 4096));
+		Settings.StepRatio = FMath::Clamp(CVarUniVolumeStepRatio.GetValueOnGameThread(), 0.005f, 1.0f);
+		Settings.MaxSubsamples = UniCore::u32(FMath::Clamp(CVarUniVolumeMaxSubsamples.GetValueOnGameThread(), 1, 8));
+		Settings.bPrefilter = CVarUniVolumePrefilter.GetValueOnGameThread() != 0;
+		Settings.bLutStart = CVarUniVolumeLutStart.GetValueOnGameThread() != 0;
 		const UniCore::FVolumeScene Sc = VolumeBuilder->Build(*Streamer, Cam, UniCore::FVec3f{ CameraFraction.X, CameraFraction.Y, CameraFraction.Z }, V, Settings);
 		for (const UniCore::FCarrierGPU& C : Sc.Carriers)
 		{
@@ -479,7 +791,7 @@ void UUniSubsystem::LogStats() const
 	const UniCore::FUniStreamer::FStats S = Streamer->Stats();
 	const FUniRenderStats& R = FUniRenderer::Get().Stats;
 	UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: scene '%s' mode %s dm %.1f | cells ready %llu pending %llu | pool %llu / %u | batches %llu (gpu done %u failed %u) | regenerations %llu | max gather %llu | alloc failures %llu | worst latency %llu frames | last frame: %u cells drawn, %u promotion candidates | camera %s"),
-		*SceneName, MotionMode == EUniMotionMode::Cruise ? TEXT("Cruise") : TEXT("Local"), DeltaMag,
+		*SceneName, MotionMode == EUniMotionMode::Cruise ? TEXT("Cruise") : TEXT("Local"), EffectiveDeltaMag,
 		uint64(S.CellsReady), uint64(S.CellsPending), uint64(S.PoolUsed), Backend ? Backend->PoolCapacity() : 0u,
 		uint64(S.Batches), R.GenBatchesCompleted.load(), R.GenBatchesFailed.load(), uint64(S.Regenerations), uint64(S.MaxGather),
 		uint64(S.AllocFailures), uint64(S.MaxLatencyFrames), R.CellsLastFrame.load(), R.PromoteCandidatesLastFrame.load(), *Camera.ToHexString());
@@ -502,7 +814,8 @@ void UUniSubsystem::LogStats() const
 // Promotion and real space (M3, D-146, D-147)
 // ---------------------------------------------------------------------------------------------
 
-static TAutoConsoleVariable<int32> CVarUniLightRig(TEXT("uu.LightRig"), 1, TEXT("M3 placeholder: a movable directional light from the nearest active star, so promoted planets are lit (0 off)."));
+static TAutoConsoleVariable<int32> CVarUniLightRig(
+TEXT("uu.LightRig"), 1, TEXT("M3 placeholder: a movable directional light from the nearest active star, so promoted planets are lit (0 off)."));
 static TAutoConsoleVariable<float> CVarUniLightRigLux(TEXT("uu.LightRigLux"), 10.0f, TEXT("Intensity of the light rig, lux."));
 
 void UUniSubsystem::RegisterParallax(UUniParallaxComponent* C)
@@ -650,6 +963,70 @@ void UUniSubsystem::UpdateLightRig()
 		C->SetLightColor(FLinearColor(Near->Sys.StarRgb[0], Near->Sys.StarRgb[1], Near->Sys.StarRgb[2]));
 		C->SetIntensity(CVarUniLightRigLux.GetValueOnGameThread());
 	}
+}
+
+void UUniSubsystem::LogClusters() const
+{
+	const UniScenes::FClusterTuning& T = ClusterTuning;
+	UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: clusters %s (scene '%s') | fraction %.3f, LF M* %.2f alpha %.2f over %.1f..%.1f, bias power %.2f, node weight %.2f, radius x%.2f, core %.2f..%.2f, clumps <= %d (weight %.2f)"),
+		T.bEnabled ? TEXT("on") : TEXT("off"), *SceneName, T.Fraction, T.MStar, T.Alpha, T.BrightMag, T.FaintMag, T.BiasPower, T.NodeWeight, T.RadiusScale, T.CoreMin, T.CoreMax, T.MaxClumps, T.ClumpWeight);
+	if (!Streamer) { return; }
+	const UniCore::FCoord Cam = Camera.ToCore();
+	int32 N = 0, Rich = 0;
+	double Nearest = 0.0, NearestRich = 0.0;
+	for (const auto& KV : Streamer->Contributors())
+	{
+		const UniCore::FContributor& C = KV.second;
+		if (C.ParentArchetypeId != UniScenes::kCluster) { continue; }
+		const UniCore::FObjectGPU* O = Streamer->FindObject(C.Parent);
+		const double M = O ? double(UniHlsl::Uni_ObjectAbsMag(UniCore::ToHlsl(*O))) : 0.0;
+		const double D = UniCore::Length(UniCore::ToDouble(UniCore::Sub(C.Centre, Cam)));
+		++N;
+		if (N == 1 || D < Nearest) { Nearest = D; }
+		if (M < -25.5) { ++Rich; if (Rich == 1 || D < NearestRich) { NearestRich = D; } }
+	}
+	UE_LOG(LogUnifiedUniverse, Log, TEXT("  %d clusters resident (%d rich, M < -25.5); nearest %s, nearest rich %s. uu.GotoCluster [rich] jumps to one."),
+		N, Rich, N ? UTF8_TO_TCHAR(UniCore::FormatDistance(Nearest).c_str()) : TEXT("-"), Rich ? UTF8_TO_TCHAR(UniCore::FormatDistance(NearestRich).c_str()) : TEXT("-"));
+}
+
+bool UUniSubsystem::GoToCluster(bool bRich)
+{
+	if (!bEnabled || !Streamer) { return false; }
+	const UniCore::FCoord Cam = Camera.ToCore();
+	const UniCore::FContributor* Best = nullptr;
+	double BestD = 0.0, BestM = 0.0;
+	for (const auto& KV : Streamer->Contributors())
+	{
+		const UniCore::FContributor& C = KV.second;
+		if (C.ParentArchetypeId != UniScenes::kCluster) { continue; }
+		const UniCore::FObjectGPU* O = Streamer->FindObject(C.Parent);
+		if (!O) { continue; }
+		const double M = double(UniHlsl::Uni_ObjectAbsMag(UniCore::ToHlsl(*O)));
+		if (bRich && M >= -25.5) { continue; }
+		const double D = UniCore::Length(UniCore::ToDouble(UniCore::Sub(C.Centre, Cam)));
+		if (!Best || D < BestD) { Best = &C; BestD = D; BestM = M; }
+	}
+	if (!Best)
+	{
+		UE_LOG(LogUnifiedUniverse, Warning, TEXT("UnifiedUniverse: no %scluster resident yet (uu.Enable web or flythrough, then give the cluster level a moment to fill)."), bRich ? TEXT("rich ") : TEXT(""));
+		return false;
+	}
+	// 3 influence radii out along the current direction from it (or +x), facing its centre; free
+	// flight at a speed that crosses the cluster in about 10 s.
+	UniCore::FVec3d Dir = UniCore::ToDouble(UniCore::Sub(Cam, Best->Centre));
+	const double L = UniCore::Length(Dir);
+	Dir = L > 0.0 ? UniCore::FVec3d{ Dir.X / L, Dir.Y / L, Dir.Z / L } : UniCore::FVec3d{ 1.0, 0.0, 0.0 };
+	const double Out = 3.0 * Best->InfluenceCm;
+	UniCore::FCoord To = Best->Centre;
+	UniCore::FVec3f Frac{};
+	UniCore::AddDisplacement(To, Frac, UniCore::FVec3d{ Dir.X * Out, Dir.Y * Out, Dir.Z * Out });
+	SetFreeFly(true, 0.2 * Best->InfluenceCm);
+	SetFlySpeed(0.2 * Best->InfluenceCm);
+	SetCamera(FUniCoord::Make(To));
+	if (APlayerController* PC = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr) { PC->SetControlRotation(FVector(-Dir.X, -Dir.Y, -Dir.Z).Rotation()); }
+	UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: jumped to a cluster of M = %.2f (~%.0f galaxies) that was %s away; now %s from its centre."),
+		BestM, Best->NTotal, UTF8_TO_TCHAR(UniCore::FormatDistance(BestD).c_str()), UTF8_TO_TCHAR(UniCore::FormatDistance(Out).c_str()));
+	return true;
 }
 
 void UUniSubsystem::LogSystems() const
@@ -856,7 +1233,20 @@ namespace
 			if (UUniSubsystem* S = Sub(World); S && Args.Num()) { S->SetUniverseTime(FCString::Atod(*Args[0])); }
 		}));
 
-	FAutoConsoleCommandWithWorldAndArgs CmdSystems(TEXT("uu.Systems"), TEXT("Log active star systems and their planets."),
+	FAutoConsoleCommandWithWorldAndArgs CmdClusters(TEXT("uu.Clusters"), TEXT("Log the cluster tuning and the resident clusters (D-151)."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>&, UWorld* World)
+		{
+			if (UUniSubsystem* S = Sub(World)) { S->LogClusters(); }
+		}));
+
+	FAutoConsoleCommandWithWorldAndArgs CmdGotoCluster(TEXT("uu.GotoCluster"), TEXT("uu.GotoCluster [rich]: jump to 3 influence radii from the nearest resident cluster (rich: M < -25.5)."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
+		{
+			if (UUniSubsystem* S = Sub(World)) { S->GoToCluster(Args.Num() > 0 && Args[0].Equals(TEXT("rich"), ESearchCase::IgnoreCase)); }
+		}));
+
+	FAutoConsoleCommandWithWorldAndArgs CmdSystems(TEXT("uu.Systems"),
+ TEXT("Log active star systems and their planets."),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>&, UWorld* World)
 		{
 			if (UUniSubsystem* S = Sub(World)) { S->LogSystems(); }
@@ -872,5 +1262,10 @@ namespace
 		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>&, UWorld* World)
 		{
 			if (UUniSubsystem* S = Sub(World)) { S->LogStats(); }
+		}));
+	FAutoConsoleCommandWithWorldAndArgs CmdPerf(TEXT("uu.Perf"), TEXT("Log the universe's per-phase cost: averages, peaks since the last uu.Perf (then reset), the worst frame's streamer breakdown (D-157)."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>&, UWorld* World)
+		{
+			if (UUniSubsystem* S = Sub(World)) { S->LogPerf(); }
 		}));
 }

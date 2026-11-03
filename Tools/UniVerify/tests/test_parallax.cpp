@@ -179,7 +179,7 @@ UNI_TEST(parallax, promotion)
 		V.Up = H::float3(V.Right.y * V.Forward.z - V.Right.z * V.Forward.y, V.Right.z * V.Forward.x - V.Right.x * V.Forward.z, V.Right.x * V.Forward.y - V.Right.y * V.Forward.x);
 		V.TanHalfFovX = 1.0f; V.TanHalfFovY = 0.5625f;
 		V.LimitingMag = H::Uni_LimitingMag(0.0f); V.SurfaceLimit = H::UNI_MU_REF; V.ExposureMag = V.LimitingMag - 1.0f;
-		V.ThetaPixel = 1.0f / 960.0f; V.GlareGain = 0.35f;
+		V.ThetaPixel = 1.0f / 960.0f; V = H::Uni_SpriteDefaults(V);
 		const H::FUniSprite S = H::Uni_ProjectObject(Dx, Dy, Dz, C.Level, 1.0f, ToHlsl(O), V, Prom.IsPromoted(Giant->Seed));
 		const bool bSprite = (S.Flags & H::UNI_SPRITE_VISIBLE) != 0u;
 		const bool bActor = Prom.IsPromoted(Giant->Seed);
@@ -205,7 +205,7 @@ UNI_TEST(parallax, promotion)
 				}
 			}
 		}
-		const double Ratio = (!bActor && bSprite) ? double(S.AngularRadius) / std::max(double(S.PhysAngularRadius), 1.0e-30) : 0.0;
+		const double Ratio = (!bActor && bSprite) ? double(H::Uni_SpriteFootprint(S)) / std::max(double(S.PhysAngularRadius), 1.0e-30) : 0.0;
 		if (Fr > 0 && bActor && !Was) { GlareRatio = PrevRatio; }   // the frame just before the swap in
 		PrevRatio = Ratio;
 		Was = bActor;
@@ -246,13 +246,27 @@ UNI_TEST(parallax, sprite_profile)
 		if (F == 0.0f && Sigma < 0.8f) { continue; }
 		Worst = std::max(Worst, std::abs(Sum - 1.0));
 		++Cases;
+		// D-156: core + halo sums to 1 + HaloRatio.
+		if (Sigma >= 0.8f && I % 3 == 0)
+		{
+			const float Hs = Sigma * float(1.5 + 3.0 * Rng.Unit());
+			const float Hr = float(0.05 + 2.0 * Rng.Unit());
+			const int Rh = int(std::ceil(std::max(5.0 * Hs, double(Rad))));
+			double SumH = 0.0;
+			for (int Y = -Rh; Y <= Rh; ++Y) for (int X = -Rh; X <= Rh; ++X)
+			{
+				const double Ex = X + 0.5 - Cx, Ey = Y + 0.5 - Cy;
+				SumH += double(H::Uni_SpriteProfileHalo(float(std::sqrt(Ex * Ex + Ey * Ey)), Sigma, F, Hs, Hr, 1.0f));
+			}
+			Worst = std::max(Worst, std::abs(SumH / (1.0 + double(Hr)) - 1.0));
+		}
 	}
 	// The blend: a body's sprite at theta_promote has exactly its physical size.
 	H::FUniView V{};
 	V.Forward = H::float3(1, 0, 0); V.Right = H::float3(0, 1, 0); V.Up = H::float3(0, 0, 1);
 	V.TanHalfFovX = 1.0f; V.TanHalfFovY = 0.5625f;
 	V.LimitingMag = H::Uni_LimitingMag(0.0f); V.SurfaceLimit = H::UNI_MU_REF; V.ExposureMag = V.LimitingMag - 1.0f;
-	V.ThetaPixel = 1.0f / 960.0f; V.GlareGain = 0.35f;
+	V.ThetaPixel = 1.0f / 960.0f; V = H::Uni_SpriteDefaults(V);
 	double WorstAtPromote = 0.0, GlareAtQuarter = 0.0;
 	for (int K = 0; K < 2; ++K)
 	{
@@ -273,10 +287,10 @@ UNI_TEST(parallax, sprite_profile)
 		for (int A = 0; A < 3; ++A) { const FU128 T = Dd.TwosComplement(A); Dl[A] = H::uint4(T.L[0], T.L[1], T.L[2], T.L[3]); }
 		const H::FUniObject Obj = H::Uni_MakeObject(H::uint3(Off[0], Off[1], Off[2]), H::UNI_ARCH_DYNAMIC_PLANET, H::UNI_OBJ_FLAG_EXTENDED, 7u, float(std::log2(R)), -10.0f, H::Uni_SurfaceBrightness(-10.0f, float(std::log2(R))), H::float3(1, 1, 1));
 		const H::FUniSprite S = H::Uni_ProjectObject(Dl[0], Dl[1], Dl[2], 40u, 1.0f, Obj, V, false);
-		if (K == 0) { WorstAtPromote = std::abs(double(S.AngularRadius) / double(S.PhysAngularRadius) - 1.0); }
-		else { GlareAtQuarter = double(S.AngularRadius) / double(S.PhysAngularRadius); }
+		if (K == 0) { WorstAtPromote = std::max(std::abs(double(H::Uni_SpriteFootprint(S)) / double(S.PhysAngularRadius) - 1.0), double(S.HaloRatio)); }
+		else { GlareAtQuarter = double(H::Uni_SpriteFootprint(S)) / double(S.PhysAngularRadius); }
 	}
-	Uni::Check(1, "T1.sprite.profile", "Sprite profile (D-148): sums to 1 over pixels within 2% for Gaussian, disc + halo and full disc, 0.8-80 px; a body's sprite is its true size at theta_promote")
+	Uni::Check(1, "T1.sprite.profile", "Sprite profile (D-148, D-156): sums to 1 (+ the halo's share) over pixels within 2% for Gaussian, disc + glare, full disc and core + halo, 0.8-80 px; a body's sprite is its true size, with no halo, at theta_promote")
 		.Metric("cases", Cases).Metric("worst_energy_err", Worst).Metric("size_err_at_promote", WorstAtPromote).Metric("glare_ratio_at_fifth", GlareAtQuarter)
 		.Pass(Cases > 200 && Worst < 0.02 && WorstAtPromote < 0.005,
 			Uni::Fmt("%d profiles: worst energy error %.2f%%; at theta_promote the sprite is %.3f%% off the body's size (at a fifth of it, still glare-sized: %.2fx)", Cases, 100.0 * Worst, 100.0 * WorstAtPromote, GlareAtQuarter));
@@ -338,31 +352,30 @@ UNI_TEST(parallax, recentre)
 
 UNI_TEST(parallax, arrival)
 {
-	// D-150 (owner): a brightness-boosted sprite keeps its boost far out and is back at its true
-	// perceived size (physical angular radius, never below a pixel) by the time it "arrives":
-	// a star at its system radius, where the planets spawn; anything else at its promotion
-	// distance. Stars from red dwarfs to supergiants, approached from 10^4 x the arrival distance.
+	// D-158 (owner: "a seamless experience at all distances: approach a star and seamlessly
+	// resolve its system and eventually the actual star actor, without any unexpected behaviour
+	// in the way the point of light reads"). On the way in nothing about the point of light may
+	// shrink or dim: its core size, its footprint (glare included) and its total light are all
+	// non-decreasing, from 10^4 x the system radius to the promotion distance. At the swap to the
+	// actor the glare is the same with and without the actor (the actor replaces only the core).
 	H::FUniView V{};
 	V.Forward = H::float3(1, 0, 0); V.Right = H::float3(0, 1, 0); V.Up = H::float3(0, 0, 1);
 	V.TanHalfFovX = 1.0f; V.TanHalfFovY = 0.5625f;
 	V.LimitingMag = H::Uni_LimitingMag(0.0f); V.SurfaceLimit = H::UNI_MU_REF; V.ExposureMag = V.LimitingMag - 1.0f;
-	V.ThetaPixel = 1.0f / 960.0f; V.GlareGain = 0.35f;
+	V.ThetaPixel = 1.0f / 960.0f; V = H::Uni_SpriteDefaults(V);
 	V.SystemArchetypeMask = 1u << UniScenes::kStar;
 	struct FStar { const char* Name; float M; double RSun; };
 	const FStar Stars[] = { { "red dwarf", 10.0f, 0.3 }, { "Sun", 4.83f, 1.0 }, { "giant", 0.0f, 10.0 }, { "supergiant", -7.0f, 500.0 } };
-	double WorstAtArrival = 0.0, MinFarBoost = 1.0e30;
-	int NonMonotone = 0;
+	int Shrinks = 0, Dims = 0, CoreShrinks = 0, GlareStars = 0, Samples = 0;
+	double WorstSwap = 0.0;
 	std::string Detail;
 	for (const FStar& St : Stars)
 	{
 		const double R = St.RSun * 6.957e10;
 		const double Arrive = double(H::Uni_ArrivalDistance(UniScenes::kStar, V.SystemArchetypeMask, St.M, float(R)));
-		double Prev = 1.0e30;
-		double FarBoost = 0.0, AtArrive = 0.0;
-		for (int K = 0; K <= 400; ++K)
+		const double Promote = R / double(H::UNI_THETA_PROMOTE);
+		auto Project = [&](double D, bool bPromoted)
 		{
-			const double D = Arrive * std::pow(10.0, 4.0 - 4.5 * K / 400.0);   // 10^4 x arrival down to 0.3 x
-			if (D < 2.0 * R) { break; }
 			FCoord Cam = CellOrigin(CellOf(FCoord::Origin(), 70));
 			FVec3f Fr{};
 			const FCellKey Kc = CellOf(Cam, 64);
@@ -376,22 +389,112 @@ UNI_TEST(parallax, arrival)
 			const FDelta Dd = Sub(O, Cam);
 			H::uint4 Dl[3];
 			for (int A = 0; A < 3; ++A) { const FU128 T = Dd.TwosComplement(A); Dl[A] = H::uint4(T.L[0], T.L[1], T.L[2], T.L[3]); }
-			const H::FUniObject Obj = H::Uni_MakeObject(H::uint3(Off[0], Off[1], Off[2]), UniScenes::kStar, 0u, 9u, float(std::log2(R)), St.M, 0.0f, H::float3(1, 1, 1));
-			const H::FUniSprite S = H::Uni_ProjectObject(Dl[0], Dl[1], Dl[2], 64u, 1.0f, Obj, V, false);
+			const H::FUniObject Obj = H::Uni_MakeObject(H::uint3(Off[0], Off[1], Off[2]), UniScenes::kStar, bPromoted ? H::UNI_OBJ_FLAG_PROMOTED : 0u, 9u, float(std::log2(R)), St.M, 0.0f, H::float3(1, 1, 1));
+			return H::Uni_ProjectObject(Dl[0], Dl[1], Dl[2], 64u, 1.0f, Obj, V, bPromoted);
+		};
+		double PrevFoot = 0.0, PrevCore = 0.0, PrevLight = 0.0, FootFar = 0.0, FootNear = 0.0;
+		bool bGlare = false;
+		const double DFar = Arrive * 1.0e4;
+		for (int K = 0; K <= 400; ++K)
+		{
+			const double D = DFar * std::pow(Promote * 1.0001 / DFar, K / 400.0);
+			const H::FUniSprite S = Project(D, false);
 			if (!(S.Flags & H::UNI_SPRITE_VISIBLE)) { continue; }
-			const double TrueSize = std::max(double(S.PhysAngularRadius), double(V.ThetaPixel));
-			const double Ratio = double(S.AngularRadius) / TrueSize;
-			if (K == 0) { FarBoost = Ratio; }
-			if (D <= Arrive * 1.0001) { AtArrive = std::max(AtArrive, std::abs(Ratio - 1.0)); }
-			// The boost may only shrink on the way in (a little growth from brightness far out, before the ramp, is fine).
-			if (D < Arrive * H::UNI_ARRIVAL_RANGE && Ratio > Prev * 1.0001) { ++NonMonotone; }
-			Prev = Ratio;
+			++Samples;
+			const double Foot = double(H::Uni_SpriteFootprint(S));
+			const double Core = double(S.AngularRadius);
+			const double Light = double(S.Radiance.x) * (1.0 + double(S.HaloRatio));
+			Shrinks += Foot < PrevFoot * (1.0 - 1.0e-4) ? 1 : 0;
+			CoreShrinks += Core < PrevCore * (1.0 - 1.0e-4) ? 1 : 0;
+			Dims += Light < PrevLight * (1.0 - 1.0e-4) ? 1 : 0;
+			bGlare = bGlare || S.HaloRatio > 0.0f;
+			if (FootFar == 0.0) { FootFar = Foot / double(V.ThetaPixel); }
+			FootNear = Foot / double(V.ThetaPixel);
+			PrevFoot = Foot; PrevCore = Core; PrevLight = Light;
 		}
-		WorstAtArrival = std::max(WorstAtArrival, AtArrive);
-		MinFarBoost = std::min(MinFarBoost, FarBoost);
-		Detail += Uni::Fmt("%s%s: arrives at %s, boost far out %.1fx, at arrival %.4f off true", Detail.empty() ? "" : "; ", St.Name, FormatDistance(Arrive).c_str(), FarBoost, AtArrive);
+		// The swap: the promoted star's sprite is its glare alone, identical to the unpromoted one's.
+		const H::FUniSprite A = Project(Promote * 0.999, false), B = Project(Promote * 0.999, true);
+		const bool bHaloOnly = (B.Flags & H::UNI_SPRITE_VISIBLE) && (B.Flags & H::UNI_SPRITE_HALO_ONLY) && H::Uni_SpriteCoreWeight(B) == 0.0f;
+		const double SwapErr = A.HaloRatio > 0.0f ? (bHaloOnly ? std::max(std::abs(double(B.HaloRadius) / double(A.HaloRadius) - 1.0), std::abs(double(B.Radiance.x * B.HaloRatio) / double(A.Radiance.x * A.HaloRatio) - 1.0)) : 1.0) : 0.0;
+		WorstSwap = std::max(WorstSwap, SwapErr);
+		GlareStars += bGlare ? 1 : 0;
+		Detail += Uni::Fmt("%s%s: footprint %.2f px at %s -> %.1f px at promotion (%s)%s", Detail.empty() ? "" : "; ", St.Name, FootFar, FormatDistance(DFar).c_str(), FootNear, FormatDistance(Promote).c_str(), bGlare ? ", glare" : "");
 	}
-	Uni::Check(1, "T1.sprite.arrival", "Brightness boost fades to the true perceived size by arrival (D-150): stars at their system radius, within 0.1%, monotone over the ramp, still boosted far out")
-		.Metric("worst_at_arrival", WorstAtArrival).Metric("min_far_boost", MinFarBoost).Metric("non_monotone", NonMonotone)
-		.Pass(WorstAtArrival < 1.0e-3 && NonMonotone == 0 && MinFarBoost > 1.2, Detail);
+	Uni::Check(1, "T1.sprite.arrival", "Seamless approach (D-158): from 10^4 x a star's system radius to its promotion, its core, footprint and total light never shrink (0.01%); at the swap the actor keeps the sprite's glare exactly")
+		.Metric("samples", Samples).Metric("footprint_shrinks", Shrinks).Metric("core_shrinks", CoreShrinks).Metric("light_dims", Dims).Metric("glare_stars", GlareStars).Metric("worst_swap_err", WorstSwap)
+		.Pass(Samples > 1000 && Shrinks == 0 && CoreShrinks == 0 && Dims == 0 && GlareStars >= 3 && WorstSwap < 1.0e-5, Detail);
+}
+
+UNI_TEST(parallax, sprite_style)
+{
+	// D-156 (owner): a sprite is a pinpoint core plus a faint, capped halo. Brightness shows as
+	// intensity, not size: the core is the larger of the true size and CorePx at every
+	// brightness, its light saturates (never above the saturation level, untouched well below
+	// it), and the halo only appears above saturation, growing with the doublings of brightness
+	// up to its cap (HaloMax / CorePx x the core). A Sun-like star approached from 3 Mpc to its
+	// promotion distance (the brightness span of a whole flight).
+	H::FUniView V{};
+	V.Forward = H::float3(1, 0, 0); V.Right = H::float3(0, 1, 0); V.Up = H::float3(0, 0, 1);
+	V.TanHalfFovX = 1.0f; V.TanHalfFovY = 0.5625f;
+	V.LimitingMag = H::Uni_LimitingMag(0.0f); V.SurfaceLimit = H::UNI_MU_REF; V.ExposureMag = V.LimitingMag - 1.0f;
+	V.ThetaPixel = 1.0f / 960.0f;
+	V = H::Uni_SpriteDefaults(V);
+	V.SystemArchetypeMask = 1u << UniScenes::kStar;
+	const double R = 6.957e10;
+	const float M = 4.83f;
+	const double Arrive = double(H::Uni_ArrivalDistance(UniScenes::kStar, V.SystemArchetypeMask, M, float(R)));
+	auto Project = [&](const H::FUniView& Vw, double D)
+	{
+		FCoord Cam = CellOrigin(CellOf(FCoord::Origin(), 70));
+		FVec3f Fr{};
+		const FCellKey Kc = CellOf(Cam, 64);
+		const FCoord O = CellOrigin(Kc);
+		FCoord P = O;
+		AddDisplacement(P, Fr, FVec3d{ 1.0e17, 0.0, 0.0 });
+		Cam = P;
+		AddDisplacement(Cam, Fr, FVec3d{ -D, 0.0, 0.0 });
+		u32 Off[3];
+		for (int A = 0; A < 3; ++A) { Off[A] = Shr(Sub(P.Axis(A), O.Axis(A)), 64 - 32).L[3]; }
+		const FDelta Dd = Sub(O, Cam);
+		H::uint4 Dl[3];
+		for (int A = 0; A < 3; ++A) { const FU128 T = Dd.TwosComplement(A); Dl[A] = H::uint4(T.L[0], T.L[1], T.L[2], T.L[3]); }
+		const H::FUniObject Obj = H::Uni_MakeObject(H::uint3(Off[0], Off[1], Off[2]), UniScenes::kStar, 0u, 9u, float(std::log2(R)), M, 0.0f, H::float3(1, 1, 1));
+		return H::Uni_ProjectObject(Dl[0], Dl[1], Dl[2], 64u, 1.0f, Obj, Vw, false);
+	};
+	H::FUniView Phys = V;
+	Phys.CoreSat = 0.0f;   // physical mode: all light in the core
+	const double Theta = double(V.ThetaPixel), Sat = double(V.CoreSat);
+	int Samples = 0, CoreOff = 0, OverSat = 0, HaloBelowSat = 0, HaloOverCap = 0, HaloShrank = 0, PhysHalo = 0;
+	double WorstFaint = 0.0, MaxIntensity = 0.0, FootAtMax = 0.0, PrevFoot = 0.0, OldGlareAtMax = 0.0;
+	(void)Arrive;
+	const double DFar = 9.26e24, DNear = R / double(H::UNI_THETA_PROMOTE);   // 3 Mpc to the promotion distance
+	for (int K = 0; K <= 300; ++K)
+	{
+		const double D = DFar * std::pow(DNear / DFar, K / 300.0);
+		const H::FUniSprite S = Project(V, D);
+		const H::FUniSprite Sp = Project(Phys, D);
+		if (!(S.Flags & H::UNI_SPRITE_VISIBLE) || !(Sp.Flags & H::UNI_SPRITE_VISIBLE)) { continue; }
+		++Samples;
+		const double I = double(Sp.Radiance.x);              // white: luminance = intensity, all of it in the core
+		const double Core = double(S.Radiance.x);
+		const double Want = std::max(double(S.PhysAngularRadius), Theta * double(V.CorePx));
+		CoreOff += std::abs(double(S.AngularRadius) / Want - 1.0) > 1.0e-6 ? 1 : 0;
+		const double Area = double(S.AngularRadius) / (Theta * double(V.CorePx));
+		OverSat += Core > Sat * Area * Area * (1.0 + 1.0e-5) ? 1 : 0;   // a resolved core saturates per area
+		if (I < Sat / 8.0) { WorstFaint = std::max(WorstFaint, std::abs(Core / I - 1.0)); }
+		HaloBelowSat += (I < Sat && S.HaloRatio > 0.0f) ? 1 : 0;
+		const double Foot = double(H::Uni_SpriteFootprint(S));
+		HaloOverCap += Foot > double(S.AngularRadius) * double(V.HaloMaxPx / V.CorePx) * (1.0 + 1.0e-5) ? 1 : 0;   // the cap scales with a resolved core (D-158)
+		HaloShrank += (Foot < PrevFoot * (1.0 - 1.0e-5)) ? 1 : 0;   // brighter (closer) never smaller
+		PhysHalo += Sp.HaloRatio > 0.0f ? 1 : 0;
+		PrevFoot = Foot;
+		if (I > MaxIntensity) { MaxIntensity = I; FootAtMax = Foot / Theta; OldGlareAtMax = 1.0 + 0.35 * std::log2(1.0 + I); }
+	}
+	Uni::Check(1, "T1.sprite.style", "Sprite style (D-156, D-158), a Sun-like star from 3 Mpc to its promotion: core = max(true size, CorePx) at every brightness, core light <= saturation and within 0.01% of the intensity below 1/8 of it, a halo only above saturation, growing with brightness, within its cap; physical mode has no halo")
+		.Metric("samples", Samples).Metric("core_size_errors", CoreOff).Metric("over_saturation", OverSat).Metric("worst_faint_err", WorstFaint)
+		.Metric("halo_below_sat", HaloBelowSat).Metric("halo_over_cap", HaloOverCap).Metric("halo_shrank", HaloShrank).Metric("physical_halos", PhysHalo)
+		.Metric("max_intensity", MaxIntensity).Metric("footprint_px_at_max", FootAtMax).Metric("old_glare_px_at_max", OldGlareAtMax)
+		.Pass(Samples > 100 && CoreOff == 0 && OverSat == 0 && WorstFaint < 1.0e-4 && HaloBelowSat == 0 && HaloOverCap == 0 && HaloShrank == 0 && PhysHalo == 0 && MaxIntensity > 1.0e3 * Sat,
+			Uni::Fmt("%d distances, intensity up to %.2g: the brightest is %.2f px (sigma, glare included; the D-150 footprint made it %.1f px); core size errors %d, over saturation %d, faint error %.4f%%, halos below saturation %d, over the cap %d, shrinking %d, in physical mode %d",
+				Samples, MaxIntensity, FootAtMax, OldGlareAtMax, CoreOff, OverSat, 100.0 * WorstFaint, HaloBelowSat, HaloOverCap, HaloShrank, PhysHalo));
 }

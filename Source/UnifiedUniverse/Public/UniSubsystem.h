@@ -18,13 +18,29 @@
 //   uu.Speed <cm/s>                     free-flight speed (any magnitude, 1 .. 1e32)
 //   uu.Cruise <cm/s>                    move along the view direction (0: stop, back to Local)
 //   uu.Teleport <solar|void>            jump the camera (coarse-to-fine rebuild)
-//   uu.Sensitivity <dm>                 limiting-magnitude offset, -5..5
+//   uu.Sensitivity <dm>                 limiting-magnitude offset, -5..5 (plus the travel boost)
+//   uu.TravelSensitivity <mag>          most sensitivity added while travelling fast (0: off; D-154)
+//   uu.TravelStart / uu.TravelFull <cm/s>  speeds where the travel boost starts / is full
 //   uu.Exposure <mag>                   exposure bias in magnitudes (negative = brighter)
 //   uu.Volume <0|1>                     the volume pass: unresolved glow, dust, background
 //   uu.Stats                            log streaming and render statistics
+//   uu.Perf                             log per-phase cost: averages and peaks since the last
+//                                       uu.Perf, the worst frame's streamer breakdown, work counts (D-157)
+//   uu.PerfHud <0|1>                    the same, live on screen
+//   uu.PerfHitchMs <ms>                 log the breakdown of any frame whose universe work on the
+//                                       game thread exceeds this (0: off; default 50)
+//   uu.VolumeMaxSteps / uu.VolumeStepRatio / uu.VolumeMaxSubsamples   volume march quality (D-157)
+//   uu.Sprite.<handle> <value>          sprite style (D-156): CorePx, Saturation, HaloGain,
+//                                       HaloGrowth, HaloMax
 //   uu.TimeScale <x>                    universe clock rate (1 = real time; orbits run on it)
 //   uu.Time <seconds>                   set the universe clock
 //   uu.Systems                          log active star systems and their planets
+//   uu.Clusters                         log the cluster tuning and the resident clusters (D-151)
+//   uu.GotoCluster [rich]               jump to 3 influence radii from the nearest resident cluster
+//                                       (rich: M < -25.5), facing it
+//   uu.Cluster.<handle> <value>         cluster tuning (Enable, Fraction, MStar, Alpha, BrightMag,
+//                                       FaintMag, BiasPower, NodeWeight, RadiusScale, CoreMin,
+//                                       CoreMax, MaxClumps, ClumpWeight); applied on the next uu.Enable
 //   uu.GotoSystem [planet]              jump into the nearest star system with a gas giant
 //                                       (planet: to 30 radii from the giant, to watch it promote)
 //   uu.LightRig <0|1>                   the directional light from the active star (M3 placeholder)
@@ -40,7 +56,18 @@
 #include "UniVolume.h"
 #include "UniSystem.h"
 #include "UniPromotion.h"
+#include "UniDemoScenes.h"
+#include "UniTravel.h"
+#include "UniProfile.h"
+#include "UniWebTexture.h"
 #include "UniSubsystem.generated.h"
+
+/** D-157: game-thread phases of the universe's frame (plain C++, not reflected). */
+namespace UniPerf
+{
+	enum EPhase : int32 { PerfTick, PerfStreamer, PerfPromotion, PerfParallax, PerfLightRig, PerfPushFrame, PerfSystems, PerfVolumeBuild, PerfCount };
+	inline constexpr int32 StreamPhaseCount = int32(UniCore::EStreamPhase::Count);
+}
 
 UENUM(BlueprintType)
 enum class EUniMotionMode : uint8
@@ -109,6 +136,8 @@ public:
 	void SetVolumeEnabled(bool bOn) { bVolume = bOn; }
 	bool IsVolumeEnabled() const { return bVolume; }
 	void LogStats() const;
+	/** D-157: per-phase cost, averaged and peak since the last call (which resets the peaks). */
+	void LogPerf();
 
 	/** Free flight for testing: velocity follows the view every frame, WASD/QE give the
 	 *  direction, the mouse wheel doubles or halves the speed. Works at any speed: the universal
@@ -126,6 +155,10 @@ public:
 	void SetUniverseTime(double Seconds) { UniverseTime = Seconds; }
 	double GetUniverseTime() const { return UniverseTime; }
 	void LogSystems() const;
+	/** D-151: cluster tuning in effect, and the resident clusters. */
+	void LogClusters() const;
+	/** Jump to 3 influence radii from the nearest resident cluster (bRich: M < -25.5). */
+	bool GoToCluster(bool bRich);
 	/** Resolve the nearest star (within 100 pc) whose system has a gas giant, and jump into it
 	 *  in free flight, facing the star. */
 	bool GoToSystem(bool bToPlanet = false);
@@ -147,10 +180,14 @@ public:
 
 private:
 	void PushFrame();
+	void SetupWebTexture(UniCore::FUniverseDef& Def);   // D-164
 	FVector GetViewLocation(FRotator* OutRotation = nullptr) const;
 
 	bool bEnabled = false;
 	FString SceneName;
+	/** D-164: the web texture of the current universe (bound to the CPU sampler; outlives the
+	 *  generator and the streamer's integral jobs, so it is released after them). */
+	TUniquePtr<UniCore::FWebTexture> WebTexture;
 	TUniquePtr<UniCore::FUniverseModel> Model;
 	TUniquePtr<UniCore::FRefGenerator> Generator;
 	TUniquePtr<UniCore::IGenBackend> Backend;
@@ -160,6 +197,30 @@ private:
 	uint32 BackgroundVersion = 0;
 	UniCore::FCoord BackgroundAnchor;
 	TArray<FVector4f> BackgroundLutLast;
+
+	// Travel sensitivity (D-154): the owner's sensitivity plus a speed-driven boost
+	UniCore::FTravelSensitivity Travel;
+	float EffectiveDeltaMag = 0.0f;
+	FUniCoord PrevCamera;
+	bool bCameraJumped = true;
+
+	// Instrumentation (D-157). Game-thread phases of the universe's frame, in ms.
+	static const TCHAR* PerfPhaseName(int32 Phase);
+	double PerfMs[UniPerf::PerfCount] = {};
+	double PerfAvg[UniPerf::PerfCount] = {};
+	double PerfPeak[UniPerf::PerfCount] = {};
+	double StreamAvg[UniPerf::StreamPhaseCount] = {};
+	UniCore::FStreamProfile StreamLast;        // the last frame's streamer breakdown and counts
+	UniCore::FStreamProfile StreamWorst;       // the worst frame's since the last uu.Perf
+	double StreamWorstTickMs = 0.0;
+	uint64 PerfFrames = 0;
+	uint64 PerfHitches = 0;
+	void RecordPerf();
+	FString StreamBreakdown(const UniCore::FStreamProfile& P) const;
+	void DrawPerfHud() const;
+
+	// Clusters (D-151): the tuning the current universe was built with
+	UniScenes::FClusterTuning ClusterTuning;
 
 	// Star systems (D-142..D-145)
 	TUniquePtr<UniCore::FSystemManager> Systems;

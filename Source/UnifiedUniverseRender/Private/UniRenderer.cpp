@@ -17,14 +17,24 @@
 #include "Misc/EngineVersionComparison.h"
 #include "HAL/PlatformProcess.h"
 #include "Misc/ScopeLock.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
+
+#include <limits>
 
 static TAutoConsoleVariable<float> CVarUniSpriteExtent(TEXT("uu.SpriteExtent"), 3.0f, TEXT("Sprite quad half size in Gaussian sigmas."), ECVF_RenderThreadSafe);
-static TAutoConsoleVariable<float> CVarUniGlare(TEXT("uu.GlareGain"), 0.35f, TEXT("Sprite footprint growth with flux."), ECVF_RenderThreadSafe);
+// D-156 sprite style: a pinpoint core plus a faint, capped halo (replaces uu.GlareGain).
+static TAutoConsoleVariable<float> CVarUniSpriteCorePx(TEXT("uu.Sprite.CorePx"), UniHlsl::UNI_SPRITE_CORE_PX, TEXT("Core size of an unresolved sprite (Gaussian sigma, pixels). Brightness no longer enlarges it (D-156)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniSpriteSaturation(TEXT("uu.Sprite.Saturation"), UniHlsl::UNI_SPRITE_CORE_SAT, TEXT("Intensity (exposure units: 1 = a star at the exposure magnitude) where a sprite's core stops brightening. 0: physical (all light in the core, no halo; the engine's bloom does the glare)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniSpriteHaloGain(TEXT("uu.Sprite.HaloGain"), UniHlsl::UNI_SPRITE_HALO_GAIN, TEXT("Halo light per doubling of brightness over saturation, in units of the saturation level (0: no halo)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniSpriteHaloGrowth(TEXT("uu.Sprite.HaloGrowth"), UniHlsl::UNI_SPRITE_HALO_GROWTH_PX, TEXT("Halo size growth per doubling of brightness over saturation (pixels of Gaussian sigma)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniSpriteHaloMax(TEXT("uu.Sprite.HaloMax"), UniHlsl::UNI_SPRITE_HALO_MAX_PX, TEXT("Largest halo of an unresolved sprite (Gaussian sigma, pixels)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniVolumeDivisor(TEXT("uu.VolumeDivisor"), 2, TEXT("Volume march resolution divisor (1 = full, 2 = half, 4 = quarter)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniBackgroundSize(TEXT("uu.BackgroundSize"), 256, TEXT("Background direction-map face size (texels)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniVolumeDebug(TEXT("uu.VolumeDebug"), 0, TEXT("Volume debug view (lesson #37): 0 off, 1 steps per ray (magenta = truncated), 2 coverage (R carriers, G supersampling, B truncated), 3 emission (log10 heat), 4 dust transmittance."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<float> CVarUniVolumeDebugLogLo(TEXT("uu.VolumeDebugLogLo"), 0.0f, TEXT("uu.VolumeDebug 3: log10 radiance mapped to the bottom of the heat ramp (the ramp spans 6 decades)."), ECVF_RenderThreadSafe);
-static TAutoConsoleVariable<int32> CVarUniBackgroundFaces(TEXT("uu.BackgroundFacesPerFrame"), 2, TEXT("Background faces re-marched per frame while dirty (1..6)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<int32> CVarUniBackgroundMode(TEXT("uu.BackgroundMode"), 2, TEXT("D-166: how the background (the periodic web) is marched. 0: into the direction map (D-136/D-159), a few faces per frame. 1: per pixel with the local volume, every frame. 2: per pixel while the background is changing (travel), the map once it has been still for uu.BackgroundStillFrames."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<int32> CVarUniBackgroundStillFrames(TEXT("uu.BackgroundStillFrames"), 30, TEXT("D-166: uu.BackgroundMode 2 switches to the direction map after this many frames without a background change."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<int32> CVarUniBackgroundFaces(TEXT("uu.BackgroundFacesPerFrame"), 2, TEXT("Background map faces marched per frame during a refresh (1..6; D-159: a refresh is always all six faces from one snapshot, cross-faded in)."), ECVF_RenderThreadSafe);
 
 namespace
 {
@@ -60,6 +70,7 @@ namespace
 struct FUniRenderer::FPromoteReadback
 {
 	TUniquePtr<FRHIGPUBufferReadback> Count;
+	TUniquePtr<FRHIGPUBufferReadback> Args;   // D-157: the sprite draw args (instance count = sprites drawn)
 	bool bPending = false;
 };
 
@@ -137,7 +148,8 @@ void FUniRenderer::SetFrame_GameThread(FUniFrameData&& Data)
 	TSharedRef<FUniFrameData, ESPMode::ThreadSafe> Payload = MakeShared<FUniFrameData, ESPMode::ThreadSafe>(MoveTemp(Data));
 	ENQUEUE_RENDER_COMMAND(UniSetFrame)([Payload](FRHICommandListImmediate&)
 	{
-		FUniRenderer::Get().RenderFrame = *Payload;
+		TRACE_CPUPROFILER_EVENT_SCOPE(Uni_SetFrame_RT);
+		FUniRenderer::Get().RenderFrame = MoveTemp(*Payload);   // the payload is not used again: move, not copy
 	});
 }
 
@@ -155,6 +167,72 @@ void FUniRenderer::SetTables_GameThread(TArray<UniCore::FSliceGPU> Slices, TArra
 		R.LutRT = Payload->Lut;
 		R.bTablesDirty = true;
 	});
+}
+
+void FUniRenderer::SetWebTexture_GameThread(uint32 Size, TArray<TArray<FUintVector2>> Mips)
+{
+	check(IsInGameThread());
+	struct FWeb { uint32 Size = 0; TArray<TArray<FUintVector2>> Mips; };
+	TSharedRef<FWeb, ESPMode::ThreadSafe> Payload = MakeShared<FWeb, ESPMode::ThreadSafe>();
+	Payload->Size = Size;
+	Payload->Mips = MoveTemp(Mips);
+	ENQUEUE_RENDER_COMMAND(UniSetWebTexture)([Payload](FRHICommandListImmediate&)
+	{
+		FUniRenderer& R = FUniRenderer::Get();
+		R.WebSizeRT = Payload->Size;
+		R.WebMipsRT = MoveTemp(Payload->Mips);
+		R.bWebDirty = true;
+	});
+}
+
+FRDGTextureRef FUniRenderer::RegisterWebTexture_RenderThread(FRDGBuilder& GraphBuilder)
+{
+	check(IsInRenderingThread());
+	// One mip from a buffer of packed half texels (UniWebTexUpload.usf).
+	auto Upload = [&GraphBuilder](FRDGTextureRef Tex, int32 Mip, uint32 MipSize, const TArray<FUintVector2>& Texels)
+	{
+		FUniWebTexUploadCS::FParameters* P = GraphBuilder.AllocParameters<FUniWebTexUploadCS::FParameters>();
+		P->InTexels = GraphBuilder.CreateSRV(UploadStructured(GraphBuilder, TEXT("UniWebTexels"), Texels));
+		P->OutMip = GraphBuilder.CreateUAV(FRDGTextureUAVDesc(Tex, uint8(Mip)));
+		P->MipSize = MipSize;
+		const int32 G = FMath::DivideAndRoundUp(int32(MipSize), 4);
+		TShaderMapRef<FUniWebTexUploadCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.WebTexture.Upload mip %d (%u^3)", Mip, MipSize), CS, P, FIntVector(G, G, G));
+	};
+	if (bWebDirty)
+	{
+		bWebDirty = false;
+		WebTexture.SafeRelease();
+		if (WebSizeRT > 0u && WebMipsRT.Num() > 0)
+		{
+			const FRDGTextureDesc Desc = FRDGTextureDesc::Create3D(FIntVector(int32(WebSizeRT)), PF_FloatRGBA, FClearValueBinding::Black,
+				TexCreate_ShaderResource | TexCreate_UAV, uint8(WebMipsRT.Num()));
+			FRDGTextureRef Tex = GraphBuilder.CreateTexture(Desc, TEXT("UniWebTexture"));
+			for (int32 M = 0; M < WebMipsRT.Num(); ++M)
+			{
+				const uint32 S = FMath::Max(WebSizeRT >> M, 1u);
+				if (uint64(WebMipsRT[M].Num()) != uint64(S) * S * S) { UE_LOG(LogTemp, Error, TEXT("UnifiedUniverse: web texture mip %d has %d texels, expected %u^3"), M, WebMipsRT[M].Num(), S); continue; }
+				Upload(Tex, M, S, WebMipsRT[M]);   // UploadStructured copies the texels into the graph
+			}
+			WebMipsRT.Empty();
+			WebTexture = GraphBuilder.ConvertToExternalTexture(Tex);
+			return Tex;
+		}
+		WebMipsRT.Empty();
+	}
+	if (WebTexture.IsValid()) { return GraphBuilder.RegisterExternalTexture(WebTexture, TEXT("UniWebTexture")); }
+	if (!WebDummy.IsValid())
+	{
+		// Fail closed: a textured web sampled without its texture reads NaN (nothing passes a
+		// density test), never a plausible value (lesson #1).
+		FRDGTextureRef D = GraphBuilder.CreateTexture(FRDGTextureDesc::Create3D(FIntVector(1, 1, 1), PF_FloatRGBA, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV, 1), TEXT("UniWebTextureDummy"));
+		TArray<FUintVector2> Nan;
+		Nan.Add(FUintVector2(0x7E007E00u, 0x7E007E00u));   // four half quiet NaNs
+		Upload(D, 0, 1u, Nan);
+		WebDummy = GraphBuilder.ConvertToExternalTexture(D);
+		return D;
+	}
+	return GraphBuilder.RegisterExternalTexture(WebDummy, TEXT("UniWebTextureDummy"));
 }
 
 FRDGBufferRef FUniRenderer::RegisterPool_RenderThread(FRDGBuilder& GraphBuilder)
@@ -200,15 +278,20 @@ void FUniRenderer::Release_RenderThread()
 	Pool.SafeRelease();
 	SlicesBuffer.SafeRelease();
 	LutBuffer.SafeRelease();
+	WebTexture.SafeRelease();
+	WebDummy.SafeRelease();
+	WebMipsRT.Empty();
 	PromoteRing.Empty();
 	ActivateRing.Empty();
 	{
 		FScopeLock Lock(&ActivationLock);
 		ActivationsReady.Reset();
 	}
-	BackgroundCube.SafeRelease();
-	BackgroundVersionRT = ~0u;
-	BackgroundDirtyFaces = 0x3Fu;
+	for (TRefCountPtr<IPooledRenderTarget>& M : BackgroundMaps) { M.SafeRelease(); }
+	bBgHaveCur = bBgFilling = false;
+	BgFillMask = 0u;
+	BgFilledVersion = ~0u;
+	BgBlendFrames = 0;
 	RenderFrame = FUniFrameData();
 	bTablesDirty = true;
 }
@@ -217,6 +300,7 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 	FRDGTextureRef SceneDepth, const FIntRect& DepthViewRect, float PreExposure, FRDGTextureRef& OutSlices, FIntPoint& OutMarchSize)
 {
 	const FUniFrameData& F = RenderFrame;
+	TRACE_CPUPROFILER_EVENT_SCOPE(Uni_RenderVolume);
 	RDG_EVENT_SCOPE(GraphBuilder, "Uni.Volume");
 	const FIntRect OutRect = Output.ViewRect;
 	const FMatrix Proj = View.ViewMatrices.ComputeProjectionNoAAMatrix();   // post-TSR: unjittered (W2)
@@ -232,13 +316,17 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 	VV.ThetaPixel = 2.0f * TanX / float(MarchSize.X);
 	FRDGBufferRef ParamBuf = UploadStructured(GraphBuilder, TEXT("UniVolumeParams"), F.VolumeParams);
 	FRDGBufferRef LutBuf = UploadStructured(GraphBuilder, TEXT("UniVolumeLut"), F.VolumeLut);
-	auto FillCommon = [&](FUniVolumeCommonParameters& C, const TArray<UniCore::FCarrierGPU>& Carriers, const UniCore::FVolumeViewGPU& V)
+	FRDGTextureRef WebTex = RegisterWebTexture_RenderThread(GraphBuilder);   // D-164
+	FRHISamplerState* WebSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Wrap>::GetRHI();
+	auto FillCommonWith = [&](FUniVolumeCommonParameters& C, const TArray<UniCore::FCarrierGPU>& Carriers, const UniCore::FVolumeViewGPU& V, FRDGBufferRef InParamBuf, FRDGBufferRef InLutBuf)
 	{
+		C.UniWebTexture = WebTex;
+		C.UniWebSampler = WebSampler;
 		TArray<UniCore::FVolumeViewGPU> One; One.Add(V);
 		One[0].NumCarriers = uint32(Carriers.Num());
 		C.InCarriers = GraphBuilder.CreateSRV(UploadStructured(GraphBuilder, TEXT("UniVolumeCarriers"), Carriers));
-		C.InParams = GraphBuilder.CreateSRV(ParamBuf);
-		C.InLut = GraphBuilder.CreateSRV(LutBuf);
+		C.InParams = GraphBuilder.CreateSRV(InParamBuf);
+		C.InLut = GraphBuilder.CreateSRV(InLutBuf);
 		C.InVolumeView = GraphBuilder.CreateSRV(UploadStructured(GraphBuilder, TEXT("UniVolumeView"), One));
 		C.ViewForward = FVector3f(View.GetViewDirection());
 		C.ViewRight = FVector3f(View.GetViewRight());
@@ -246,6 +334,10 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		C.TanHalfFovX = TanX;
 		C.TanHalfFovY = TanY;
 		C.Pad0 = 0.0f;
+	};
+	auto FillCommon = [&](FUniVolumeCommonParameters& C, const TArray<UniCore::FCarrierGPU>& Carriers, const UniCore::FVolumeViewGPU& V)
+	{
+		FillCommonWith(C, Carriers, V, ParamBuf, LutBuf);
 	};
 	FRHISamplerState* PointClamp = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
 	const FIntPoint DepthExtent = SceneDepth->Desc.Extent;
@@ -259,55 +351,124 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		float(DepthViewRect.Min.X) / float(DepthExtent.X) - float(OutRect.Min.X) * OScale.X,
 		float(DepthViewRect.Min.Y) / float(DepthExtent.Y) - float(OutRect.Min.Y) * OScale.Y);
 
-	// 1. Background direction map: re-march dirty faces, a few per frame (D-136).
-	const bool bBackground = F.BackgroundCarriers.Num() > 0;
-	const int32 CubeSize = FMath::Clamp(CVarUniBackgroundSize.GetValueOnRenderThread(), 16, 1024);
-	if (bBackground && (!BackgroundCube.IsValid() || BackgroundCube->GetDesc().Extent.X != CubeSize)) { BackgroundCube.SafeRelease(); BackgroundDirtyFaces = 0x3Fu; }
-	FRDGTextureRef Cube = nullptr;
-	if (bBackground)
+	// 1. Background direction map (D-136), triple buffered (D-159): a refresh marches all six
+	// faces of the back map from one snapshot, a few faces per frame, then rotates it in; the
+	// composite cross-fades from the previous map to the current one.
+	// D-166: per-pixel background. While the background changes (travel), a map refresh lags it
+	// and costs about what marching it per pixel does now that the web is a texture (D-164), so
+	// it is marched with the local carriers instead; at rest the map is cheaper and is used.
+	const int32 BgMode = FMath::Clamp(CVarUniBackgroundMode.GetValueOnRenderThread(), 0, 2);
+	if (F.BackgroundVersion != BgLastVersion) { BgLastVersion = F.BackgroundVersion; BgStillFrames = 0; } else { ++BgStillFrames; }
+	const bool bPerPixelBackground = F.BackgroundCarriers.Num() > 0
+		&& (BgMode == 1 || (BgMode == 2 && BgStillFrames < FMath::Max(CVarUniBackgroundStillFrames.GetValueOnRenderThread(), 1)));
+	if (bPerPixelBackground)
 	{
-		if (!BackgroundCube.IsValid())
+		// The map is stale once we move; when the map comes back it is marched whole first (no
+		// cross-fade from stale light).
+		bBgHaveCur = false;
+		bBgFilling = false;
+		BgFilledVersion = ~0u;
+	}
+	const bool bBackgroundIn = F.BackgroundCarriers.Num() > 0 && !bPerPixelBackground;
+	const int32 CubeSize = FMath::Clamp(CVarUniBackgroundSize.GetValueOnRenderThread(), 16, 1024);
+	const int32 FacesPerFrame = FMath::Clamp(CVarUniBackgroundFaces.GetValueOnRenderThread(), 1, 6);
+	bool bBackground = false;
+	float BackgroundBlend = 1.0f;
+	FRDGTextureRef Cube = nullptr;
+	FRDGTextureRef CubePrev = nullptr;
+	if (bBackgroundIn)
+	{
+		bool bRecreate = false;
+		for (const TRefCountPtr<IPooledRenderTarget>& M : BackgroundMaps) { bRecreate = bRecreate || !M.IsValid() || M->GetDesc().Extent.X != CubeSize; }
+		FRDGTextureRef Maps[3];
+		if (bRecreate)
 		{
 			// Float32: radiance per steradian in exposure units overflows half floats (a galaxy disc
 			// is ~7e4 per sr at the default exposure; sensitivity and exposure scale it further).
 			const FRDGTextureDesc Desc = FRDGTextureDesc::Create2DArray(FIntPoint(CubeSize, CubeSize), PF_A32B32G32R32F, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV, 6);
-			Cube = GraphBuilder.CreateTexture(Desc, TEXT("UniBackgroundCube"));
-			AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(Cube), FLinearColor(0.0f, 0.0f, 0.0f, 0.0f));
-			BackgroundCube = GraphBuilder.ConvertToExternalTexture(Cube);
+			for (int32 I = 0; I < 3; ++I)
+			{
+				Maps[I] = GraphBuilder.CreateTexture(Desc, TEXT("UniBackgroundMap"));
+				AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(Maps[I]), FLinearColor(0.0f, 0.0f, 0.0f, 0.0f));
+				BackgroundMaps[I] = GraphBuilder.ConvertToExternalTexture(Maps[I]);
+			}
+			bBgHaveCur = bBgFilling = false;
+			BgFilledVersion = ~0u;
 		}
 		else
 		{
-			Cube = GraphBuilder.RegisterExternalTexture(BackgroundCube, TEXT("UniBackgroundCube"));
+			for (int32 I = 0; I < 3; ++I) { Maps[I] = GraphBuilder.RegisterExternalTexture(BackgroundMaps[I], TEXT("UniBackgroundMap")); }
 		}
-		if (F.BackgroundVersion != BackgroundVersionRT) { BackgroundVersionRT = F.BackgroundVersion; BackgroundDirtyFaces = 0x3Fu; }
-		int32 Budget = FMath::Clamp(CVarUniBackgroundFaces.GetValueOnRenderThread(), 1, 6);
-		for (uint32 Face = 0; Face < 6 && Budget > 0; ++Face)
+		// Start a refresh only when none is running: the one in progress finishes from its own
+		// snapshot, so all six faces of a map always agree.
+		if (!bBgFilling && F.BackgroundVersion != BgFilledVersion)
 		{
-			if (!(BackgroundDirtyFaces & (1u << Face))) { continue; }
-			FUniVolumeBackgroundCS::FParameters* P = GraphBuilder.AllocParameters<FUniVolumeBackgroundCS::FParameters>();
-			FillCommon(P->Common, F.BackgroundCarriers, F.VolumeView);
-			P->CubeSize = uint32(CubeSize);
-			P->FaceBase = Face;
-			P->OutCube = GraphBuilder.CreateUAV(Cube);
-			TShaderMapRef<FUniVolumeBackgroundCS> CS(GetGlobalShaderMap(View.GetFeatureLevel()));
-			FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Volume.Background face %u", Face), CS, P, FIntVector(FMath::DivideAndRoundUp(CubeSize, 8), FMath::DivideAndRoundUp(CubeSize, 8), 1));
-			BackgroundDirtyFaces &= ~(1u << Face);
-			--Budget;
-			Stats.BackgroundFacesMarched++;
+			BgSnapCarriers = F.BackgroundCarriers;
+			BgSnapParams = F.VolumeParams;
+			BgSnapLut = F.VolumeLut;
+			BgSnapView = F.VolumeView;
+			BgFillVersion = F.BackgroundVersion;
+			BgFillMask = 0x3Fu;
+			bBgFilling = true;
+		}
+		if (bBgFilling)
+		{
+			FRDGBufferRef SnapParamBuf = UploadStructured(GraphBuilder, TEXT("UniBackgroundParams"), BgSnapParams);
+			FRDGBufferRef SnapLutBuf = UploadStructured(GraphBuilder, TEXT("UniBackgroundLut"), BgSnapLut);
+			int32 Budget = bBgHaveCur ? FacesPerFrame : 6;   // the first map is marched at once: no black sky while it fills
+			for (uint32 Face = 0; Face < 6 && Budget > 0; ++Face)
+			{
+				if (!(BgFillMask & (1u << Face))) { continue; }
+				FUniVolumeBackgroundCS::FParameters* P = GraphBuilder.AllocParameters<FUniVolumeBackgroundCS::FParameters>();
+				FillCommonWith(P->Common, BgSnapCarriers, BgSnapView, SnapParamBuf, SnapLutBuf);
+				P->CubeSize = uint32(CubeSize);
+				P->FaceBase = Face;
+				P->OutCube = GraphBuilder.CreateUAV(Maps[BgBack]);
+				TShaderMapRef<FUniVolumeBackgroundCS> CS(GetGlobalShaderMap(View.GetFeatureLevel()));
+				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Volume.Background face %u", Face), CS, P, FIntVector(FMath::DivideAndRoundUp(CubeSize, 8), FMath::DivideAndRoundUp(CubeSize, 8), 1));
+				BgFillMask &= ~(1u << Face);
+				--Budget;
+				Stats.BackgroundFacesMarched++;
+			}
+			if (BgFillMask == 0u)
+			{
+				// Rotate: previous <- current <- back <- the old previous (overwritten next refresh).
+				const int32 OldPrev = BgPrev;
+				BgPrev = BgCur;
+				BgCur = BgBack;
+				BgBack = OldPrev;
+				if (!bBgHaveCur) { BgPrev = BgCur; bBgHaveCur = true; }   // nothing to fade from
+				BgFilledVersion = BgFillVersion;
+				bBgFilling = false;
+				BgBlendFrames = 0;
+			}
+		}
+		if (bBgHaveCur)
+		{
+			bBackground = true;
+			Cube = Maps[BgCur];
+			CubePrev = Maps[BgPrev];
+			const int32 FadeFrames = FMath::DivideAndRoundUp(6, FacesPerFrame);   // one refresh's length
+			BackgroundBlend = FMath::Clamp(float(BgBlendFrames + 1) / float(FadeFrames), 0.0f, 1.0f);
+			++BgBlendFrames;
 		}
 	}
-	else
+	if (!bBackground)
 	{
 		Cube = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(FIntPoint(1, 1), PF_A32B32G32R32F, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV, 6), TEXT("UniBackgroundDummy"));
 		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(Cube), FLinearColor(0.0f, 0.0f, 0.0f, 0.0f));
+		CubePrev = Cube;
 	}
 
-	// 2. March the local carriers at reduced resolution.
+	// 2. March the local carriers at reduced resolution (D-166: with the background's, per pixel).
+	TArray<UniCore::FCarrierGPU> PerPixelCarriers;
+	if (bPerPixelBackground) { PerPixelCarriers = F.VolumeCarriers; PerPixelCarriers.Append(F.BackgroundCarriers); }
+	const TArray<UniCore::FCarrierGPU>& MarchCarriers = bPerPixelBackground ? PerPixelCarriers : F.VolumeCarriers;
 	FRDGTextureRef VolumeTex = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(MarchSize, PF_A32B32G32R32F, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV), TEXT("UniVolume"));   // float32: see the cube
 	FRDGTextureRef Slices = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(MarchSize, PF_R16F, FClearValueBinding::White, TexCreate_ShaderResource | TexCreate_UAV, UniGpuLayout::VolumeSlices), TEXT("UniVolumeSlices"));
 	{
 		FUniVolumeMarchCS::FParameters* P = GraphBuilder.AllocParameters<FUniVolumeMarchCS::FParameters>();
-		FillCommon(P->Common, F.VolumeCarriers, VV);
+		FillCommon(P->Common, MarchCarriers, VV);
 		P->InvDeviceZToWorldZTransform = FVector4f(View.InvDeviceZToWorldZTransform);
 		P->MarchToDepthUV = MarchToDepthUV;
 		P->SceneDepthTexture = SceneDepth;
@@ -318,7 +479,7 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		P->OutVolume = GraphBuilder.CreateUAV(VolumeTex);
 		P->OutSlices = GraphBuilder.CreateUAV(Slices);
 		TShaderMapRef<FUniVolumeMarchCS> CS(GetGlobalShaderMap(View.GetFeatureLevel()));
-		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Volume.March %dx%d, %d carriers", MarchSize.X, MarchSize.Y, F.VolumeCarriers.Num()), CS, P, FComputeShaderUtils::GetGroupCount(MarchSize, 8));
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Volume.March %dx%d, %d carriers%s", MarchSize.X, MarchSize.Y, MarchCarriers.Num(), bPerPixelBackground ? TEXT(" (with the background)") : TEXT("")), CS, P, FComputeShaderUtils::GetGroupCount(MarchSize, 8));
 	}
 
 	// 3. Composite: upsample + background, additive into the output (before the sprites).
@@ -338,11 +499,12 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		C.CubeSize = bBackground ? uint32(CubeSize) : 1u;
 		C.bBackground = bBackground ? 1u : 0u;
 		C.BackgroundStartCm = F.BackgroundStartCm;
-		C.Pad1 = 0.0f;
+		C.BackgroundBlend = BackgroundBlend;   // D-159
 		C.DebugMode = uint32(FMath::Clamp(CVarUniVolumeDebug.GetValueOnRenderThread(), 0, 4));
 		C.DebugScale = 1.0f / FMath::Max(PreExposure, 1.0e-6f);
 		C.VolumeTexture = VolumeTex;
 		C.CubeTexture = Cube;
+		C.CubePrevTexture = CubePrev;
 		C.LinearClampSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
 		P->RenderTargets[0] = FRenderTargetBinding(Output.Texture, ERenderTargetLoadAction::ELoad);
 		TShaderMapRef<FUniVolumeCompositeVS> VS(GetGlobalShaderMap(View.GetFeatureLevel()));
@@ -376,13 +538,16 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 	check(IsInRenderingThread());
 	const FUniFrameData& F = RenderFrame;
 	if (!UniShadersEnabled() || !F.bEnabled || F.Cells.Num() == 0 || !SceneColor.IsValid() || !SceneDepth) { return; }
+	TRACE_CPUPROFILER_EVENT_SCOPE(Uni_RenderBackdrop);
 	RDG_EVENT_SCOPE(GraphBuilder, "UnifiedUniverse");
 
 	FRDGBufferRef PoolBuf = RegisterPool_RenderThread(GraphBuilder);
 	FRDGBufferRef CellBuf = UploadStructured(GraphBuilder, TEXT("UniCells"), F.Cells);
 
 	FRDGBufferRef SpriteBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(UniGpuLayout::SpriteBytes, UniGpuLayout::MaxSprites), TEXT("UniSprites"));
-	FRDGBufferRef ArgsBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateIndirectDesc<FRHIDrawIndirectParameters>(1), TEXT("UniSpriteArgs"));
+	FRDGBufferDesc ArgsDesc = FRDGBufferDesc::CreateIndirectDesc<FRHIDrawIndirectParameters>(1);
+	ArgsDesc.Usage |= EBufferUsageFlags::SourceCopy;   // D-157: the sprite count is read back for uu.Perf
+	FRDGBufferRef ArgsBuf = GraphBuilder.CreateBuffer(ArgsDesc, TEXT("UniSpriteArgs"));
 	FRDGBufferRef PromoteBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(FUintVector2), UniGpuLayout::MaxPromote), TEXT("UniPromote"));
 	FRDGBufferDesc PromoteCountDesc = FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), 1);
 	PromoteCountDesc.Usage |= EBufferUsageFlags::SourceCopy;
@@ -463,7 +628,11 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 		P->ExposureMag = LimitingMag - 1.0f + F.ExposureBias;
 		P->SurfaceLimit = 25.0f + FMath::Clamp(F.DeltaMag, -5.0f, 5.0f);         // UNI_MU_REF + dm
 		P->ThetaPixel = 1.0f / PixelsPerRadian;
-		P->GlareGain = CVarUniGlare.GetValueOnRenderThread();
+		P->SpriteCorePx = FMath::Clamp(CVarUniSpriteCorePx.GetValueOnRenderThread(), 0.25f, 16.0f);
+		P->SpriteCoreSat = FMath::Max(CVarUniSpriteSaturation.GetValueOnRenderThread(), 0.0f);
+		P->SpriteHaloGain = FMath::Max(CVarUniSpriteHaloGain.GetValueOnRenderThread(), 0.0f);
+		P->SpriteHaloGrowthPx = FMath::Max(CVarUniSpriteHaloGrowth.GetValueOnRenderThread(), 0.0f);
+		P->SpriteHaloMaxPx = FMath::Clamp(CVarUniSpriteHaloMax.GetValueOnRenderThread(), 0.0f, 64.0f);
 		uint32 GroupsX = 1;
 		const FIntVector Groups = WrappedGroups(uint32(F.Cells.Num()), GroupsX);
 		P->DispatchGroupsX = GroupsX;
@@ -475,11 +644,14 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 	if (PromoteRing.Num() == 0) { for (int32 I = 0; I < 3; ++I) { PromoteRing.Add(MakeShared<FPromoteReadback>()); } }
 	for (const TSharedPtr<FPromoteReadback>& R : PromoteRing)
 	{
-		if (R->bPending && R->Count->IsReady())
+		if (R->bPending && R->Count->IsReady() && R->Args->IsReady())
 		{
 			const uint32* Ptr = static_cast<const uint32*>(R->Count->Lock(sizeof(uint32)));   // render thread only (lesson #24)
 			Stats.PromoteCandidatesLastFrame = Ptr ? *Ptr : 0u;
 			R->Count->Unlock();
+			const uint32* Args = static_cast<const uint32*>(R->Args->Lock(sizeof(FRHIDrawIndirectParameters)));
+			Stats.SpritesLastFrame = Args ? FMath::Min(Args[1], UniGpuLayout::MaxSprites) : 0u;   // {vertices, instances, 0, 0}
+			R->Args->Unlock();
 			R->bPending = false;
 		}
 	}
@@ -488,7 +660,9 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 		if (!R->bPending)
 		{
 			if (!R->Count.IsValid()) { R->Count = MakeUnique<FRHIGPUBufferReadback>(TEXT("UniPromoteCountReadback")); }
+			if (!R->Args.IsValid()) { R->Args = MakeUnique<FRHIGPUBufferReadback>(TEXT("UniSpriteArgsReadback")); }
 			AddEnqueueCopyPass(GraphBuilder, R->Count.Get(), PromoteCountBuf, sizeof(uint32));
+			AddEnqueueCopyPass(GraphBuilder, R->Args.Get(), ArgsBuf, sizeof(FRHIDrawIndirectParameters));
 			R->bPending = true;
 			PromoteRingNext = (PromoteRingNext + 1) % PromoteRing.Num();
 		}
@@ -647,6 +821,7 @@ UniCore::u32 FUniGpuGenBackend::PoolCapacity() const { return UniGpuLayout::Dyna
 void FUniGpuGenBackend::SubmitProbe(std::shared_ptr<UniCore::FGenBatch> Batch)
 {
 	check(IsInGameThread());
+	TRACE_CPUPROFILER_EVENT_SCOPE(Uni_GenSubmitProbe);
 	TSharedPtr<FRequest, ESPMode::ThreadSafe> Req = MakeShared<FRequest, ESPMode::ThreadSafe>();
 	Req->Batch = Batch;
 	Req->Probe.StartTime = FPlatformTime::Seconds();
@@ -668,6 +843,7 @@ void FUniGpuGenBackend::SubmitProbe(std::shared_ptr<UniCore::FGenBatch> Batch)
 	ENQUEUE_RENDER_COMMAND(UniGenProbe)([Req, Payload](FRHICommandListImmediate& RHICmdList)
 	{
 		Req->Probe.StartTime = FPlatformTime::Seconds();   // the timeout runs from execution, not from enqueue
+		TRACE_CPUPROFILER_EVENT_SCOPE(Uni_GenProbe_RT);
 		const uint32 NumTasks = uint32(Payload->Num());
 		if (NumTasks == 0) { Req->Probe.bSubmitted = true; return; }
 		FRDGBuilder GraphBuilder(RHICmdList);
@@ -679,6 +855,8 @@ void FUniGpuGenBackend::SubmitProbe(std::shared_ptr<UniCore::FGenBatch> Batch)
 		P->InTasks = GraphBuilder.CreateSRV(TaskBuf);
 		P->OutCounts = GraphBuilder.CreateUAV(CountBuf);
 		P->NumTasks = NumTasks;
+		P->UniWebTexture = FUniRenderer::Get().RegisterWebTexture_RenderThread(GraphBuilder);   // D-164
+		P->UniWebSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Wrap>::GetRHI();
 		uint32 GroupsX = 1;
 		const FIntVector Groups = WrappedGroups(NumTasks, GroupsX);
 		P->DispatchGroupsX = GroupsX;
@@ -693,6 +871,7 @@ void FUniGpuGenBackend::SubmitProbe(std::shared_ptr<UniCore::FGenBatch> Batch)
 void FUniGpuGenBackend::SubmitPlace(std::shared_ptr<UniCore::FGenBatch> Batch)
 {
 	check(IsInGameThread());
+	TRACE_CPUPROFILER_EVENT_SCOPE(Uni_GenSubmitPlace);
 	TSharedPtr<FRequest, ESPMode::ThreadSafe>* Found = Requests.Find(Batch->Ticket);
 	if (!Found) { return; }
 	TSharedPtr<FRequest, ESPMode::ThreadSafe> Req = *Found;
@@ -717,6 +896,7 @@ void FUniGpuGenBackend::SubmitPlace(std::shared_ptr<UniCore::FGenBatch> Batch)
 	ENQUEUE_RENDER_COMMAND(UniGenPlace)([Req, Payload](FRHICommandListImmediate& RHICmdList)
 	{
 		Req->Place.StartTime = FPlatformTime::Seconds();
+		TRACE_CPUPROFILER_EVENT_SCOPE(Uni_GenPlace_RT);
 		const uint32 NumTasks = uint32(Payload->Tasks.Num());
 		FRDGBuilder GraphBuilder(RHICmdList);
 		FUniRenderer& R = FUniRenderer::Get();
@@ -736,6 +916,8 @@ void FUniGpuGenBackend::SubmitPlace(std::shared_ptr<UniCore::FGenBatch> Batch)
 			P->OutPool = GraphBuilder.CreateUAV(PoolBuf);
 			P->OutAccepted = GraphBuilder.CreateUAV(AccBuf);
 			P->NumTasks = NumTasks;
+			P->UniWebTexture = R.RegisterWebTexture_RenderThread(GraphBuilder);   // D-164
+			P->UniWebSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Wrap>::GetRHI();
 			uint32 GroupsX = 1;
 			const FIntVector Groups = WrappedGroups(NumTasks, GroupsX);
 			P->DispatchGroupsX = GroupsX;
@@ -814,6 +996,7 @@ bool FUniGpuGenBackend::Poll(const UniCore::FGenBatch& Batch, bool bPlace)
 	Ph.bCopyEnqueued = true;
 	ENQUEUE_RENDER_COMMAND(UniGenCopy)([Req, bPlace](FRHICommandListImmediate&)
 	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(Uni_GenCopy_RT);
 		std::shared_ptr<UniCore::FGenBatch> B = Req->Batch;
 		const size_t N = B->Tasks.size();
 		if (!bPlace)

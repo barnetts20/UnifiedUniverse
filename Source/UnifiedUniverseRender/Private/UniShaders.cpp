@@ -23,3 +23,4 @@ IMPLEMENT_GLOBAL_SHADER(FUniVolumeMarchCS, "/Plugin/UnifiedUniverse/Private/UniV
 IMPLEMENT_GLOBAL_SHADER(FUniVolumeBackgroundCS, "/Plugin/UnifiedUniverse/Private/UniVolume.usf", "BackgroundCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FUniVolumeCompositeVS, "/Plugin/UnifiedUniverse/Private/UniVolume.usf", "CompositeVS", SF_Vertex);
 IMPLEMENT_GLOBAL_SHADER(FUniVolumeCompositePS, "/Plugin/UnifiedUniverse/Private/UniVolume.usf", "CompositePS", SF_Pixel);
+IMPLEMENT_GLOBAL_SHADER(FUniWebTexUploadCS, "/Plugin/UnifiedUniverse/Private/UniWebTexUpload.usf", "UploadCS", SF_Compute);   // D-164

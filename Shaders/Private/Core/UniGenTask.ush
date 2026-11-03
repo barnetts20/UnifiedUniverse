@@ -26,7 +26,7 @@
 #include "UniFields.ush"
 #include "UniPlacement.ush"
 
-/** GPU-MIRROR: UniCore::FGenTaskGPU (176 bytes). */
+/** GPU-MIRROR: UniCore::FGenTaskGPU (208 bytes). */
 struct FUniGenTask
 {
 	FUniFieldFrame Frame;
@@ -40,7 +40,30 @@ struct FUniGenTask
 	uint PoolCapacity;        // n after truncation
 	uint IndexBase;
 	float4 Suppress;          // suppressor centre in cell units relative to the cell origin, radius in cell units (w <= 0: none)
+	uint4 BoxLo;              // D-153: sampling box in cell offsets (xyz; w unused). Probes and candidates
+	uint4 BoxSpan;            //        lie in [Lo, Lo + Span) per axis; Span 0 = the whole axis (identity)
 };
+
+/** D-153: an in-cell offset (2^-32 cell units) mapped into the task's sampling box. Span 0 is
+ *  the identity, bit for bit, so tasks without a box place exactly as before. */
+UNI_FN uint Uni_BoxMap(uint InOffset, uint InLo, uint InSpan)
+{
+	if (InSpan == 0u) { return InOffset; }
+	return InLo + Uni_MulHi32(InOffset, InSpan);
+}
+
+UNI_FN uint3 Uni_BoxOffset(FUniGenTask InT, uint3 InOffset)
+{
+	return uint3(Uni_BoxMap(InOffset.x, InT.BoxLo.x, InT.BoxSpan.x), Uni_BoxMap(InOffset.y, InT.BoxLo.y, InT.BoxSpan.y), Uni_BoxMap(InOffset.z, InT.BoxLo.z, InT.BoxSpan.z));
+}
+
+/** The same for a probe's unit position: Lo + v Span (v itself when Span is 0). */
+UNI_FN float Uni_BoxUnit(float InV, uint InLo, uint InSpan)
+{
+	if (InSpan == 0u) { return InV; }
+	const float S = 1.0f / 4294967296.0f;
+	return (float)InLo * S + InV * ((float)InSpan * S);
+}
 
 /** GPU-MIRROR: UniCore::FSliceGPU (64 bytes). */
 struct FUniSlice
@@ -68,7 +91,9 @@ struct FUniTaskCount
 
 UNI_FN float Uni_TaskProbe(FUniGenTask InT, uint InK)
 {
-	return Uni_FieldSample(InT.FieldId, Uni_FieldFramePoint(InT.Frame, Uni_ProbeUnit(InT.CellSeed, InK)), InT.Params);
+	const float3 V = Uni_ProbeUnit(InT.CellSeed, InK);
+	const float3 U = float3(Uni_BoxUnit(V.x, InT.BoxLo.x, InT.BoxSpan.x), Uni_BoxUnit(V.y, InT.BoxLo.y, InT.BoxSpan.y), Uni_BoxUnit(V.z, InT.BoxLo.z, InT.BoxSpan.z));
+	return Uni_FieldSample(InT.FieldId, Uni_FieldFramePoint(InT.Frame, U), InT.Params);
 }
 
 /** Probe reduction -> count. Sum and max are over all UNI_PROBES_PER_CELL probes. */
@@ -77,6 +102,42 @@ UNI_FN FUniTaskCount Uni_TaskCount(FUniGenTask InT, float InProbeSum, float InPr
 	FUniTaskCount C;
 	C.Mean = InProbeSum / (float)UNI_PROBES_PER_CELL;
 	C.Envelope = InProbeMax * UNI_ENVELOPE_PAD;
+	// D-153: a field with sub-probe features bounds itself over the sampling box (rotation keeps
+	// distances: the nearest point of the box to the centre, in field units). Zero for others.
+	if (InT.Frame.Periodic == 0u)
+	{
+		const float S = InT.Frame.SizeP;
+		float D2 = 0.0f;
+		for (uint A = 0u; A < 3u; ++A)
+		{
+			const float Lo = Uni_BoxUnit(0.0f, A == 0u ? InT.BoxLo.x : (A == 1u ? InT.BoxLo.y : InT.BoxLo.z), A == 0u ? InT.BoxSpan.x : (A == 1u ? InT.BoxSpan.y : InT.BoxSpan.z));
+			const float Hi = Uni_BoxUnit(1.0f, A == 0u ? InT.BoxLo.x : (A == 1u ? InT.BoxLo.y : InT.BoxLo.z), A == 0u ? InT.BoxSpan.x : (A == 1u ? InT.BoxSpan.y : InT.BoxSpan.z));
+			const float O = A == 0u ? InT.Frame.OriginP.x : (A == 1u ? InT.Frame.OriginP.y : InT.Frame.OriginP.z);
+			const float Q0 = O + Lo * S, Q1 = O + Hi * S;
+			const float E = (Q0 > 0.0f) ? Q0 : ((Q1 < 0.0f) ? -Q1 : 0.0f);
+			D2 += E * E;
+		}
+		C.Envelope = max(C.Envelope, Uni_FieldBoundBeyond(InT.FieldId, sqrt(D2), InT.Params));
+	}
+	// D-165: a textured web's cell mean comes from its mips: a power-of-two cell of at least one
+	// texel is exactly one texel of the mip whose texels are its size, read at its centre
+	// (trilinear weight 1). 128 probes of a spiky field (the adhesion web's node matter peaks at
+	// ~1250x its mean) put the mean of a cell holding a whole tile out by ~100%, one way or the
+	// other; counts follow the mean. Probes still set the envelope. Smaller cells, and webs with a
+	// bias power (a power of the mean is not the mean of the power), keep the probes.
+	if (InT.FieldId == UNI_FIELD_WEB && InT.Frame.Periodic != 0u && Uni_WebIsTextured(InT.Params)
+		&& !(InT.Params.C.x > 0.0f && InT.Params.C.x != 1.0f)
+		&& InT.BoxSpan.x == 0u && InT.BoxSpan.y == 0u && InT.BoxSpan.z == 0u)
+	{
+		const float N = max(InT.Params.C.w, 1.0f);
+		const float Texels = InT.Frame.SizeP * N;
+		if (Texels >= 1.0f)
+		{
+			const float H = 0.5f * min(InT.Frame.SizeP, 1.0f);
+			const float3 Centre = frac(float3(InT.Frame.OriginP.x + H, InT.Frame.OriginP.y + H, InT.Frame.OriginP.z + H));
+			C.Mean = UniField_WebTex(Centre, InT.Params, log2(Texels));
+		}
+	}
 	const float Lambda = InT.LambdaScale * C.Mean;
 	C.Count = (C.Envelope > 0.0f) ? Uni_PoissonCount(Lambda, InT.CellSeed) : 0u;
 	// D-114: budget follows the expected acceptance with 4x headroom.
@@ -88,7 +149,7 @@ UNI_FN FUniTaskCount Uni_TaskCount(FUniGenTask InT, float InProbeSum, float InPr
 /** Candidate J: its offset, and whether it passes rejection. */
 UNI_FN bool Uni_TaskCandidate(FUniGenTask InT, float InEnvelope, uint InJ, UNI_OUT(uint3) OutOffset, UNI_OUT(float) OutDensity)
 {
-	OutOffset = Uni_CandidateOffset(InT.CellSeed, InJ);
+	OutOffset = Uni_BoxOffset(InT, Uni_CandidateOffset(InT.CellSeed, InJ));
 	OutDensity = Uni_FieldSample(InT.FieldId, Uni_FieldFramePoint(InT.Frame, Uni_OffsetUnit(OutOffset)), InT.Params);
 	return Uni_Accept(InT.CellSeed, InJ, OutDensity, InEnvelope);
 }

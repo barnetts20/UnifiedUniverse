@@ -47,6 +47,33 @@ namespace UniCore
 		return C;
 	}
 
+	/** D-151: the cluster field's integral over the unit ball, analytically (UniField_Cluster):
+	 *  the beta-model body is q1 q2 4 pi int_0^Cut (1 + s^2/rc^2)^-1.5 taper(s) s^2 ds (exact, the
+	 *  ellipsoidal map has Jacobian q1 q2), each Plummer clump 4 pi a^3 / 3 (its tail beyond the
+	 *  soft edge, < 0.3% of the total, is ignored; T1.field.cluster measures it). */
+	inline double ClusterFieldIntegral(const H::FUniFieldParams& P)
+	{
+		const double Cut = double(P.A.w);
+		const double Rc = std::max(double(P.A.x), 1.0e-4);
+		const double Q1 = std::max(double(P.A.y), 0.05), Q2 = std::max(double(P.A.z), 0.05);
+		const int N = 8192;
+		double Body = 0.0;
+		for (int I = 0; I < N; ++I)
+		{
+			const double S = (double(I) + 0.5) / double(N) * Cut;
+			const double X = 1.0 + S * S / (Rc * Rc);
+			const double W = double(H::Uni_ClusterTaper(float(S), float(Cut)));
+			Body += W * S * S / (X * std::sqrt(X));
+		}
+		Body *= Cut / double(N) * 4.0 * 3.14159265358979323846 * Q1 * Q2;
+		const double NClumps = std::min(std::floor(std::max(double(P.B.x), 0.0)), double(H::UNI_CLUSTER_MAX_CLUMPS));
+		const double Clumps = (NClumps > 0.0 && P.B.y > 0.0f) ? NClumps * double(P.B.y) * 4.0 / 3.0 * 3.14159265358979323846 * std::pow(std::max(double(P.B.z), 1.0e-4), 3.0) : 0.0;
+		return Body + Clumps;
+	}
+
+	/** D-151: fields whose normaliser is analytic: no sampled integral, nothing to wait for. */
+	inline bool FieldHasAnalyticIntegral(u32 FieldId) { return FieldId == H::UNI_FIELD_CLUSTER; }
+
 	inline H::FUniObject ToHlsl(const FObjectGPU& O)
 	{
 		H::FUniObject R;
@@ -151,6 +178,93 @@ namespace UniCore
 				AnchorLevels.push_back(L);
 				AnchorCells.push_back(CellOf(A.Coord, L));
 			}
+			// D-167: catalogue entries, by level: each one's position in its tile as an exact
+			// tile-local coordinate (cm, < 2^PeriodBits).
+			for (size_t Ci = 0; Ci < D.Catalogues.size(); ++Ci)
+			{
+				const FCatalogue& Cat = D.Catalogues[Ci];
+				for (size_t Ei = 0; Ei < Cat.Entries.size(); ++Ei)
+				{
+					FCatRef R;
+					R.Cat = u32(Ci);
+					R.Entry = u32(Ei);
+					R.Level = Model.LevelOf(Cat.ArchetypeId, Cat.Entries[Ei].AbsMag);
+					for (int Ax = 0; Ax < 3; ++Ax)
+					{
+						const double F = std::clamp(Cat.Entries[Ei].Pos[Ax] - std::floor(Cat.Entries[Ei].Pos[Ax]), 0.0, 0.9999999999999999);
+						const u64 M53 = u64(F * 9007199254740992.0);   // 53 bits of the fraction
+						R.E[Ax] = Cat.PeriodBits >= 53 ? Shl(FU128::FromU64(M53), Cat.PeriodBits - 53) : Shr(FU128::FromU64(M53), 53 - Cat.PeriodBits);
+					}
+					CatByLevel[R.Level].push_back(CatRefs.size());
+					CatRefs.push_back(R);
+				}
+			}
+		}
+
+		/** D-167: levels at which catalogues place objects, with their archetypes. */
+		std::map<int, std::set<u32>> CatalogueLevels() const
+		{
+			std::map<int, std::set<u32>> R;
+			const FUniverseDef& D = Model.Definition();
+			for (const FCatRef& C : CatRefs) { R[C.Level].insert(D.Catalogues[C.Cat].ArchetypeId); }
+			return R;
+		}
+		bool CatalogueAtLevel(int L) const { return CatByLevel.count(L) != 0; }
+
+		/** Authored objects (anchors, catalogue entries) in cell K? */
+		bool HasAuthored(const FCellKey& K) const
+		{
+			for (const FCellKey& A : AnchorCells) { if (A == K) { return true; } }
+			bool bAny = false;
+			ForEachCatalogueObject(K, [&](const FCatRef&, const u32*, u32) { bAny = true; });
+			return bAny;
+		}
+
+		/** D-167: every catalogue object in cell K: (entry, in-cell offset in 2^-32 cell units,
+		 *  copy within the cell: 0 unless the cell holds several tiles). */
+		template <typename F>
+		void ForEachCatalogueObject(const FCellKey& K, F&& Fn) const
+		{
+			const auto It = CatByLevel.find(K.Level);
+			if (It == CatByLevel.end()) { return; }
+			const FUniverseDef& D = Model.Definition();
+			const int L = K.Level;
+			for (size_t Ri : It->second)
+			{
+				const FCatRef& R = CatRefs[Ri];
+				const int P = D.Catalogues[R.Cat].PeriodBits;
+				if (L <= P)
+				{
+					// The cell lies inside one tile: the entry is in it if its cell index within the
+					// tile is the cell's.
+					bool bIn = true;
+					u32 Off[3];
+					for (int Ax = 0; Ax < 3 && bIn; ++Ax)
+					{
+						bIn = MaskLow(K.C[Ax], P - L) == Shr(R.E[Ax], L);
+						const FU128 Rel = MaskLow(R.E[Ax], L);
+						Off[Ax] = L >= 32 ? u32(Shr(Rel, L - 32).L[3]) : u32(Shl(Rel, 32 - L).L[3]);
+					}
+					if (bIn) { Fn(R, Off, 0u); }
+				}
+				else
+				{
+					// The cell holds (2^(L-P))^3 whole tiles (cells are aligned to their size).
+					const int Sh = std::min(L - P, 3);
+					const u32 N = 1u << Sh;
+					for (u32 Tz = 0; Tz < N; ++Tz) for (u32 Ty = 0; Ty < N; ++Ty) for (u32 Tx = 0; Tx < N; ++Tx)
+					{
+						const u32 T[3] = { Tx, Ty, Tz };
+						u32 Off[3];
+						for (int Ax = 0; Ax < 3; ++Ax)
+						{
+							const FU128 Rel = Add(Shl(FU128::FromU64(T[Ax]), P), R.E[Ax]);
+							Off[Ax] = L >= 32 ? u32(Shr(Rel, L - 32).L[3]) : u32(Shl(Rel, 32 - L).L[3]);
+						}
+						Fn(R, Off, (Tz * N + Ty) * N + Tx);
+					}
+				}
+			}
 		}
 
 		const FUniverseModel& ModelRef() const { return Model; }
@@ -230,7 +344,7 @@ namespace UniCore
 			if (It != IntegralCache.end()) { C.IntegralAll = It->second; return C.IntegralAll; }
 			C.IntegralAll = ComputeIntegral(C);
 			IntegralCache[C.Id] = C.IntegralAll;
-			++InlineIntegrals;
+			if (!FieldHasAnalyticIntegral(C.Emitter->FieldId)) { ++InlineIntegrals; }
 			return C.IntegralAll;
 		}
 
@@ -238,7 +352,7 @@ namespace UniCore
 		mutable size_t InlineIntegrals = 0;
 
 		/** D-140: is the integral known without computing it? */
-		bool HasIntegral(const FContributor& C) const { return C.IntegralAll >= 0.0 || IntegralCache.count(C.Id) != 0; }
+		bool HasIntegral(const FContributor& C) const { return C.IntegralAll >= 0.0 || FieldHasAnalyticIntegral(C.Emitter->FieldId) || IntegralCache.count(C.Id) != 0; }
 		/** D-140: store a value computed elsewhere (the streamer's worker), by id. */
 		void StoreIntegral(u32 Id, double Value) const { IntegralCache[Id] = Value; }
 
@@ -248,6 +362,18 @@ namespace UniCore
 		{
 			const bool bPeriodic = C.Emitter->bDensityMode || C.bRoot;
 			const H::FUniFieldParams P = C.Params.ToHlsl();
+			if (!bPeriodic && C.Emitter->FieldId == H::UNI_FIELD_CLUSTER) { return ClusterFieldIntegral(P); }   // D-151
+			// D-165: a textured web without a power is linear in its channels: its period mean is
+			// exact from the texture's means. Sampling it misses by several % on spiky channels
+			// (the adhesion web's node matter peaks at ~1250x its mean), and counts follow the mean.
+			if (bPeriodic && C.Emitter->FieldId == H::UNI_FIELD_WEB && H::Uni_WebIsTextured(P) && !(P.C.x > 0.0f && P.C.x != 1.0f))
+			{
+				const H::float4 Mn = H::UniWebTexMean();
+				double Mean = double(P.A.z) + double(P.A.w) * Mn.x + double(P.B.x) * Mn.y;
+				if (P.C.y > 0.0f) { Mean += double(P.C.y) * Mn.z; }
+				if (P.D.x > 0.0f) { Mean += double(P.D.x) * Mn.w; }
+				return Mean;
+			}
 			const int G = 32;
 			const float Cell = bPeriodic ? 1.0f / float(G) : 2.0f / float(G);
 			const u32 Seed0 = H::Uni_SeedMix(C.Id, 0xA11A11u);
@@ -301,7 +427,10 @@ namespace UniCore
 			Out.FieldId = C.Emitter->FieldId;
 			Out.ChildArchetypeId = Child;
 			Out.SliceIndex = u32(SliceIdx);
-			Out.LambdaScale = float(LambdaScale(C, K, *S, Out.Frame.SizeP) * LambdaMultiplier);
+			// D-153: the sampling box (whole cell unless the emitter asks for one), and lambda over it.
+			const double BoxFrac = SampleBox(C, K, Out.BoxLo, Out.BoxSpan);
+			if (!(BoxFrac > 0.0)) { return false; }
+			Out.LambdaScale = float(LambdaScale(C, K, *S, Out.Frame.SizeP) * BoxFrac * LambdaMultiplier);
 			// One suppressor per task (the first that touches the cell), in cell units.
 			const double W = CellWidthCm(K.Level);
 			for (const FSuppressor& Sp : D.Suppressors)
@@ -319,6 +448,35 @@ namespace UniCore
 			return true;
 		}
 
+		/** D-153: the part of cell K that C's influence sphere's bounding box overlaps, as in-cell
+		 *  offsets per axis, widened outward to whole 2^-32 steps; returns its volume fraction
+		 *  (0: no overlap). Span 0 = whole axis. Without bSampleBox, or for root contributors, the
+		 *  whole cell (fraction 1). */
+		double SampleBox(const FContributor& C, const FCellKey& K, uint32_t OutLo[4], uint32_t OutSpan[4]) const
+		{
+			for (int A = 0; A < 4; ++A) { OutLo[A] = 0u; OutSpan[A] = 0u; }
+			if (C.bRoot || !C.Emitter || !C.Emitter->bSampleBox) { return 1.0; }
+			const double W = CellWidthCm(K.Level);
+			const FVec3d Rel = ToDouble(Sub(C.Centre, CellOrigin(K)));
+			const double Ctr[3] = { Rel.X / W, Rel.Y / W, Rel.Z / W };
+			const double R = C.InfluenceCm / W;
+			double Frac = 1.0;
+			for (int A = 0; A < 3; ++A)
+			{
+				const double Lo = std::clamp(Ctr[A] - R, 0.0, 1.0), Hi = std::clamp(Ctr[A] + R, 0.0, 1.0);
+				if (!(Hi > Lo)) { return 0.0; }
+				if (Lo <= 0.0 && Hi >= 1.0) { continue; }                 // whole axis: identity
+				const double T32 = 4294967296.0;
+				const double L = std::floor(Lo * T32);
+				const double S = std::min(std::ceil(Hi * T32), T32) - L;
+				if (S >= T32) { continue; }
+				OutLo[A] = u32(L);
+				OutSpan[A] = u32(std::max(S, 1.0));
+				Frac *= double(OutSpan[A]) / T32;
+			}
+			return Frac;
+		}
+
 		static H::FUniGenTask ToHlsl(const FGenTaskGPU& T)
 		{
 			H::FUniGenTask R;
@@ -330,6 +488,8 @@ namespace UniCore
 			R.CellSeed = T.CellSeed; R.FieldId = T.FieldId; R.ChildArchetypeId = T.ChildArchetypeId; R.SliceIndex = T.SliceIndex;
 			R.LambdaScale = T.LambdaScale; R.PoolBase = T.PoolBase; R.PoolCapacity = T.PoolCapacity; R.IndexBase = T.IndexBase;
 			R.Suppress = H::float4(T.Suppress[0], T.Suppress[1], T.Suppress[2], T.Suppress[3]);
+			R.BoxLo = H::uint4(T.BoxLo[0], T.BoxLo[1], T.BoxLo[2], T.BoxLo[3]);
+			R.BoxSpan = H::uint4(T.BoxSpan[0], T.BoxSpan[1], T.BoxSpan[2], T.BoxSpan[3]);
 			return R;
 		}
 
@@ -441,20 +601,48 @@ namespace UniCore
 				Out.Indices.push_back(kFirstAnchorIndex + u32(I));
 				Out.ObjectContributor.push_back(0u);
 			}
+
+			// D-167: catalogue objects in this cell, at reserved indices. Magnitude and position are
+			// the entry's; radius and colour are drawn from the copy's own seed, as for generated
+			// objects (Uni_TaskMakeObject), so copies differ.
+			ForEachCatalogueObject(K, [&](const FCatRef& R, const u32* Off, u32 Copy)
+			{
+				const FCatalogue& Cat = D.Catalogues[R.Cat];
+				const FArchetype& AA = D.Arch(Cat.ArchetypeId);
+				const u32 Local = Copy * u32(Cat.Entries.size()) + R.Entry;
+				const u32 Seed = H::Uni_ObjectSeed(CellSeed(D.Seed, K, Cat.ArchetypeId, kCatalogueContributor + R.Cat, 0u), Local);
+				const float M = Cat.Entries[R.Entry].AbsMag;
+				const H::float4 Rm(AA.RadiusModel[0], AA.RadiusModel[1], AA.RadiusModel[2], AA.RadiusModel[3]);
+				const H::float4 Cm(AA.ColourModel[0], AA.ColourModel[1], AA.ColourModel[2], AA.ColourModel[3]);
+				const float RL2 = H::Uni_DrawRadiusLog2(Seed, M, Rm);
+				const H::float3 Rgb = H::Uni_DrawColour(Seed, M, Cm);
+				const bool bExt = AA.Visibility == EUniVisibility::Extended;
+				const u32 Flags = H::UNI_OBJ_FLAG_ANCHOR | (bExt ? H::UNI_OBJ_FLAG_EXTENDED : 0u) | (AA.Emitters.empty() ? 0u : H::UNI_OBJ_FLAG_HAS_CONTRIBUTOR);
+				const float SB = bExt ? SurfaceBrightness(M, RL2) : 0.0f;
+				Out.Objects.push_back(FromHlsl(H::Uni_MakeObject(H::uint3(Off[0], Off[1], Off[2]), Cat.ArchetypeId, Flags, Seed, RL2, M, SB, Rgb)));
+				Out.Indices.push_back(kFirstCatalogueIndex + Local);
+				Out.ObjectContributor.push_back(0u);
+			});
 			Out.Hash = HashContent(Out);
 		}
 
 		/** Contributors created by the objects of a generated cell (pass 4). */
 		std::vector<FContributor> MakeContributors(const FCellContent& C) const
 		{
-			const FUniverseDef& D = Model.Definition();
 			std::vector<FContributor> Out;
-			for (size_t I = 0; I < C.Objects.size(); ++I)
+			for (size_t I = 0; I < C.Objects.size(); ++I) { MakeContributorsFor(C, I, Out); }
+			return Out;
+		}
+
+		/** D-168: the contributors of object I of a cell only (appended to Out). */
+		void MakeContributorsFor(const FCellContent& C, size_t I, std::vector<FContributor>& Out) const
+		{
+			const FUniverseDef& D = Model.Definition();
 			{
 				const FObjectGPU& O = C.Objects[I];
 				const u32 Arch = O.A[3] & 0xFFFFu;
 				const FArchetype& A = D.Arch(Arch);
-				if (A.Emitters.empty()) { continue; }
+				if (A.Emitters.empty()) { return; }
 				const bool bAnchor = ((O.A[3] >> 16) & H::UNI_OBJ_FLAG_ANCHOR) != 0u;
 				const FAnchor* Anc = nullptr;
 				if (bAnchor) { for (const FAnchor& X : D.Anchors) { if (X.Seed == O.B[0]) { Anc = &X; } } }
@@ -489,7 +677,6 @@ namespace UniCore
 					Out.push_back(Ct);
 				}
 			}
-			return Out;
 		}
 
 		const std::vector<int>& AnchorLevelList() const { return AnchorLevels; }
@@ -515,6 +702,11 @@ namespace UniCore
 		std::vector<FContributor> Roots;
 		std::vector<int> AnchorLevels;
 		std::vector<FCellKey> AnchorCells;
+		// D-167: catalogue entries and their levels.
+		struct FCatRef { u32 Cat = 0; u32 Entry = 0; int Level = 0; FU128 E[3]; };
+		std::vector<FCatRef> CatRefs;
+		std::map<int, std::vector<size_t>> CatByLevel;
+		static constexpr u32 kCatalogueContributor = 0xCA7A0000u;   // the "contributor" in a catalogue copy's cell seed
 	};
 
 	// ======================================================================================
@@ -540,6 +732,7 @@ namespace UniCore
 			std::set<int> Ls;
 			for (const FUniEmitter& E : D.RootEmitters) { AddRange(Ls, E.ChildArchetypeId, 0); }
 			for (const FAnchor& A : D.Anchors) { Ls.insert(Gen.ModelRef().LevelOf(A.ArchetypeId, A.AbsMag)); AddRange(Ls, A.ArchetypeId, 1); }
+			for (const auto& KV : Gen.CatalogueLevels()) { Ls.insert(KV.first); for (u32 A : KV.second) { AddRange(Ls, A, 1); } }   // D-167
 			for (int L : Ls) { Levels.emplace(L, FLevel(L)); }
 		}
 
@@ -567,7 +760,9 @@ namespace UniCore
 			double Moved = 0.0;
 			if (bHasCamera) { Moved = Length(ToDouble(Sub(Coord, Camera))); }
 			Camera = Coord; CameraFrac = Frac; bHasCamera = true;
-			const int N = UniHlsl::Uni_WindowHalfWidth(float(DeltaMag));
+			const double Reach = double(UniHlsl::Uni_WindowReach(float(DeltaMag)));   // D-162: 5^3 at dm 0
+			const double NoLead[3] = { 0.0, 0.0, 0.0 };
+			bMeasureDirty = true;   // the camera moved: every offset changes
 
 			for (auto It = Levels.rbegin(); It != Levels.rend(); ++It)
 			{
@@ -588,21 +783,31 @@ namespace UniCore
 				// fade); only the new outer shell enters, and it lies beyond relevance.
 				bool bResized = false;
 				auto OldInWindow = Lv.InWindow;
-				if (Lv.Win.Geometry().N != N) { Lv.Win = FLevelWindow(L, N); Lv.InWindow.clear(); bResized = true; }
+				// D-162: the same window plan as the runtime streamer (at rest: no forward stretch).
+				const int MinSide[3] = { 1, 1, 1 };
+				const FWindowGeometry Next = PlanWindow(L, Camera, Reach, NoLead, NoLead, MinSide, &Lv.Win);
+				if (!Lv.Win.IsValid() || !Lv.Win.Geometry().SameShape(Next))
+				{
+					if (Lv.Win.IsValid()) { Lv.InWindow.clear(); bResized = true; }
+					Lv.Win = FLevelWindow(Next);
+				}
 
 				// Gather first, against the window the camera is about to have: contributors
 				// emitting at L that overlap it (D-004 list). With none, the level is inactive and
 				// costs nothing; reactivation rebuilds it (design: Level windows, Activation).
-				FWindowGeometry Next = Lv.Win.Geometry();
-				Next.Centre = CellOf(Camera, L);
 				std::vector<const FContributor*> Gathered = Gather(Next);
 				Lv.Stats.MaxContributors = std::max(Lv.Stats.MaxContributors, Gathered.size());
+				std::vector<u32> GatherIds;
+				GatherIds.reserve(Gathered.size());
+				for (const FContributor* C : Gathered) { GatherIds.push_back(C->Id); }
+				const bool bGatherChanged = GatherIds != Lv.GatherIds;
+				Lv.GatherIds = std::move(GatherIds);
 				if (Gathered.empty() && !AnchorInWindow(Next))
 				{
 					if (Lv.Win.IsValid())
 					{
 						for (const FCellKey& K : Lv.InWindow) { if (bEvictOnExit) { Evict(K); } }
-						Lv.Win = FLevelWindow(L, N);
+						Lv.Win = FLevelWindow(Next);
 						Lv.InWindow.clear();
 					}
 					Lv.bActive = false;
@@ -611,7 +816,7 @@ namespace UniCore
 				}
 				Lv.bActive = true;
 
-				const FWindowDiff Diff = Lv.Win.Recentre(Next.Centre);
+				const FWindowDiff Diff = Lv.Win.Recentre(Next);
 				// A rebuilt level, or a window that jumped more than one cell (resume after velocity
 				// LOD, teleport), can hold cells inside relevance: it fades in from zero (D-116).
 				if (((Diff.bRebuilt && !bResized) || bJump) && !bFirstFrame) { Lv.Fade = 0.0f; }
@@ -624,8 +829,10 @@ namespace UniCore
 					Lv.InWindow.insert(WC.Key);
 				}
 				if (bResized && bEvictOnExit) { for (const FCellKey& K : OldInWindow) { if (!Lv.InWindow.count(K)) { Evict(K); } } }
-				// D-113: cells whose contributor set grew are regenerated.
-				for (const FCellKey& K : Lv.InWindow) { EnsureCell(Lv, K, Gathered, false); }
+				// D-113: cells whose contributor set grew are regenerated. A cell's set is the gathered
+				// list filtered by the exact overlap test, so with the same gathered list (and no
+				// resize) every kept cell would find its own set again: skipping is exact (D-151).
+				if (bGatherChanged || bResized) { for (const FCellKey& K : Lv.InWindow) { EnsureCell(Lv, K, Gathered, false); } }
 
 				size_t Res = 0;
 				for (const FCellKey& K : Lv.InWindow) { Res += Cache.at(K).Objects.size(); }
@@ -680,6 +887,7 @@ namespace UniCore
 	private:
 		struct FLevel
 		{
+			std::vector<u32> GatherIds;   // last frame's gathered ids (D-151: skip the D-113 pass when unchanged)
 			explicit FLevel(int L) : Win(L, UniHlsl::UNI_WINDOW_N) {}
 			FLevelWindow Win;
 			FVelocityLod Lod;
@@ -728,9 +936,11 @@ namespace UniCore
 			return J;
 		}
 
-		/** Authored anchors make their own level active: nothing emits them. */
+		/** Authored anchors make their own level active: nothing emits them. So does a catalogue
+		 *  (D-167): it repeats every tile, so every window at its level holds some of it. */
 		bool AnchorInWindow(const FWindowGeometry& G) const
 		{
+			if (Gen.CatalogueAtLevel(G.Level)) { return true; }
 			const std::vector<int>& Ls = Gen.AnchorLevelList();
 			const std::vector<FCellKey>& Ks = Gen.AnchorCellList();
 			for (size_t I = 0; I < Ls.size(); ++I)
@@ -741,8 +951,27 @@ namespace UniCore
 			return false;
 		}
 
-		std::vector<const FContributor*> Gather(const FWindowGeometry& G) const
+		/** D-151: every registered contributor's child level range and camera offset, once per
+		 *  frame (as the runtime streamer does, D-138), in id order. */
+		struct FMeasuredRef { const FContributor* C; int LMin, LMax; FVec3d D; };
+		std::vector<FMeasuredRef> Measured;
+		bool bMeasureDirty = true;   // set whenever Registered changes, so a contributor registered by a
+		                             // coarser level this frame is gathered by finer levels this frame
+
+		void MeasureContributors()
 		{
+			Measured.clear();
+			Measured.reserve(Registered.size());
+			for (const auto& KV : Registered)
+			{
+				const FSliceTable& T = Gen.ModelRef().SlicesOf(KV.second.Emitter->ChildArchetypeId);
+				Measured.push_back({ &KV.second, T.LMin, T.LMax, ToDouble(Sub(KV.second.Centre, Camera)) });
+			}
+		}
+
+		std::vector<const FContributor*> Gather(const FWindowGeometry& G)
+		{
+			if (bMeasureDirty) { MeasureContributors(); bMeasureDirty = false; }
 			std::vector<const FContributor*> Out;
 			const int L = G.Level;
 			for (const FContributor& R : Gen.RootContributors())
@@ -750,28 +979,31 @@ namespace UniCore
 				const FSliceTable& T = Gen.ModelRef().SlicesOf(R.Emitter->ChildArchetypeId);
 				if (L >= T.LMin && L <= T.LMax) { Out.push_back(&R); }
 			}
-			// Window AABB relative to the centre cell's origin: [-N w, (N+1) w]^3.
+			// Window AABB relative to the centre cell's origin: [Lo w, (Hi+1) w] per axis. Offsets are
+			// camera-relative doubles; the margin covers their rounding, so the list is a superset
+			// of the exact one and the exact per-cell overlap test (EnsureCell) decides.
 			const double W = CellWidthCm(L);
-			const FCoord O = CellOrigin(G.Centre);
-			for (const auto& KV : Registered)
+			const FVec3d Ow = ToDouble(Sub(CellOrigin(G.Centre), Camera));
+			double Lo[3], Hi[3];   // D-162: per-axis box
+			for (int A = 0; A < 3; ++A) { Lo[A] = G.Lo[A] * W; Hi[A] = (G.Hi[A] + 1) * W; }
+			const bool bCovered = G.AxisCovered();
+			for (const FMeasuredRef& M : Measured)
 			{
-				const FContributor& C = KV.second;
-				const FSliceTable& T = Gen.ModelRef().SlicesOf(C.Emitter->ChildArchetypeId);
-				if (L < T.LMin || L > T.LMax) { continue; }
-				if (!G.AxisCovered())
+				if (L < M.LMin || L > M.LMax) { continue; }
+				if (!bCovered)
 				{
-					const FVec3d D = ToDouble(Sub(C.Centre, O));
-					const double P[3] = { D.X, D.Y, D.Z };
+					const double P[3] = { M.D.X - Ow.X, M.D.Y - Ow.Y, M.D.Z - Ow.Z };
 					double Dist2 = 0.0;
-					for (double V : P)
+					for (int A = 0; A < 3; ++A)
 					{
-						const double Lo = -G.N * W, Hi = (G.N + 1) * W;
-						const double E = V < Lo ? Lo - V : (V > Hi ? V - Hi : 0.0);
+						const double V = P[A];
+						const double E = V < Lo[A] ? Lo[A] - V : (V > Hi[A] ? V - Hi[A] : 0.0);
 						Dist2 += E * E;
 					}
-					if (Dist2 > C.InfluenceCm * C.InfluenceCm) { continue; }
+					const double R = M.C->InfluenceCm * (1.0 + 1.0e-9) + 1.0e-9 * (Length(M.D) + Length(Ow)) + 1.0;
+					if (Dist2 > R * R) { continue; }
 				}
-				Out.push_back(&C);
+				Out.push_back(M.C);
 			}
 			return Out;
 		}
@@ -803,7 +1035,7 @@ namespace UniCore
 			Gen.GenerateCell(K, Mine, C);
 			for (const FTaskStats& T : C.Tasks) { Lv.Stats.Truncated += T.Truncated; }
 			++Lv.Stats.Generated;
-			for (FContributor& Ct : Gen.MakeContributors(C)) { Registered[Ct.Id] = Ct; }
+			for (FContributor& Ct : Gen.MakeContributors(C)) { Registered[Ct.Id] = Ct; bMeasureDirty = true; }
 			if (OnGenerated) { OnGenerated(C); }
 			if (OnEnterWindow) { OnEnterWindow(C, Lv.Fade); }
 			Cache[K] = std::move(C);
@@ -819,7 +1051,7 @@ namespace UniCore
 
 		void Unregister(const FCellContent& C)
 		{
-			for (const FContributor& Ct : Gen.MakeContributors(C)) { Registered.erase(Ct.Id); }
+			for (const FContributor& Ct : Gen.MakeContributors(C)) { Registered.erase(Ct.Id); bMeasureDirty = true; }
 		}
 
 		const FRefGenerator& Gen;

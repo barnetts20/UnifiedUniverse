@@ -76,8 +76,10 @@ namespace UniCore
 		uint32_t PoolCapacity;           // objects this task may write (per-cell truncation keeps lowest candidates)
 		uint32_t IndexBase;              // object index within its cell for the first accepted object
 		float Suppress[4];               // suppressor centre (cell units, from the cell origin) and radius; w <= 0: none
+		uint32_t BoxLo[4];               // D-153: sampling box, in-cell offsets (xyz); Span 0 = whole axis
+		uint32_t BoxSpan[4];
 	};
-	static_assert(sizeof(FGenTaskGPU) == 176, "FGenTaskGPU must match FUniGenTask (UniGenTask.ush)");
+	static_assert(sizeof(FGenTaskGPU) == 208, "FGenTaskGPU must match FUniGenTask (UniGenTask.ush)");
 
 	// GPU-MIRROR
 	struct FTaskCountGPU

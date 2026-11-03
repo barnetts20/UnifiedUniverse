@@ -32,6 +32,7 @@ public class UnifiedUniverse : ModuleRules
 		{
 			"RHI",                  // GDynamicRHI (GPU parity test: skip without a GPU)
 			"RenderCore",           // FlushRenderingCommands (GPU parity test readback)
+			"Projects",             // IPluginManager: the plugin's Data/Noise folder (D-165)
 		});
 	}
 }

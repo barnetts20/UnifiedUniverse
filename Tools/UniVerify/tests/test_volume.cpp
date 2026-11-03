@@ -208,7 +208,10 @@ UNI_TEST(volume, march)
 		const FCoord Cam = C.bSolar ? UniScenes::SolarCamera() : Moved(FCoord::Origin(), C.Offset);
 		P.Update(Cam, FVec3f{});
 		FCamera Cm; Cm.Coord = Cam; Cm.Width = 96; Cm.Height = 54; Cm.LookAlong(C.Look);
-		const FVolumeScene Sc = VB.Build(P, Cam, FVec3f{}, Cm.View());
+		// The integrator against brute force, on the exact field: D-160's prefiltering averages
+		// a pixel's footprint on purpose (T2.vol.equivalence checks that it keeps the light).
+		FVolumeSettings Exact; Exact.bPrefilter = false;
+		const FVolumeScene Sc = VB.Build(P, Cam, FVec3f{}, Cm.View(), Exact);
 		const H::FUniVolumeView V = ToHlsl(Sc.View);
 		double CaseWorst = 0.0;
 		for (int Y = 0; Y < 9; ++Y) for (int X = 0; X < 16; ++X)

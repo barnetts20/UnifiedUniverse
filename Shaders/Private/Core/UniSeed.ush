@@ -53,6 +53,7 @@ static const uint UNI_CH_CONTRIBUTOR = 0x98C9F94Au; // ChannelId("CONTRIBUTOR") 
 static const uint UNI_CH_SLICE = 0x4A3EBEB1u;       // ChannelId("SLICE")       reserved: slice-local draws
 static const uint UNI_CH_SHAPE = 0x458FA9C6u;       // ChannelId("SHAPE")       field shape params per contributor
 static const uint UNI_CH_SYSTEM = 0x3FBAD1DCu;      // ChannelId("SYSTEM")      star system (planets) per star (D-142)
+static const uint UNI_CH_CLUMP = 0x2CEDF020u;       // ChannelId("CLUMP")       cluster sub-clump positions (D-151)
 
 // ------------------------------------------------------------------------------------------
 // ProcSeed port

@@ -22,14 +22,14 @@ bool UniShadersEnabled();
 namespace UniGpuLayout
 {
 	inline constexpr uint32 ObjectBytes = sizeof(UniCore::FObjectGPU);          // 32
-	inline constexpr uint32 TaskBytes = sizeof(UniCore::FGenTaskGPU);           // 176
+	inline constexpr uint32 TaskBytes = sizeof(UniCore::FGenTaskGPU);           // 208 (D-153 sampling box)
 	inline constexpr uint32 TaskCountBytes = sizeof(UniCore::FTaskCountGPU);    // 16
 	inline constexpr uint32 SliceBytes = sizeof(UniCore::FSliceGPU);            // 64
 	inline constexpr uint32 CellBytes = sizeof(UniCore::FCellGPU);              // 64
-	inline constexpr uint32 SpriteBytes = 48;                                   // FUniSprite in UniProject.ush
+	inline constexpr uint32 SpriteBytes = 64;                                   // FUniSprite in UniProject.ush (D-156: + halo)
 	inline constexpr uint32 DrawArgsElements = 4;                               // {6, instances, 0, 0}
 	inline constexpr uint32 PoolCapacity = 2097152;                             // D-005: 64 MB
-	inline constexpr uint32 MaxSprites = 1u << 20;                              // 48 MB of sprites
+	inline constexpr uint32 MaxSprites = 1u << 20;                              // 64 MB of sprites
 	inline constexpr uint32 MaxPromote = 256;
 	inline constexpr uint32 DynamicPoolSlots = 256;                             // D-143: planet records, rewritten every frame
 	inline constexpr uint32 DynamicPoolBase = PoolCapacity - DynamicPoolSlots;  // the streamer allocates below this
@@ -41,7 +41,7 @@ namespace UniGpuLayout
 	inline constexpr uint32 FieldParamsBytes = sizeof(UniCore::FFieldParamsGPU); // 64
 	inline constexpr uint32 VolumeSlices = 8;                                   // UNI_VOL_SLICES (UniVolume.ush)
 	inline constexpr uint32 VolumeLutEntries = 256;                             // UNI_VOL_LUT_SIZE
-	inline constexpr uint32 MaxCarriers = 64;
+	inline constexpr uint32 MaxCarriers = 128;                                  // D-161
 }
 static_assert(UniGpuLayout::VolumeSlices == UniHlsl::UNI_VOL_SLICES, "slice count");
 static_assert(UniGpuLayout::VolumeLutEntries == UniHlsl::UNI_VOL_LUT_SIZE, "volume LUT size");
@@ -57,6 +57,10 @@ struct FUniSpriteGPU
 	float NdcY;
 	uint32 Flags;
 	float PhysAngularRadius;
+	float HaloRadius;     // D-156
+	float HaloRatio;
+	float Pad0;
+	float Pad1;
 };
 static_assert(sizeof(FUniSpriteGPU) == UniGpuLayout::SpriteBytes, "FUniSpriteGPU must match FUniSprite (UniProject.ush)");
 
@@ -71,6 +75,8 @@ public:
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<FUniTaskCount>, OutCounts)
 		SHADER_PARAMETER(uint32, NumTasks)
 		SHADER_PARAMETER(uint32, DispatchGroupsX)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniWebTexture)   // D-164 (UniWebTexture.ush)
+		SHADER_PARAMETER_SAMPLER(SamplerState, UniWebSampler)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
@@ -96,6 +102,8 @@ public:
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutAccepted)
 		SHADER_PARAMETER(uint32, NumTasks)
 		SHADER_PARAMETER(uint32, DispatchGroupsX)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniWebTexture)   // D-164
+		SHADER_PARAMETER_SAMPLER(SamplerState, UniWebSampler)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
@@ -160,7 +168,11 @@ public:
 		SHADER_PARAMETER(float, ExposureMag)
 		SHADER_PARAMETER(float, SurfaceLimit)
 		SHADER_PARAMETER(float, ThetaPixel)
-		SHADER_PARAMETER(float, GlareGain)
+		SHADER_PARAMETER(float, SpriteCorePx)        // D-156 sprite style
+		SHADER_PARAMETER(float, SpriteCoreSat)
+		SHADER_PARAMETER(float, SpriteHaloGain)
+		SHADER_PARAMETER(float, SpriteHaloGrowthPx)
+		SHADER_PARAMETER(float, SpriteHaloMaxPx)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
@@ -179,6 +191,8 @@ BEGIN_SHADER_PARAMETER_STRUCT(FUniVolumeCommonParameters, )
 	SHADER_PARAMETER(float, TanHalfFovY)
 	SHADER_PARAMETER(FVector3f, ViewUp)
 	SHADER_PARAMETER(float, Pad0)
+	SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniWebTexture)   // D-164
+	SHADER_PARAMETER_SAMPLER(SamplerState, UniWebSampler)
 END_SHADER_PARAMETER_STRUCT()
 
 class FUniVolumeMarchCS : public FGlobalShader
@@ -243,11 +257,12 @@ BEGIN_SHADER_PARAMETER_STRUCT(FUniVolumeCompositeParameters, )
 	SHADER_PARAMETER(uint32, CubeSize)
 	SHADER_PARAMETER(uint32, bBackground)
 	SHADER_PARAMETER(float, BackgroundStartCm)
-	SHADER_PARAMETER(float, Pad1)
+	SHADER_PARAMETER(float, BackgroundBlend)   // D-159: previous -> current background map
 	SHADER_PARAMETER(uint32, DebugMode)
 	SHADER_PARAMETER(float, DebugScale)
 	SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float4>, VolumeTexture)
 	SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float4>, CubeTexture)
+	SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float4>, CubePrevTexture)
 	SHADER_PARAMETER_SAMPLER(SamplerState, LinearClampSampler)
 END_SHADER_PARAMETER_STRUCT()
 
@@ -329,3 +344,19 @@ BEGIN_SHADER_PARAMETER_STRUCT(FUniSpritePassParameters, )
 	RDG_BUFFER_ACCESS(DrawArgs, ERHIAccess::IndirectArgs)
 	RENDER_TARGET_BINDING_SLOTS()
 END_SHADER_PARAMETER_STRUCT()
+
+/** D-164: writes one mip of the web texture from a buffer of packed RGBA16F texels (UniWebTexUpload.usf). */
+class FUniWebTexUploadCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FUniWebTexUploadCS);
+	SHADER_USE_PARAMETER_STRUCT(FUniWebTexUploadCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint2>, InTexels)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture3D<float4>, OutMip)
+		SHADER_PARAMETER(uint32, MipSize)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
+};

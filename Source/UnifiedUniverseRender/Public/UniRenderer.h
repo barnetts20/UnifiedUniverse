@@ -111,6 +111,17 @@ public:
 	/** Game thread. Slice table and LUTs, once per universe definition. */
 	void SetTables_GameThread(TArray<UniCore::FSliceGPU> Slices, TArray<float> Lut);
 
+	/** Game thread (D-164): the web texture's texels, every mip (Size >> m)^3, x fastest, as
+	 *  UniCore::FWebTexture holds them: RGBA16F packed two halves per uint (R | G << 16,
+	 *  B | A << 16). Uploaded on the render thread before the next pass that samples it. Size 0
+	 *  clears it (passes then bind a 1^3 NaN dummy, so a textured web that is sampled without its
+	 *  texture places and draws nothing). */
+	void SetWebTexture_GameThread(uint32 Size, TArray<TArray<FUintVector2>> Mips);
+
+	/** Render thread (D-164): the web texture registered into a graph (uploaded on first use
+	 *  after SetWebTexture), or the NaN dummy. */
+	FRDGTextureRef RegisterWebTexture_RenderThread(FRDGBuilder& GraphBuilder);
+
 	/** Render thread: draws the backdrop additively into Output (a render-targetable copy of
 	 *  scene colour, made by the view extension). Called from the view extension. */
 	void RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& View, const FScreenPassRenderTarget& Output,
@@ -138,10 +149,34 @@ private:
 	TRefCountPtr<FRDGPooledBuffer> LutBuffer;
 	bool bTablesDirty = true;
 
-	// Volume: the background direction map persists across frames (D-136); faces still to march.
-	TRefCountPtr<IPooledRenderTarget> BackgroundCube;
-	uint32 BackgroundVersionRT = ~0u;
-	uint32 BackgroundDirtyFaces = 0x3Fu;
+	// D-164: the web texture (render thread).
+	TArray<TArray<FUintVector2>> WebMipsRT;
+	uint32 WebSizeRT = 0;
+	bool bWebDirty = false;
+	TRefCountPtr<IPooledRenderTarget> WebTexture;
+	TRefCountPtr<IPooledRenderTarget> WebDummy;
+
+	// Volume: the background direction map persists across frames (D-136). D-159: triple
+	// buffered. A refresh marches all six faces of the BACK map from one snapshot of the
+	// background's carriers, parameters, LUT and view (a few faces per frame), then rotates it to
+	// CURRENT; the composite cross-fades from PREVIOUS to CURRENT over the next refresh's length.
+	// Before, a refresh restarted whenever the background changed (every frame at speed), so the
+	// first faces were re-marched forever and the rest kept stale light: one face brighter than
+	// its neighbours, an "inside a cube" read.
+	TRefCountPtr<IPooledRenderTarget> BackgroundMaps[3];
+	int32 BgPrev = 0, BgCur = 1, BgBack = 2;
+	bool bBgHaveCur = false;
+	bool bBgFilling = false;
+	uint32 BgFillMask = 0u;
+	uint32 BgFillVersion = 0u;
+	uint32 BgFilledVersion = ~0u;
+	int32 BgBlendFrames = 0;
+	uint32 BgLastVersion = ~0u;   // D-166: frames since the background last changed
+	int32 BgStillFrames = 0;
+	TArray<UniCore::FCarrierGPU> BgSnapCarriers;
+	TArray<UniCore::FFieldParamsGPU> BgSnapParams;
+	TArray<FVector4f> BgSnapLut;
+	UniCore::FVolumeViewGPU BgSnapView{};
 	void RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& View, const FScreenPassRenderTarget& Output,
 		FRDGTextureRef SceneDepth, const FIntRect& DepthViewRect, float PreExposure, FRDGTextureRef& OutSlices, FIntPoint& OutMarchSize);
 

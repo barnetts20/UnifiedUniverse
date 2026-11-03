@@ -41,11 +41,16 @@
 
 #include "UniGenRef.h"
 
+#include <algorithm>
 #include <atomic>
 #include <deque>
 #include <functional>
+#include <iterator>
 #include <memory>
+#include <limits>
 #include <thread>
+#include <unordered_set>
+#include "UniProfile.h"
 
 namespace UniCore
 {
@@ -60,6 +65,7 @@ namespace UniCore
 		std::vector<FObjectGPU> ReadObjects;            // their records, concatenated
 		std::vector<std::pair<u32, FObjectGPU>> Writes; // authored records (anchors) uploaded into the pool with the place phase
 		bool bFailed = false;                           // set by a backend that timed out: cells of this batch fail closed
+		std::vector<FCellKey> CellKeys;                 // D-157: the cells that joined, in join order (CellsOf looks them up)
 	};
 
 	/** Generation backend. Submit* never block; Poll* return true once results are in. */
@@ -166,7 +172,19 @@ namespace UniCore
 			std::vector<FGenTaskGPU> Tasks;
 			std::shared_ptr<FGenBatch> Batch;
 			std::vector<size_t> BatchTaskIndex;     // where this cell's tasks sit in its batch
-			std::vector<u32> OwnedContributors;     // registered from this cell's objects
+			// D-168: the cell's emitter objects (indices into Readback.Objects), each asleep (not
+			// registered) until the camera comes within reach of its influence; see UpdateWake.
+			struct FSleeper { FVec3d Local; double InfluenceCm = 0.0; int LMax = -1; bool bAwake = false; std::vector<u32> Ids; };   // Local: centre - cell origin (cm)
+			std::vector<u32> EmitterObjects;
+			std::vector<FSleeper> Sleepers;        // filled the first time the cell comes near
+			double MaxInfluenceCm = 0.0;           // over its emitter objects' emitters
+			int MaxChildLevel = -1;                // the coarsest level any of them emits at
+			size_t AwakeCount = 0;
+			// The camera may move ScanSlackCm from ScanCamera before any of the cell's objects can
+			// change state (negative: scan next frame). ScanTheta: the WakeTheta it was found at.
+			FCoord ScanCamera;
+			double ScanSlackCm = -1.0;
+			double ScanTheta = 0.0;
 			FCellContent Readback;                   // emitter objects with indices (for contributors)
 			FCellContent Anchors;                    // authored objects of this cell (anchors), CPU-known
 			size_t ReadOffset = 0;                   // where this cell's read-back objects start in its batch's ReadObjects
@@ -196,6 +214,7 @@ namespace UniCore
 				AddArch(E.ChildArchetypeId, AddArch, 1);
 			}
 			for (const FAnchor& A : D.Anchors) { Ls.insert(Gen.ModelRef().LevelOf(A.ArchetypeId, A.AbsMag)); AddArch(A.ArchetypeId, AddArch, 1); }
+			for (const auto& KV : Gen.CatalogueLevels()) { Ls.insert(KV.first); for (u32 A : KV.second) { AddArch(A, AddArch, 1); } }   // D-167
 			for (int L : Ls) { Levels.emplace(L, FLevel(L)); }
 
 			// D-137: parent levels. ArchAt[L] = archetypes that can have objects at level L (from
@@ -224,6 +243,10 @@ namespace UniCore
 				ArchAt[Gen.ModelRef().LevelOf(A.ArchetypeId, A.AbsMag)].insert(A.ArchetypeId);
 				Collect(A.ArchetypeId, Collect, 1);
 			}
+			for (const auto& KV : Gen.CatalogueLevels())   // D-167
+			{
+				for (u32 A : KV.second) { ArchAt[KV.first].insert(A); Collect(A, Collect, 1); }
+			}
 			for (auto& LKV : Levels)
 			{
 				const std::set<u32>& Here = ArchAt[LKV.first];
@@ -238,28 +261,47 @@ namespace UniCore
 					if (bParent) { LKV.second.Parents.push_back(PKV.first); }
 				}
 			}
+			// D-155: the largest influence radius any contributor at a level can have (from the
+			// archetypes placed there and their slices' brightest magnitude, and anchors).
+			for (const auto& PKV : ArchAt)
+			{
+				double R = 0.0;
+				for (u32 PA : PKV.second)
+				{
+					const FArchetype& A = D.Arch(PA);
+					const FSlice* S = Gen.ModelRef().SlicesOf(PA).ForLevel(PKV.first);
+					const double M = S ? S->BrightM : A.AbsMag.MMin;
+					for (const FUniEmitter& E : A.Emitters) { R = std::max(R, E.InfluenceMul * A.RadiusMaxCm(M)); }
+				}
+				LevelMaxInfluence[PKV.first] = std::max(LevelMaxInfluence[PKV.first], R);
+			}
+			for (const FAnchor& A : D.Anchors)
+			{
+				const int L = Gen.ModelRef().LevelOf(A.ArchetypeId, A.AbsMag);
+				for (const FUniEmitter& E : D.Arch(A.ArchetypeId).Emitters) { LevelMaxInfluence[L] = std::max(LevelMaxInfluence[L], E.InfluenceMul * std::exp2(double(A.RadiusLog2))); }
+			}
 		}
 
 		double DeltaMag = 0.0;
 		bool bVelocityLod = true;
+		/** D-157: this frame's phase times and work counts (reset by Update; CellTable adds). */
+		mutable FStreamProfile Profile;
 		int VelocityK = UniHlsl::UNI_VELOCITY_LOD_K;
-		static constexpr int UNI_WINDOW_N_MOVE_MAX = 4;   // D-139: widest window motion may use (9^3 cells)
+		/** D-162: most forward stretch, in cells, a level's window takes for speed; a level whose
+		 *  lead exceeds it is suspended (velocity LOD). */
+		static constexpr int UNI_WINDOW_LEAD_MAX = 3;
 		static constexpr int ShrinkAfterFrames = 30;
-
-		/** D-139: window half-width for a level whose camera lead is LeadCells (speed x latency,
-		 *  in its cells). Equals Uni_WindowHalfWidth(dm) at rest. */
-		static int MovingHalfWidth(double InDeltaMag, double LeadCells)
-		{
-			const int Rest = UniHlsl::Uni_WindowHalfWidth(float(InDeltaMag));
-			const double SensScale = double(UniHlsl::Uni_SensitivityScale(float(InDeltaMag)));
-			const double Need = double(UniHlsl::UNI_WINDOW_N_EFF) * SensScale + LeadCells;
-			const int Moving = std::min(int(std::ceil(Need - 1.0e-5)), std::max(Rest, UNI_WINDOW_N_MOVE_MAX));
-			return std::max(Rest, std::min(Moving, UniHlsl::UNI_WINDOW_N_MAX));
-		}
 
 		/** D-140: compute normalising integrals on worker threads (runtime). Offline checks that
 		 *  count frames turn it off: the same values, computed inline. */
 		bool bAsyncIntegrals = true;
+		/** D-168: contributors subtending at least this (rad) are awake whatever their distance, so
+		 *  the volume builder finds them (it asks for those above its reject angle: the engine sets
+		 *  this to half of it every frame). 1/480: half the reject angle at 960 px. */
+		double WakeTheta = 1.0 / 480.0;
+		/** D-168: false registers every emitter object as soon as its cell is Ready (the earlier
+		 *  behaviour), for A/B checks. */
+		bool bLazyWake = true;
 		static constexpr size_t MaxIntegralJobs = 4;
 		/** Runs a job on some worker thread (D-140). Empty: a detached std::thread. */
 		std::function<void(std::function<void()>)> RunJob;
@@ -281,41 +323,73 @@ namespace UniCore
 		/** One frame. Window bookkeeping, then the generation protocol advanced by one step. */
 		void Update(const FCoord& Coord)
 		{
-			const double Moved = bHasCamera ? Length(ToDouble(Sub(Coord, Camera))) : 0.0;
+			Profile.BeginFrame();
+			FProfileScope ScopeUpdate(Profile, EStreamPhase::Update);
+			const FVec3d MoveVec = bHasCamera ? ToDouble(Sub(Coord, Camera)) : FVec3d{ 0.0, 0.0, 0.0 };
 			Camera = Coord; bHasCamera = true;
-			const int NRest = UniHlsl::Uni_WindowHalfWidth(float(DeltaMag));
+			const double Reach = double(UniHlsl::Uni_WindowReach(float(DeltaMag)));   // D-162: 2 cells at dm 0 (5^3)
 			++FrameNo;
-			PumpIntegrals();
-			AdvanceBatches();
-			MeasureContributors();
+			{ FProfileScope S(Profile, EStreamPhase::Integrals); PumpIntegrals(); }
+			{ FProfileScope S(Profile, EStreamPhase::Batches); AdvanceBatches(); }
+			{ FProfileScope S(Profile, EStreamPhase::Wake); UpdateWake(); }
+			{ FProfileScope S(Profile, EStreamPhase::Measure); MeasureContributors(); }
 
 			// Coarse first, so a parent's readiness is this frame's when its children look at it.
+			FProfileScope ScopeLevels(Profile, EStreamPhase::Levels);
+			for (auto& KV : Levels) { KV.second.bPendingValid = false; }
 			for (auto It = Levels.rbegin(); It != Levels.rend(); ++It)
 			{
 				FLevel& Lv = It->second;
 				const int L = It->first;
-				bool bParentsReady = true;   // D-137: wait for parent levels only
-				for (int P : Lv.Parents) { bParentsReady = bParentsReady && LevelReady(Levels.at(P)); }
-				// D-139: lead = how far the camera moves (in this level's cells) while a cell fills,
-				// plus the frame the window itself trails by.
-				const double Lead = (Moved / CellWidthCm(L)) * (LatencyEst + 1.0);
-				int N = NRest;
+				Lv.bPendingValid = false;   // this level's cells change below; its list is rebuilt after
+				bool bParentsReady = true;   // D-137: wait for parent levels only (D-155: for the cells that can reach this one)
+				{
+					FProfileScope S(Profile, EStreamPhase::ParentGate);
+					for (int P : Lv.Parents) { bParentsReady = bParentsReady && ParentReadyFor(Levels.at(P), P, L); }
+				}
+				// D-162 (replaces D-139's symmetric widening): the lead is how far the camera moves, in
+				// this level's cells, while a cell fills (plus the frame the window trails by), per
+				// axis. The window stretches forward by it along the direction of travel only, so the
+				// cost grows linearly with speed instead of cubically, and each shift still brings in
+				// one face. Past UNI_WINDOW_LEAD_MAX cells of lead the level is suspended (velocity
+				// LOD): its objects would cross the screen faster than they can be generated.
+				const double W = CellWidthCm(L);
+				const double MoveCells[3] = { MoveVec.X / W, MoveVec.Y / W, MoveVec.Z / W };
+				double LeadPos[3] = { 0.0, 0.0, 0.0 }, LeadNeg[3] = { 0.0, 0.0, 0.0 };
+				double Lead = 0.0;
 				if (bVelocityLod)
 				{
-					const int Want = MovingHalfWidth(DeltaMag, Lead);
-					const int Cur = Lv.Win.IsValid() ? Lv.Win.Geometry().N : NRest;
-					// Widening multiplies a level's cells by up to (9/5)^3; never at the cost of
-					// failing cells: above 70% pool use a window keeps its width (and suspension,
-					// as before D-139, takes over).
+					// Growing a window never at the cost of failing cells: above 70% pool use the
+					// stretch is dropped (suspension, as before D-139, takes over).
 					const bool bRoom = Pool.UsedCount() < u32(0.7 * double(Backend.PoolCapacity()));
-					if (Want > Cur && !bRoom) { N = Cur; Lv.ShrinkFrames = 0; }
-					else if (Want >= Cur) { N = Want; Lv.ShrinkFrames = 0; }
-					else { N = (++Lv.ShrinkFrames >= ShrinkAfterFrames) ? std::max(Want, Cur - 1) : Cur; if (N != Cur) { Lv.ShrinkFrames = 0; } }
-					N = std::max(N, NRest);
+					for (int A = 0; A < 3; ++A)
+					{
+						const double La = MoveCells[A] * (LatencyEst + 1.0);
+						Lead = std::max(Lead, std::abs(La));
+						if (!bRoom) { continue; }
+						(La > 0.0 ? LeadPos[A] : LeadNeg[A]) = std::min(std::abs(La), double(UNI_WINDOW_LEAD_MAX));
+					}
 				}
-				const double SensScale = double(UniHlsl::Uni_SensitivityScale(float(DeltaMag)));
-				const double Slack = double(std::max(NRest, UNI_WINDOW_N_MOVE_MAX)) - double(UniHlsl::UNI_WINDOW_N_EFF) * SensScale;
-				bool bSusp = bVelocityLod && Lv.Lod.UpdateLead(Lead, Slack);
+				// Shrink hysteresis: a side grows at once and shrinks one cell per ShrinkAfterFrames.
+				int MinSide[3] = { 1, 1, 1 };
+				if (Lv.Win.IsValid())
+				{
+					bool bWantShrink = false;
+					for (int A = 0; A < 3; ++A)
+					{
+						const int Need = WindowSide(Reach + LeadNeg[A], Reach + LeadPos[A]);
+						const int Cur = Lv.Win.Geometry().Side(A);
+						MinSide[A] = Cur;
+						if (Need < Cur) { bWantShrink = true; }
+					}
+					if (bWantShrink && ++Lv.ShrinkFrames >= ShrinkAfterFrames)
+					{
+						Lv.ShrinkFrames = 0;
+						for (int A = 0; A < 3; ++A) { MinSide[A] = std::max(WindowSide(Reach + LeadNeg[A], Reach + LeadPos[A]), Lv.Win.Geometry().Side(A) - 1); }
+					}
+					if (!bWantShrink) { Lv.ShrinkFrames = 0; }
+				}
+				bool bSusp = bVelocityLod && Lv.Lod.UpdateLead(Lead, double(UNI_WINDOW_LEAD_MAX));
 				const bool bJump = Lv.Win.IsValid() && CentreJump(Lv.Win.Geometry(), CellOf(Camera, L)) > 1;
 				if (bSusp) { Lv.bHeld = true; }
 				else if (Lv.bHeld && bJump && Lv.Fade > 0.0f) { bSusp = true; }
@@ -335,49 +409,73 @@ namespace UniCore
 				// included; only the new outer shell is generated. Fade is not reset.
 				bool bResized = false;
 				std::unordered_map<FCellKey, FCell, FCellKeyHasher> Kept;
-				if (Lv.Win.Geometry().N != N) { Kept = std::move(Lv.Cells); Lv.Cells.clear(); Lv.Win = FLevelWindow(L, N); bResized = true; }
-				FWindowGeometry Next = Lv.Win.Geometry();
-				Next.Centre = CellOf(Camera, L);
-				const std::vector<const FContributor*> Gathered = Gather(Next);
+				const FWindowGeometry Next = PlanWindow(L, Camera, Reach, LeadPos, LeadNeg, MinSide, &Lv.Win);
+				if (!Lv.Win.IsValid() || !Lv.Win.Geometry().SameShape(Next))
+				{
+					// A new shape (sensitivity, stretch): every cell still inside is kept (D-126).
+					if (Lv.Win.IsValid()) { Kept = std::move(Lv.Cells); Lv.Cells.clear(); bResized = true; }
+					Lv.Win = FLevelWindow(Next);
+				}
+				std::vector<const FContributor*> Gathered;
+				std::vector<FReachBox> Boxes;
+				{ FProfileScope S(Profile, EStreamPhase::Gather); Gathered = Gather(Next, &Boxes); }
+				Profile.Gathered += Gathered.size();
 				MaxGather = std::max(MaxGather, Gathered.size());
 				if (Gathered.empty() && !AnchorInWindow(Next))
 				{
 					for (auto& KV : Kept) { Release(KV.second); }
-					if (Lv.Win.IsValid()) { EvictAll(Lv); Lv.Win = FLevelWindow(L, N); }
+					if (Lv.Win.IsValid()) { EvictAll(Lv); Lv.Win = FLevelWindow(Next); }
 					Lv.GatherIds.clear();
 					continue;
 				}
 				// D-138: Ready cells only need re-checking for new contributors when the gathered
-				// set changed (or the cell became Ready since the last check).
+				// set gained some (or the cell became Ready since the last check). D-168: only
+				// against the ids gained since the set the checked cells were last checked against
+				// (GatherIds, updated when the check runs: a frame whose parents were not ready
+				// used to update it without checking), so a frame of fast travel no longer
+				// re-tests every contributor of every Ready cell.
 				std::vector<u32> Ids;
 				Ids.reserve(Gathered.size());
 				for (const FContributor* Ct : Gathered) { Ids.push_back(Ct->Id); }
 				std::sort(Ids.begin(), Ids.end());   // Gather's order follows distance, which changes as the camera moves
-				const bool bGatherChanged = Ids != Lv.GatherIds;
-				if (bGatherChanged) { Lv.GatherIds = std::move(Ids); }
-				const FWindowDiff Diff = Lv.Win.Recentre(Next.Centre);
-				if (((Diff.bRebuilt && !bResized) || bJump) && !bFirstFrame) { Lv.Fade = 0.0f; }
-				for (const FCellKey& K : Diff.Exiting) { Evict(Lv, K); }
-				for (const FWindowCell& C : Diff.Entering)
+				std::vector<u32> NewIds;
+				std::set_difference(Ids.begin(), Ids.end(), Lv.GatherIds.begin(), Lv.GatherIds.end(), std::back_inserter(NewIds));
+				const bool bGatherGrew = !NewIds.empty();
 				{
-					auto K = Kept.find(C.Key);
-					if (K != Kept.end()) { Lv.Cells[C.Key] = std::move(K->second); Kept.erase(K); continue; }
-					Lv.Cells[C.Key] = FCell(); Lv.Cells[C.Key].Key = C.Key;
+					FProfileScope S(Profile, EStreamPhase::Window);
+					const FWindowDiff Diff = Lv.Win.Recentre(Next);
+					if (((Diff.bRebuilt && !bResized) || bJump) && !bFirstFrame) { Lv.Fade = 0.0f; }
+					for (const FCellKey& K : Diff.Exiting) { Evict(Lv, K); }
+					for (const FWindowCell& C : Diff.Entering)
+					{
+						auto K = Kept.find(C.Key);
+						if (K != Kept.end()) { Lv.Cells[C.Key] = std::move(K->second); Kept.erase(K); continue; }
+						Lv.Cells[C.Key] = FCell(); Lv.Cells[C.Key].Key = C.Key;
+					}
+					for (auto& KV : Kept) { Release(KV.second); }   // shrank out of the window
 				}
-				for (auto& KV : Kept) { Release(KV.second); }   // shrank out of the window
 
 				if (bParentsReady)
 				{
 					std::vector<FCell*> ToBuild;
-					for (auto& KV : Lv.Cells)
+					FCellBins Bins;
+					bool bBinned = false;
+					auto EnsureBins = [&]() -> const FCellBins& { if (!bBinned) { Bins = BinGathered(Next, Gathered, Boxes); bBinned = true; } return Bins; };
 					{
-						FCell& C = KV.second;
-						if (C.State == ECellState::Waiting) { ToBuild.push_back(&C); continue; }
-						if (C.State != ECellState::Ready || (C.bGrowthChecked && !bGatherChanged)) { continue; }
-						C.bGrowthChecked = true;
-						if (ContributorsGrew(C, Gathered)) { ++Regenerations; Release(C); C.State = ECellState::Waiting; C.bGrowthChecked = false; ToBuild.push_back(&C); }
+						FProfileScope S(Profile, EStreamPhase::Growth);
+						for (auto& KV : Lv.Cells)
+						{
+							FCell& C = KV.second;
+							if (C.State == ECellState::Waiting) { ToBuild.push_back(&C); continue; }
+							if (C.State != ECellState::Ready || (C.bGrowthChecked && !bGatherGrew)) { continue; }
+							const bool bDelta = C.bGrowthChecked;
+							C.bGrowthChecked = true;
+							++Profile.GrowthChecks;
+							if (ContributorsGrew(C, EnsureBins(), Next, bDelta ? &NewIds : nullptr)) { ++Regenerations; Release(C); C.State = ECellState::Waiting; C.bGrowthChecked = false; ToBuild.push_back(&C); }
+						}
 					}
-					if (!ToBuild.empty()) { SubmitCells(ToBuild, Gathered); }
+					Lv.GatherIds = std::move(Ids);   // every Ready cell is now checked against it
+					if (!ToBuild.empty()) { FProfileScope S(Profile, EStreamPhase::Submit); SubmitCells(ToBuild, EnsureBins(), Next); }
 				}
 				for (auto& KV : Lv.Cells) { ++KV.second.Frames; }
 			}
@@ -389,6 +487,7 @@ namespace UniCore
 		 *  activation read back from the GPU names its cell by index into this frame's table). */
 		std::vector<FCellGPU> CellTable(std::vector<FCellKey>* OutKeys = nullptr) const
 		{
+			FProfileScope Scope(Profile, EStreamPhase::CellTable);
 			std::vector<FCellGPU> Out;
 			if (OutKeys) { OutKeys->clear(); }
 			for (const auto& LKV : Levels)
@@ -415,6 +514,7 @@ namespace UniCore
 					if (OutKeys) { OutKeys->push_back(C.Key); }
 				}
 			}
+			Profile.CellTableEntries += Out.size();
 			return Out;
 		}
 
@@ -469,6 +569,24 @@ namespace UniCore
 		// Volume inputs (UniVolume.h, FVolumeSource): resident contributors, the parent object a
 		// contributor came from, and level fades.
 		const std::map<u32, FContributor>& Contributors() const { return Registered; }
+
+		/** D-161: the registered contributors whose influence radius subtends more than
+		 *  MinTheta (rad) from the camera, from this frame's measured distances (within
+		 *  MeasureErr), sorted by id. No map walk and no 128-bit subtraction per contributor.
+		 *  Valid after Update (evicted ones are skipped). */
+		std::vector<const FContributor*> NearContributors(double MinTheta) const
+		{
+			std::vector<const FContributor*> Out;
+			for (const FMeasured& M : Measured)
+			{
+				const double Rm = M.Dist - MeasureErr;
+				if (Rm > 0.0 && M.InfluenceCm <= MinTheta * Rm) { continue; }
+				if (!M.Ptr || PendingRemove.count(M.Id)) { continue; }
+				Out.push_back(M.Ptr);
+			}
+			std::sort(Out.begin(), Out.end(), [](const FContributor* A, const FContributor* B) { return A->Id < B->Id; });
+			return Out;
+		}
 		float LevelFade(int L) const { auto It = Levels.find(L); return It == Levels.end() ? 0.0f : It->second.Fade; }
 		const FObjectGPU* FindObject(const FObjectId& Id) const
 		{
@@ -498,6 +616,12 @@ namespace UniCore
 			std::vector<int> Parents;      // D-137: levels whose objects can be contributors here
 			std::vector<u32> GatherIds;    // D-138: ids of last frame's gathered set
 			int ShrinkFrames = 0;          // D-139: slow frames since the window could shrink
+			// D-168: the level's cells not yet Ready (nor Failed), listed once per frame after the
+			// level is processed, for every finer level's parent gate (was a walk of every cell
+			// per child level per frame).
+			struct FPendingCell { FVec3d Off; double Len = 0.0; };   // origin - camera, and its length
+			mutable std::vector<FPendingCell> Pending;
+			mutable bool bPendingValid = false;
 		};
 
 		static bool LevelReady(const FLevel& Lv)
@@ -536,6 +660,7 @@ namespace UniCore
 
 		bool AnchorInWindow(const FWindowGeometry& G) const
 		{
+			if (Gen.CatalogueAtLevel(G.Level)) { return true; }   // D-167: a catalogue repeats every tile
 			for (size_t I = 0; I < Gen.AnchorLevelList().size(); ++I)
 			{
 				if (Gen.AnchorLevelList()[I] != G.Level) { continue; }
@@ -544,14 +669,77 @@ namespace UniCore
 			return false;
 		}
 
-		std::vector<const FContributor*> Gather(const FWindowGeometry& G) const
+		/** D-161: the window cells a gathered contributor can reach, as a box of offsets from the
+		 *  window's centre cell (within the window's [Lo, Hi]); bWide: test it against every cell. A superset
+		 *  (the exact Gen.Overlaps still decides), so binning never changes a result. */
+		struct FReachBox { int Lo[3] = { 0, 0, 0 }; int Hi[3] = { 0, 0, 0 }; bool bWide = true; };
+
+		/** D-161: gathered contributors binned by the window cells they can reach, so a cell tests
+		 *  only its own candidates: before, every cell tested every gathered contributor
+		 *  (2,700 cells x 1,700 contributors = 1.25M exact tests, ~170 ms, when a window shifted in
+		 *  a cluster). */
+		struct FCellBins
+		{
+			int Lo[3] = { 0, 0, 0 }, Hi[3] = { 0, 0, 0 };
+			bool bActive = false;                                 // false: every contributor is wide
+			const std::vector<const FContributor*>* All = nullptr;
+			std::vector<const FContributor*> Wide;
+			std::vector<std::vector<const FContributor*>> Bins;   // by window offset
+			int Side(int A) const { return Hi[A] - Lo[A] + 1; }
+			int Index(int Dx, int Dy, int Dz) const { return ((Dx - Lo[0]) * Side(1) + (Dy - Lo[1])) * Side(2) + (Dz - Lo[2]); }
+		};
+
+		FCellBins BinGathered(const FWindowGeometry& G, const std::vector<const FContributor*>& Gathered, const std::vector<FReachBox>& Boxes) const
+		{
+			FCellBins B;
+			for (int A = 0; A < 3; ++A) { B.Lo[A] = G.Lo[A]; B.Hi[A] = G.Hi[A]; }
+			B.All = &Gathered;
+			B.bActive = !G.AxisCovered() && Boxes.size() == Gathered.size();
+			if (!B.bActive) { return B; }
+			B.Bins.resize(size_t(B.Side(0)) * B.Side(1) * B.Side(2));
+			for (size_t I = 0; I < Gathered.size(); ++I)
+			{
+				const FReachBox& X = Boxes[I];
+				const long long Vol = X.bWide ? 0 : (long long)(X.Hi[0] - X.Lo[0] + 1) * (X.Hi[1] - X.Lo[1] + 1) * (X.Hi[2] - X.Lo[2] + 1);
+				if (X.bWide || Vol > 64) { B.Wide.push_back(Gathered[I]); continue; }
+				for (int A = X.Lo[0]; A <= X.Hi[0]; ++A) for (int Bv = X.Lo[1]; Bv <= X.Hi[1]; ++Bv) for (int C = X.Lo[2]; C <= X.Hi[2]; ++C)
+				{
+					B.Bins[size_t(B.Index(A, Bv, C))].push_back(Gathered[I]);
+				}
+			}
+			return B;
+		}
+
+		/** The candidates for one cell: the wide contributors plus the cell's bin. */
+		template <typename F> void ForEachCandidate(const FCellBins& B, const FWindowGeometry& G, const FCellKey& K, F&& Fn) const
+		{
+			int D[3] = { 0, 0, 0 };
+			bool bInside = B.bActive;
+			for (int A = 0; A < 3 && bInside; ++A)
+			{
+				const FU128 Df = Sub(K.C[A], G.Centre.C[A]);   // wraps at the level seam like the window
+				const bool bSmall = (Df.L[0] == 0u && Df.L[1] == 0u && Df.L[2] == 0u) || (Df.L[0] == ~0u && Df.L[1] == ~0u && Df.L[2] == ~0u);
+				D[A] = int(int32_t(Df.L[3]));
+				bInside = bSmall && D[A] >= B.Lo[A] && D[A] <= B.Hi[A];
+			}
+			if (!bInside)
+			{
+				// Not binned (covered axes) or not in this window: every gathered contributor.
+				if (B.All) { for (const FContributor* Ct : *B.All) { Fn(Ct); } }
+				return;
+			}
+			for (const FContributor* Ct : B.Wide) { Fn(Ct); }
+			for (const FContributor* Ct : B.Bins[size_t(B.Index(D[0], D[1], D[2]))]) { Fn(Ct); }
+		}
+
+		std::vector<const FContributor*> Gather(const FWindowGeometry& G, std::vector<FReachBox>* OutBoxes = nullptr) const
 		{
 			std::vector<const FContributor*> Out;
 			const int L = G.Level;
 			for (const FContributor& R : Gen.RootContributors())
 			{
 				const FSliceTable& T = Gen.ModelRef().SlicesOf(R.Emitter->ChildArchetypeId);
-				if (L >= T.LMin && L <= T.LMax) { Out.push_back(&R); }
+				if (L >= T.LMin && L <= T.LMax) { Out.push_back(&R); if (OutBoxes) { OutBoxes->push_back(FReachBox{}); } }
 			}
 			const double W = CellWidthCm(L);
 			// D-138: distances from the window origin through the per-frame camera deltas,
@@ -559,63 +747,200 @@ namespace UniCore
 			// the exact overlap test (Gen.Overlaps) decides tasks, so it is made conservative by a
 			// margin far above the rounding (relative 1e-12 of the distances involved).
 			const FVec3d Ow = ToDouble(Sub(CellOrigin(G.Centre), Camera));
-			const double Lo = -G.N * W, Hi = (G.N + 1) * W;
+			// D-162: the window's box per axis, from the centre cell's origin.
+			double Lo[3], Hi[3], Ext = 0.0;
+			for (int A = 0; A < 3; ++A) { Lo[A] = G.Lo[A] * W; Hi[A] = (G.Hi[A] + 1) * W; Ext = std::max({ Ext, std::abs(Lo[A]), std::abs(Hi[A]) }); }
 			// Measured is sorted by distance from the camera: nothing beyond the window's bounding
 			// sphere plus the largest influence can reach it.
 			const bool bCovered = G.AxisCovered();
-			const double Reach = Length(Ow) + 1.7320508075688772 * std::max(std::abs(Lo), std::abs(Hi)) + MaxInfluence;
-			const double Cut = Reach * (1.0 + 1.0e-9) + 1.0;
+			const double Reach = Length(Ow) + 1.7320508075688772 * Ext + MaxInfluence;
+			const double Cut = Reach * (1.0 + 1.0e-9) + 1.0 + MeasureErr;
 			for (const FMeasured& M : Measured)
 			{
 				if (!bCovered && M.Dist > Cut) { break; }
 				if (L < M.LMin || L > M.LMax) { continue; }
+				FReachBox Box;
 				if (!bCovered)
 				{
 					const double P[3] = { M.D.X - Ow.X, M.D.Y - Ow.Y, M.D.Z - Ow.Z };
-					const double Margin = 1.0e-12 * (M.Dist + Length(Ow) + std::abs(Hi)) + 1.0;
+					const double Margin = 1.0e-12 * (M.Dist + Length(Ow) + Ext) + 1.0 + MeasureErr;
 					double Dist2 = 0.0;
-					for (double V : P) { const double E = V < Lo ? Lo - V : (V > Hi ? V - Hi : 0.0); Dist2 += E * E; }
+					for (int A = 0; A < 3; ++A) { const double V = P[A]; const double E = V < Lo[A] ? Lo[A] - V : (V > Hi[A] ? V - Hi[A] : 0.0); Dist2 += E * E; }
 					const double R = M.InfluenceCm + Margin;
 					if (Dist2 > R * R) { continue; }
+					// D-161: the cells its sphere's bounding box touches, one cell of slack each way.
+					Box.bWide = false;
+					for (int A = 0; A < 3; ++A)
+					{
+						const double CLo = std::floor((P[A] - R) / W) - 1.0, CHi = std::floor((P[A] + R) / W) + 1.0;
+						Box.Lo[A] = int(std::clamp(CLo, double(G.Lo[A]), double(G.Hi[A])));
+						Box.Hi[A] = int(std::clamp(CHi, double(G.Lo[A]), double(G.Hi[A])));
+					}
 				}
 				// Looked up again: a coarser level may have evicted (unregistered) it this frame.
 				auto It = Registered.find(M.Id);
-				if (It != Registered.end()) { Out.push_back(&It->second); }
+				if (It != Registered.end()) { Out.push_back(&It->second); if (OutBoxes) { OutBoxes->push_back(Box); } }
 			}
 			return Out;
 		}
 
 		/** D-138: every registered contributor's offset from the camera, once per frame. */
-		void MeasureContributors()
+		/** D-138, made incremental by D-155: each contributor's offset from a measure anchor near
+		 *  the camera is computed exactly once, when it registers; per frame its camera offset is
+		 *  one double subtraction. The anchor re-bases (one exact pass, in place: D-168) when the
+		 *  camera is 300 Mpc from it (D-168: was 30, a 15-40 ms pass every 18 frames at 100 Mpc/s;
+		 *  the rounding at 300 Mpc is ~1e12 cm, inside every margin). The rounding of the two-step offset, at most 4 eps (|offset| + |camera
+		 *  offset|), is added to every margin that uses it (MeasureErr), so Gather stays a
+		 *  superset of the exact answer and the exact overlap test still decides. */
+		void PushMeasureEntry(u32 Id, const FContributor& C)
 		{
-			Measured.clear();
-			Measured.reserve(Registered.size());
-			MaxInfluence = 0.0;
-			for (const auto& KV : Registered)
-			{
-				FMeasured M;
-				M.Id = KV.first;
-				M.InfluenceCm = KV.second.InfluenceCm;
-				const FSliceTable& T = Gen.ModelRef().SlicesOf(KV.second.Emitter->ChildArchetypeId);
-				M.LMin = T.LMin; M.LMax = T.LMax;
-				M.D = ToDouble(Sub(KV.second.Centre, Camera));
-				M.Dist = Length(M.D);
-				Measured.push_back(M);
-				MaxInfluence = std::max(MaxInfluence, M.InfluenceCm);
-			}
-			std::sort(Measured.begin(), Measured.end(), [](const FMeasured& A, const FMeasured& B) { return A.Dist != B.Dist ? A.Dist < B.Dist : A.Id < B.Id; });
+			FMeasured M;
+			M.Id = Id;
+			M.InfluenceCm = C.InfluenceCm;
+			const FSliceTable& T = Gen.ModelRef().SlicesOf(C.Emitter->ChildArchetypeId);
+			M.LMin = T.LMin; M.LMax = T.LMax;
+			M.Off = ToDouble(Sub(C.Centre, MeasureAnchor));
+			M.Ptr = &C;   // a std::map node: stable until it is erased (then its id is in PendingRemove)
+			Measured.push_back(M);
+			MeasuredIds.insert(Id);
 		}
 
-		bool ContributorsGrew(const FCell& C, const std::vector<const FContributor*>& Gathered) const
+		void MeasureContributors()
 		{
-			std::vector<u32> Ids;
-			for (const FContributor* Ct : Gathered) { if (Gen.Overlaps(*Ct, C.Key)) { Ids.push_back(Ct->Id); } }
-			std::sort(Ids.begin(), Ids.end());
-			return !std::includes(C.ContributorSet.begin(), C.ContributorSet.end(), Ids.begin(), Ids.end());
+			const double Rebase = 300.0 * 3.0856775814913673e24;   // 300 Mpc (D-168)
+			const bool bRebase = !bMeasureAnchor || Length(ToDouble(Sub(Camera, MeasureAnchor))) > Rebase;
+			if (!bMeasureAnchor)
+			{
+				MeasureAnchor = Camera;
+				bMeasureAnchor = true;
+				Measured.clear();
+				MeasuredIds.clear();
+				Measured.reserve(Registered.size());
+				for (const auto& KV : Registered) { PushMeasureEntry(KV.first, KV.second); }
+			}
+			else
+			{
+				if (!PendingRemove.empty())
+				{
+					size_t W = 0;
+					for (size_t I = 0; I < Measured.size(); ++I)
+					{
+						if (PendingRemove.count(Measured[I].Id)) { MeasuredIds.erase(Measured[I].Id); continue; }
+						Measured[W++] = Measured[I];
+					}
+					Measured.resize(W);
+				}
+				if (bRebase)
+				{
+					// D-168: in place, in the list's own order (nearly sorted still), each offset
+					// exact again from its contributor (Ptr is valid: removals are filtered above).
+					// Was a rebuild from the map in id order, which then needed a full sort.
+					MeasureAnchor = Camera;
+					for (FMeasured& M : Measured) { M.Off = ToDouble(Sub(M.Ptr->Centre, MeasureAnchor)); }
+				}
+				for (u32 Id : PendingAdd)
+				{
+					if (MeasuredIds.count(Id)) { continue; }
+					auto It = Registered.find(Id);
+					if (It == Registered.end()) { continue; }
+					PushMeasureEntry(Id, It->second);
+				}
+			}
+			PendingAdd.clear();
+			PendingRemove.clear();
+			const FVec3d Cam = ToDouble(Sub(Camera, MeasureAnchor));
+			MaxInfluence = 0.0;
+			double MaxOff = 0.0;
+			for (FMeasured& M : Measured)
+			{
+				M.D = FVec3d{ M.Off.X - Cam.X, M.Off.Y - Cam.Y, M.Off.Z - Cam.Z };
+				M.Dist = Length(M.D);
+				MaxInfluence = std::max(MaxInfluence, M.InfluenceCm);
+				MaxOff = std::max(MaxOff, Length(M.Off));
+			}
+			MeasureErr = 4.0 * 2.220446049250313e-16 * (MaxOff + Length(Cam)) + 1.0;
+			// The list stays in last frame's order, which is nearly sorted: insertion sort is
+			// linear then. A budget bounds it (a jump or fast travel reorders much of it): past it, std::sort.
+			auto Less = [](const FMeasured& A, const FMeasured& B) { return A.Dist != B.Dist ? A.Dist < B.Dist : A.Id < B.Id; };
+			size_t Moves = 0;
+			const size_t Budget = 2 * Measured.size() + 64;   // D-168: past ~2 moves each, a full sort is cheaper
+			bool bSorted = true;
+			for (size_t I = 1; I < Measured.size(); ++I)
+			{
+				if (!Less(Measured[I], Measured[I - 1])) { continue; }
+				FMeasured V = Measured[I];
+				size_t J = I;
+				while (J > 0 && Less(V, Measured[J - 1])) { Measured[J] = Measured[J - 1]; --J; if (++Moves > Budget) { break; } }
+				Measured[J] = V;
+				if (Moves > Budget) { bSorted = false; break; }
+			}
+			if (!bSorted) { std::sort(Measured.begin(), Measured.end(), Less); }
+		}
+
+		/** D-155: is every cell of parent level Lp that could hold a contributor reaching level L's
+		 *  widest possible window (N_max) Ready? A cell that cannot reach it holds nothing level L
+		 *  needs, so L need not wait for it: before, every galaxy level stalled while a new slab of
+		 *  200 Mpc cluster cells, 200-300 Mpc away, filled (T2.stream.responsive, 30 Mpc/s). A
+		 *  contributor at Lp lies inside its cell and reaches at most LevelMaxInfluence[Lp]. */
+		bool ParentReadyFor(const FLevel& Lp, int LpLevel, int L) const
+		{
+			auto It = LevelMaxInfluence.find(LpLevel);
+			const double Reach = It == LevelMaxInfluence.end() ? std::numeric_limits<double>::infinity() : It->second;
+			const double W = CellWidthCm(L), Wp = CellWidthCm(LpLevel);
+			const FVec3d Oc = ToDouble(Sub(CellOrigin(CellOf(Camera, L)), Camera));
+			const double N = double(UniHlsl::UNI_WINDOW_N_MAX + UNI_WINDOW_LEAD_MAX);   // D-162: the widest a stretched window gets
+			const double CLo[3] = { Oc.X - N * W, Oc.Y - N * W, Oc.Z - N * W };
+			const double CHi[3] = { Oc.X + (N + 1.0) * W, Oc.Y + (N + 1.0) * W, Oc.Z + (N + 1.0) * W };
+			if (!Lp.bPendingValid)
+			{
+				Lp.Pending.clear();
+				for (const auto& KV : Lp.Cells)
+				{
+					if (KV.second.State == ECellState::Ready || KV.second.State == ECellState::Failed) { continue; }
+					FLevel::FPendingCell P;
+					P.Off = ToDouble(Sub(CellOrigin(KV.first), Camera));
+					P.Len = Length(P.Off);
+					Lp.Pending.push_back(P);
+				}
+				Lp.bPendingValid = true;
+			}
+			const double LenOc = Length(Oc);
+			for (const FLevel::FPendingCell& Pc : Lp.Pending)
+			{
+				const FVec3d& Op = Pc.Off;
+				const double PLo[3] = { Op.X, Op.Y, Op.Z };
+				double D2 = 0.0;
+				for (int A = 0; A < 3; ++A)
+				{
+					const double Gap = std::max({ 0.0, CLo[A] - (PLo[A] + Wp), PLo[A] - CHi[A] });
+					D2 += Gap * Gap;
+				}
+				const double Margin = 1.0e-9 * (Pc.Len + LenOc + Wp + N * W) + 1.0;
+				if (D2 <= (Reach + Margin) * (Reach + Margin)) { return false; }
+			}
+			return true;
+		}
+
+		/** Does a gathered contributor overlap C that C was not generated with? OnlyNew (sorted):
+		 *  test only those ids (D-168: the cell was checked against every other one already;
+		 *  the overlap test is exact, so the answer is the same). Ids C already has are not
+		 *  tested at all. */
+		bool ContributorsGrew(const FCell& C, const FCellBins& Bins, const FWindowGeometry& G, const std::vector<u32>* OnlyNew = nullptr) const
+		{
+			bool bGrew = false;
+			ForEachCandidate(Bins, G, C.Key, [&](const FContributor* Ct)
+			{
+				if (bGrew) { return; }
+				if (OnlyNew && !std::binary_search(OnlyNew->begin(), OnlyNew->end(), Ct->Id)) { return; }
+				if (std::binary_search(C.ContributorSet.begin(), C.ContributorSet.end(), Ct->Id)) { return; }
+				++Profile.OverlapTests;
+				if (Gen.Overlaps(*Ct, C.Key)) { bGrew = true; }
+			});
+			return bGrew;
 		}
 
 		/** Build tasks for the given cells and submit their probe phase as one batch. */
-		void SubmitCells(const std::vector<FCell*>& Cells, const std::vector<const FContributor*>& Gathered)
+		void SubmitCells(const std::vector<FCell*>& Cells, const FCellBins& Bins, const FWindowGeometry& G)
 		{
 			auto B = std::make_shared<FGenBatch>();
 			B->Ticket = ++NextTicket;
@@ -623,7 +948,7 @@ namespace UniCore
 			for (FCell* C : Cells)
 			{
 				std::vector<const FContributor*> Mine;
-				for (const FContributor* Ct : Gathered) { if (Gen.Overlaps(*Ct, C->Key)) { Mine.push_back(Ct); } }
+				ForEachCandidate(Bins, G, C->Key, [&](const FContributor* Ct) { ++Profile.OverlapTests; if (Gen.Overlaps(*Ct, C->Key)) { Mine.push_back(Ct); } });
 				// D-140: wait (stay Waiting) for any normalising integral still being computed.
 				bool bIntegrals = true;
 				for (const FContributor* Ct : Mine) { bIntegrals = IntegralReady(*Ct) && bIntegrals; }
@@ -644,8 +969,7 @@ namespace UniCore
 				// A cell with neither tasks nor anchors is empty and Ready at once. A cell with
 				// anchors but no tasks still goes through the batch, so its anchors are allocated,
 				// uploaded and registered like everything else.
-				bool bHasAnchor = false;
-				for (const FCellKey& AK : Gen.AnchorCellList()) { bHasAnchor = bHasAnchor || AK == C->Key; }
+				const bool bHasAnchor = Gen.HasAuthored(C->Key);   // anchors and catalogue objects (D-167)
 				if (C->Tasks.empty() && !bHasAnchor)
 				{
 					C->Batch.reset(); C->PoolCount = 0; C->State = ECellState::Ready; C->bGrowthChecked = false;
@@ -653,12 +977,15 @@ namespace UniCore
 					continue;
 				}
 				C->Batch = B;
+				B->CellKeys.push_back(C->Key);
 				C->State = ECellState::Probing;
 				C->SubmittedAt = FrameNo;
 				++Joined;
+				++Profile.CellsSubmitted;
+				Profile.TasksSubmitted += C->Tasks.size();
 			}
 			if (Joined == 0) { return; }
-			Backend.SubmitProbe(B);
+			{ FProfileScope S(Profile, EStreamPhase::Backend); Backend.SubmitProbe(B); }
 			Inflight.push_back(B);
 			++BatchesSubmitted;
 		}
@@ -701,7 +1028,8 @@ namespace UniCore
 			for (auto It = Inflight.begin(); It != Inflight.end();)
 			{
 				std::shared_ptr<FGenBatch> B = *It;
-				std::vector<FCell*> Mine = CellsOf(B);
+				std::vector<FCell*> Mine;
+				{ FProfileScope S(Profile, EStreamPhase::BatchCells); Mine = CellsOf(B); }
 				const bool bProbing = !Mine.empty() && Mine.front()->State == ECellState::Probing;
 				if (Mine.empty()) { It = Inflight.erase(It); continue; }   // all its cells were evicted
 				if (bProbing)
@@ -751,7 +1079,7 @@ namespace UniCore
 					}
 					// Tasks of failed cells write nothing.
 					for (FCell* C : Mine) { if (C->State == ECellState::Failed) { for (size_t T = 0; T < C->Tasks.size(); ++T) { B->Tasks[C->BatchTaskIndex[T]].PoolCapacity = 0; } } }
-					Backend.SubmitPlace(B);
+					{ FProfileScope S(Profile, EStreamPhase::Backend); Backend.SubmitPlace(B); }
 					++It;
 					continue;
 				}
@@ -765,6 +1093,8 @@ namespace UniCore
 					continue;
 				}
 				// Ready: register contributors from the read-back emitter objects.
+				FProfileScope ScopeRegister(Profile, EStreamPhase::Register);
+				Profile.ObjectsReadBack += B->ReadObjects.size();
 				for (FCell* C : Mine)
 				{
 					if (C->State != ECellState::Placing) { continue; }
@@ -785,7 +1115,10 @@ namespace UniCore
 						}
 					}
 					AppendAnchors(*C);
-					for (FContributor& Ct : Gen.MakeContributors(C->Readback)) { C->OwnedContributors.push_back(Ct.Id); Registered[Ct.Id] = Ct; }
+					// D-168: nothing is registered here. The emitter objects sleep until UpdateWake finds
+					// the camera within reach of their influence (bulk registration of every galaxy
+					// in a coarse window, 300k at once, was the intergalactic-speed hitch).
+					NoteEmitterObjects(*C);
 					C->State = ECellState::Ready;
 					C->bGrowthChecked = false;
 					C->Batch.reset();
@@ -796,6 +1129,178 @@ namespace UniCore
 				}
 				It = Inflight.erase(It);
 			}
+		}
+
+		/** D-168: the cell's emitter objects, and the cell-level bounds the wake pass culls with. */
+		void NoteEmitterObjects(FCell& C)
+		{
+			const FUniverseDef& D = Gen.ModelRef().Definition();
+			C.EmitterObjects.clear();
+			C.Sleepers.clear();
+			C.AwakeCount = 0;
+			C.MaxInfluenceCm = 0.0;
+			C.MaxChildLevel = -1;
+			C.ScanSlackCm = -1.0;
+			auto LI = LevelMaxInfluence.find(C.Key.Level);
+			for (size_t I = 0; I < C.Readback.Objects.size(); ++I)
+			{
+				const u32 Arch = C.Readback.Objects[I].A[3] & 0xFFFFu;
+				const FArchetype& A = D.Arch(Arch);
+				if (A.Emitters.empty()) { continue; }
+				C.EmitterObjects.push_back(u32(I));
+				for (const FUniEmitter& E : A.Emitters) { C.MaxChildLevel = std::max(C.MaxChildLevel, Gen.ModelRef().SlicesOf(E.ChildArchetypeId).LMax); }
+			}
+			// The level's bound (its archetypes' largest radius at their brightest), refined per
+			// object when the cell first comes near.
+			C.MaxInfluenceCm = LI == LevelMaxInfluence.end() ? std::numeric_limits<double>::infinity() : LI->second;
+			if (!(C.MaxInfluenceCm < std::numeric_limits<double>::infinity()))
+			{
+				// No bound known for the level: measure the objects now.
+				FillSleepers(C);
+			}
+		}
+
+		void FillSleepers(FCell& C)
+		{
+			if (!C.Sleepers.empty() || C.EmitterObjects.empty()) { return; }
+			const FUniverseDef& D = Gen.ModelRef().Definition();
+			C.Sleepers.resize(C.EmitterObjects.size());
+			double MaxI = 0.0;
+			for (size_t K = 0; K < C.EmitterObjects.size(); ++K)
+			{
+				const FObjectGPU& O = C.Readback.Objects[C.EmitterObjects[K]];
+				const FArchetype& A = D.Arch(O.A[3] & 0xFFFFu);
+				const double Radius = std::exp2(double(UniHlsl::Uni_ObjectRadiusLog2(UniCore::ToHlsl(O))));
+				FCell::FSleeper& Sl = C.Sleepers[K];
+				const u32 Off[3] = { O.A[0], O.A[1], O.A[2] };
+				Sl.Local = ToDouble(Sub(ObjectCoord(C.Key, Off), CellOrigin(C.Key)));
+				for (const FUniEmitter& E : A.Emitters)
+				{
+					Sl.InfluenceCm = std::max(Sl.InfluenceCm, E.InfluenceMul * Radius);
+					Sl.LMax = std::max(Sl.LMax, Gen.ModelRef().SlicesOf(E.ChildArchetypeId).LMax);
+				}
+				MaxI = std::max(MaxI, Sl.InfluenceCm);
+			}
+			C.MaxInfluenceCm = MaxI;
+		}
+
+		/** D-168: the farthest any window cell at level L can be from the camera: the window is at
+		 *  most N_max + lead cells from the camera's cell per axis, plus that cell. */
+		static double WindowReachCm(int L)
+		{
+			return double(UniHlsl::UNI_WINDOW_N_MAX + UNI_WINDOW_LEAD_MAX + 1) * 1.7320508075688772 * CellWidthCm(L);
+		}
+
+		/** D-168: wake and sleep contributors by distance. An emitter object is registered (its
+		 *  contributors made and measured) only while it could matter this frame:
+		 *    - its influence could reach a window of the levels it emits at: distance - influence
+		 *      <= WindowReachCm(its coarsest child level), so every Gather sees exactly what it saw
+		 *      with everything registered (the streamer stays identical to the reference), or
+		 *    - it subtends WakeTheta or more (the volume builder asks for those above its reject
+		 *      angle; the engine sets WakeTheta to half of it).
+		 *  It sleeps again past 1.5x both. So each object wakes inside a distance WakeD and sleeps
+		 *  outside SleepD > WakeD. Whole cells are culled by their bounds first, and each scan
+		 *  records how far the camera can move before any of the cell's objects (or its bound)
+		 *  can cross its threshold: until then the cell costs one distance per frame. Distances
+		 *  only shrink by what the camera moves, so a skipped cell would have changed nothing. */
+		void UpdateWake()
+		{
+			const double Th = std::max(WakeTheta, 1.0e-9);
+			for (auto& LKV : Levels)
+			{
+				for (auto& CKV : LKV.second.Cells)
+				{
+					FCell& C = CKV.second;
+					if (C.State != ECellState::Ready || C.EmitterObjects.empty()) { continue; }
+					if (!bLazyWake)
+					{
+						if (C.AwakeCount < C.EmitterObjects.size())
+						{
+							FillSleepers(C);
+							for (size_t K = 0; K < C.Sleepers.size(); ++K) { if (!C.Sleepers[K].bAwake) { WakeUp(C, K); } }
+						}
+						continue;
+					}
+					if (C.ScanSlackCm > 0.0 && std::abs(Th - C.ScanTheta) <= 1.0e-3 * C.ScanTheta
+						&& Length(ToDouble(Sub(Camera, C.ScanCamera))) < C.ScanSlackCm)
+					{
+						Profile.Asleep += C.EmitterObjects.size() - C.AwakeCount;
+						continue;
+					}
+					ScanWake(C, Th);
+					Profile.Asleep += C.EmitterObjects.size() - C.AwakeCount;
+				}
+			}
+			Profile.Awake = Registered.size();
+		}
+
+		/** One cell of UpdateWake: wakes and sleeps its objects, and records its slack. */
+		void ScanWake(FCell& C, double Th)
+		{
+			C.ScanCamera = Camera;
+			C.ScanTheta = Th;
+			// Cell bound: the nearest point of the cell, the largest influence in it.
+			const double W = CellWidthCm(C.Key.Level);
+			const FVec3d O = ToDouble(Sub(CellOrigin(C.Key), Camera));
+			double D2 = 0.0;
+			const double Oa[3] = { O.X, O.Y, O.Z };
+			for (int A = 0; A < 3; ++A) { const double E = Oa[A] > 0.0 ? Oa[A] : (Oa[A] + W < 0.0 ? -(Oa[A] + W) : 0.0); D2 += E * E; }
+			const double Dc = std::sqrt(D2);
+			const double R = C.MaxChildLevel >= 0 ? WindowReachCm(C.MaxChildLevel) : 0.0;
+			const double MaxI = C.MaxInfluenceCm;
+			// Every object is past its SleepD while the nearest point is past both bounds.
+			const double NearD = std::max(MaxI + 1.5 * R + 1.0, 1.5 * MaxI / Th);
+			if (Dc > NearD)
+			{
+				if (C.AwakeCount > 0) { for (FCell::FSleeper& Sl : C.Sleepers) { if (Sl.bAwake) { Sleep(C, Sl); } } }
+				C.ScanSlackCm = 0.999 * (Dc - NearD);
+				return;
+			}
+			FillSleepers(C);
+			double Slack = std::numeric_limits<double>::infinity();
+			for (size_t K = 0; K < C.Sleepers.size(); ++K)
+			{
+				FCell::FSleeper& Sl = C.Sleepers[K];
+				const double Rl = Sl.LMax >= 0 ? WindowReachCm(Sl.LMax) : 0.0;
+				// (centre - origin) + (origin - camera): two roundings of at most a cell width
+				// and the distance, far inside the margin.
+				const double Dist = Length(FVec3d{ Sl.Local.X + O.X, Sl.Local.Y + O.Y, Sl.Local.Z + O.Z });
+				const double Margin = 1.0e-9 * (Dist + Rl + W) + 1.0;
+				const double WakeD = std::max(Sl.InfluenceCm + Rl + Margin, Sl.InfluenceCm / Th);
+				const double SleepD = std::max(Sl.InfluenceCm + 1.5 * Rl + Margin, 1.5 * Sl.InfluenceCm / Th);
+				if (!Sl.bAwake && Dist <= WakeD) { WakeUp(C, K); }
+				else if (Sl.bAwake && Dist > SleepD) { Sleep(C, Sl); }
+				Slack = std::min(Slack, Sl.bAwake ? SleepD - Dist : Dist - WakeD);
+			}
+			// The margin absorbs the coordinate rounding; a non-positive slack rescans next frame.
+			C.ScanSlackCm = 0.999 * Slack - 1.0;
+		}
+
+		void WakeUp(FCell& C, size_t K)
+		{
+			FCell::FSleeper& Sl = C.Sleepers[K];
+			std::vector<FContributor> Made;
+			Gen.MakeContributorsFor(C.Readback, C.EmitterObjects[K], Made);
+			Sl.Ids.clear();
+			for (FContributor& Ct : Made)
+			{
+				Sl.Ids.push_back(Ct.Id);
+				Registered[Ct.Id] = Ct;
+				PendingAdd.push_back(Ct.Id);
+				PendingRemove.erase(Ct.Id);
+				++Profile.ContributorsAdded;
+				++Profile.Woken;
+			}
+			Sl.bAwake = true;
+			++C.AwakeCount;
+		}
+
+		void Sleep(FCell& C, FCell::FSleeper& Sl)
+		{
+			for (u32 Id : Sl.Ids) { Registered.erase(Id); PendingRemove.insert(Id); ++Profile.ContributorsRemoved; ++Profile.Slept; }
+			Sl.Ids.clear();
+			Sl.bAwake = false;
+			if (C.AwakeCount > 0) { --C.AwakeCount; }
 		}
 
 		/** Anchors are authored, not generated: the CPU knows them and registers them directly. */
@@ -809,10 +1314,22 @@ namespace UniCore
 			}
 		}
 
+		/** The cells still in batch B, in join order. D-157: looked up by key (each a hash
+		 *  lookup) instead of scanning every cell of every level once per in-flight batch per frame,
+		 *  O(batches x resident cells). A key whose cell was evicted (or rejoined another batch)
+		 *  is skipped, as the scan skipped it. */
 		std::vector<FCell*> CellsOf(const std::shared_ptr<FGenBatch>& B)
 		{
 			std::vector<FCell*> Out;
-			for (auto& LKV : Levels) for (auto& KV : LKV.second.Cells) { if (KV.second.Batch == B) { Out.push_back(&KV.second); } }
+			Out.reserve(B->CellKeys.size());
+			for (const FCellKey& K : B->CellKeys)
+			{
+				++Profile.BatchCellScans;
+				auto L = Levels.find(K.Level);
+				if (L == Levels.end()) { continue; }
+				auto It = L->second.Cells.find(K);
+				if (It != L->second.Cells.end() && It->second.Batch == B) { Out.push_back(&It->second); }
+			}
 			return Out;
 		}
 
@@ -820,8 +1337,15 @@ namespace UniCore
 		{
 			Pool.Release(C.PoolStart, C.PoolCount);
 			C.PoolStart = C.PoolCount = 0;
-			for (u32 Id : C.OwnedContributors) { Registered.erase(Id); }
-			C.OwnedContributors.clear();
+			for (FCell::FSleeper& Sl : C.Sleepers)
+			{
+				if (!Sl.bAwake) { continue; }
+				for (u32 Id : Sl.Ids) { Registered.erase(Id); PendingRemove.insert(Id); }
+				Profile.ContributorsRemoved += Sl.Ids.size();
+			}
+			C.Sleepers.clear();
+			C.EmitterObjects.clear();
+			C.AwakeCount = 0;
 		}
 
 		void Evict(FLevel& Lv, const FCellKey& K)
@@ -843,7 +1367,14 @@ namespace UniCore
 		FPoolAllocator Pool;
 		std::map<int, FLevel> Levels;
 		std::map<u32, FContributor> Registered;
-		struct FMeasured { u32 Id = 0; int LMin = 0, LMax = -1; double InfluenceCm = 0.0; FVec3d D; double Dist = 0.0; };
+		struct FMeasured { u32 Id = 0; int LMin = 0, LMax = -1; double InfluenceCm = 0.0; FVec3d Off; FVec3d D; double Dist = 0.0; const FContributor* Ptr = nullptr; };
+		std::map<int, double> LevelMaxInfluence;   // D-155
+		FCoord MeasureAnchor;
+		bool bMeasureAnchor = false;
+		double MeasureErr = 1.0;
+		std::vector<u32> PendingAdd;
+		std::unordered_set<u32> PendingRemove;
+		std::unordered_set<u32> MeasuredIds;
 		double MaxInfluence = 0.0;
 		std::vector<FMeasured> Measured;   // D-138: rebuilt at the start of every Update (by id: evictions later in the frame are skipped)
 		std::deque<std::shared_ptr<FGenBatch>> Inflight;

@@ -101,3 +101,34 @@ Glare grows only with log flux, so every star crosses over at about the same on-
 - Size is continuous through the crossover (offline).
 - Sprite flux equals actor emissive flux at the swap (needs UE, UE-7).
 - Hysteresis gives no flicker.
+
+## B-004: Galaxy groups (owner, 2026-11-02)
+
+**Status:** not started. Most real galaxies live in groups of a few bright galaxies plus dwarfs. D-151 makes rich and poor clusters (M ≤ −24.5) explicit and leaves groups as field galaxies.
+
+**Why not the same way:** a group as a parent of galaxies must be resident wherever its brightest member can be seen (D-152): about 330 Mpc. Groups are 10–100× more numerous than clusters. At FaintMag −23 that is about 130,000 resident groups (measured: 1.16M before D-152), each a contributor the streamer measures every frame.
+
+**Options:**
+1. **Group clumping in the web field.** Give the field galaxies' web a node term like the clusters'. The galaxies themselves crowd into group-sized clumps at nodes, with no new objects. Cheap; rerolls field galaxies; no group objects for gameplay.
+2. **Group parents for faint members only.** Groups place only galaxies fainter than about −20; their bright members come from the web. Group reach then drops to a few Mpc.
+3. **Spatial index for contributors.** A coarse grid instead of per-frame measurement of every contributor, so 10⁵ contributors cost what 10⁴ do now. Also a performance-pass item.
+
+## B-005: Sampling boxes for galaxies' coarse star levels (D-153 follow-up)
+
+The coarsest star levels (the brightest stars) have cells comparable to a galaxy's influence sphere, so the same probe miss can under-place them. Turning `bSampleBox` on for the galaxy emitter would fix it, but rerolls stars. Measure first (a T2 member census per galaxy, like T2.cluster.members), and decide before content.
+
+## B-006: Cluster realism
+
+Elliptical and lenticular galaxies dominate cluster cores (the morphology-density relation). Members currently roll the same spiral parameters as field galaxies.
+- A galaxy archetype variant, or parameter ranges conditioned on the parent, would add it.
+- So would intracluster light: a diffuse glow, about 10–20% of a rich cluster's light, which the volume could carry.
+- So would a brightest cluster galaxy at the centre, as an anchor-like first member.
+
+## B-007: Clusters from the adhesion node list (owner, 2026-11-03; D-165 follow-up) — DONE (D-167)
+The noise project's `*_nodes.json` lists every node cluster (position in tile units, mass as a share of the tile's mass, heaviest first). Place one cluster per node above a mass cut, at its position, with richness (absolute magnitude, members) from its mass, instead of drawing clusters from the node-matter channel. Needs a catalogue emitter: objects from a list rather than a Poisson draw (per cell: the list entries inside it, on GPU and CPU alike). Field galaxies already exclude the node matter, so nothing is counted twice.
+
+## B-008: March the textured web farther (D-165 follow-up)
+The analytic tail past the march (0.5 periods) is ~99% of the background's light and uniform, so the adhesion web's structure barely shows in a full frame. With the texture, far samples can read the mip matching the step (not just the pixel) and take log steps, so marching several periods costs tens of steps. Measure the look and the cost; then the per-pixel background at speed.
+
+## B-009: Spread cell submissions over frames (D-168 follow-up)
+After D-168 the game thread's remaining spikes at speed are cells entering at once: a coarse window shift or a travel-sensitivity resize brings 500–1,000 cells in one frame, and task building (Submit) plus eviction (Window) cost 20–40 ms on the reference for them. A per-frame budget on cells submitted (nearest the camera first, never one inside the visible radius left waiting) would spread them; T2.stream.responsive bounds what the delay may cost.

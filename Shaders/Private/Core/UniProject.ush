@@ -29,8 +29,17 @@ static const uint UNI_SPRITE_VISIBLE = 1u;
 static const uint UNI_SPRITE_PROMOTE_CANDIDATE = 2u;
 static const uint UNI_SPRITE_EXTENDED = 4u;
 static const uint UNI_SPRITE_BODY = 8u;           // D-148: a resolved body (extended, no children): disc profile
+static const uint UNI_SPRITE_HALO_ONLY = 16u;     // D-158: a promoted star: its actor draws the disc, the sprite keeps its glare
 static const float UNI_SPRITE_DISC_MIN_PX = 1.5f; // below this a body is drawn as a plain Gaussian
 static const float UNI_ARRIVAL_RANGE = 4.0f;      // D-150: the brightness boost fades over the last 4x in distance
+
+// D-156 sprite style defaults (the owner tunes them live: uu.Sprite.*).
+static const float UNI_SPRITE_CORE_PX = 1.0f;         // core sigma, px: an unresolved source is a pinpoint
+static const float UNI_SPRITE_CORE_SAT = 16.0f;       // intensity (exposure units) where the core saturates: 3 mag over exposure
+static const float UNI_SPRITE_HALO_GAIN = 0.25f;      // halo energy per doubling over saturation (x saturation)
+static const float UNI_SPRITE_HALO_GROWTH_PX = 0.5f;  // halo sigma growth per doubling over saturation, px
+static const float UNI_SPRITE_HALO_MAX_PX = 4.0f;     // halo sigma cap, px
+
 
 /** D-150: the distance at which an object's sprite must be back at its true perceived size.
  *  A star whose archetype has systems: its activation radius, where its planets spawn. Anything
@@ -64,8 +73,13 @@ struct FUniView
 	float ExposureMag;        // magnitude that maps to intensity 1
 	float SurfaceLimit;       // mu_lim = mu_ref + dm
 	float ThetaPixel;         // angular radius of one pixel: minimum sprite footprint
-	float GlareGain;          // footprint growth with flux
 	uint SystemArchetypeMask; // D-150: archetypes whose objects arrive at their system radius (UniSystem.ush)
+	// D-156 sprite style: a pinpoint core plus a capped halo (Uni_SpriteDefaults sets these).
+	float CorePx;             // core sigma for an unresolved source, pixels (<= 0: UNI_SPRITE_CORE_PX)
+	float CoreSat;            // intensity at which the core saturates (<= 0: physical: no saturation, no halo)
+	float HaloGain;           // halo energy per doubling of intensity over saturation, in units of saturation
+	float HaloGrowthPx;       // halo sigma growth per doubling over saturation, pixels
+	float HaloMaxPx;          // halo sigma cap for an unresolved source, pixels
 };
 
 struct FUniSprite
@@ -78,7 +92,37 @@ struct FUniSprite
 	float NdcY;
 	uint Flags;
 	float PhysAngularRadius;  // R / r, rad (promotion, volumetric hand-off)
+	float HaloRadius;         // D-156: halo sigma, rad (0: no halo)
+	float HaloRatio;          // D-156: halo energy / core energy (0: no halo)
+	float Pad0;
+	float Pad1;
 };
+
+/** D-156: FUniView with the default sprite style. */
+UNI_FN FUniView Uni_SpriteDefaults(FUniView InView)
+{
+	FUniView V = InView;
+	V.CorePx = UNI_SPRITE_CORE_PX;
+	V.CoreSat = UNI_SPRITE_CORE_SAT;
+	V.HaloGain = UNI_SPRITE_HALO_GAIN;
+	V.HaloGrowthPx = UNI_SPRITE_HALO_GROWTH_PX;
+	V.HaloMaxPx = UNI_SPRITE_HALO_MAX_PX;
+	return V;
+}
+
+UNI_FN float Uni_SpriteCorePx(FUniView InView)
+{
+	return InView.CorePx > 0.0f ? InView.CorePx : UNI_SPRITE_CORE_PX;
+}
+
+/** D-156: the core's energy for an intensity, saturating at Sat with a sharp knee:
+ *  I / (1 + (I / Sat)^4)^(1/4): within 0.01% of I below Sat / 8, 0.84 Sat at Sat, Sat far above it. */
+UNI_FN float Uni_SpriteSaturate(float InIntensity, float InSat)
+{
+	const float X = min(InIntensity / InSat, 1.0e4f);   // X^4 stays finite; past 1e4 the result is Sat to 1e-16
+	const float X2 = X * X;
+	return InSat * X * rsqrt(sqrt(1.0f + X2 * X2));
+}
 
 /** Promotion test with hysteresis. */
 UNI_FN bool Uni_PromoteTest(float InDistance, float InRadius, bool InWasPromoted)
@@ -135,6 +179,10 @@ UNI_FN FUniSprite Uni_ProjectObject(uint4 InCellDeltaX, uint4 InCellDeltaY, uint
 	S.NdcY = 0.0f;
 	S.Flags = 0u;
 	S.PhysAngularRadius = 0.0f;
+	S.HaloRadius = 0.0f;
+	S.HaloRatio = 0.0f;
+	S.Pad0 = 0.0f;
+	S.Pad1 = 0.0f;
 
 	const uint3 Off = uint3(InObj.A.x, InObj.A.y, InObj.A.z);
 	const float3 Rel = Uni_ObjectRelative(InCellDeltaX, InCellDeltaY, InCellDeltaZ, Off, InLevel, InView.CameraFraction);
@@ -146,7 +194,12 @@ UNI_FN FUniSprite Uni_ProjectObject(uint4 InCellDeltaX, uint4 InCellDeltaY, uint
 	S.PhysAngularRadius = Radius / R;
 	const uint ObjFlags = Uni_ObjectFlags(InObj);
 	if (Uni_PromoteTest(R, Radius, InWasPromoted)) { S.Flags = S.Flags | UNI_SPRITE_PROMOTE_CANDIDATE; }
-	if ((ObjFlags & (UNI_OBJ_FLAG_PROMOTED | UNI_OBJ_FLAG_DELTA_HIDDEN)) != 0u) { return S; }
+	if ((ObjFlags & UNI_OBJ_FLAG_DELTA_HIDDEN) != 0u) { return S; }
+	// D-158: a promoted point source (a star) keeps its glare: the actor replaces only the core,
+	// so the point of light reads the same across the swap. Promoted extended objects (planets)
+	// are drawn by their actor alone, as before.
+	const bool bPromoted = (ObjFlags & UNI_OBJ_FLAG_PROMOTED) != 0u;
+	if (bPromoted && (ObjFlags & UNI_OBJ_FLAG_EXTENDED) != 0u) { return S; }
 
 	// Photometry. Every source has a point-source visibility from its apparent magnitude. An
 	// extended source also has a resolved visibility from its surface brightness, which ramps
@@ -175,25 +228,50 @@ UNI_FN FUniSprite Uni_ProjectObject(uint4 InCellDeltaX, uint4 InCellDeltaY, uint
 	S.NdcY = Ny;
 	S.RenderPos = Dir * Uni_Compress(R);
 
-	// D-150 (owner, generalising D-148): far away a sprite is enlarged with its brightness so it
-	// stays visible the whole way in; over the last 4x in distance before it "arrives" (a star:
-	// its system radius, where its planets spawn; anything else: its promotion distance) the boost
-	// fades to the object's true perceived size: its physical angular radius, never below one
-	// pixel. Flux is unchanged (the profile is normalised); only the footprint shrinks.
-	// Inside the ramp the boost is frozen at its value at the ramp's start (the brightness the
-	// object has at UNI_ARRIVAL_RANGE x its arrival distance), so the footprint only shrinks on the
-	// way in; the light itself keeps rising as 1 / r^2.
+	// D-156, revised by D-158 (owner: "a seamless experience at all distances: approach a star,
+	// resolve its system and eventually its actor without any unexpected behaviour in the way the
+	// point of light reads"). A sprite is a CORE plus, for a point source, a GLARE halo, and
+	// neither ever shrinks on the way in:
+	//  - Core: a Gaussian of sigma max(true angular radius, CorePx pixels): pegged at CorePx
+	//    while unresolved, growing with the true size once that is larger. Its light is the
+	//    intensity up to a saturation level; a resolved core saturates per area
+	//    (Sat x (core / CorePx)^2), so its surface brightness holds as it grows.
+	//  - Glare (point sources only: stars; not galaxies, clusters or planets): above
+	//    saturation, energy HaloGain x Sat x (doublings over Sat) and sigma core x (1 + growth),
+	//    the growth HaloGrowth pixels per doubling, capped at HaloMax / CorePx. While unresolved
+	//    that is CorePx + HaloGrowth x doublings pixels, at most HaloMax; once resolved the whole
+	//    sprite scales with the true size (the doublings over the area-scaled saturation stop
+	//    changing), so the glare grows with the disc instead of being left behind.
+	//  - Approach: brightness only rises, so core and glare only grow. There is no arrival ramp
+	//    any more (D-150 is superseded). A promoted star keeps its glare (HALO_ONLY) and its actor
+	//    draws the disc.
+	//  - CoreSat <= 0: physical mode: all light in the core, no glare (the engine's bloom).
 	const bool bBody = bExtended && (ObjFlags & UNI_OBJ_FLAG_HAS_CONTRIBUTOR) == 0u;
-	const float Arrival = Uni_ArrivalDistance(Uni_ObjectArchetype(InObj), InView.SystemArchetypeMask, AbsMag, Radius);
-	const float RampStart = UNI_ARRIVAL_RANGE * Arrival;
-	const float GlareIntensity = (R < RampStart) ? Intensity * (R / RampStart) * (R / RampStart) : Intensity;
-	const float Glare = InView.ThetaPixel * (1.0f + InView.GlareGain * log2(1.0f + GlareIntensity));
-	const float TrueSize = max(S.PhysAngularRadius, InView.ThetaPixel);
-	const float ToTrue = Uni_ArrivalWeight(R, Arrival);
-	S.AngularRadius = max(TrueSize, lerp(max(Glare, TrueSize), TrueSize, ToTrue));
+	const bool bPoint = (ObjFlags & UNI_OBJ_FLAG_EXTENDED) == 0u;
+	const float CorePx = Uni_SpriteCorePx(InView);
+	const float CoreMin = CorePx * InView.ThetaPixel;
+	S.AngularRadius = max(S.PhysAngularRadius, CoreMin);
+	S.HaloRadius = 0.0f;
+	S.HaloRatio = 0.0f;
+	float CoreE = Intensity;
+	if (InView.CoreSat > 0.0f)
+	{
+		const float Area = S.AngularRadius / CoreMin;
+		const float Sat = InView.CoreSat * Area * Area;
+		CoreE = Uni_SpriteSaturate(Intensity, Sat);
+		const float Over = bPoint ? max(log2(max(Intensity, 1.0e-30f) / Sat), 0.0f) : 0.0f;   // doublings over saturation
+		const float HaloE = InView.HaloGain * Sat * Over;
+		if (HaloE > 0.0f && CoreE > 0.0f)
+		{
+			const float Growth = min(max(InView.HaloMaxPx / CorePx - 1.0f, 0.0f), InView.HaloGrowthPx * Over / CorePx);
+			S.HaloRadius = S.AngularRadius * (1.0f + Growth);
+			S.HaloRatio = HaloE / CoreE;
+		}
+	}
+	if (bPromoted && !(S.HaloRatio > 0.0f)) { return S; }   // a promoted star without glare: the actor alone
 	const float3 Col = Uni_UnpackColour(InObj.B.w);
-	S.Radiance = Col * (Intensity / max(Uni_Luminance(Col), 1.0e-3f));   // luminance = intensity (D-135)
-	S.Flags = S.Flags | UNI_SPRITE_VISIBLE | (bExtended ? UNI_SPRITE_EXTENDED : 0u) | (bBody ? UNI_SPRITE_BODY : 0u);
+	S.Radiance = Col * (CoreE / max(Uni_Luminance(Col), 1.0e-3f));   // the core's light; luminance = core energy (D-135)
+	S.Flags = S.Flags | UNI_SPRITE_VISIBLE | (bExtended ? UNI_SPRITE_EXTENDED : 0u) | (bBody ? UNI_SPRITE_BODY : 0u) | (bPromoted ? UNI_SPRITE_HALO_ONLY : 0u);
 	return S;
 }
 
@@ -218,6 +296,31 @@ UNI_FN float Uni_SpriteProfile(float InRPx, float InSigmaPx, float InDiscFrac)
 	const float D = InDiscFrac * InSigmaPx;
 	const float Disc = saturate(D + 0.5f - InRPx) / (3.14159265f * D * D + 0.2617994f);   // pi D^2 + pi/12: the 1 px soft edge's area
 	return lerp(Gauss, Disc, InDiscFrac);
+}
+
+/** D-158: the core's share of the profile: 0 for a promoted star (its actor draws the disc). */
+UNI_FN float Uni_SpriteCoreWeight(FUniSprite InS)
+{
+	return (InS.Flags & UNI_SPRITE_HALO_ONLY) != 0u ? 0.0f : 1.0f;
+}
+
+/** D-156: the angular radius the sprite's quad must cover: the halo's when it has one. */
+UNI_FN float Uni_SpriteFootprint(FUniSprite InS)
+{
+	return InS.HaloRatio > 0.0f ? max(InS.AngularRadius, InS.HaloRadius) : InS.AngularRadius;
+}
+
+/** D-156: core (Uni_SpriteProfile, times CoreWeight: D-158) plus halo: a Gaussian of sigma
+ *  HaloSigmaPx carrying HaloRatio x the core's energy. Sums to CoreWeight + HaloRatio over the
+ *  pixels, so with Radiance the core's light the halo adds HaloRatio x Radiance. */
+UNI_FN float Uni_SpriteProfileHalo(float InRPx, float InSigmaPx, float InDiscFrac, float InHaloSigmaPx, float InHaloRatio, float InCoreWeight)
+{
+	float W = InCoreWeight > 0.0f ? InCoreWeight * Uni_SpriteProfile(InRPx, InSigmaPx, InDiscFrac) : 0.0f;
+	if (InHaloRatio > 0.0f && InHaloSigmaPx > 0.0f)
+	{
+		W += InHaloRatio * exp(-0.5f * (InRPx * InRPx) / (InHaloSigmaPx * InHaloSigmaPx)) / (6.2831853f * InHaloSigmaPx * InHaloSigmaPx);
+	}
+	return W;
 }
 
 #endif // UNI_PROJECT_USH

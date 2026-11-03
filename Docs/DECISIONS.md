@@ -598,3 +598,250 @@ The other checks are unchanged: T2.parallax.promotion still finds the sprite at 
 Known: a promoted star's sprite is now a pixel inside its sphere, so the "corona" of D-147 is gone. With no emissive engine material, the placeholder star sphere is lit from behind and looks dark. It needs an emissive material (owner's asset) or B-003's bloom hand-off.
 Reroll impact: None.
 Status: Provisional
+
+D-151 — Galaxy clusters: a Cluster archetype on the web, with budget-consistent members and tuning handles
+Question: Owner: "the universe level field needs a bit more population so we aren't swimming through large black voids". Start from a realistic distribution, with handles to tune it.
+Decision:
+- **Archetype.** A Cluster archetype (id 3), placed by a second root emitter on the galaxies' own web lattice (same G, widths, seed), sharpened with a power (BiasPower 2) and a node term (NodeWeight 6, where four lattice sites are equidistant), so clusters sit where filaments meet.
+- **Members.** Each cluster's emitter places galaxies with a new field (UNI_FIELD_CLUSTER): a triaxial isothermal beta model, ellipsoidal radius, core 0.06–0.14 of the influence radius. Up to 3 Plummer sub-clumps sit at seeded positions (new seed channel CLUMP), and the body tapers smoothly over the outer 35%. Its normaliser is analytic, so there are no sampled integrals and nothing to wait for.
+- **Counts.** Budget-consistent: a cluster's galaxies add up to its own magnitude (D-133).
+- **Light.** Clusters are Extended, so their light hands over to a volume carrier as they grow (D-129), like galaxies.
+- **Fraction.** Field galaxies scale by (1 − Fraction), so the total galaxy density is unchanged.
+- **Realistic defaults (FClusterTuning):**
+  - 15% of all galaxies are cluster members, 8.6% in rich clusters (M < −25, 300+ galaxies).
+  - Cluster luminosity function: Schechter, M* = −25.3, α = −2, over −27.5 to −24.5.
+  - About 214 members on average, density 1.4e-5 per Mpc³ (rich: 5.6e-6).
+- **Groups stay field galaxies.** Groups (most real galaxies) as explicit parents cost 10–100× more resident clusters (D-152). They are B-004.
+- **Handles.** Enable, Fraction, MStar, Alpha, BrightMag, FaintMag, BiasPower, NodeWeight, RadiusScale, CoreMin/Max, MaxClumps, ClumpWeight. In UE these are `uu.Cluster.*`, applied on `uu.Enable`.
+- **Commands.** `uu.Clusters` and `uu.GotoCluster [rich]`.
+- **Resolve threshold.** A cluster's resolve threshold is 5e-3 rad (about 6 px): smaller, it counts as unresolved for residency. Its light is then the volume's, which models every child by point flux, so this is consistent with it. At 1 px they would be resident out to 1.6 Gpc.
+Rationale (offline):
+- **T2.cluster.census:** 14,063 resident from intergalactic space; density 1.39e-5 against 1.40e-5. The web density at clusters is 3.0× the mean, against 2.0× at field galaxies. Members are exactly 15.0%.
+- **T2.cluster.members:** a rich cluster has 534 members against 493 expected (+1.8σ). Its summed light is M = −25.88 against −26.00 (1.5σ). Its radial profile matches the field (KS 0.053, 99% limit 0.071).
+- **T1.field.cluster:** the analytic normaliser is unbiased against sampling (mean −0.02%).
+- **T2.cluster.no_reroll:** with clusters off, the web scene is the old one record for record.
+- **Stills:** `still_cluster_*`.
+Reroll impact: HIGH for web content (field galaxy counts scale by 0.85; clusters are new). Owner-approved direction; tune before authoring. With Enable = 0 there is no change.
+Status: Provisional
+
+D-152 — Parents are resident where their children can be visible, not where their windows can reach (amends D-101)
+Question: Making clusters parents of galaxies kept 1.16 million clusters resident. D-101 required a parent within the farthest corner of its children's widest window: √3 (N_max + 1) 2^L, 600 Mpc for galaxies' 50 Mpc level.
+Decision: The reach is, per child level L, min(the largest child relevance at L × K(Δm cover), (N_max + 1) 2^L) + √3 2^L, plus the influence radius.
+- Δm cover = +2.5 (`kParentCoverDeltaMag`).
+- The reasoning: a child cell generated without a parent is regenerated when the parent arrives. That is invisible as long as every object in it is still beyond the children's visible radius then.
+- Above +2.5, at the coarsest child level only, a bright member can appear when its parent arrives.
+Rationale:
+- For clusters, about 330 Mpc instead of 600–840 Mpc; with D-151's threshold, 14,000 resident clusters instead of 1.16 million.
+- Every existing parent's relevance was already set by its own visibility. The star and galaxy slice tables and relevances are bit-identical, and the content is too (T2.cluster.no_reroll).
+Reroll impact: None for existing content (checked); it sets cluster levels.
+Status: Provisional
+
+D-153 — Sampling boxes and analytic envelope bounds for small contributors in large cells
+Question: A cluster's 2–5 Mpc influence sphere sits inside galaxy cells of up to 50 Mpc. A cell's 128 probes usually all missed it, so the cluster got 380 of its 493 members and a third of its light. Inside smaller cells, the probes missed its 0.2 Mpc core, so the rejection envelope capped the core at half its density.
+Decision:
+- **Sampling box.** An emitter can ask for one (`bSampleBox`). Its tasks probe and place only inside the part of the cell its influence sphere overlaps: in-cell offsets per axis, with lambda scaled by the box's volume.
+- **The mapping.** It is exact integer arithmetic: Lo + mulhi(offset, Span), with a 32-bit `Uni_MulHi32` because SM5 has no 64-bit integers. Span 0 is the identity, so tasks without a box place bit-for-bit as before.
+- **Envelope bound.** The cluster field also bounds itself over the box (`Uni_FieldBoundBeyond`, from the box's nearest point to the centre). The envelope is max(probe max × 1.25, bound); other fields return 0 and are unchanged.
+- **Task size.** FGenTaskGPU grows from 176 to 208 bytes (BoxLo, BoxSpan).
+- **Users.** Only the cluster emitter uses it. Galaxies' coarse star levels might benefit too, but turning it on for them would reroll stars (B-005).
+Rationale:
+- T2.cluster.members: from 380 members and M = −24.82 to 534 and −25.88.
+- Core fraction (within 0.1 of the influence radius): from 6.0% to 12.0% (field: 12.9%).
+- 0.00% of candidates above the envelope.
+- T1.box.map: 2M products exact, every offset inside its box, span 0 the identity.
+Reroll impact: None for existing content (no box, no bound).
+Status: Provisional
+
+D-154 — Travel sensitivity
+Question: Owner: travelling between galaxies is "hunting specks". At the naked-eye limit a bright galaxy fades beyond about 3 Mpc, and a rich cluster's mean surface brightness (~25.4 mag/arcsec²) sits just past the limit.
+Decision: While the camera moves fast, sensitivity rises by itself (`UniTravel.h`, FTravelSensitivity).
+- It is added to the owner's own `uu.Sensitivity`, driven by the camera's actual speed.
+- 0 below 100 kpc/s, +2.5 mag at 10 Mpc/s and above, smoothstep in log speed between.
+- Rate-limited: up 2 mag/s, down 1 mag/s.
+- It goes through the existing sensitivity path: windows widen with it (T3.sensitivity: 0 pops on a sweep at ~2.5 mag/s), the D-139 pool guard applies, and nothing generated changes.
+- +2.5 is D-152's cover, so cluster members stay complete.
+- Teleports and jumps don't count as speed.
+- `uu.TravelSensitivity <mag>` (0 turns it off), `uu.TravelStart`, `uu.TravelFull`. The HUD shows "dm +x (travel +y)".
+Rationale: T1.travel.sensitivity, the curve and a scripted trip: peak +2.50, worst rate 2.00 mag/s, back to 0 within 2.6 s of stopping.
+Reroll impact: None (render and windows only).
+Status: Provisional
+
+Note (D-151 follow-up, verification tooling): the reference pipeline (FRefPipeline, used by every offline check) scanned every registered contributor for every level every frame, the cost the runtime streamer removed in D-138. With 17,500 contributors, the 2,400-frame flythrough check ran for over 40 minutes. It now measures contributors once per frame (refreshed whenever the registry changes, so same-frame registration still works), tests boxes in doubles with a margin (superset; the exact per-cell test still decides), and skips the D-113 regeneration pass when a level's gathered set is unchanged (exactly equivalent). Old and new pipelines produce the same hash over every resident record, fade and generation statistic, on the web and galaxy scenes over 60 moving frames.
+Note (D-151, volume): a rich cluster's background LUT tail (flux per child ~1e10 × distance ~1e28 cm) overflowed float and made the background NaN (T3.vol.background, T3.vol.nested). Each child table's LUT is now scaled by a power of two near 1 / (its mean flux), undone in its carriers' amplitudes (`LutScale`). The march only uses LUT × amplitude, and power-of-two scaling is exact, so galaxy results are bit-for-bit unchanged. The background with clusters is 27.43 mag/arcsec², the same as without them: clusters move light, they don't add it.
+
+D-155 — Streamer cost and parent gating with clusters (amends D-137, D-138)
+Question: With 14,000 resident clusters (17,500 contributors), T2.stream.responsive measured the streamer at 13–16 ms per frame in the web scene, against about 1 ms before. At 30 Mpc/s, 1.7% of frames had a visible galaxy cell not Ready.
+Decision:
+- **Measurement (D-138).** It is now incremental. Each contributor's offset from a measure anchor near the camera is computed exactly once, at registration; per frame it is a double subtraction. The anchor re-bases (one exact pass) every 30 Mpc. Its rounding bound, 4 eps (|offset| + |camera offset|), is added to the gather margins, so the gather is still a superset and the exact overlap test decides. The sort is an insertion sort from last frame's order (nearly sorted, so linear), with a budget and a fallback to std::sort.
+- **Gating (D-137).** A level waits only for the parent cells that could hold a contributor reaching its widest window. That is bounded by the largest influence any object at the parent level can have (`LevelMaxInfluence`, from the archetypes and anchors placed there). Before, every galaxy level stalled while a new slab of 200 Mpc cluster cells, 200–300 Mpc away, filled.
+- **Latency bound.** T2.stream.responsive's bound is now 6 frames per depth of the parent chain (two deep with clusters): a coarse galaxy cell whose cluster cell fills at the same time waits for it, beyond the visible radius.
+Rationale:
+- Profiled offline at 10 Mpc/s with 17,500 contributors: streamer Update about 3 ms including the CPU stand-in's generation (the GPU's work in the engine), of which bookkeeping is about 1.1 ms, back to the pre-cluster level.
+- Steady-flight holes: 0 at every speed (from 100).
+- T2.stream.parity is unchanged: 114,456 objects, 0 differ.
+Reroll impact: None.
+Status: Provisional
+
+D-156 — Sprite style: pinpoint core plus a capped halo (replaces the D-150 glare footprint, keeps its arrival rule)
+Question: Owner, in the engine: inside a dense galaxy the sky is "snowflakes". Far, bright stars are several pixels across, and size no longer says anything about distance. The D-150 footprint grew as 1 + 0.35 log2(1 + I) pixels of Gaussian sigma: a star 5 mag over exposure was ~3.3 px sigma (a 20 px quad), one at I = 5e7 nearly 10 px. Owner chose option A of three (A: core + capped halo; B: magnitude-to-size table with a cap; C: pinpoints and the engine's bloom).
+Decision (`UniProject.ush`, Uni_ProjectObject):
+- **Core:** a Gaussian of sigma max(true angular radius, CorePx). Brightness does not enlarge it. Its light is the intensity up to a saturation level, with a sharp knee (I / (1 + (I/Sat)^4)^(1/4): untouched below Sat/8, never above Sat). A resolved source saturates per area (Sat × (core / CorePx)^2), so a disc keeps its surface brightness.
+- **Halo:** only above saturation. Energy HaloGain × Sat × (doublings over Sat); sigma CorePx + HaloGrowth × doublings, capped at HaloMax. Faint and wide: it carries "this is very bright" without turning the star into a blob.
+- **Arrival (D-150 kept):** inside the last 4× before arrival the halo's driving intensity is frozen and the halo fades out; at arrival only the core, at its true size, is left (T1.sprite.arrival, now on the footprint and halo share).
+- **Physical mode:** `uu.Sprite.Saturation 0` puts all light in the core with no halo (option C: the engine's bloom does the glare).
+- **Handles** (live, render thread): `uu.Sprite.CorePx` 1, `.Saturation` 16 (3 mag over exposure), `.HaloGain` 0.25, `.HaloGrowth` 0.5 px per doubling, `.HaloMax` 4 px. `uu.GlareGain` is gone.
+- FUniSprite grows from 48 to 64 bytes (HaloRadius, HaloRatio, two pads); the quad covers the halo when there is one, the core otherwise.
+Rationale: T1.sprite.style: a Sun-like star from 3 Mpc to its arrival ramp (intensity up to 4.8e7): core size exact at every distance, core light never over saturation and within 0.005% below Sat/8, no halo below saturation, halo never over the cap and never shrinking as brightness rises, none in physical mode. Its brightest sprite is 4.0 px sigma (the D-150 glare made it 9.9 px). Most stars now draw a ~6×6 quad instead of up to 60×60, which also cuts sprite overdraw.
+Light: the total drawn for a bright star is no longer its intensity (core capped, halo logarithmic). This is a display choice, render-only; the volume and every photometric budget are unaffected (D-135 holds for the core below saturation and in physical mode).
+Reroll impact: None (render only).
+Status: Provisional (owner tuning)
+
+D-157 — Performance instrumentation and volume march cost
+Question: Owner, in the engine: 10 FPS in a dense galaxy, 3–7 FPS near a cluster, worse at intergalactic speed. `stat unit` and ProfileGPU: when facing a cluster the GPU is 123 ms, 42.7 of 45.6 ms of one frame in `Uni.Volume.March` (30 carriers); in flight, spikes of 223 ms on the game thread. The supersampling debug view showed 1 ray per pixel almost everywhere: supersampling is not the cost.
+Decision:
+- **Instrumentation.** The streamer times its own phases (`UniProfile.h`, FStreamProfile: integrals, batches, batch-cell search, registration, measurement, levels, parent gate, gather, window, growth checks, task building, cell table) and counts its work (cells and tasks submitted, overlap tests, growth checks, objects read back, contributors added/removed, gathered, batch-cell scans). Engine-agnostic: steady clock, optional hooks. The subsystem times its own phases (streamer, promotion, parallax, light rig, push frame with systems and volume build) and adds Insights scopes (`Uni_Tick`, `Uni_StreamerUpdate`, `Uni_PushFrame`, `Uni_VolumeBuild`, `Uni_RenderBackdrop`, `Uni_RenderVolume`, `Uni_Gen*`). `uu.Perf` logs averages, peaks since the last call and the worst frame's streamer breakdown; `uu.PerfHud 1` shows it live; `uu.PerfHitchMs` (50) logs any slower frame's breakdown. The sprite count is read back (no stall, a ring) for both.
+- **Cluster volume steps.** The cluster field's step hint capped every step inside 0.7 of the centre at 0.3 clump radii (0.008–0.018 field units): 80–190 steps per ray across the whole cluster disc. It now uses, per clump, a quarter of max(distance to its centre, its radius), so steps shrink only near a clump. Render only (the step hint is used by the volume march alone).
+- **Volume quality handles:** `uu.VolumeMaxSteps` (512), `uu.VolumeStepRatio` (0.08), `uu.VolumeMaxSubsamples` (8; FUniVolumeView's pad becomes MaxSubsamples, 0 meaning 8). With `uu.VolumeDivisor` (2) these trade glow quality for GPU time.
+- The frame payload moves to the render thread instead of being copied.
+- **Batch cells by key.** Advancing in-flight generation batches found each batch's cells by scanning every cell of every level, once per batch per frame (O(batches × resident cells), worst at speed when windows widen and many batches are in flight). Each batch now records its cells' keys at submission and looks them up; evicted or re-submitted cells are skipped exactly as the scan skipped them. T2.stream.* (parity 114,456 objects, 0 differ; responsive, fail-closed, resize, async integrals) pass unchanged.
+Rationale: gate 75/75, plus the stream group rerun with the batch lookup.
+Reroll impact: None.
+Status: Provisional (the game-thread spike's cause is to be read from uu.Perf in the engine)
+
+D-158 — Seamless approach: nothing about a point of light shrinks or dims on the way in (supersedes D-150; revises D-156)
+Question: Owner, in the engine after D-156: "stars grow as we approach and then shrink as we get close to them spawning". Owner's goal, in their words: "a seamless experience at all distance levels allowing us to approach a star and seamlessly resolve the star system and eventually the actual star actor without ever having any kind of unexpected behavior in the way the point of light reads". Their first instinct: peg it at a minimum angular size, let it grow once its perceived size exceeds that.
+Decision (`UniProject.ush`):
+- **No arrival ramp.** The D-150 rule (shrink a brightness-boosted sprite to its true size over the last 4× before arrival) is removed; it is what read as "grows, then shrinks". Uni_ArrivalDistance stays (systems and tests use it).
+- **Core:** pegged at CorePx while unresolved, the true size once larger (as D-156). Light saturates per area.
+- **Glare (the D-156 halo):** point sources only (stars). Not galaxies, clusters or planets: their light already resolves through size, the volume and the actor. It is driven by the current intensity, so it only grows on the way in. Its width is the core's × (1 + HaloGrowth × doublings / CorePx), capped at HaloMax / CorePx × the core: identical to D-156 while unresolved, and once the disc resolves the whole sprite scales with it (the doublings over the area-scaled saturation stop changing) instead of the glare being left behind at 4 px.
+- **Swap to the actor:** a promoted star keeps its sprite's glare (UNI_SPRITE_HALO_ONLY: core weight 0); the actor replaces only the disc. Promoted planets are drawn by their actor alone, as before. The reference renderer does the same.
+Rationale:
+- T1.sprite.arrival, rewritten: red dwarf, Sun, giant, supergiant, each from 10^4 × its system radius to its promotion distance: core size, footprint and total light never decrease (0 of 1,600+ samples, 0.01% tolerance); all four have glare; at the swap the glare's width and light are identical with and without the actor (< 1e-5). Footprint: a pinpoint far out (1–1.7 px) to ~77 px of glare around a 19 px disc at promotion.
+- T1.sprite.style (D-156's properties) holds from 3 Mpc to promotion.
+- T2.parallax.promotion: planets unchanged (size at the swap exact, never drawn twice or not at all).
+Reroll impact: None (render only).
+Status: Provisional (owner tuning; glare strength near a star: `uu.Sprite.HaloGain`, `uu.Sprite.HaloMax`)
+
+D-159 — Background map: whole, consistent refreshes (amends D-136)
+Question: Owner: at speed one face of the background map is brighter than its neighbours, an "inside a cube" read. Cause: the map was refreshed a few faces per frame (2), and a refresh restarted from face 0 whenever the background changed. At intergalactic speed it changes every frame (camera parallax at 0.1 Mpc, and the D-154 travel sensitivity changing its LUT), so faces 0 and 1 were re-marched forever and faces 2–5 kept old light.
+Decision: three maps (previous, current, back). A refresh snapshots the background's carriers, field parameters, LUT and view, marches all six faces of the back map from that snapshot (`uu.BackgroundFacesPerFrame` per frame; the first map at once), then rotates it to current. A change arriving mid-refresh waits for the next one. The composite cross-fades from previous to current over one refresh's length, so faces always agree and a refresh never pops.
+Why baked at all (owner question): the map carries the unresolved light of everything from 0.1 Mpc to the horizon (effectively billions of galaxies; the resident galaxies are already drawn as sprites). Marched per pixel instead, every ray runs from 0.1 Mpc to the horizon: at half resolution ~615k long rays per frame against 6 × 256² = 393k per refresh (~131k per frame while moving at 2 faces per frame), and nothing at rest. The cost: a refresh lags the camera by ~3 frames. If the near background visibly drifts at intergalactic speed, the next step is to march the near shell (0.1 Mpc to a few tens of Mpc) per pixel with the local carriers and bake only the far shell, where parallax is negligible.
+Rationale: engine only (the reference renders the map whole); needs UE (UE-13).
+Reroll impact: None.
+Status: Provisional
+
+D-160 — Volume cost near and inside clusters
+Question: Owner, in the engine after D-157: facing a cluster the GPU is still ~70 ms (`stat unit`: Game 16 ms, GPU 70 ms). Reproduced on the CPU reference (T2.vol.cost: the same core, 484 × 318, one thread): from 8 Mpc and from uu.GotoCluster's landing the cluster costs ~15 steps per ray over the 8–15% of pixels it covers; from inside the core (1 cluster + 63 galaxy carriers, every ray in the cluster) 22.5 s, 547 steps per ray. Three costs multiplied:
+- every local carrier marched from 1 pc with log-uniform steps (s = 0.08 t): ~190 steps per ray before reaching anything, from inside a cluster;
+- galaxies 4–50 px across were supersampled over their whole footprint (up to 8 × 8 rays per pixel, D-130), to resolve their 0.0125-thick disc and their arms, and each sub-ray re-marched the cluster's long chord;
+- the cluster's clump centres (three hashes and a sine/cosine each) were recomputed at every sample and step hint.
+Decision (volume only; placement is untouched: T2.cluster.no_reroll):
+- **LUT start.** An emission-only carrier starts where its LUT is significant (the entry before the first above 1e-6 of the block's peak; nearer, every child is resolved and drawn as a sprite). Dusty carriers keep the 1 pc start (dust absorbs at any distance). `uu.VolumeLutStart`.
+- **Prefiltered galaxies.** `UniField_GalaxyFiltered(p, footprint)`: the disc's vertical profile is broadened to He = sqrt(H² + (F/2)²) with its column kept, and the arms blend to their azimuthal mean past the local arm scale; Foot = 0 is UniField_Galaxy exactly. The march passes the pixel's transverse footprint (t θ_px / R). Galaxy carriers are then supersampled only for rays within 6 bulge radii of the bulge (`Uni_CarrierSubsamplesRay`). `uu.VolumePrefilter`.
+- **Clump centres once per ray** for the first cluster on the ray (`UniField_ClusterC`, `Uni_ClusterStepHintC`; UniField_Cluster calls the same code with the centres it computes, so the field is one source).
+Rationale:
+- T2.vol.cost, inside the core: 22.5 s → 1.14 s; cluster alone 6.7 s → 0.59 s (191 → 31 steps per ray); galaxies 4.1 s → 0.53 s (11,756 → 704 supersampled pixels). From the landing: 74 → 50 ms.
+- T2.vol.equivalence (inside the core, D-157 march vs D-160, 242 × 159): cluster light +0.001%, total +3.7%, galaxies +4.0%, 21× fewer steps. Against higher resolution both converge to the same galaxy light (2× and 4×: old 858 → 859 → 866, new 893 → 877 → 870): at this resolution the old march is 1.2% low and the new 2.9% high. The new error is the prefiltered dust absorbing a little less than resolved lanes (without dust it is 1.8% low). Individual pixels of small galaxies change (averaged lanes instead of supersampled ones); totals hold.
+Reroll impact: None (render only).
+Status: Provisional (engine timing to confirm: ProfileGPU `Uni.Volume.March`)
+
+D-161 — Game-thread cost at speed, and carrier flicker in cluster cores
+Question: Owner's engine logs (uu.PerfHitchMs): a steady ~40–45 ms per frame of "volume build" on the game thread with ~17,500 contributors, and 50–240 ms spikes when a coarse window shifted in a dense region: Submit and Growth ~170 ms (2,700 cells × 1,700 gathered contributors = 1.25M exact overlap tests), Register ~45 ms and Measure ~40 ms (56,000 galaxies registering at once), Window ~50 ms (85,000 evicted). Separately, in a cluster core "the density-marched galaxies flip around frame to frame", and a frame showed 62 carriers (cap 64).
+Decision:
+- **Cell binning.** Gather records, per gathered contributor, the box of window cells its sphere can reach; growth checks and task building test each cell only against its own bin plus the few wide contributors. A superset of the exact answer; the exact overlap test still decides, so results are identical (T2.stream.parity, 0 objects differ).
+- **Carrier build.** The build rejects contributors whose influence radius subtends less than half the handoff start before any per-object work, using the streamer's per-frame measured distances (`NearContributors`, sorted by id: the map's order, so the carriers are identical). T2.vol.build_cost: 9.3 ms → 1.2 ms on the reference with 17,521 contributors, identical carriers.
+- **Carrier caps.** Per ray: 8 → 12 carriers; past the cap the least significant (weight × angular size) is replaced, and every kept carrier fades out as its significance nears the best one left out, so carriers trade places continuously. Per frame: 64 → 128 carriers, with the same fade at the cap.
+- **Bulge supersampling reach.** A ray is supersampled for a galaxy's bulge when it passes within 6 r_e plus 1.5 pixel footprints (was 6 r_e): a bulge smaller than the pixel falls inside it wherever the centre ray passes, and the switch doubled a pixel's light between frames. *Superseded by D-163 (the bulge is prefiltered instead).*
+Rationale: T2.vol.continuity (new): inside a rich cluster's core, moving 0.25 kpc per frame, no visible 10 × 10 pixel block of the volume changes by more than 10% (6.9%; it was 36% with the old bulge reach). The bulk register/evict cost (56k contributors at once) is not addressed here; D-162 makes each shift smaller.
+Reroll impact: None.
+Status: Provisional
+
+D-162 — Window boxes with a forward stretch; 5³ at rest after measuring 4³ (amends D-010, D-118, D-139)
+Question: Owner: would a fixed 3³ or 4³ neighbourhood per level, sized with a margin beyond visibility, outperform a dynamically widened scan? D-139 widened windows symmetrically at speed (5³ → 9³, ×5.8 cells, and a 9 × 9 slab entering per shift), which is what the hitch logs showed. Owner chose to try 4³ (recalling UltraLargeScale, where each extra ring cost dearly) with forward-only stretching, and asked for the measured cost of each.
+Decision:
+- **Window boxes** (`UniWindow.h`): a level's window is any box of cell offsets [Lo, Hi] per axis around the centre cell, not only (2N+1)³. Slot addressing generalises per axis (Side = Hi − Lo + 1; covered axes at ≤ 2(Side + N) cells; seam unwrapping within Side − 1 + N of zero).
+- **Reach** (`Uni_WindowReach`): N_eff k + 1/K cells, placed by the camera's position in its cell (`PlanWindow`, `PlaceWindowAxis`): ceil(2 · reach) + 1 cells per axis.
+- **N_eff stays 1.75: 5³ at rest** (reach 2 cells). 4³ (N_eff 1.25) was built and measured, and costs more (below). The window box code takes either; it is one constant.
+- **Forward stretch** (replaces D-139's symmetric widening): per axis, the window extends ahead by the lead (speed × (latency + 1), in the level's cells) along the direction of travel only, up to 3 cells; beyond that the level is suspended (velocity LOD). Sides grow at once and shrink one cell per 30 frames. Placement keeps the previous position while it still covers the reach, so a window shifts only when it must.
+- The reference pipeline plans its windows with the same function (at rest), so parity holds.
+Measurement (same scene, same flight, reference pipeline; `Flythrough` scene, solar camera fill, then 200 frames from 3 Gpc to 20 Mpc):
+
+| | 5³ (N_eff 1.75) | 4³ (N_eff 1.25) |
+|---|---|---|
+| cells per level | 125 | 64 |
+| resident objects, solar fill | 67,444 | 130,457 (1.93×) |
+| of which stars (galaxy interior levels) | 49,581 | 68,071 (1.37×) |
+| of which galaxies + clusters | 17,863 | 62,386 (3.5×) |
+| longest gather list | 244 | 986 (D-004 trigger is 256) |
+| 200 frames of flight (wall time) | 12.3 s | 52.4 s (4.3×) |
+| cluster census volume | 1.01e9 Mpc³ | 4.13e9 Mpc³ (4.1×) |
+
+Why smaller is dearer here: levels are octaves and a slice goes to the smallest level whose reach covers its relevance radius (N_eff · 2^L ≥ R). Lowering N_eff pushes slices to cells twice as wide; a 4³ window of those cells is (8/5)³ = 4.1× the volume of the 5³ window it replaces. Averaged over radii the penalty is (4/1.25)³ / (5/1.75)³ ≈ 1.4× (the stars above); slices that sit just below an octave boundary pay the full 4.1× (the galaxies and clusters above). UltraLargeScale's layers had fixed cell sizes, so there fewer cells meant less volume; here they mean bigger cells. Larger windows go the other way (7³ ≈ 0.7× the volume of 5³) at more cells per level and more per shift; not pursued.
+Rationale: T1.window.boxes (new): bijection, slot stability and diffs over even, asymmetric and stretched boxes on plain, seam and covered levels; placement always covers the reach and never moves without cause. T2.stream.parity, resize, fail-closed, volume parity, responsive and async integrals pass. With N_eff 1.75 the reference reproduces the D-160 residency exactly (same objects, same gather lengths).
+Reroll impact: None (N_eff unchanged from D-118; the 4³ trial was never delivered).
+Status: Provisional (engine measurement: uu.Perf at speed, the forward stretch)
+
+D-163 — Prefiltered bulges; no supersampling for prefiltered galaxies (amends D-160, supersedes D-161's bulge reach)
+Question: The full gate on D-161 showed the cluster-core march at 7.8e6 steps (D-160: 1.9e6; old march 5.7e7) and 5x slower than D-160. Cause: D-161's wider bulge reach supersampled every pixel near a sub-pixel bulge, and a pixel's supersampling is the maximum over all its carriers, so each such pixel marched every carrier (the cluster included) up to 8 × 8 times.
+Decision: `UniField_GalaxyFiltered` widens the bulge to the footprint: r_e' = sqrt(r_e² + foot²), amplitude × (r_e / r_e')³ (the profile's integral goes as r_e³, so its light is kept). The step hint uses r_e'. `Uni_CarrierSubsamplesRay` returns 1 for every prefiltered carrier (signature now (carrier, θ_pixel)). Placement and the unfiltered field are unchanged.
+Rationale (cluster core, reference, 242 × 159): steps 7.8e6 → 1.39e6 (old march 5.7e7: 41×), galaxy light the same as with the supersampling (1022.5 vs 1023.3), T2.vol.continuity 7.1% (limit 10%). T2.vol.equivalence now separates emission from dust: galaxies without dust match the old march within 3.4% (0.6% at 2× resolution); with dust they are 6.7% brighter, because a widened lane mixes with the widened stars instead of screening the far half of the disc (10% of the light absorbed against 19% resolved). Limits: emission 5%, with dust 8%. A prefilter that keeps the screen (e.g. dust widened less than the stars) is a possible later refinement.
+Reroll impact: None (render only).
+Status: Provisional (engine: ProfileGPU Uni.Volume.March in a cluster core)
+
+D-164 — The cosmic web from a baked 3D texture (amends D-012, D-130, D-136; first step of the texture plan in TEXTURE_SPECS.md)
+Question: Owner: move the density fields to baked volume textures (their texture project bakes them, with full mips) so the volume stops paying for procedural fields at every sample; the background march cost 11–15 ms per face. What should the runtime read, and how do placement, integrals and the volume stay one source?
+Decision:
+- **Channels.** The web texture holds R walls and G filaments (each mixed over the two lattices with weight2), B nodes, A unused: `Uni_WebChannels`, the procedural web's own terms regrouped. The runtime rebuilds the density as Floor + WallW R + FilW G + NodeW B, then the bias power (`UniField_WebTex`). Linear in the channels, so mips average the density exactly (only the clusters' power acts after filtering). Width, lattices and seed are baked (the bake key); weights, floor and power stay live.
+- **One source.** Cores sample it only through `UNI_WEB_TEX_SAMPLE(P, Mip)`: in HLSL a SampleLevel on the global in `Shaders/Private/UniWebTexture.ush` (wrap, trilinear, linear mips), included by every .usf; in C++ the shim's `UniWebTexSample`, the same filter over the CPU copy of the same half-exact texels (`UniCore::FWebTexture`, bound with `BindWebTexture`). Unbound it returns NaN (fail closed). `UniField_Web` with C.z = 1 (C.w = texels per period) reads mip 0, so GPU placement, CPU normalising integrals and the reference all read the texture.
+- **Volume.** A textured web carrier is prefiltered by its mips: it samples the mip whose texels match the pixel footprint (no blend to the mean), steps one texel of that mip (`UNI_WEB_TEX_STEP`), and has its own log step ratio 0.2 (new per-carrier `StepRatio`, replacing a pad; 0 = the view's; a step takes the smallest active ratio, so every other carrier marches exactly as before).
+- **Stand-in.** Until the owner's textures arrive, `FWebTexture::Bake` bakes today's procedural web: 128³ per period (0.78 Mpc texels for the demo's 100 Mpc), each mip-0 texel the mean of 2³ samples, mips exact 2×2×2 means, all rounded to half. The engine bakes it at `uu.Enable` (std::thread) and caches it in `Saved/UnifiedUniverse/`; it is uploaded through a compute pass from a structured buffer (`UniWebTexUpload.usf`), so the renderer stays on RDG resources.
+- **Handles.** `uu.WebSource` (1 texture, 0 procedural), `uu.WebTexSize` (128), `uu.WebTexSupersample` (2); apply at `uu.Enable`.
+Rationale: T1.webtex.format (half rounding, bake = channels at texel centres, mips = exact means, sampler at centres / midpoints / wrap / across mips, no seam at the tile edge, cache round trip, channels = procedural web to 4e-7, unbound = NaN). T2.webtex.field: textured vs procedural web, correlation 0.997 and mean −0.04% (galaxy web), 0.995 / −5.7% (cluster web: power after filtering). T2.webtex.census: cluster density 1.39e-5 per Mpc³ (emitter 1.4e-5), field galaxies at their slice's density, clusters on 2.87× the mean web density vs 1.88× for field galaxies. T3.webtex.background: the marched part of the background map (0.1–50 Mpc) within 0.12% of the procedural light, texel correlation 0.999, 107 → 78 steps per texel and 12× faster on the reference. The analytic tail beyond 50 Mpc is ~99% of the background's light and unchanged. Every procedural check is unchanged (the per-carrier ratio is exact when unused).
+Not yet: warp textures (none delivered; the stand-in has the procedural web's own shape), normalising integrals from coarse mips (they sample the texture now, already cheap), a longer march extent (now affordable), per-pixel background at speed (next).
+Reroll impact: Yes, for the web's galaxies and clusters when textured (placement reads the texel-averaged web). None with uu.WebSource 0.
+Status: Provisional (UE-14)
+
+D-165 — The noise project's adhesion web in the runtime (amends D-151, D-164)
+Question: The texture project delivered its textures (Data/Noise: raw RGBA16F mip 0 and mip chains with sidecars, plus VolumeTexture assets in Content/Noise). How does the runtime use them, and do clusters stay a discrete type (owner's question)?
+Decision:
+- **Clusters stay discrete, placed by the field.** The texture holds the web at 1.56 Mpc texels; a cluster's core (0.1–0.3 Mpc) and clumps are far below that, its members stream in only near it, and from afar it is one sprite and one glow. So the texture decides where clusters are, and the cluster object draws the sub-texel part. Now: clusters follow the node matter channel; next: one cluster per heavy node of the node list (BACKLOG).
+- **Texture.** `web_adhesion_density_mid` (uu.WebTexture; young / mid / old, or standin): R walls, G filaments, B nodes, A void (uncollapsed) matter, each a mass density in units of the tile's mean (their sum's mean is 1). Loaded from the raw files (`FWebTexture::LoadDelivered`: mip 0 and the delivered mips, as delivered; no rebuild), not the .uasset; uploaded like the stand-in. Data/Noise and Content/Noise are not tracked (owner: the noise project regenerates them).
+- **Scene** (`UseDeliveredWeb`). The tile is 2^89 cm (200 Mpc: periods are powers of two; the spec's 160 Mpc is not one). Field galaxies follow R + G + A (new void weight in D.x, `UniField_WebTex`); clusters follow B; members are the node matter's share of all galaxies (9.4% for mid, from the texture's mean), replacing uu.Cluster.Fraction for this web.
+- **Exact counts on spiky fields.** A linear textured web takes its period mean from the texture's last mip (normalising integral), and a power-of-two cell of at least one texel takes its mean from the mip whose texels are its size, read at its centre (`Uni_TaskCount`). The node matter peaks at ~1250× its mean: 128 probes of a cell holding a whole tile put its mean out by ~100% either way, and clusters came out 9% over their emitter over 125 tiles. Probes still set the rejection envelope, and webs with a bias power keep probing (a power of the mean is not the mean of the power).
+- Missing texture: the web's emitters are removed (no web galaxies, no glow) with an error naming the file and how to regenerate it. Never the procedural web in its place.
+Rationale: T1.webtex.delivered (128³, 8 mips; channel means match the sidecar to 2e-9; 299,593 mip texels within rounding of their children's mean; no seam). T2.webtex.adhesion_census: 8,944 clusters at 8.86e-6 per Mpc³ (emitter 8.8e-6), node matter at clusters 49× its mean; field galaxies at their slice's density (0.00092 vs 0.000944 per Mpc³) on matter 3.2× its mean. T3.webtex.adhesion_stills: background 83 steps per ray. The stand-in checks are unchanged.
+Seen in the stills: the marched background (0.1–100 Mpc) shows the adhesion web's knots and filaments; the full frame is dominated by the analytic tail beyond the march (uniform, ~99% of the light), so the structure barely shows. Marching farther with the texture is the fix (next).
+Reroll impact: Yes, the web scene's galaxies and clusters (new web, new period). uu.WebTexture standin or uu.WebSource 0 give the earlier ones.
+Status: Provisional (UE-14)
+
+D-166 — Per-pixel background while travelling (amends D-136, D-159)
+Question: Owner: bring the top end down so any speed works; the cached background map may stay as a mode below a travel speed. With the web a texture (D-164: ~12× cheaper per ray), is per-pixel marching affordable?
+Decision: `uu.BackgroundMode` (renderer): 0 the direction map (D-136/D-159); 1 per pixel, every frame; **2 (default) per pixel while the background is changing** (its version bumps whenever the camera moves a quarter map texel's parallax, i.e. any travel), the map once it has been still for `uu.BackgroundStillFrames` (30). Per pixel, the background carriers are appended to the local ones and marched in the one volume pass at the march resolution (uu.VolumeDivisor), so no refresh lags the camera and no face is stale. Switching to per pixel drops the map; when the map comes back it is marched whole before it is shown (no cross-fade from stale light).
+Rationale: the union march and the map + composite agree to 0.5% of the light (T3.vol.cube). Cost per frame: a half-resolution 1080p march is ~0.5M rays, about four times a two-face map refresh (2 × 256² rays), and each textured web ray costs ~1/12 of a procedural one on the reference. Needs the engine measurement: ProfileGPU `Uni.Volume.March … (with the background)` at speed.
+Reroll impact: None (render only).
+Status: Provisional (UE-14)
+
+D-167 — Clusters from the adhesion node list; half-precision web texture on the CPU (amends D-151, D-165)
+Question: Owner chose (of: rank-map to the LF, light traces mass, all nodes as groups) to rank-map: one cluster per heavy node, magnitudes from the tuned cluster luminosity function by rank. And the density textures are moving to 256³: what does that cost on the CPU side?
+Decision:
+- **Catalogues** (`FCatalogue` in the universe definition): authored objects at fixed tile positions, repeated every 2^PeriodBits cm. The generator emits a cell's entries like anchors (CPU-authored, reserved indices from 2^20, `UNI_OBJ_FLAG_ANCHOR`); each copy gets its own seed (cell seed with a catalogue "contributor", then the copy's index), so radius, colour, shape and members differ per tile while position and magnitude are the entry's. A catalogue keeps its levels active (it repeats every tile); the streamer sends its cells through the anchor path.
+- **Rank-map** (`UseDeliveredWeb` with the node list): K = cluster density (uu.Cluster.Fraction, the LF) × tile volume = 113 per 200 Mpc tile; the K heaviest nodes, the i-th at the LF quantile (i + 1/2) / K (−26.5 to −24.5 for mid). The cluster web emitter is removed. Field galaxies follow walls, filaments, void matter and the node matter the clusters do not take (the lighter nodes: groups), scaled uniformly by 1 − (top-K node mass) / (all node mass); members are uu.Cluster.Fraction again. Without a node list the node-channel placement (D-165) remains.
+- **Half on the CPU.** `FWebTexture` keeps every mip as RGBA16F halves (the delivered bytes; the stand-in rounds to them), so a 256³ tile is 128 MB on the CPU as on the GPU (was float32, twice that); the CPU sampler decodes through a 64K table. The upload sends the halves packed two per uint and the upload shader decodes them (lossless).
+Rationale: T2.webtex.nodes: 113 of 4,125 nodes are clusters, heaviest brightest; 14,125 clusters resident over 125 tiles, every one at its entry's exact position and magnitude, exactly 113 per tile; a regenerated cell is identical; field galaxies at their slice's density (0.000862 vs 0.000886 per Mpc³) on matter 4.25× the mean. All earlier web texture checks unchanged with half storage (the CPU reference samples ~2× slower; the GPU is unaffected).
+Reroll impact: Yes, the web scene's clusters (now on the node list) and field galaxies (weights).
+Status: Provisional (UE-14)
+
+
+D-168 — Contributors woken by distance; streamer bookkeeping at intergalactic speed (amends D-138, D-155, D-161)
+Question: Owner: under 10 fps at intergalactic speeds (game thread 50–700 ms per frame, GPU 10 ms), back to 60 once stopped. The log: Measure ~155 ms every frame, Register up to 294 ms (+356k contributors in one frame), Window 195 ms (−332k), Submit up to 100 ms.
+Diagnosis: every emitter object of every Ready cell was registered as a contributor at once, ~330k in the flythrough scene once travel sensitivity (D-154, +2.5 mag) widens the galaxy windows. Almost none can matter: a galaxy only feeds its stars' windows, which are kpc across around the camera, and the volume only asks for those subtending its reject angle. And Measure's insertion sort had a budget of 16 moves per entry before falling back to a full sort; at speed the order changes enough to spend it every frame (16 × 330k moves of 88-byte entries).
+Decision:
+- **Lazy wake.** A Ready cell notes its emitter objects; each is registered (contributors made, measured, gathered) only while it could matter: distance − influence ≤ the reach of any window of its coarsest child level ((N_max + lead_max + 1)·√3 cells, so every Gather sees exactly what it saw with everything registered), or it subtends WakeTheta or more (the engine sets it to half the volume's reject angle each frame). It sleeps past 1.5× both. Cells are culled by their bound (the level's largest influence) before any object is looked at, and each scan records how far the camera may move before anything in the cell can change state: until then the cell costs one distance per frame. Object distances are cell-local doubles (no 128-bit subtraction per object).
+- **Measure.** Sort budget 2 moves per entry, then std::sort. The anchor re-bases in place, keeping the list's order (was a rebuild from the map in id order, then a full sort), every 300 Mpc (was 30: the two-step rounding at 300 Mpc is ~1e12 cm, inside every margin, and MeasureErr already carries it).
+- **Growth checks** test only contributors the cell does not already have, and a Ready cell checked before is tested only against ids gathered since (exact overlap test either way). The gathered-ids baseline now advances only when the check runs (a frame whose parents were not ready used to advance it without checking).
+- **Parent gate:** each parent level's not-yet-Ready cells and their camera offsets are listed once per frame, not walked per child level.
+- New profile phase Wake (and counters woken / slept / awake / asleep in uu.StreamBreakdown and the hitch line), and Backend (the backend's submits, nested in Batches or Submit: on the CPU reference all of generation, in the engine the RDG enqueue).
+Rationale: T2.webtex.travel: the flythrough scene with the adhesion web and node list, from rest in the Milky Way accelerating to 100 Mpc/s with travel sensitivity, 3-frame backend latency. Ready cells and their objects at four points of the flight identical with everything registered (27,572 cells, 958,766 objects, 0 differ). Bookkeeping per frame (the update less the backend's generation) on the reference: 42.7 ms mean / 292 worst with everything registered (317k contributors; with this decision's other changes) → 11.5 ms mean / 55 worst woken by distance (44k awake of 317k emitter objects). Before this decision (everything registered, old sort, old growth and gate): 82 ms mean / 470 worst. T2.stream.* unchanged (parity 0 differ, volume parity identical).
+Not yet: Submit and Window still scale with the cells entering a frame (a coarse shift or a sensitivity resize brings 500–1,000 cells at once: 20–40 ms on the reference); a per-frame submission budget would spread them.
+Reroll impact: None (the same cells, the same objects).
+Status: Provisional (UE-15)

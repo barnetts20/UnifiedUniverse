@@ -1,0 +1,20 @@
+// UniWebTexUpload.usf
+// D-164: writes one mip of the web texture from a structured buffer of packed RGBA16F texels (x
+// fastest, then y, then z): uint2 = (R | G << 16, B | A << 16), exactly UniCore::FWebTexture's
+// halves. Decoded to float and stored into the RGBA16F texture, so the GPU reads exactly the CPU's
+// texels (half -> float -> half is lossless).
+// Uploading through a buffer and a compute pass keeps the renderer on RDG resources only.
+
+#include "/Engine/Public/Platform.ush"
+
+StructuredBuffer<uint2> InTexels;
+RWTexture3D<float4> OutMip;
+uint MipSize;
+
+[numthreads(4, 4, 4)]
+void UploadCS(uint3 Id : SV_DispatchThreadID)
+{
+	if (Id.x >= MipSize || Id.y >= MipSize || Id.z >= MipSize) { return; }
+	const uint2 H = InTexels[(Id.z * MipSize + Id.y) * MipSize + Id.x];
+	OutMip[Id] = float4(f16tof32(H.x & 0xFFFFu), f16tof32(H.x >> 16u), f16tof32(H.y & 0xFFFFu), f16tof32(H.y >> 16u));
+}

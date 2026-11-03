@@ -168,6 +168,18 @@ UNI_FN uint Uni_PoissonCount(float InLambda, uint InCellSeed)
 // Candidates
 // ------------------------------------------------------------------------------------------
 
+/** The high 32 bits of a 32 x 32 bit product, exactly, in 32-bit arithmetic (no uint64 in SM5). */
+UNI_FN uint Uni_MulHi32(uint InA, uint InB)
+{
+	const uint Al = InA & 0xFFFFu, Ah = InA >> 16u;
+	const uint Bl = InB & 0xFFFFu, Bh = InB >> 16u;
+	const uint Lo = Al * Bl;
+	const uint M1 = Ah * Bl;
+	const uint M2 = Al * Bh;
+	const uint T = (Lo >> 16u) + (M1 & 0xFFFFu) + (M2 & 0xFFFFu);
+	return Ah * Bh + (M1 >> 16u) + (M2 >> 16u) + (T >> 16u);
+}
+
 UNI_FN uint3 Uni_CandidateOffset(uint InCellSeed, uint InJ)
 {
 	return uint3(Uni_DrawU32(InCellSeed, UNI_CH_PLACE, InJ * 3u + 0u),

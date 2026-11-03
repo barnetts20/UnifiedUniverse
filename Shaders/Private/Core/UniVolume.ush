@@ -34,12 +34,13 @@
 static const uint UNI_VOL_LUT_SIZE = 256u;          // entries per emission LUT block
 static const float UNI_VOL_LN_T_LO = 34.538776f;    // ln(1e15 cm): below, entry 0
 static const float UNI_VOL_LN_T_HI = 71.383884f;    // ln(1e31 cm): above, last entry
-static const uint UNI_VOL_MAX_ACTIVE = 8u;          // carriers intersected by one ray
+static const uint UNI_VOL_MAX_ACTIVE = 12u;         // carriers marched by one ray (D-161: 8 -> 12; past it, the least significant are faded out, not cut)
 static const uint UNI_VOL_SLICES = 8u;              // transmittance slices
 
 static const uint UNI_CARRIER_PERIODIC = 1u;        // root field: p = frac(...), unbounded chord
 static const uint UNI_CARRIER_DUST = 2u;            // has an absorbing field
 static const uint UNI_CARRIER_TAIL = 4u;            // add the analytic tail past TEnd (background)
+static const uint UNI_CARRIER_PREFILTER = 8u;       // D-160: sample the field prefiltered over the pixel footprint (galaxies)
 
 /** One marched volume. 112 bytes (UniCore::FCarrierGPU, static_assert). */
 struct FUniCarrier
@@ -61,7 +62,7 @@ struct FUniCarrier
 	float TStart;           // cm
 	float TEnd;             // cm (local carriers: the chord bounds it; periodic: march extent)
 	float ResolveScale;     // field units: smallest feature to resolve (supersampling)
-	float Pad0;
+	float StepRatio;        // D-164: this carrier's log step ratio (0: the view's); a step takes the smallest of the active carriers'
 	float Pad1;
 	float Pad2;
 };
@@ -75,7 +76,7 @@ struct FUniVolumeView
 	float ThetaPixel;       // rad per pixel (prefilter footprint)
 	float SliceLnTLo;       // transmittance slices span [lo, hi] in ln t
 	float SliceLnTHi;
-	float Pad0;
+	uint MaxSubsamples;     // D-157: cap on rays per pixel axis (Uni_CarrierSubsamples; 0 = 8)
 	float3 DustSigmaRgb;    // reddening: sigma per channel relative to sigma
 	float Pad1;
 };
@@ -157,23 +158,61 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 	float A0[UNI_VOL_MAX_ACTIVE];
 	float A1[UNI_VOL_MAX_ACTIVE];
 	float3 ADir[UNI_VOL_MAX_ACTIVE];
+	float AKey[UNI_VOL_MAX_ACTIVE];
 	uint NA = 0u;
-	float TMin = 3.0e38f;
-	float TMax = 0.0f;
+	float KDrop = 0.0f;   // D-161: the most significant carrier this ray had to leave out
 	for (uint C = 0u; C < InView.NumCarriers; ++C)
 	{
 		const FUniCarrier Ca = InCarriers[C];
-		if (!(Ca.Weight > 0.0f) || NA >= UNI_VOL_MAX_ACTIVE) { continue; }
+		if (!(Ca.Weight > 0.0f)) { continue; }
 		const float3 Ld = Uni_CarrierLocalDir(Ca, InDir);
 		float T0, T1;
 		if (!Uni_CarrierInterval(Ca, Ld, InTScene, T0, T1)) { continue; }
-		Act[NA] = C; A0[NA] = T0; A1[NA] = T1; ADir[NA] = Ld;
-		TMin = min(TMin, T0);
-		TMax = max(TMax, T1);
-		NA = NA + 1u;
+		// D-161: significance = weight x angular size. Past the cap, the least significant carrier
+		// is replaced, and every kept carrier fades out as its significance nears the best one
+		// left out (below), so carriers trade places continuously instead of flipping frame to
+		// frame inside a cluster, where one ray crosses many galaxies' spheres.
+		const float Key = Ca.Weight / max(sqrt(dot(Ca.CamLocal, Ca.CamLocal)), 1.0e-3f);
+		uint Slot = NA;
+		if (NA >= UNI_VOL_MAX_ACTIVE)
+		{
+			uint Low = 0u;
+			for (uint Q = 1u; Q < UNI_VOL_MAX_ACTIVE; ++Q) { if (AKey[Q] < AKey[Low]) { Low = Q; } }
+			if (!(Key > AKey[Low])) { KDrop = max(KDrop, Key); continue; }
+			KDrop = max(KDrop, AKey[Low]);
+			Slot = Low;
+		}
+		else
+		{
+			NA = NA + 1u;
+		}
+		Act[Slot] = C; A0[Slot] = T0; A1[Slot] = T1; ADir[Slot] = Ld; AKey[Slot] = Key;
 	}
 	Res.Active = NA;
 	if (NA == 0u) { return Res; }
+	float TMin = 3.0e38f;
+	float TMax = 0.0f;
+	float AFade[UNI_VOL_MAX_ACTIVE];
+	for (uint Ia = 0u; Ia < NA; ++Ia)
+	{
+		TMin = min(TMin, A0[Ia]);
+		TMax = max(TMax, A1[Ia]);
+		AFade[Ia] = KDrop > 0.0f ? saturate((AKey[Ia] - KDrop) / (0.25f * AKey[Ia])) : 1.0f;
+	}
+
+	// D-160: the first cluster on the ray has its clump centres computed once here, not at every
+	// sample and step hint (each is three hashes and a sine and cosine).
+	uint ClusterSlot = UNI_VOL_MAX_ACTIVE;
+	float3 Cc0 = float3(0.0f, 0.0f, 0.0f), Cc1 = Cc0, Cc2 = Cc0, Cc3 = Cc0;
+	for (uint Ic = 0u; Ic < NA; ++Ic)
+	{
+		if (ClusterSlot == UNI_VOL_MAX_ACTIVE && InCarriers[Act[Ic]].FieldId == UNI_FIELD_CLUSTER)
+		{
+			const FUniFieldParams Pc = InParams[InCarriers[Act[Ic]].ParamIndex];
+			ClusterSlot = Ic;
+			Cc0 = Uni_ClusterCentre(Pc, 0u); Cc1 = Uni_ClusterCentre(Pc, 1u); Cc2 = Uni_ClusterCentre(Pc, 2u); Cc3 = Uni_ClusterCentre(Pc, 3u);
+		}
+	}
 
 	const float SliceScale = (float)UNI_VOL_SLICES / max(InView.SliceLnTHi - InView.SliceLnTLo, 1.0e-3f);
 	uint NextSlice = 0u;
@@ -187,9 +226,11 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 	UNI_LOOP
 	for (uint Step = 0u; Step < InView.MaxSteps; ++Step)
 	{
-		// Active set at T, the next interval boundary, and the step.
+		// Active set at T, the next interval boundary, and the step: the smallest active log step
+		// ratio (D-164: per carrier, 0 = the view's) times T, at least MinStepCm, then every hint.
 		float Next = TMax;
-		float S = max(InView.StepRatio * T, InView.MinStepCm);
+		float Ratio = 3.0e38f;
+		float Hint = 3.0e38f;
 		bool bAny = false;
 		for (uint I = 0u; I < NA; ++I)
 		{
@@ -200,13 +241,19 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 			const FUniCarrier Ca = InCarriers[Act[I]];
 			const FUniFieldParams Par = InParams[Ca.ParamIndex];
 			const float3 P = Uni_CarrierPoint(Ca, ADir[I], T);
+			Ratio = min(Ratio, Ca.StepRatio > 0.0f ? Ca.StepRatio : InView.StepRatio);
 			bool bHint = true;
 			if (Ca.FeatureScale > 0.0f)
 			{
 				// Prefiltered fields need no hint once the pixel footprint is past the blend.
 				bHint = T * InView.ThetaPixel * Ca.InvRadius < 4.0f * Ca.FeatureScale;
 			}
-			if (bHint) { S = min(S, Uni_FieldStepHint(Ca.FieldId, P, ADir[I], Par) / Ca.InvRadius); }
+			if (bHint)
+			{
+				const float FootH = (Ca.Flags & UNI_CARRIER_PREFILTER) != 0u ? T * InView.ThetaPixel * Ca.InvRadius : 0.0f;   // D-160
+				const float H = I == ClusterSlot ? Uni_ClusterStepHintC(P, Par, Cc0, Cc1, Cc2, Cc3) : Uni_FieldStepHintFoot(Ca.FieldId, P, ADir[I], Par, FootH);
+				Hint = min(Hint, H / Ca.InvRadius);
+			}
 		}
 		if (!bAny)
 		{
@@ -214,6 +261,7 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 			T = Next;   // a gap between intervals: nothing to integrate
 			continue;
 		}
+		float S = min(max(Ratio * T, InView.MinStepCm), Hint);
 		S = max(min(S, Next - T), 1.0e-6f * T);
 		const float Tm = T + 0.5f * S;
 
@@ -235,9 +283,11 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 				const float Foot = Tm * InView.ThetaPixel * Ca.InvRadius;
 				Blend = saturate((Foot / Ca.FeatureScale - 1.0f) * (1.0f / 3.0f));
 			}
+			// D-160: a prefiltered carrier samples its field over the pixel's transverse footprint.
+			const float FootS = (Ca.Flags & UNI_CARRIER_PREFILTER) != 0u ? Tm * InView.ThetaPixel * Ca.InvRadius : 0.0f;
 			if (Blend < 1.0f)
 			{
-				Rho = Uni_FieldSample(Ca.FieldId, P, Par);
+				Rho = J == ClusterSlot ? UniField_ClusterC(P, Par, Cc0, Cc1, Cc2, Cc3) : Uni_FieldSampleFoot(Ca.FieldId, P, Par, FootS);
 				Rho = Rho + (Ca.MeanDensity - Rho) * Blend;
 			}
 			else
@@ -247,14 +297,14 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 			if (Rho > 0.0f)
 			{
 				const float3 L = Uni_VolumeLut(InLut, Ca.LutIndex, Tm);
-				const float K = (Ca.Amplitude * Ca.Weight * Rho) * Du;
+				const float K = (Ca.Amplitude * Ca.Weight * AFade[J] * Rho) * Du;
 				E = E + L * K;
 			}
 			if ((Ca.Flags & UNI_CARRIER_DUST) != 0u)
 			{
 				const FUniFieldParams DPar = InParams[Ca.DustParamIndex];
-				const float Rd = Uni_FieldSample(Ca.FieldId, P, DPar);
-				if (Rd > 0.0f) { Tau = Tau + InView.DustSigmaRgb * (DPar.D.y * Rd * Du); }
+				const float Rd = Uni_FieldSampleFoot(Ca.FieldId, P, DPar, FootS);
+				if (Rd > 0.0f) { Tau = Tau + InView.DustSigmaRgb * (DPar.D.y * Rd * Du * AFade[J]); }
 			}
 		}
 		// Exact within the step for constant emission and extinction.
@@ -302,6 +352,13 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 	return Res;
 }
 
+/** D-157: the per-pixel-axis ray count after the view's cap (uu.VolumeMaxSubsamples). */
+UNI_FN uint Uni_ClampSubsamples(uint InSS, FUniVolumeView InView)
+{
+	const uint Cap = InView.MaxSubsamples == 0u ? 8u : InView.MaxSubsamples;
+	return clamp(InSS, 1u, Cap);
+}
+
 /** Rays per pixel axis this carrier needs (D-130): enough that its ResolveScale spans at least
  *  half a pixel, capped at 8 x 8. Local carriers only (periodic fields prefilter instead).
  *  The pass marches a pixel with the maximum over the carriers its centre ray intersects;
@@ -312,6 +369,17 @@ UNI_FN uint Uni_CarrierSubsamples(FUniCarrier InC, float InThetaPixel)
 	const float Dist = max(sqrt(dot(InC.CamLocal, InC.CamLocal)), 1.0e-6f);   // field units
 	const float FeaturePx = InC.ResolveScale / Dist / InThetaPixel;
 	return (uint)clamp(ceil(0.5f / max(FeaturePx, 1.0e-6f)), 1.0f, 8.0f);
+}
+
+/** D-160/D-163: rays per pixel axis for one ray through this carrier. A prefiltered galaxy needs
+ *  no supersampling: its disc and arms are filtered (D-160) and so is its bulge, widened to the
+ *  footprint with its light kept (D-163; D-161's supersampling around sub-pixel bulges cost 3-5x
+ *  the steps, since one bulge supersampled every carrier on its pixels). Every other carrier:
+ *  Uni_CarrierSubsamples. */
+UNI_FN uint Uni_CarrierSubsamplesRay(FUniCarrier InC, float InThetaPixel)
+{
+	if ((InC.Flags & UNI_CARRIER_PREFILTER) != 0u) { return 1u; }
+	return Uni_CarrierSubsamples(InC, InThetaPixel);
 }
 
 // ------------------------------------------------------------------------------------------
