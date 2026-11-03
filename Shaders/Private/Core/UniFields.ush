@@ -373,6 +373,16 @@ UNI_FN float Uni_GalaxyArmMean(float InSharpness)
 	return rsqrt(3.14159265f * (max(InSharpness, 0.1f) + 0.25f));
 }
 
+/** D-172: the share of the bulge profile exp(-3.67 (sqrt(r / r_e) - 1)) (spherical, r_e = InRe)
+ *  inside radius InCut: with x = sqrt(r / r_e) its light goes as x^5 e^(-b x), so the share is
+ *  the regularised incomplete gamma P(6, b X) = 1 - e^(-bX) sum_k<6 (bX)^k / k!, X = sqrt(Cut / r_e). */
+UNI_FN float Uni_BulgeInCut(float InRe, float InCut)
+{
+	const float Y = 3.67f * sqrt(InCut / max(InRe, 1.0e-6f));
+	const float Sum = 1.0f + Y * (1.0f + Y * (0.5f + Y * (1.0f / 6.0f + Y * (1.0f / 24.0f + Y * (1.0f / 120.0f)))));
+	return saturate(1.0f - exp(-Y) * Sum);
+}
+
 UNI_FN float UniField_GalaxyFiltered(float3 InP, FUniFieldParams InPar, float InFoot)
 {
 	const float Cut = InPar.D.x;
@@ -431,9 +441,11 @@ UNI_FN float UniField_GalaxyFiltered(float3 InP, FUniFieldParams InPar, float In
 			// D-163: a bulge smaller than the footprint is widened to it, keeping its light (the
 			// profile's integral goes as r_e^3), so one ray per pixel sees its light wherever the
 			// pixel falls, without supersampling every carrier on that pixel.
+			// D-172: keeping the light inside the cut: a widened profile puts more of it past the
+			// influence radius, where the field is zero (an early type's large spheroid lost ~10%).
 			const float Rf = sqrt(Re * Re + InFoot * InFoot);
 			const float S = Re / Rf;
-			Amp = Amp * (S * S * S);
+			Amp = Amp * (S * S * S) * (Uni_BulgeInCut(Re, Cut) / max(Uni_BulgeInCut(Rf, Cut), 1.0e-6f));
 			Re = Rf;
 		}
 		const float R3 = sqrt(Rcyl * Rcyl + (Z / Q) * (Z / Q));
@@ -609,8 +621,10 @@ UNI_FN float Uni_FieldResolveScale(uint InFieldId, FUniFieldParams InPar)
 
 /** D-164: the textured web's step: UNI_WEB_TEX_STEP texels of the mip the footprint selects
  *  (the field is trilinear between texel centres, so a texel-sized midpoint step integrates it
- *  to within the texel's own error). */
-static const float UNI_WEB_TEX_STEP = 1.0f;
+ *  to within the texel's own error). D-171: 2 texels (256^3 adhesion web, against 1: light
+ *  -0.01%, pixel correlation 0.99996, 99th-percentile pixel 1.4%; 144 -> 83 steps per ray.
+ *  4 texels: 99th percentile 9.7%). */
+static const float UNI_WEB_TEX_STEP = 2.0f;
 
 UNI_FN float Uni_WebTexStepHint(FUniFieldParams InPar, float InFoot)
 {

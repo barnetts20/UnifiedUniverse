@@ -163,15 +163,38 @@ UNI_FN bool Uni_TaskSuppressed(FUniGenTask InT, uint3 InOffset)
 	return dot(D, D) < InT.Suppress.w * InT.Suppress.w;
 }
 
+/** D-172: the morphology-density relation. A cluster's members are early types (elliptical or
+ *  lenticular) with probability Outer + (Core - Outer) exp(-r / Scale), r the member's distance
+ *  from the cluster centre in units of its influence radius (the field's unit): ~80% in the
+ *  core, ~40% at the virial radius (~0.25), toward the field's share outside. The cluster's
+ *  field parameters carry it, C = (Core, Outer, Scale, colour shift in log10 K); Core = 0 is off
+ *  (no draw, no change). Its own channel, so every other draw of every object is unchanged. */
+UNI_FN float Uni_ClusterEarlyFraction(FUniFieldParams InPar, float InR)
+{
+	const float Scale = max(InPar.C.z, 1.0e-3f);
+	return saturate(InPar.C.y + (InPar.C.x - InPar.C.y) * exp(-InR / Scale));
+}
+
+UNI_FN bool Uni_TaskEarlyType(FUniGenTask InT, uint InObjSeed, uint3 InOffset)
+{
+	if (InT.FieldId != UNI_FIELD_CLUSTER || !(InT.Params.C.x > 0.0f)) { return false; }
+	const float3 P = Uni_FieldFramePoint(InT.Frame, Uni_OffsetUnit(InOffset));
+	return Uni_DrawUnit(InObjSeed, UNI_CH_MORPH, 0u) < Uni_ClusterEarlyFraction(InT.Params, sqrt(dot(P, P)));
+}
+
 /** The record for the object with acceptance rank InLocal. */
 UNI_FN FUniObject Uni_TaskMakeObject(FUniGenTask InT, FUniSlice InS, StructuredBuffer<float> InLut, uint InLocal, uint3 InOffset)
 {
 	const uint ObjSeed = Uni_ObjectSeed(InT.CellSeed, InLocal);
 	const float M = Uni_DrawAbsMag(ObjSeed, 0.0f, 1.0f, InS.BrightM, InS.FaintM, InLut, InS.LutBase, InS.LutCount);
 	const float RL2 = Uni_DrawRadiusLog2(ObjSeed, M, InS.RadiusModel);
-	const float3 Rgb = Uni_DrawColour(ObjSeed, M, InS.ColourModel);
+	// D-172: an early-type member is redder (older stars): its colour model's temperature shifted.
+	const bool bEarly = Uni_TaskEarlyType(InT, ObjSeed, InOffset);
+	float4 Cm = InS.ColourModel;
+	if (bEarly) { Cm.x = Cm.x + InT.Params.C.w; }
+	const float3 Rgb = Uni_DrawColour(ObjSeed, M, Cm);
 	const float SB = ((InS.ChildFlags & UNI_OBJ_FLAG_EXTENDED) != 0u) ? Uni_SurfaceBrightness(M, RL2) : 0.0f;
-	return Uni_MakeObject(InOffset, InT.ChildArchetypeId, InS.ChildFlags, ObjSeed, RL2, M, SB, Rgb);
+	return Uni_MakeObject(InOffset, InT.ChildArchetypeId, InS.ChildFlags | (bEarly ? UNI_OBJ_FLAG_EARLY : 0u), ObjSeed, RL2, M, SB, Rgb);
 }
 
 /** The blank written to pool slots a task reserved but did not fill (lesson #27). */

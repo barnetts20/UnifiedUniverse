@@ -117,7 +117,7 @@ Glare grows only with log flux, so every star crosses over at about the same on-
 
 The coarsest star levels (the brightest stars) have cells comparable to a galaxy's influence sphere, so the same probe miss can under-place them. Turning `bSampleBox` on for the galaxy emitter would fix it, but rerolls stars. Measure first (a T2 member census per galaxy, like T2.cluster.members), and decide before content.
 
-## B-006: Cluster realism
+## B-006: Cluster realism — PARTLY DONE (D-172: morphology-density; intracluster light and a brightest cluster galaxy remain)
 
 Elliptical and lenticular galaxies dominate cluster cores (the morphology-density relation). Members currently roll the same spiral parameters as field galaxies.
 - A galaxy archetype variant, or parameter ranges conditioned on the parent, would add it.
@@ -127,8 +127,15 @@ Elliptical and lenticular galaxies dominate cluster cores (the morphology-densit
 ## B-007: Clusters from the adhesion node list (owner, 2026-11-03; D-165 follow-up) — DONE (D-167)
 The noise project's `*_nodes.json` lists every node cluster (position in tile units, mass as a share of the tile's mass, heaviest first). Place one cluster per node above a mass cut, at its position, with richness (absolute magnitude, members) from its mass, instead of drawing clusters from the node-matter channel. Needs a catalogue emitter: objects from a list rather than a Poisson draw (per cell: the list entries inside it, on GPU and CPU alike). Field galaxies already exclude the node matter, so nothing is counted twice.
 
-## B-008: March the textured web farther (D-165 follow-up)
+## B-008: March the textured web farther (D-165 follow-up) — CLOSED (D-170: measured, no visible gain)
 The analytic tail past the march (0.5 periods) is ~99% of the background's light and uniform, so the adhesion web's structure barely shows in a full frame. With the texture, far samples can read the mip matching the step (not just the pixel) and take log steps, so marching several periods costs tens of steps. Measure the look and the cost; then the per-pixel background at speed.
 
 ## B-009: Spread cell submissions over frames (D-168 follow-up)
 After D-168 the game thread's remaining spikes at speed are cells entering at once: a coarse window shift or a travel-sensitivity resize brings 500–1,000 cells in one frame, and task building (Submit) plus eviction (Window) cost 20–40 ms on the reference for them. A per-frame budget on cells submitted (nearest the camera first, never one inside the visible radius left waiting) would spread them; T2.stream.responsive bounds what the delay may cost.
+
+## B-010: How visible should the web be in the sky? (owner, art direction; D-170 follow-up)
+Physically, the integrated light of unresolved galaxies is isotropic to a few percent: D-170 marched the web to 3.2 Gpc and the image did not change. The structure that does show is the near ~100 Mpc over a uniform pedestal (the tail). Options: (a) leave it physical; (b) a near-web glow: the web's density within N Mpc added as a faint, non-physical emission with its own gain (render only, like uu.WebDebug but in the beauty pass); (c) dim the pedestal (scale the tail) so the near structure carries the contrast. (b) is the owner's "low-grade field contribution to the background".
+
+## B-011: Galaxy impostors in cluster interiors (D-172 follow-up)
+Inside a rich core the volume marches up to 12 galaxies per ray and 128 per frame (D-161 caps), ~36 steps per ray of which 31 are the cluster's own glow. Cheap now; when warp textures go into the galaxy density each galaxy sample costs more. Then: galaxies under N pixels drawn from a cached impostor (a small view-dependent image per galaxy, re-rendered when the view direction changes by a few degrees) instead of marched. Measure with the warp textures first.
+

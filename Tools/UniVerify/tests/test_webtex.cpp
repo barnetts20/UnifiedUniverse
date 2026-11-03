@@ -904,3 +904,119 @@ UNI_TEST(webtex, travel)
 			Uni::Fmt("%zu cells / %zu objects at 4 frames of the flight compared, %zu differ; everything registered: %.1f ms mean, %.1f worst (measure up to %.1f), %zu contributors; woken by distance: %.2f ms mean, %.1f worst (measure up to %.2f), %zu awake of %zu emitter objects (%.1fx less per frame)",
 				Cells, Objects, Differ, Out[0].MeanMs, Out[0].WorstMs, Out[0].MeasureWorst, Out[0].PeakAwake, Out[1].MeanMs, Out[1].WorstMs, Out[1].MeasureWorst, Out[1].PeakAwake, Out[1].PeakAll, Gain));
 }
+
+UNI_TEST(webtex, debug)
+{
+	// D-169: uu.WebDebug, the textured web in false colour (Uni_WebDebugMarch, the core the march
+	// pass runs). Stills of the channel mix, the node channel and the placement field from
+	// intergalactic space on the adhesion web with its node list; then checks that the views show
+	// what they claim: clusters (the heaviest nodes) on bright node-view pixels, field galaxies on
+	// bright placement-view pixels, every ray finite and within the step budget, and an unbound
+	// texture reported (dark magenta), not drawn as an empty web.
+	std::string Err;
+	const FWebTexture& T = Delivered(&Err);
+	std::vector<FWebNode> Nodes;
+	if (!T.IsValid() || !LoadWebNodes(kDeliveredDir, kDeliveredName, Nodes, &Err)) { Uni::Check(2, "T2.webtex.debug", "D-169 web debug views").Pass(false, "not loaded: " + Err); return; }
+	const UniScenes::FClusterTuning Tun;
+	FUniverseDef Def = UniScenes::WebToGalaxy(Tun);
+	const H::float4 Mean = T.Mean();
+	UniScenes::UseDeliveredWeb(Def, Tun, T.Size, Mean.z / (double(Mean.x) + Mean.y + Mean.z + Mean.w), &Nodes);
+	FBindScope Bind(T);
+	FUniverseModel M(Def);
+	FRefGenerator G(M);
+	FVolumeBuilder VB(M, G);
+	FRefPipeline P(G);
+	P.bVelocityLod = false;
+	const FCoord Cam = UniScenes::VoidCamera();
+	P.Update(Cam, FVec3f{});
+	FCamera Cm; Cm.Coord = Cam; Cm.Width = 320; Cm.Height = 180; Cm.LookAlong({ 1, 0.3, 0.1 });
+	const FVolumeScene Bg = VB.Build(P, Cam, FVec3f{}, Cm.View()).Subset(true);
+	const H::FUniVolumeView V = ToHlsl(Bg.View);
+	const auto Cb = Bg.CarrierBuf();
+	const auto Pb = Bg.ParamBuf();
+	const float Depth = float(150.0 * Units::Mpc);
+	struct FView { u32 Mode; const char* Name; const char* Title; std::vector<float> Lum; u64 Steps = 0; u32 MaxSteps = 0; bool bFinite = true; double Covered = 0.0; };
+	FView Views[] = { { 1u, "still_webdebug_channels", "uu.WebDebug 1: walls blue, filaments green, nodes red, void grey (D-169)", {} },
+		{ 4u, "still_webdebug_nodes", "uu.WebDebug 4: node matter over its mean (D-169)", {} },
+		{ 6u, "still_webdebug_placement", "uu.WebDebug 6: the galaxy web's field as placement reads it (D-169)", {} } };
+	const auto T0 = std::chrono::steady_clock::now();
+	for (FView& Vw : Views)
+	{
+		FImage Img(Cm.Width, Cm.Height);
+		Vw.Lum.assign(size_t(Cm.Width) * Cm.Height, 0.0f);
+		for (int Y = 0; Y < Cm.Height; ++Y)
+		{
+			for (int X = 0; X < Cm.Width; ++X)
+			{
+				const FV3 D = PixelDir(Cm, Cm.Width, Cm.Height, X + 0.5, Y + 0.5);
+				u32 St = 0;
+				const H::float4 C = H::Uni_WebDebugMarch(H::float3(float(D.X), float(D.Y), float(D.Z)), 3.0e38f, Cb, Pb, V, Vw.Mode, Depth, 2.0f, 0.3f, St);
+				Vw.Steps += St;
+				Vw.MaxSteps = std::max(Vw.MaxSteps, St);
+				if (!std::isfinite(C.x) || !std::isfinite(C.y) || !std::isfinite(C.z)) { Vw.bFinite = false; }
+				Vw.Covered += C.w;
+				Vw.Lum[size_t(Y) * Cm.Width + X] = 0.2126f * C.x + 0.7152f * C.y + 0.0722f * C.z;
+				// Display colour straight to the image (the PPM tonemaps 1 - exp(-I): invert it).
+				auto Inv = [](float Vc) { return float(-std::log(1.0 - std::min(std::max(double(Vc), 0.0), 0.999))); };
+				Img.Add(X, Y, Inv(C.x), Inv(C.y), Inv(C.z));
+			}
+		}
+		WriteFrame(Img, Vw.Name, { Vw.Title, Uni::Fmt("adhesion web (mid), 150 Mpc deep, threshold 2x the mean; %.0f steps per ray", double(Vw.Steps) / (double(Cm.Width) * Cm.Height)) });
+	}
+	const double Secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - T0).count();
+
+	// Resident clusters and field galaxies inside the view and the depth: their pixels' brightness
+	// against the view's mean.
+	auto PixelOf = [&](const FCoord& C, int& OutX, int& OutY, double& OutDist) -> bool
+	{
+		const FVec3d Dv = ToDouble(Sub(C, Cam));
+		OutDist = Length(Dv);
+		const double F = Dv.X * Cm.Forward.X + Dv.Y * Cm.Forward.Y + Dv.Z * Cm.Forward.Z;
+		if (F <= 0.0) { return false; }
+		const double Nx = (Dv.X * Cm.Right.X + Dv.Y * Cm.Right.Y + Dv.Z * Cm.Right.Z) / F / Cm.TanX();
+		const double Ny = (Dv.X * Cm.Up.X + Dv.Y * Cm.Up.Y + Dv.Z * Cm.Up.Z) / F / Cm.TanY();
+		OutX = int(std::floor((Nx * 0.5 + 0.5) * Cm.Width));
+		OutY = int(std::floor((0.5 - Ny * 0.5) * Cm.Height));
+		return OutX >= 0 && OutY >= 0 && OutX < Cm.Width && OutY < Cm.Height;
+	};
+	double SumNodes = 0.0, SumPlace = 0.0;
+	long long NClusters = 0, NGal = 0;
+	for (const auto& KV : P.CacheRef())
+	{
+		for (const FObjectGPU& O : KV.second.Objects)
+		{
+			if ((O.A[3] >> 16) & H::UNI_OBJ_FLAG_DELTA_HIDDEN) { continue; }
+			const u32 Arch = O.A[3] & 0xFFFFu;
+			if (Arch != UniScenes::kCluster && Arch != UniScenes::kGalaxy) { continue; }
+			const u32 Off[3] = { O.A[0], O.A[1], O.A[2] };
+			int X = 0, Y = 0;
+			double Dist = 0.0;
+			if (!PixelOf(ObjectCoord(KV.first, Off), X, Y, Dist) || Dist > 0.5 * Depth) { continue; }   // the near half: less hidden behind nearer structure
+			const size_t I = size_t(Y) * Cm.Width + X;
+			if (Arch == UniScenes::kCluster) { SumNodes += Views[1].Lum[I]; ++NClusters; }
+			else { SumPlace += Views[2].Lum[I]; ++NGal; }
+		}
+	}
+	auto MeanOf = [](const std::vector<float>& L) { double S = 0.0; for (float V : L) { S += V; } return L.empty() ? 0.0 : S / double(L.size()); };
+	const double NodeRatio = NClusters ? (SumNodes / double(NClusters)) / std::max(MeanOf(Views[1].Lum), 1e-12) : 0.0;
+	const double PlaceRatio = NGal ? (SumPlace / double(NGal)) / std::max(MeanOf(Views[2].Lum), 1e-12) : 0.0;
+	bool bFinite = true;
+	u32 MaxSteps = 0;
+	for (const FView& Vw : Views) { bFinite = bFinite && Vw.bFinite; MaxSteps = std::max(MaxSteps, Vw.MaxSteps); }
+	const double StepsPerRay = double(Views[0].Steps) / (double(Cm.Width) * Cm.Height);
+	const double Coverage = Views[0].Covered / (double(Cm.Width) * Cm.Height);
+	// Unbound: no texture, so the view says so.
+	H::float4 Unbound;
+	{
+		BindWebTexture(nullptr);
+		u32 St = 0;
+		Unbound = H::Uni_WebDebugMarch(H::float3(1.0f, 0.0f, 0.0f), 3.0e38f, Cb, Pb, V, 1u, Depth, 2.0f, 0.3f, St);
+		BindWebTexture(&T);
+	}
+	const bool bUnbound = Unbound.x > 0.2f && Unbound.y == 0.0f && Unbound.z > 0.2f;
+	Uni::Check(2, "T2.webtex.debug", "D-169 web debug views: clusters sit on bright pixels of the node view (2x the view's mean), field galaxies on bright pixels of the placement view (1.3x), every ray finite within the step budget, an unbound texture shown as dark magenta")
+		.Metric("node_ratio", NodeRatio).Metric("placement_ratio", PlaceRatio).Metric("steps_per_ray", StepsPerRay).Metric("coverage", Coverage)
+		.Pass(bFinite && MaxSteps < H::UNI_WEB_DEBUG_MAX_STEPS && NClusters > 0 && NGal > 0 && NodeRatio >= 2.0 && PlaceRatio >= 1.3 && bUnbound,
+			Uni::Fmt("%lld clusters in view at %.1fx the node view's mean brightness, %lld field galaxies at %.2fx the placement view's; %.0f steps per ray (most %u), coverage %.2f; 3 views of %d x %d in %.1f s; unbound %s",
+				NClusters, NodeRatio, NGal, PlaceRatio, StepsPerRay, MaxSteps, Coverage, Cm.Width, Cm.Height, Secs, bUnbound ? "dark magenta" : "NOT flagged"));
+}

@@ -50,7 +50,7 @@ UNI_TEST(seed, channels)
 		{ "PLACE", H::UNI_CH_PLACE }, { "ACCEPT", H::UNI_CH_ACCEPT }, { "MAG", H::UNI_CH_MAG },
 		{ "RADIUS", H::UNI_CH_RADIUS }, { "COLOUR", H::UNI_CH_COLOUR }, { "ORIENT", H::UNI_CH_ORIENT },
 		{ "TILE", H::UNI_CH_TILE }, { "ANCHOR", H::UNI_CH_ANCHOR }, { "CONTRIBUTOR", H::UNI_CH_CONTRIBUTOR },
-		{ "SLICE", H::UNI_CH_SLICE }, { "SHAPE", H::UNI_CH_SHAPE }, { "SYSTEM", H::UNI_CH_SYSTEM }, { "CLUMP", H::UNI_CH_CLUMP },
+		{ "SLICE", H::UNI_CH_SLICE }, { "SHAPE", H::UNI_CH_SHAPE }, { "SYSTEM", H::UNI_CH_SYSTEM }, { "CLUMP", H::UNI_CH_CLUMP }, { "MORPH", H::UNI_CH_MORPH },
 	};
 	int Bad = 0;
 	std::unordered_set<u32> Seen;

@@ -56,6 +56,13 @@ namespace UniScenes
 		double CoreMin = 0.06, CoreMax = 0.14;
 		int MaxClumps = 3;
 		double ClumpWeight = 0.6;
+		/** D-172, morphology-density: the share of members that are early types (elliptical or
+		 *  lenticular: no arms, no dust, redder) is EarlyOuter + (EarlyCore - EarlyOuter)
+		 *  exp(-r / EarlyScale), r in units of the influence radius (~4 cluster radii; the
+		 *  virial radius is ~0.25). Observed: ~80% in cores, ~40-50% near the virial radius,
+		 *  ~20% in the field. EarlyCore 0: off (members as before D-172). */
+		double EarlyCore = 0.8, EarlyOuter = 0.2, EarlyScale = 0.25;
+		double EarlyColourShift = -0.07;   // log10 K: ~5600 K -> ~4800 K at the reference magnitude
 	};
 
 	/** The galaxy number density over the galaxy luminosity function (the D-012 placeholder). */
@@ -130,6 +137,20 @@ namespace UniScenes
 			{ "Arms.Amplitude", 8, 0.3f, 0.8f, 1.0f, 0.0f },
 			{ "Arms.Phase", 10, 0.0f, 6.2831853f, 1.0f, 0.0f },
 		};
+		// D-172: early types (cluster members drawn as such): a dominant, rounder, larger
+		// spheroid, little or no disc (elliptical to lenticular), no arms. Their stars follow it.
+		E.bEarlyShape = true;
+		E.EarlyExemplar = E.Exemplar;
+		E.EarlyExemplar.V[0] = 0.12f;   // disc scale length (lenticulars)
+		E.EarlyExemplar.V[1] = 0.03f;   // thicker disc
+		E.EarlyExemplar.V[5] = 1.5f;    // spheroid weight
+		E.EarlyExemplar.V[6] = 0.0f;    // no arms
+		E.EarlyExemplar.V[8] = 0.0f;
+		E.EarlyRanges = {
+			{ "Early.DiscWeight", 2, 0.0f, 0.6f, 2.0f, 0.0f },   // 0 elliptical .. 0.6 lenticular, skewed to ellipticals
+			{ "Early.BulgeRadius", 3, 0.06f, 0.12f, 1.0f, 0.0f },   // r_e ~3 kpc at M*; larger would cut 10-20% of an n = 2 profile at the influence radius
+			{ "Early.BulgeAxis", 4, 0.55f, 0.95f, 1.0f, 0.0f },
+		};
 		A.Emitters.push_back(E);
 		// Render-only dust (D-132): placeholder, about the Milky Way's face-on A_V.
 		A.Volume.bDust = true;
@@ -167,6 +188,10 @@ namespace UniScenes
 		P.V[5] = 0.0f;     // clump weight
 		P.V[6] = 0.04f;    // clump radius
 		P.V[7] = 0.0f;     // clump seed
+		P.V[8] = 0.8f;     // D-172: early-type share at the centre
+		P.V[9] = 0.2f;     //        ... far out
+		P.V[10] = 0.25f;   //        ... e-folding radius
+		P.V[11] = -0.07f;  //        their colour shift (log10 K)
 		return P;
 	}
 
@@ -198,6 +223,10 @@ namespace UniScenes
 		E.ChildArchetypeId = kGalaxy;
 		E.FieldId = H::UNI_FIELD_CLUSTER;
 		E.Exemplar = ClusterExemplar();
+		E.Exemplar.V[8] = float(std::clamp(T.EarlyCore, 0.0, 1.0));
+		E.Exemplar.V[9] = float(std::clamp(T.EarlyOuter, 0.0, 1.0));
+		E.Exemplar.V[10] = float(std::max(T.EarlyScale, 1.0e-3));
+		E.Exemplar.V[11] = float(T.EarlyColourShift);
 		// Budget-consistent membership: N(M) galaxies of mean flux F add up to 10^(-0.4 M).
 		E.NTotalRefMag = -26.0;
 		E.NTotal = std::pow(10.0, -0.4 * E.NTotalRefMag) / GalaxyMeanFluxV();

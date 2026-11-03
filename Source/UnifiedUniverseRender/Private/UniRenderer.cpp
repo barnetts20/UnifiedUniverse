@@ -32,6 +32,10 @@ static TAutoConsoleVariable<int32> CVarUniVolumeDivisor(TEXT("uu.VolumeDivisor")
 static TAutoConsoleVariable<int32> CVarUniBackgroundSize(TEXT("uu.BackgroundSize"), 256, TEXT("Background direction-map face size (texels)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniVolumeDebug(TEXT("uu.VolumeDebug"), 0, TEXT("Volume debug view (lesson #37): 0 off, 1 steps per ray (magenta = truncated), 2 coverage (R carriers, G supersampling, B truncated), 3 emission (log10 heat), 4 dust transmittance."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<float> CVarUniVolumeDebugLogLo(TEXT("uu.VolumeDebugLogLo"), 0.0f, TEXT("uu.VolumeDebug 3: log10 radiance mapped to the bottom of the heat ramp (the ramp spans 6 decades)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<int32> CVarUniWebDebug(TEXT("uu.WebDebug"), 0, TEXT("D-169: the textured cosmic web in false colour (replaces the volume; sprites still drawn). 0 off, 1 channels (walls blue, filaments green, nodes red, void grey), 2 walls, 3 filaments, 4 nodes, 5 void (each over its own mean, heat ramp), 6 placement (the galaxy web's field as placement reads it)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniWebDebugDepth(TEXT("uu.WebDebugDepth"), 150.0f, TEXT("D-169: uu.WebDebug marches this far (Mpc). The tile is 200 Mpc; past it the web repeats."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniWebDebugThreshold(TEXT("uu.WebDebugThreshold"), 2.0f, TEXT("D-169: uu.WebDebug shows density above this multiple of the mean (full strength 100x above it)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniWebDebugOpacity(TEXT("uu.WebDebugOpacity"), 0.3f, TEXT("D-169: uu.WebDebug opacity per texel at full strength (higher: only the nearest structure shows)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniBackgroundMode(TEXT("uu.BackgroundMode"), 2, TEXT("D-166: how the background (the periodic web) is marched. 0: into the direction map (D-136/D-159), a few faces per frame. 1: per pixel with the local volume, every frame. 2: per pixel while the background is changing (travel), the map once it has been still for uu.BackgroundStillFrames."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniBackgroundStillFrames(TEXT("uu.BackgroundStillFrames"), 30, TEXT("D-166: uu.BackgroundMode 2 switches to the direction map after this many frames without a background change."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniBackgroundFaces(TEXT("uu.BackgroundFacesPerFrame"), 2, TEXT("Background map faces marched per frame during a refresh (1..6; D-159: a refresh is always all six faces from one snapshot, cross-faded in)."), ECVF_RenderThreadSafe);
@@ -359,8 +363,11 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 	// it is marched with the local carriers instead; at rest the map is cheaper and is used.
 	const int32 BgMode = FMath::Clamp(CVarUniBackgroundMode.GetValueOnRenderThread(), 0, 2);
 	if (F.BackgroundVersion != BgLastVersion) { BgLastVersion = F.BackgroundVersion; BgStillFrames = 0; } else { ++BgStillFrames; }
+	// D-169: the web debug view marches the background carriers (the web) per pixel.
+	const int32 WebDebug = FMath::Clamp(CVarUniWebDebug.GetValueOnRenderThread(), 0, 6);
+	const uint32 VolDebugMode = WebDebug > 0 ? 5u : uint32(FMath::Clamp(CVarUniVolumeDebug.GetValueOnRenderThread(), 0, 4));
 	const bool bPerPixelBackground = F.BackgroundCarriers.Num() > 0
-		&& (BgMode == 1 || (BgMode == 2 && BgStillFrames < FMath::Max(CVarUniBackgroundStillFrames.GetValueOnRenderThread(), 1)));
+		&& (WebDebug > 0 || BgMode == 1 || (BgMode == 2 && BgStillFrames < FMath::Max(CVarUniBackgroundStillFrames.GetValueOnRenderThread(), 1)));
 	if (bPerPixelBackground)
 	{
 		// The map is stale once we move; when the map comes back it is marched whole first (no
@@ -474,8 +481,12 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		P->SceneDepthTexture = SceneDepth;
 		P->SceneDepthSampler = PointClamp;
 		P->MarchSize = FUintVector2(uint32(MarchSize.X), uint32(MarchSize.Y));
-		P->DebugMode = uint32(FMath::Clamp(CVarUniVolumeDebug.GetValueOnRenderThread(), 0, 4));
+		P->DebugMode = VolDebugMode;
 		P->DebugLogLo = CVarUniVolumeDebugLogLo.GetValueOnRenderThread();
+		P->WebDebugMode = uint32(FMath::Max(WebDebug, 1));
+		P->WebDebugDepthCm = float(double(FMath::Max(CVarUniWebDebugDepth.GetValueOnRenderThread(), 0.1f)) * 3.0856775814913673e24);
+		P->WebDebugThreshold = FMath::Max(CVarUniWebDebugThreshold.GetValueOnRenderThread(), 1.0e-3f);
+		P->WebDebugOpacity = FMath::Max(CVarUniWebDebugOpacity.GetValueOnRenderThread(), 0.0f);
 		P->OutVolume = GraphBuilder.CreateUAV(VolumeTex);
 		P->OutSlices = GraphBuilder.CreateUAV(Slices);
 		TShaderMapRef<FUniVolumeMarchCS> CS(GetGlobalShaderMap(View.GetFeatureLevel()));
@@ -500,7 +511,7 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		C.bBackground = bBackground ? 1u : 0u;
 		C.BackgroundStartCm = F.BackgroundStartCm;
 		C.BackgroundBlend = BackgroundBlend;   // D-159
-		C.DebugMode = uint32(FMath::Clamp(CVarUniVolumeDebug.GetValueOnRenderThread(), 0, 4));
+		C.DebugMode = VolDebugMode;
 		C.DebugScale = 1.0f / FMath::Max(PreExposure, 1.0e-6f);
 		C.VolumeTexture = VolumeTex;
 		C.CubeTexture = Cube;

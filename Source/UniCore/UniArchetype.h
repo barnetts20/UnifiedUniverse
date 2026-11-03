@@ -167,6 +167,12 @@ namespace UniCore
 		 *  clusters: 2-5 Mpc inside 50 Mpc cells, where 128 probes of the whole cell usually all
 		 *  miss it). Off by default: turning it on for an existing emitter changes its content. */
 		bool bSampleBox = false;
+		/** D-172: the shape of an early-type parent (one placed with UNI_OBJ_FLAG_EARLY, a cluster
+		 *  member drawn as elliptical / lenticular): its own exemplar and ranges (own stream names,
+		 *  so a late type's draws never change). Without it an early type keeps the usual shape. */
+		bool bEarlyShape = false;
+		FFieldParams EarlyExemplar;
+		std::vector<FParamRange> EarlyRanges;
 	};
 
 	/** Render-only volume appearance of an archetype (Docs/VOLUMETRICS.md, D-132). Never read by

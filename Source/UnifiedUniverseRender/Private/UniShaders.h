@@ -210,6 +210,10 @@ public:
 		SHADER_PARAMETER(FUintVector2, MarchSize)
 		SHADER_PARAMETER(uint32, DebugMode)
 		SHADER_PARAMETER(float, DebugLogLo)
+		SHADER_PARAMETER(uint32, WebDebugMode)        // D-169
+		SHADER_PARAMETER(float, WebDebugDepthCm)
+		SHADER_PARAMETER(float, WebDebugThreshold)
+		SHADER_PARAMETER(float, WebDebugOpacity)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutVolume)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float>, OutSlices)
 	END_SHADER_PARAMETER_STRUCT()

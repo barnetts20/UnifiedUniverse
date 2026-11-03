@@ -219,6 +219,7 @@ namespace UniHlsl
 	}
 
 	inline float dot(const float3& A, const float3& B) { return A.x * B.x + A.y * B.y + A.z * B.z; }
+	inline float dot(const float4& A, const float4& B) { return A.x * B.x + A.y * B.y + A.z * B.z + A.w * B.w; }
 	inline float length(const float3& A) { return sqrt(dot(A, A)); }
 	inline float3 normalize(const float3& A) { return A * rsqrt(dot(A, A)); }
 	inline float3 cross(const float3& A, const float3& B)

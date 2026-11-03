@@ -352,6 +352,109 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 	return Res;
 }
 
+// ------------------------------------------------------------------------------------------
+// D-169: web debug views (uu.WebDebug). Render-only false colour of the textured web, to check
+// its shape directly instead of from where galaxies land. The ray is marched front to back
+// through the first textured periodic web carrier (one texel of the footprint's mip per step,
+// out to InDepthCm) with an emission-absorption transfer function: a sample shows only where
+// its density is above InThreshold times the mean, brighter and more opaque up to 100x, so
+// near structure hides what is behind it (depth reads). Colours:
+//   1 channels   walls blue, filaments green, nodes red, void grey, mixed by overdensity
+//   2 walls  3 filaments  4 nodes  5 void   one channel over its own mean, heat ramp
+//   6 placement  the carrier's own field (what galaxy placement reads) over its mean, heat ramp
+// Returns display colour (rgb, 0..1) and coverage (a). No texture bound or no textured web:
+// dark magenta, so a missing texture is not mistaken for an empty web.
+// ------------------------------------------------------------------------------------------
+
+static const uint UNI_WEB_DEBUG_MAX_STEPS = 1024u;
+
+/** Blue -> cyan -> green -> yellow -> red over [0, 1]. */
+UNI_FN float3 Uni_DebugHeat(float InX)
+{
+	const float X = saturate(InX) * 4.0f;
+	if (X < 1.0f) { return float3(0.0f, X, 1.0f); }
+	if (X < 2.0f) { return float3(0.0f, 1.0f, 2.0f - X); }
+	if (X < 3.0f) { return float3(X - 2.0f, 1.0f, 0.0f); }
+	return float3(1.0f, 4.0f - X, 0.0f);
+}
+
+/** The first carrier that is the textured periodic web, or NumCarriers. */
+UNI_FN uint Uni_WebDebugCarrier(StructuredBuffer<FUniCarrier> InCarriers, StructuredBuffer<FUniFieldParams> InParams, uint InNum)
+{
+	for (uint C = 0u; C < InNum; ++C)
+	{
+		const FUniCarrier Ca = InCarriers[C];
+		if ((Ca.Flags & UNI_CARRIER_PERIODIC) == 0u || Ca.FieldId != UNI_FIELD_WEB) { continue; }
+		if (Uni_WebIsTextured(InParams[Ca.ParamIndex])) { return C; }
+	}
+	return InNum;
+}
+
+UNI_FN float4 Uni_WebDebugMarch(float3 InDir, float InTScene, StructuredBuffer<FUniCarrier> InCarriers, StructuredBuffer<FUniFieldParams> InParams,
+	FUniVolumeView InView, uint InMode, float InDepthCm, float InThreshold, float InOpacity, UNI_OUT(uint) OutSteps)
+{
+	OutSteps = 0u;
+	const uint Ci = Uni_WebDebugCarrier(InCarriers, InParams, InView.NumCarriers);
+	if (Ci >= InView.NumCarriers) { return float4(0.25f, 0.0f, 0.25f, 1.0f); }
+	const FUniCarrier Ca = InCarriers[Ci];
+	const FUniFieldParams Par = InParams[Ca.ParamIndex];
+	const float3 Ld = Uni_CarrierLocalDir(Ca, InDir);
+	const float N = max(Par.C.w, 1.0f);                       // texels per period
+	const float4 ChMean = UNI_WEB_TEX_SAMPLE(float3(0.5f, 0.5f, 0.5f), 64.0f);   // the last mip: each channel's tile mean
+	if (!(ChMean.x + ChMean.y + ChMean.z + ChMean.w > 0.0f)) { return float4(0.25f, 0.0f, 0.25f, 1.0f); }   // NaN (unbound) or empty
+	const float SumMean = ChMean.x + ChMean.y + ChMean.z + ChMean.w;
+	const float FieldMean = max(Ca.MeanDensity, 1.0e-20f);
+	const float Thr = max(InThreshold, 1.0e-6f);
+	const float TEnd = min(InDepthCm, InTScene);
+	float T = 0.0f;
+	float Tr = 1.0f;
+	float3 Col = float3(0.0f, 0.0f, 0.0f);
+	UNI_LOOP
+	for (uint Step = 0u; Step < UNI_WEB_DEBUG_MAX_STEPS; ++Step)
+	{
+		if (T >= TEnd || Tr < 0.01f) { break; }
+		const float Foot = T * InView.ThetaPixel * Ca.InvRadius;
+		const float Mip = Uni_WebTexMip(Par, Foot);
+		const float Du = exp2(floor(Mip)) / N;                  // one texel of that mip, field units
+		const float S = min(Du / Ca.InvRadius, TEnd - T);
+		const float3 P = Uni_CarrierPoint(Ca, Ld, T + 0.5f * S);
+		const float4 Ch = UNI_WEB_TEX_SAMPLE(P, Mip);
+		OutSteps = Step + 1u;
+		float Rho;
+		float3 Tint;
+		if (InMode == 1u)
+		{
+			Rho = (Ch.x + Ch.y + Ch.z + Ch.w) / SumMean;
+			const float4 Od = float4(Ch.x / max(ChMean.x, 1.0e-20f), Ch.y / max(ChMean.y, 1.0e-20f), Ch.z / max(ChMean.z, 1.0e-20f), Ch.w / max(ChMean.w, 1.0e-20f));
+			const float4 Wt = float4(Od.x, Od.y, Od.z, 0.5f * Od.w);
+			const float WSum = max(Wt.x + Wt.y + Wt.z + Wt.w, 1.0e-20f);
+			Tint = (float3(0.15f, 0.35f, 1.0f) * Wt.x + float3(0.2f, 1.0f, 0.3f) * Wt.y + float3(1.0f, 0.2f, 0.1f) * Wt.z + float3(0.5f, 0.5f, 0.5f) * Wt.w) / WSum;
+		}
+		else if (InMode >= 2u && InMode <= 5u)
+		{
+			const float4 Sel = float4(InMode == 2u ? 1.0f : 0.0f, InMode == 3u ? 1.0f : 0.0f, InMode == 4u ? 1.0f : 0.0f, InMode == 5u ? 1.0f : 0.0f);
+			Rho = dot(Ch, Sel) / max(dot(ChMean, Sel), 1.0e-20f);
+			Tint = float3(1.0f, 1.0f, 1.0f);
+		}
+		else
+		{
+			Rho = UniField_WebTex(P, Par, Mip) / FieldMean;
+			Tint = float3(1.0f, 1.0f, 1.0f);
+		}
+		// Above the threshold: 0 at it, 1 two decades up (log), opacity per texel of mip 0.
+		const float X = Rho > Thr ? saturate(0.5f * log10(Rho / Thr)) : 0.0f;
+		if (X > 0.0f)
+		{
+			const float A = 1.0f - exp(-InOpacity * X * (Du * N));
+			const float3 C = (InMode == 1u ? Tint * (0.35f + 0.65f * X) : Uni_DebugHeat(X)) * (1.0f - 0.6f * T / max(TEnd, 1.0f));
+			Col = Col + C * (Tr * A);
+			Tr = Tr * (1.0f - A);
+		}
+		T = T + S;
+	}
+	return float4(Col.x, Col.y, Col.z, 1.0f - Tr);
+}
+
 /** D-157: the per-pixel-axis ray count after the view's cap (uu.VolumeMaxSubsamples). */
 UNI_FN uint Uni_ClampSubsamples(uint InSS, FUniVolumeView InView)
 {

@@ -20,6 +20,8 @@
 //   2 coverage      red = carriers hit (/4), green = supersampling factor (/8), blue = truncated
 //   3 emission      log10 of the march's luminance radiance over [DebugLogLo, DebugLogLo + 6]
 //   4 transmittance near luminance transmittance (dust) as grey
+//   5 web           D-169 (uu.WebDebug): the textured web in false colour (Uni_WebDebugMarch;
+//                   WebDebugMode picks channels / placement), with the background carriers
 //
 // Structured buffers carry every struct, including the view (lesson #2: no constant buffer
 // mirroring a C++ layout). Each is mirrored in UniCore/UniVolume.h with a static_assert.
@@ -88,6 +90,10 @@ float SceneDistanceAtUV(float2 InUV, float InCosToForward)
 uint2 MarchSize;
 uint DebugMode;
 float DebugLogLo;
+uint WebDebugMode;          // D-169: 1 channels, 2 walls, 3 filaments, 4 nodes, 5 void, 6 placement
+float WebDebugDepthCm;
+float WebDebugThreshold;    // x the mean
+float WebDebugOpacity;      // per texel at full strength
 RWTexture2D<float4> OutVolume;
 RWTexture2DArray<float> OutSlices;
 
@@ -101,6 +107,15 @@ void MarchCS(uint3 Id : SV_DispatchThreadID)
 	const float2 Px = float2((float)Id.x + 0.5f, (float)Id.y + 0.5f);
 	const float3 Dir = PixelDir(Px, Size);
 	const float TScene = SceneDistanceAtUV(Px * MarchToDepthUV.xy + MarchToDepthUV.zw, dot(Dir, ViewForward));
+	if (DebugMode == 5u)
+	{
+		// D-169: one ray per pixel, the web only; no dust, so the slices are clear.
+		uint WebSteps;
+		const float4 W = Uni_WebDebugMarch(Dir, TScene, InCarriers, InParams, V, WebDebugMode, WebDebugDepthCm, WebDebugThreshold, WebDebugOpacity, WebSteps);
+		OutVolume[Id.xy] = float4(W.rgb, 0.0f);
+		for (uint K5 = 0u; K5 < UNI_VOL_SLICES; ++K5) { OutSlices[uint3(Id.x, Id.y, K5)] = 1.0f; }
+		return;
+	}
 
 	uint SS = 1u;
 	for (uint C = 0u; C < V.NumCarriers; ++C)

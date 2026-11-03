@@ -574,7 +574,7 @@ namespace UniCore
 					G.TEnd = 3.0e38f;
 					Cd.Par = C.Params.Pack();
 					const FVolumeProfile& Prof = D.Arch(C.ParentArchetypeId).Volume;
-					Cd.bDust = Prof.bDust && Prof.DustTau > 0.0f && C.Emitter->FieldId == HV::UNI_FIELD_GALAXY;
+					Cd.bDust = Prof.bDust && Prof.DustTau > 0.0f && C.Emitter->FieldId == HV::UNI_FIELD_GALAXY && !C.bEarly;   // D-172: early types are dust-poor
 					if (Cd.bDust) { Cd.Dust = DustFrom(C.Params, Prof).Pack(); G.Flags |= HV::UNI_CARRIER_DUST; }
 					// D-160: an emission-only carrier starts where its LUT does. Nearer than that every
 					// child is resolved (drawn as a sprite), so the unresolved emission is < 1e-6 of

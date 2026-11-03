@@ -437,3 +437,25 @@ A reviewer read the uncompiled engine code against UE 5.3–5.6 without seeing i
   4. Report the worst remaining hitch lines: Submit/Window spikes when a coarse window shifts are the known remainder (500–1,000 cells entering at once).
 - **Failure looks like:** a galaxy's stars or its glow missing until you stop (woken too late: report which level), glow popping in at a distance (WakeTheta), or contributors climbing back to 300k (cells not being culled).
 
+## 13f. Web debug views (D-169, UE-15)
+*Owner asked for a way to see the web's components directly. Verified offline: T2.webtex.debug (stills still_webdebug_channels / _nodes / _placement).*
+
+- **What changes:** `uu.WebDebug 1..6` replaces the volume's light with the textured web in false colour (galaxy and cluster sprites still drawn): 1 all channels (walls blue, filaments green, nodes red, void grey), 2 walls, 3 filaments, 4 nodes, 5 void, 6 the placement field. `uu.WebDebugDepth` (Mpc, 150), `uu.WebDebugThreshold` (× the mean, 2), `uu.WebDebugOpacity` (0.3). `0` turns it off.
+- **Test steps:**
+  1. Build (new march-pass parameters WebDebugMode/DepthCm/Threshold/Opacity; `Uni_WebDebugMarch` in the shared core).
+  2. `uu.Enable web` (or flythrough), `uu.WebDebug 1`: a 3D web of green filaments and blue sheets with red knots. `uu.WebDebug 4`: knots only; clusters' sprites should sit on them. `uu.WebDebug 6`: galaxies (sprites) should crowd the bright parts.
+  3. `uu.WebDebugDepth 40` to see only the near structure; `uu.WebDebugThreshold 10` for the densest parts only. Fly: the structure should repeat every 200 Mpc with no seams.
+- **Failure looks like:** dark magenta everywhere (no textured web: texture missing or uu.WebSource 0), black (threshold too high or no background carriers), or the view not following the camera (march not getting the background carriers).
+
+## 13g. Background web cost and reach (D-170, D-171, UE-15)
+- **D-171:** the textured web steps 2 texels at a time (was 1): the background march is ~40% cheaper with the same light (pixels within 1.4% at the 99th percentile). ProfileGPU `Uni.Volume.March … (with the background)` while flying should drop by about that much against the previous build.
+- **D-170 (no code):** marching the web to 3.2 Gpc carried 42% of the light instead of 2% but changed nothing visible; the background is isotropic past ~100 Mpc, as the real one is. How visible the web should be in the sky is now an art question for you (BACKLOG B-010).
+
+## 13h. Cluster members: ellipticals in the cores (D-172, UE-15)
+*Owner: many galaxies visible inside a cluster; realistic? Yes for a rich cluster's interior; but members were all spirals. Verified offline: T2.cluster.morphology, T2.vol.equivalence, T3.cluster.stills (core still: round, smooth ellipticals now dominate the centre).*
+
+- **What changes:** cluster members are elliptical or lenticular with a probability that falls with distance from the centre (~2/3 in the core, ~1/4 far out): no arms, no dust, redder. Field galaxies are untouched. `uu.Cluster.EarlyCore 0` (then `uu.Enable`) gives the old members back for A/B; `EarlyOuter`, `EarlyScale`, `EarlyColour` tune it.
+- **Content:** cluster members' shapes, colours and stars change for the early types; positions, magnitudes and every late type are the same.
+- **Test steps:** `uu.GotoCluster rich`, fly into the core: mostly smooth, round or lens-shaped, yellower galaxies at the centre, spirals more common toward the edge. ProfileGPU `Uni.Volume.March` inside the core: no costlier than before (offline ~8% fewer galaxy steps).
+- **Failure looks like:** spirals in the core as before (the cluster parameters not reaching the place pass: C of the cluster's field), all members elliptical, or galaxies whose stars no longer line up with their glow (CPU and GPU disagreeing on the flag).
+

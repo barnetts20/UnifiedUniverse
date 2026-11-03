@@ -106,6 +106,7 @@ namespace UniCore
 		double InfluenceCm = 0.0;
 		float Rot[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
 		FFieldParams Params;
+		bool bEarly = false;                  // D-172: the parent is an early type (its emitter's early shape; no dust)
 		double NTotal = 0.0;
 		mutable double IntegralAll = -1.0;   // field-space integral over the unit ball / period (lazy, cached)
 	};
@@ -664,7 +665,19 @@ namespace UniCore
 					Ct.InfluenceCm = Em.InfluenceMul * Radius;
 					// Exemplar -> ranges (keyed by name) -> [bags] -> [logic hook] (lesson #15).
 					Ct.Params = Em.Exemplar;
+					// D-172: an early-type parent (placement decided it, UNI_OBJ_FLAG_EARLY) takes the
+					// emitter's early shape, rolled from its own streams.
+					const bool bEarly = Em.bEarlyShape && ((O.A[3] >> 16) & H::UNI_OBJ_FLAG_EARLY) != 0u && !Anc;
 					if (Anc && E < Anc->EmitterParams.size()) { Ct.Params = Anc->EmitterParams[E]; }
+					else if (bEarly)
+					{
+						Ct.Params = Em.EarlyExemplar;
+						Ct.bEarly = true;
+						if (!A.bDefaultsOnly)
+						{
+							for (const FParamRange& R : Em.EarlyRanges) { Ct.Params.V[R.Slot] = H::Uni_RollRange(O.B[0], ChannelIdUpper(R.Name), R.Min, R.Max, R.Bias, R.Quantize); }
+						}
+					}
 					else if (!A.bDefaultsOnly)
 					{
 						for (const FParamRange& R : Em.Ranges)

@@ -51,6 +51,10 @@ namespace UniClusterCVars
 	TAutoConsoleVariable<float> CoreMax(TEXT("uu.Cluster.CoreMax"), float(Defaults.CoreMax), TEXT("Largest core radius, as a fraction of the influence radius."));
 	TAutoConsoleVariable<int32> MaxClumps(TEXT("uu.Cluster.MaxClumps"), Defaults.MaxClumps, TEXT("Most sub-clumps per cluster (0..4)."));
 	TAutoConsoleVariable<float> ClumpWeight(TEXT("uu.Cluster.ClumpWeight"), float(Defaults.ClumpWeight), TEXT("Largest sub-clump weight."));
+	TAutoConsoleVariable<float> EarlyCore(TEXT("uu.Cluster.EarlyCore"), float(Defaults.EarlyCore), TEXT("D-172: share of members that are early types (elliptical / lenticular) at a cluster's centre (0: off, members as before D-172)."));
+	TAutoConsoleVariable<float> EarlyOuter(TEXT("uu.Cluster.EarlyOuter"), float(Defaults.EarlyOuter), TEXT("D-172: early-type share far from the centre (the field's, ~0.2)."));
+	TAutoConsoleVariable<float> EarlyScale(TEXT("uu.Cluster.EarlyScale"), float(Defaults.EarlyScale), TEXT("D-172: radius over which the early-type share falls from EarlyCore toward EarlyOuter, in influence radii (~0.25 = the virial radius)."));
+	TAutoConsoleVariable<float> EarlyColour(TEXT("uu.Cluster.EarlyColour"), float(Defaults.EarlyColourShift), TEXT("D-172: early types' colour shift in log10 K (negative: redder)."));
 
 	UniScenes::FClusterTuning Read()
 	{
@@ -68,6 +72,10 @@ namespace UniClusterCVars
 		T.CoreMax = FMath::Clamp(double(CoreMax.GetValueOnGameThread()), T.CoreMin, 0.5);
 		T.MaxClumps = FMath::Clamp(MaxClumps.GetValueOnGameThread(), 0, int32(UniHlsl::UNI_CLUSTER_MAX_CLUMPS));
 		T.ClumpWeight = FMath::Max(double(ClumpWeight.GetValueOnGameThread()), 0.0);
+		T.EarlyCore = FMath::Clamp(double(EarlyCore.GetValueOnGameThread()), 0.0, 1.0);
+		T.EarlyOuter = FMath::Clamp(double(EarlyOuter.GetValueOnGameThread()), 0.0, 1.0);
+		T.EarlyScale = FMath::Clamp(double(EarlyScale.GetValueOnGameThread()), 0.01, 2.0);
+		T.EarlyColourShift = FMath::Clamp(double(EarlyColour.GetValueOnGameThread()), -0.5, 0.5);
 		return T;
 	}
 }

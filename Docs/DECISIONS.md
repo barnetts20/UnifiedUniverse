@@ -845,3 +845,35 @@ Rationale: T2.webtex.travel: the flythrough scene with the adhesion web and node
 Not yet: Submit and Window still scale with the cells entering a frame (a coarse shift or a sensitivity resize brings 500–1,000 cells at once: 20–40 ms on the reference); a per-frame submission budget would spread them.
 Reroll impact: None (the same cells, the same objects).
 Status: Provisional (UE-15)
+
+D-169 — Web debug views (uu.WebDebug)
+Question: Owner: going only by cluster and galaxy placement makes the overall shape of the web hard to verify; are there debug modes for its components?
+Decision: `uu.WebDebug` (renderer, render-only): the volume pass draws the textured web in false colour instead of its light (sprites still drawn on top), marching the background carriers per pixel. Core `Uni_WebDebugMarch` (UniVolume.ush, shared with the CPU reference): the first textured periodic web carrier, front to back, one texel of the footprint's mip per step, out to `uu.WebDebugDepth` (150 Mpc), with an emission-absorption transfer: a sample shows only above `uu.WebDebugThreshold` (2) times its mean, full strength two decades above, opacity `uu.WebDebugOpacity` (0.3) per texel at full strength, and a mild fade with distance so near structure reads in front. Modes: 1 channels (walls blue, filaments green, nodes red, void grey, mixed by overdensity), 2 walls, 3 filaments, 4 nodes, 5 void (each over its own tile mean, heat ramp), 6 placement (the galaxy web's own field, weights and floor included, over its mean: what galaxy placement reads). No texture bound: dark magenta (never an empty-looking web). Volume debug mode 5 internally; uu.VolumeDebug keeps 1–4.
+Rationale: T2.webtex.debug on the adhesion web with its node list, from intergalactic space: resident clusters in view sit at 2.2× the node view's mean brightness, field galaxies at 1.34× the placement view's; every ray finite, 192 steps per ray (budget 1,024); unbound flagged. Stills: still_webdebug_channels / _nodes / _placement.
+Reroll impact: None (render only).
+Status: Provisional (UE-15)
+
+D-170 — Marching the textured web farther: measured, not adopted (closes B-008)
+Question: B-008: the analytic tail past the march (0.5 periods) is ~98% of the background's light and uniform, so would marching the textured web much farther (cheap with mips) make its structure show?
+Measured (reference, adhesion web, intergalactic space, full background with the tail): marching to 16 periods (3.2 Gpc), with log steps of 0.05 past 0.5 periods each sampling the mip matching the step: total light +0.04% (same integral), the march carries 42% of the light instead of 2%, 144 → 215 steps per ray. The image is unchanged to the eye and in contrast (std/mean of 4 px and 20 px blocks 0.301 → 0.300, 0.298 → 0.297; that contrast is the pixels' solid-angle falloff, the same in both). Far shells add structure at ever smaller angles and average out within a pixel; the integrated background is isotropic, as the real extragalactic background is.
+Decision: not adopted (no code kept). The web's visible structure in the background is the near ~100 Mpc over a nearly uniform pedestal; showing it more is an art choice (a near-web glow, or a dimmer pedestal), now B-010 for the owner.
+Reroll impact: None.
+Status: Measured
+
+D-171 — Textured web step: 2 texels (amends D-164)
+Question: With the 256³ adhesion web the background march went from 83 to 144 steps per ray (texels half the size). Can the textured web step 2 texels of its mip instead of 1?
+Decision: UNI_WEB_TEX_STEP = 2. Measured on the adhesion background from intergalactic space (marched part, against 1 texel): light −0.01%, pixel correlation 0.99996, median pixel 0.1%, 99th percentile 1.4%; 144 → 83 steps per ray, 40% less time. 4 texels: 55 steps, but 99th percentile 9.7% (correlation 0.997), not taken.
+Rationale: T3.webtex.background (cube light −0.13%, correlation 0.999, 107 → 50 steps per texel against the procedural web, 11× faster), T3.webtex.adhesion_stills (83 steps per ray).
+Reroll impact: None (render only).
+Status: Provisional (UE-15)
+
+D-172 — Morphology-density relation for cluster members (amends D-151, D-163)
+Question: Owner: inside a cluster many galaxies show as more than a dot; is that realistic, and what about its cost? Rich-cluster interiors really do show dozens of resolved galaxies (the Milky Way's sparse sky is a poor group's near a void). What was unrealistic: members rolled the same spirals as the field, while cluster cores are dominated by ellipticals and lenticulars (Dressler 1980).
+Decision:
+- **Placement decides** (shared core, `Uni_TaskEarlyType` in UniGenTask.ush): a member placed by a cluster's field is an early type with probability Outer + (Core − Outer) exp(−r / Scale), r its distance from the cluster centre in influence radii (~4 cluster radii; virial ~0.25), drawn on a new channel MORPH. Defaults Core 0.8, Outer 0.2, Scale 0.25 (~67% inside 0.1, ~50% to 0.25, ~35% to 0.5, ~25% beyond): carried by the cluster's field parameters C (unused before), so anchors and catalogue clusters have them too; `uu.Cluster.EarlyCore` (0 = off), `EarlyOuter`, `EarlyScale`, `EarlyColour`. The object gets `UNI_OBJ_FLAG_EARLY` (32) and a redder colour (its colour model −0.07 in log10 K, ~5600 → ~4800 K).
+- **Shape** (CPU contributor, the emitter's new early shape): a spheroid of weight 1.5, r_e 0.06–0.12 influence radii (~3 kpc at M*), axis 0.55–0.95, disc weight 0–0.6 skewed to 0 (elliptical to lenticular), no arms, rolled on their own stream names. Its stars follow it. No dust carrier for early types.
+- **Bulge prefilter keeps the light inside the cut:** D-163's widened bulge is rescaled by the ratio of its in-cut share before and after widening, P(6, 3.67 √(Cut / r_e)) (closed form). Render only. Without it a spheroid-dominated galaxy a few pixels across lost ~10% of its light (spirals ~3%).
+Rationale: T2.cluster.morphology (anchored rich cluster, 534 members, 39% early; per radial bin within 2.4 sigma of the rule; galaxies identical to the rule off except early types' colour and flag; early types redder (R/B 1.16 vs 1.03); no arms; dust-free; late types' parameters unchanged; 0 of 3,028 web-scene field galaxies early; galaxy volume steps in the core −8%). T2.vol.equivalence: galaxies' emission +2.3% against the exact march (was −3.4% before D-172 with spirals, −10% with early types before the in-cut rescale). T2.vol.cost: galaxies inside the core 448 → 294 ms on the reference. T2.cluster.members unchanged (positions and magnitudes are).
+Not done (cost): per-ray carriers stay capped at 12 and per-frame at 128 (D-161); inside a rich core the march is ~36 steps per ray, 31 of them the cluster's own glow. Impostors for small galaxies wait for the warp textures that would make galaxy samples costly (BACKLOG B-011).
+Reroll impact: Yes, cluster members only: early types' colour, shape and stars (their positions and magnitudes, and every late type, unchanged). uu.Cluster.EarlyCore 0 restores them.
+Status: Provisional (UE-15)

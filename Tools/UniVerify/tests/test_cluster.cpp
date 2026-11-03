@@ -683,3 +683,179 @@ UNI_TEST(cluster, volume_continuity)
 		.Metric("worst_jump", WorstJump).Metric("carriers", MaxActive).Metric("frames", Frames)
 		.Pass(Frames == 12 && WorstJump < 0.10, Uni::Fmt("%d frames, up to %d carriers: worst frame-to-frame change of a visible block %.1f%%", Frames, MaxActive, 100.0 * WorstJump));
 }
+
+UNI_TEST(cluster, morphology)
+{
+	// D-172, the morphology-density relation: a rich cluster's members are early types (no arms,
+	// no dust, redder) with probability Outer + (Core - Outer) exp(-r / Scale). Checks, against
+	// the same cluster with it off (EarlyCore 0): every object at the same position and magnitude
+	// (only early types' colour and flag differ); the early share per radial bin within 4 sigma of
+	// the rule; early types redder; their contributors on the early shape (no arms) and without
+	// dust carriers; late types' parameters unchanged; no field galaxy of the web scene early; and
+	// the volume inside the core no costlier.
+	auto Run = [](bool bOn, std::map<std::string, std::vector<FObjectGPU>>& OutSnap, std::vector<FContributor>& OutMembers, double& OutInfluence, u32& OutClusterId)
+	{
+		FUniverseDef D = AnchoredCluster();
+		if (!bOn) { D.Anchors[0].EmitterParams[0].V[8] = 0.0f; }
+		auto M = std::make_shared<FUniverseModel>(D);
+		FRefGenerator G(*M);
+		FRefPipeline P(G);
+		P.bVelocityLod = false;
+		P.Update(Moved(FCoord::Origin(), FVec3d{ 0.1 * Units::Mpc, -0.05 * Units::Mpc, 0.02 * Units::Mpc }), FVec3f{});
+		OutSnap = Snapshot(P);
+		OutMembers.clear();
+		for (const auto& KV : P.Contributors()) { if (KV.second.ParentArchetypeId == UniScenes::kCluster) { OutClusterId = KV.first; OutInfluence = KV.second.InfluenceCm; } }
+		for (const auto& KV : P.Contributors()) { if (KV.second.ParentArchetypeId == UniScenes::kGalaxy) { OutMembers.push_back(KV.second); } }
+		return M;
+	};
+	std::map<std::string, std::vector<FObjectGPU>> SnapOn, SnapOff;
+	std::vector<FContributor> MemOn, MemOff;
+	double Influence = 0.0, InflOff = 0.0;
+	u32 ClusterId = 0, ClusterIdOff = 0;
+	auto ModelOn = Run(true, SnapOn, MemOn, Influence, ClusterId);
+	Run(false, SnapOff, MemOff, InflOff, ClusterIdOff);
+	const FFieldParams Fp = AnchoredCluster().Anchors[0].EmitterParams[0];
+	const H::FUniFieldParams Hp = Fp.ToHlsl();
+	// Objects: same set, same positions and magnitudes; colour and the flag differ only for early types.
+	size_t Objects = 0, Early = 0, Mismatch = 0, CellsDiff = 0;
+	struct FBin { double Lo, Hi; long long N = 0, E = 0; double Expect = 0.0; };
+	std::vector<FBin> Bins = { { 0.0, 0.1 }, { 0.1, 0.25 }, { 0.25, 0.5 }, { 0.5, 1.0 } };
+	double RbEarly = 0.0, RbLate = 0.0;
+	long long NLate = 0;
+	auto HasGalaxies = [](const std::vector<FObjectGPU>& V) { for (const FObjectGPU& O : V) { const u32 A = O.A[3] & 0xFFFFu; if (A == UniScenes::kGalaxy || A == UniScenes::kCluster) { return true; } } return false; };
+	for (const auto& KV : SnapOn)
+	{
+		// Galaxy and cluster cells only: an early type's stars follow its new shape (by design).
+		auto It = SnapOff.find(KV.first);
+		const bool bGal = HasGalaxies(KV.second) || (It != SnapOff.end() && HasGalaxies(It->second));
+		if (!bGal) { continue; }
+		if (It == SnapOff.end() || It->second.size() != KV.second.size()) { ++CellsDiff; continue; }
+		for (size_t I = 0; I < KV.second.size(); ++I)
+		{
+			const FObjectGPU& A = KV.second[I];
+			const FObjectGPU& B = It->second[I];
+			const u32 Fa = A.A[3] >> 16, Fb = B.A[3] >> 16;
+			const bool bE = (Fa & H::UNI_OBJ_FLAG_EARLY) != 0u;
+			const bool bSame = A.A[0] == B.A[0] && A.A[1] == B.A[1] && A.A[2] == B.A[2] && (A.A[3] & 0xFFFFu) == (B.A[3] & 0xFFFFu)
+				&& (Fa & ~H::UNI_OBJ_FLAG_EARLY) == Fb && A.B[0] == B.B[0] && A.B[1] == B.B[1] && A.B[2] == B.B[2] && (bE || A.B[3] == B.B[3]);
+			if (!bSame) { ++Mismatch; }
+			if ((A.A[3] & 0xFFFFu) != UniScenes::kGalaxy || (Fa & H::UNI_OBJ_FLAG_DELTA_HIDDEN)) { continue; }
+			++Objects;
+			Early += bE ? 1 : 0;
+			const H::float3 Rgb = H::Uni_UnpackColour(A.B[3]);
+			const double Rb = double(Rgb.x) / std::max(double(Rgb.z), 1e-3);
+			if (bE) { RbEarly += Rb; } else { RbLate += Rb; ++NLate; }
+		}
+	}
+	// The radial rule: members' distances in the cluster's field (anchored at the origin, fixed
+	// orientation, so the field point is the offset over the influence radius).
+	{
+		FRefGenerator G(*ModelOn);
+		FRefPipeline P(G);
+		P.bVelocityLod = false;
+		P.Update(Moved(FCoord::Origin(), FVec3d{ 0.1 * Units::Mpc, -0.05 * Units::Mpc, 0.02 * Units::Mpc }), FVec3f{});
+		for (const auto& KV : P.CacheRef())
+		{
+			const FCellContent& C = KV.second;
+			for (size_t I = 0; I < C.Objects.size(); ++I)
+			{
+				const FObjectGPU& O = C.Objects[I];
+				if ((O.A[3] & 0xFFFFu) != UniScenes::kGalaxy || C.ObjectContributor[I] != ClusterId || ((O.A[3] >> 16) & H::UNI_OBJ_FLAG_DELTA_HIDDEN)) { continue; }
+				const u32 Off[3] = { O.A[0], O.A[1], O.A[2] };
+				const double R = Length(ToDouble(Sub(ObjectCoord(KV.first, Off), FCoord::Origin()))) / Influence;
+				for (FBin& Bn : Bins)
+				{
+					if (R < Bn.Lo || R >= Bn.Hi) { continue; }
+					++Bn.N;
+					Bn.E += ((O.A[3] >> 16) & H::UNI_OBJ_FLAG_EARLY) ? 1 : 0;
+					Bn.Expect += double(H::Uni_ClusterEarlyFraction(Hp, float(R)));
+				}
+			}
+		}
+	}
+	double WorstZ = 0.0;
+	std::string BinText;
+	for (const FBin& Bn : Bins)
+	{
+		if (Bn.N == 0) { continue; }
+		const double Pm = Bn.Expect / double(Bn.N);
+		const double Z = (double(Bn.E) - Bn.Expect) / std::sqrt(std::max(double(Bn.N) * Pm * (1.0 - Pm), 1e-9));
+		WorstZ = std::max(WorstZ, std::abs(Z));
+		BinText += Uni::Fmt(" r %.2f-%.2f: %lld/%lld early (rule %.2f);", Bn.Lo, Bn.Hi, Bn.E, Bn.N, Pm);
+	}
+	// Contributors: early ones on the early shape, late ones as before.
+	std::map<u32, FContributor> OffById;
+	for (const FContributor& C : MemOff) { OffById[C.Id] = C; }
+	size_t EarlyCt = 0, EarlyArms = 0, LateChanged = 0;
+	for (const FContributor& C : MemOn)
+	{
+		if (C.bEarly) { ++EarlyCt; EarlyArms += (C.Params.V[6] != 0.0f || C.Params.V[8] != 0.0f) ? 1 : 0; continue; }
+		auto It = OffById.find(C.Id);
+		if (It == OffById.end() || std::memcmp(It->second.Params.V, C.Params.V, sizeof(C.Params.V)) != 0) { ++LateChanged; }
+	}
+	// No early field galaxy in the web scene.
+	size_t FieldEarly = 0, FieldGal = 0;
+	{
+		FUniverseModel Mw(UniScenes::WebToGalaxy());
+		FRefGenerator Gw(Mw);
+		FRefPipeline Pw(Gw);
+		Pw.bVelocityLod = false;
+		Pw.Update(UniScenes::VoidCamera(), FVec3f{});
+		std::set<u32> ClusterIds;
+		for (const auto& KV : Pw.Contributors()) { if (KV.second.ParentArchetypeId == UniScenes::kCluster) { ClusterIds.insert(KV.first); } }
+		for (const auto& KV : Pw.CacheRef())
+		{
+			for (size_t I = 0; I < KV.second.Objects.size(); ++I)
+			{
+				const FObjectGPU& O = KV.second.Objects[I];
+				if ((O.A[3] & 0xFFFFu) != UniScenes::kGalaxy || ClusterIds.count(KV.second.ObjectContributor[I])) { continue; }
+				++FieldGal;
+				FieldEarly += ((O.A[3] >> 16) & H::UNI_OBJ_FLAG_EARLY) ? 1 : 0;
+			}
+		}
+	}
+	// Dust carriers of early types, and the cost inside the core, against off.
+	size_t EarlyDust = 0;
+	double Steps[2] = { 0, 0 }, Ms[2] = { 0, 0 };
+	for (int K = 0; K < 2; ++K)
+	{
+		FUniverseDef D = AnchoredCluster();
+		if (K == 0) { D.Anchors[0].EmitterParams[0].V[8] = 0.0f; }
+		FUniverseModel M(D);
+		FRefGenerator G(M);
+		FVolumeBuilder VB(M, G);
+		FRefPipeline P(G);
+		P.bVelocityLod = false;
+		const FVec3d Off{ 0.384 * Units::Mpc, -0.256 * Units::Mpc, 0.192 * Units::Mpc };
+		const FCoord Cam = Moved(FCoord::Origin(), Off);
+		P.Update(Cam, FVec3f{});
+		FCamera Cm; Cm.Coord = Cam; Cm.Width = 242; Cm.Height = 159; Cm.DeltaMag = 0.0;
+		Cm.LookAlong({ -Off.X, -Off.Y, -Off.Z });
+		FVolumeScene S = VB.Build(P, Cam, FVec3f{}, Cm.View()).Subset(false);
+		for (FCarrierGPU& C : S.Carriers) { if (C.FieldId != H::UNI_FIELD_GALAXY) { C.Weight = 0.0f; } }
+		if (K == 1)
+		{
+			for (const auto& KV : P.Contributors())
+			{
+				const FContributor& C = KV.second;
+				if (!C.bEarly) { continue; }
+				// An early type's dust is off at the source (the builder's rule), whatever is resident.
+				const FArchetype& A = M.Definition().Arch(C.ParentArchetypeId);
+				const bool bDust = A.Volume.bDust && A.Volume.DustTau > 0.0f && C.Emitter->FieldId == H::UNI_FIELD_GALAXY && !C.bEarly;
+				EarlyDust += bDust ? 1 : 0;
+			}
+		}
+		FImage Img(Cm.Width, Cm.Height);
+		const auto T0 = std::chrono::steady_clock::now();
+		const FVolumeStats St = RenderVolume(S, Cm, Img, nullptr, 2);
+		Ms[K] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - T0).count();
+		Steps[K] = double(St.Steps);
+	}
+	const double EarlyShare = Objects ? double(Early) / double(Objects) : 0.0;
+	const double RedE = Early ? RbEarly / double(Early) : 0.0, RedL = NLate ? RbLate / double(NLate) : 0.0;
+	Uni::Check(2, "T2.cluster.morphology", "D-172 morphology-density: galaxies unchanged but for early types' colour and flag (their stars follow the new shape); early share per radial bin within 4 sigma of the rule; early types redder, on the early shape (no arms), dust-free; late types' parameters unchanged; no early field galaxies; the core's galaxy volume no costlier")
+		.Metric("early_share", EarlyShare).Metric("worst_z", WorstZ).Metric("steps_on", Steps[1]).Metric("steps_off", Steps[0])
+		.Pass(Mismatch == 0 && CellsDiff == 0 && Objects > 0 && Early > 0 && WorstZ < 4.0 && RedE > RedL && EarlyCt > 0 && EarlyArms == 0 && LateChanged == 0 && FieldGal > 0 && FieldEarly == 0 && EarlyDust == 0 && Steps[1] <= Steps[0],
+			Uni::Fmt("%zu members, %.0f%% early;%s worst %.1f sigma; R/B colour %.2f early vs %.2f late; %zu early contributors (%zu with arms), %zu late changed; %zu of %zu field galaxies early; objects differing beyond colour/flag %zu, cells %zu; core galaxy volume %.2e -> %.2e steps (%.0f -> %.0f ms)",
+				Objects, 100.0 * EarlyShare, BinText.c_str(), WorstZ, RedE, RedL, EarlyCt, EarlyArms, LateChanged, FieldEarly, FieldGal, Mismatch, CellsDiff, Steps[0], Steps[1], Ms[0], Ms[1]));
+}

@@ -43,6 +43,7 @@ static const uint UNI_OBJ_FLAG_DELTA_HIDDEN = 2u;
 static const uint UNI_OBJ_FLAG_HAS_CONTRIBUTOR = 4u;
 static const uint UNI_OBJ_FLAG_EXTENDED = 8u;
 static const uint UNI_OBJ_FLAG_ANCHOR = 16u;
+static const uint UNI_OBJ_FLAG_EARLY = 32u;           // D-172: an early-type (elliptical / lenticular) cluster member
 
 // ------------------------------------------------------------------------------------------
 // Half floats, integer only (bit-identical on both sides; not the f32tof16 intrinsic, whose
