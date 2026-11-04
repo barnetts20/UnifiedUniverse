@@ -896,3 +896,53 @@ Decision:
 Rationale: T2.webtex.groups: 4,012 groups per tile after 113 clusters (heaviest brightest); from intergalactic space 984 resident, every one at its entry's exact position and magnitude; every field galaxy and cluster identical to the scene without groups (580 cells); dwarfs all within M −16..−12; the heaviest group's dwarfs with the camera at its centre 139 for a budget of 142.1 (0.98×, −0.3 σ). T2.stream.* and T2.cluster.no_reroll unchanged (new archetypes change nothing else; one more volume LUT block).
 Reroll impact: None for existing content (new archetypes only; field galaxies, clusters and stars of existing galaxies identical). New: groups and their dwarfs (and the dwarfs' stars). uu.Group.Enable 0 removes them.
 Status: Provisional (UE-16)
+
+D-175 — Catalogue lookup by tile cell (D-174 follow-up)
+Question: Owner's engine log after D-174: game-thread spikes of 50–450 ms at speed in Submit (40–250 ms of its own) and Batches (30–450 ms), with the backend calls under 1 ms. Offline the travel check did not show it (its flight holds the full-sensitivity window only briefly).
+Cause: a cell's catalogue objects were found by walking every entry at its level, about 100 µs per cell for the 4,012 groups at L86, twice per cell (HasAuthored at submission, the authored content at allocation). At travel sensitivity the L86 window is up to 13³ cells and a shift brings hundreds.
+Decision: `FRefGenerator` indexes catalogue entries per level by their cell within the tile (hash of the tile-local cell index; cells larger than a tile, or a tile deeper than 21 levels below it, keep the walk); a cell looks up its bucket, sorts the refs into the walk's order and tests each exactly as before.
+Rationale: T2.webtex.catalogue_lookup: 8,788 cells over 13³ per catalogue level around two cameras, 530,871 catalogue objects, identical to the walk (entries, offsets, order); 6.1 µs per cell against the walk's 106 µs. T2.webtex.nodes, T2.webtex.groups, T2.stream.parity unchanged.
+Reroll impact: None.
+Status: Provisional (UE-16)
+
+D-176 — Adaptive wake angle (D-168 follow-up)
+Question: Owner's hitch log after D-175: at intergalactic speed with travel sensitivity the awake set still held tens of thousands of clusters and groups. Most were awake only because they subtended more than WakeTheta (half the volume's reject angle), not because their influence reached a window; the volume keeps at most MaxCarriers = 128 of them (the largest, D-161).
+Decision: the angle threshold adapts: Th = WakeTheta x 2^(WakeStep / 4). It rises a quarter octave while more than 2 x `WakeAngleTarget` (512) objects are awake for their angle alone, falls below half the target, holds 4 frames between steps, and never goes below WakeTheta. Each scan counts its cell's angle-only objects (FCell::AngleAwake). The window-reach criterion (what generation needs) is untouched. Profile: AwakeByAngle, WakeStep.
+Rationale: the angle wake only feeds the volume builder, which keeps the 128 largest; 512 leaves 4x headroom. Generation is unchanged (T2.webtex.travel: cells Ready in both runs identical).
+Reroll impact: None.
+Status: Provisional (UE-17)
+
+D-177 — Hybrid cluster split; groups as labels; dwarfs from the map (owner's choices)
+Question: Owner's hitch logs after D-175/D-176: game-thread cost at intergalactic speed still too high, with clusters (44k awake) and groups (15k awake) the bulk of the contributors, because a cluster's bright members can be seen from ~330 Mpc (D-152), so it had to stay awake that far. The owner asked whether galaxies should simply be spawned against the density maps. They wanted to keep the look of the clusters and named clusters and groups. Options offered: a pure density field; a hybrid split; groups as labels. Owner chose **"Hybrid split"** and **"Yes, map dwarfs"**.
+Decision:
+- **Bright members authored (catalogue clusters).** A catalogue cluster's members at galaxy levels from L86 (M brighter than −20.82; ~5.3% of members) are generated on the CPU with the catalogue, around each copy, from the copy's own contributor (`FRefGenerator::CopyMembers`). The copy's object and contributor are built exactly as the streamer builds them (shape, orientation, influence, D-172 early shape).
+  - Count: Poisson(NTotal x BrightRatio), at most 64.
+  - Magnitude: a bright slice by its share, then the slice's inverse CDF.
+  - Position: drawn from the contributor's field (UniField_ClusterC), rotated to world.
+  - Morphology, radius and colour: D-172's rule; radius and colour as generated objects draw them.
+  - Seeds: all draws keyed by the copy's object seed on the new channel UNI_CH_MEMBER and the member's rank.
+  - Indices: kFirstMemberIndex (2^21) + entry x 64 + rank.
+  - Members are cached per copy, sorted by level.
+- **Lookup.** Each entry is indexed at every member level under every tile cell its members' reach can overlap, with the copy's cell offset. The reach bound is the radius model's largest draw x the influence multiplier x the largest cut, plus 1%. A cell looks up one bucket, rejects copies whose reach misses it, then visits only that level's members. HasAuthored stops at the first member.
+- **Field sampler (`SampleClusterField`).** It draws the cluster field exactly. The proposal is the body without its taper (an ellipsoidal β model, radius by safeguarded Newton on its CDF) plus the clumps without their edge (Plummer spheres, closed-form radius), each chosen by its mass. Since f ≤ h, accepting with f / h gives f, and about 85% of draws are accepted. The first version used uniform rejection in the sphere, capped at 256 tries. That needs ~1,400–25,000 tries per point for core radii 0.12–0.02, so it silently dropped most members of compact clusters; never committed.
+- **The emitter's share.** The cluster emitter now places kMember (6), the galaxy archetype with its LF cut at −20.82. Its NTotal is scaled by (1 − PBright), and BrightRatio = PBright / (1 − PBright), so the total is unchanged. Its children are at finer levels, so a cluster is woken only as far as those windows reach.
+- **Groups and dwarfs.** Groups are labels: catalogue entries with no emitter (no contributor, no bookkeeping). They keep their names, positions and magnitudes (their light is the dwarfs' worth, D-174), and uu.GotoGroup / uu.Clusters find them as resident objects (`FUniStreamer::ForEachObjectOf`). Dwarfs come from one root emitter on the web's node matter (textured), with NTotal = the groups' dwarfs per tile volume.
+- **Engine.** GoToHost takes 3 radii as a group's extent. A cluster's member estimate includes its authored members.
+Rationale:
+- Offline flight (T2.webtex.travel, 0 → 100 Mpc/s, reference container):
+
+  | | p50 | p95 | Worst | Frames over 33 ms |
+  |---|---|---|---|---|
+  | Lazy | 6.8 ms | 19.5 ms | 24.0 ms | 0 |
+  | Eager | 10.5 ms | 48.6 ms | 69.0 ms | 28 |
+
+  - Lazy run: awake contributors peak at 2.9k of 101k emitter objects. Before the split: ~60k awake, and the worst frames had 35–57 ms of Submit.
+  - Cells Ready in both runs identical (27,163 cells, 553k objects).
+- Member cost per cell (HasAuthored + content, 11³ cells around the void camera, cold / warm): L86 6.4 / 2.9 µs; L87 28.6 / 3.8 µs. The 27-bucket version measured 282 / 40 µs at L87.
+- T2.webtex.members: members inside their cluster's cut (worst at 0.71 of it); 65 for 62.1 expected over the 3 clusters within 30 Mpc (0.4σ); authored bright, emitter members faint; early types 0.80 in cores and 0.23 outside; member cells identical regenerated and from a fresh generator; the sampler's radial distribution equals plain rejection's (KS 0.009 against a 1% bar of 0.027).
+- T2.webtex.groups: groups are labels (0 contributors), all at their entries exactly; galaxies and clusters identical with groups off; the dwarf emitter's total equals the groups' dwarfs exactly; dwarfs on node matter (54x its mean).
+Reroll impact:
+- Yes, cluster members of catalogue clusters: the bright ones move to new positions and seeds, and the faint ones reroll, since their emitter's count and child archetype changed. Field galaxies, clusters themselves and stars of non-member galaxies are unchanged.
+- Dwarfs reroll: they now come from the map, not per group. Groups keep their positions, names and magnitudes.
+- Scenes with procedural clusters (no node list) are unchanged.
+Status: Provisional (UE-17)

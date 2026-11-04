@@ -26,7 +26,7 @@ namespace UniScenes
 	using namespace UniCore;
 	namespace H = UniHlsl;
 
-	constexpr u32 kStar = 1, kGalaxy = 2, kCluster = 3, kDwarf = 4, kGroup = 5;   // D-174: dwarfs and groups
+	constexpr u32 kStar = 1, kGalaxy = 2, kCluster = 3, kDwarf = 4, kGroup = 5, kMember = 6;   // D-174: dwarfs and groups; D-177: clusters' fainter members
 
 	/** D-151: the tuning handles for galaxy groups and clusters. Defaults are the realistic
 	 *  distribution; every value here changes generated content (it is a content definition), so
@@ -231,6 +231,41 @@ namespace UniScenes
 		return Value;
 	}
 
+	/** D-177: the faintest magnitude of the galaxy function's coarse, bright levels (>= the
+	 *  level of an M* galaxy's next brighter slice): the cut between a catalogue cluster's
+	 *  authored bright members and those its emitter places. Read from the galaxy slices, so it
+	 *  follows the function: the faint edge of the second-coarsest galaxy level (L86: -20.82). */
+	inline int BrightMemberMinLevel() { return 86; }
+	inline double BrightMemberCut()
+	{
+		static const double Value = []()
+		{
+			FUniverseDef D;
+			D.Seed = 69;
+			D.Archetypes.resize(3);
+			D.Archetypes[0].Id = 0; D.Archetypes[0].Name = "Root";
+			D.Archetypes[kStar] = MakeStar();
+			D.Archetypes[kGalaxy] = MakeGalaxy();
+			const FUniverseModel M(D);
+			double Cut = -20.82;
+			for (const FSlice& S : M.SlicesOf(kGalaxy).Slices) { if (S.Level == BrightMemberMinLevel()) { Cut = S.FaintM; } }
+			return Cut;
+		}();
+		return Value;
+	}
+
+	/** D-177: a catalogue cluster's fainter members (M fainter than BrightMemberCut): the galaxy
+	 *  archetype with its function cut there, so they live only at the finer levels and their
+	 *  cluster's reach is ~200 Mpc instead of ~800. Same look, morphology rule and stars. */
+	inline FArchetype MakeMember()
+	{
+		FArchetype A = MakeGalaxy();
+		A.Id = kMember;
+		A.Name = "Member";
+		A.AbsMag = FMagnitudeLut::Schechter(-21.0, -1.1, BrightMemberCut(), -16.0);
+		return A;
+	}
+
 	/** Group / cluster field exemplar (units of the influence radius, 4 x the cluster radius). */
 	inline FFieldParams ClusterExemplar()
 	{
@@ -433,9 +468,38 @@ namespace UniScenes
 				Cat.Entries.push_back(E);
 				TopMass += (*Nodes)[I].Mass;
 			}
+			// D-177: the clusters' brightest members (the coarse galaxy levels, ~5%) are authored
+			// with the catalogue; their emitter places the fainter ones (kMember), so a cluster is
+			// woken and kept resident only as far as those finer windows reach.
+			{
+				FArchetype& Ca = D.Archetypes[kCluster];
+				if (!Ca.Emitters.empty())
+				{
+					double PBright = 0.0;
+					{
+						FUniverseDef Dg;
+						Dg.Seed = 69;
+						Dg.Archetypes.resize(3);
+						Dg.Archetypes[0].Id = 0; Dg.Archetypes[0].Name = "Root";
+						Dg.Archetypes[kStar] = MakeStar();
+						Dg.Archetypes[kGalaxy] = MakeGalaxy();
+						const FUniverseModel Mg(Dg);
+						for (const FSlice& Sl : Mg.SlicesOf(kGalaxy).Slices) { if (Sl.Level >= BrightMemberMinLevel()) { PBright += Sl.P; } }
+					}
+					FUniEmitter& Ce = Ca.Emitters[0];
+					Ce.ChildArchetypeId = kMember;
+					Ce.NTotal *= std::clamp(1.0 - PBright, 0.0, 1.0);
+					Cat.bBrightMembers = PBright > 0.0;
+					Cat.MemberArchetypeId = kGalaxy;
+					Cat.MemberMinLevel = BrightMemberMinLevel();
+					Cat.BrightRatio = PBright < 1.0 ? PBright / (1.0 - PBright) : 0.0;
+				}
+			}
 			D.Catalogues.push_back(Cat);
 			// D-174: the remaining nodes are groups; each node's dwarfs go with its mass (the
 			// median-mass group holds T.GroupDwarfs), and the group's magnitude is their light.
+			// D-177 (owner): groups are labels only (named, uu.GotoGroup); their dwarfs come from
+			// the web's node matter directly (a root emitter), with the same total.
 			if (T.bGroups && T.GroupDwarfs > 0.0 && K < Nodes->size())
 			{
 				std::vector<double> Ms;
@@ -456,14 +520,32 @@ namespace UniScenes
 					E.AbsMag = float(-2.5 * std::log10(N * F));
 					Groups.Entries.push_back(E);
 				}
-				if (!Groups.Entries.empty()) { D.Catalogues.push_back(Groups); }
+				if (!Groups.Entries.empty())
+				{
+					D.Catalogues.push_back(Groups);
+					D.Archetypes[kGroup].Emitters.clear();   // a label: no contributor, no bookkeeping
+					double Dwarfs = 0.0;
+					for (const FCatalogueEntry& E : Groups.Entries) { Dwarfs += std::pow(10.0, -0.4 * double(E.AbsMag)) / F; }
+					FUniEmitter De;
+					De.ChildArchetypeId = kDwarf;
+					De.FieldId = H::UNI_FIELD_WEB;
+					De.bDensityMode = true;
+					De.PeriodBits = P;
+					De.Exemplar.V[0] = 1.0f;
+					De.Exemplar.V[1] = 0.12f;
+					De.Exemplar.V[9] = 1.0f;                // node matter only (groups' and clusters' alike)
+					De.Exemplar.V[10] = 1.0f;               // textured
+					De.Exemplar.V[11] = float(TexSize);
+					De.NTotal = Dwarfs / TileCm3;           // the dwarfs the groups held, per cm^3
+					D.RootEmitters.push_back(De);
+				}
 			}
 			D.RootEmitters.erase(std::remove_if(D.RootEmitters.begin(), D.RootEmitters.end(),
 				[](const FUniEmitter& E) { return E.FieldId == H::UNI_FIELD_WEB && E.ChildArchetypeId == kCluster; }), D.RootEmitters.end());
 			int N = 0;
 			for (FUniEmitter& E : D.RootEmitters)
 			{
-				if (E.FieldId != H::UNI_FIELD_WEB) { continue; }
+				if (E.FieldId != H::UNI_FIELD_WEB || E.ChildArchetypeId == kDwarf) { continue; }   // D-177: the dwarfs' emitter is set above
 				E.PeriodBits = P;
 				E.Exemplar = FFieldParams();
 				E.Exemplar.V[0] = 1.0f;
@@ -510,13 +592,14 @@ namespace UniScenes
 	{
 		FUniverseDef D;
 		D.Seed = 69;   // UltraLargeScale's universe root seed
-		D.Archetypes.resize(6);
+		D.Archetypes.resize(7);
 		D.Archetypes[0].Id = 0; D.Archetypes[0].Name = "Root";
 		D.Archetypes[kStar] = MakeStar();
 		D.Archetypes[kGalaxy] = MakeGalaxy();
 		D.Archetypes[kCluster] = MakeCluster();   // placed only by web scenes (AddWeb, with their tuning)
 		D.Archetypes[kDwarf] = MakeDwarf();       // D-174: placed only by groups
 		D.Archetypes[kGroup] = MakeGroup();       // D-174: placed only from the node list
+		D.Archetypes[kMember] = MakeMember();     // D-177: catalogue clusters' fainter members
 		return D;
 	}
 

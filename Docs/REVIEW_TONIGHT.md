@@ -477,3 +477,24 @@ A reviewer read the uncompiled engine code against UE 5.3–5.6 without seeing i
   4. Check the hitch lines and ProfileGPU at a group for any new cost.
 - **Failure looks like:** no groups listed (node list missing: the log says how many groups were added), dwarfs nowhere (group level not filling), or dwarfs scattered everywhere rather than clumped at groups.
 
+### 13j-bis. Groups' game-thread cost (D-175, UE-16)
+*Owner: groups undid the travel gains (hitch log: Submit and Batches 50–450 ms at speed).* Each cell at the group level walked all 4,012 group entries twice (~100 µs per cell); at travel sensitivity hundreds of such cells enter per shift. Now an index by tile cell (6 µs per cell, identical results: T2.webtex.catalogue_lookup).
+- **Test steps:** the same flight as the last log, `uu.PerfHud 1`. Submit and Batches should be back to the D-173 levels. If Submit spikes remain, send the hitch lines: the next suspects are the 5–7k-cell bursts (window rebuilds) themselves.
+
+
+
+## 13k. Intergalactic speed: the hybrid cluster split, groups as labels (D-176, D-177, UE-17)
+*Owner's choices: "Hybrid split" and "Yes, map dwarfs". Verified offline: T2.webtex.travel, T2.webtex.members, T2.webtex.groups.*
+
+- **What changes:**
+  - A catalogue cluster's brightest ~5% of members (M brighter than −20.82) are now placed with the cluster itself (authored, around each copy, from its own field). Its emitter places only the fainter ones, so a cluster is awake only as far as those finer windows reach.
+  - Groups are labels: named catalogue objects with no emitter. Dwarfs come from the web's node matter directly (same total).
+  - The angle wake adapts (D-176): it keeps ~512 objects awake for their angle alone, of which the volume uses the 128 largest.
+- **Offline, same flight as T2.webtex.travel (0 → 100 Mpc/s):** bookkeeping p50 6.8 ms, p95 19.5, worst 24.0 (was ~18 ms typical with 35–57 ms Submit spikes), 0 frames over 33 ms, about 2.9k awake contributors; content identical to the eager run.
+- **Content:** every catalogue cluster's members reroll (bright ones authored now, faint ones from a changed emitter); dwarfs reroll (from the map). Field galaxies, clusters themselves, groups' positions and names are unchanged.
+- **Test steps:**
+  1. Build (UniGenRef.h, UniStreamer.h, UniDemoScenes.h, UniSubsystem.cpp changed; new seed channel MEMBER in UniSeed.ush).
+  2. `uu.Enable flythrough`, accelerate to intergalactic speed with travel sensitivity on, `uu.PerfHud 1`: send the hitch lines. Submit and Levels should no longer spike into the 35–57 ms range; Wake stays small.
+  3. `uu.GotoCluster rich`: the cluster should look as before: bright galaxies concentrated to the core, ellipticals (redder, round) in it, fainter members around. Fly through: no pop when the bright members' cells load (they come with L86/L87 cells, which are resident far out).
+  4. `uu.Clusters`: both lines (clusters, groups) list resident counts; `uu.GotoGroup rich` lands at a group (3 radii out). Dwarfs there are clumped on the node (they no longer belong to the group object, so the jump message reports the group's light in dwarfs' worth).
+- **Failure looks like:** clusters missing their bright galaxies (member levels not filling), bright members far outside a cluster (a frame mismatch: report it), or uu.GotoGroup saying no group is resident (the new object walk not finding labels).

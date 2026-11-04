@@ -62,5 +62,9 @@
   {
     "id": "UE-16",
     "what": "Galaxy groups and dwarfs in the engine (D-174): groups resident from the node list, uu.GotoGroup [rich] landing at a group with its dwarfs and the web's bright galaxies around it, uu.Clusters listing clusters and groups from resident objects, uu.Group.Enable / uu.Group.Dwarfs, and no game-thread or GPU cost visible from groups (REVIEW_TONIGHT \u00a713j)."
+  },
+  {
+    "id": "UE-17",
+    "what": "The hybrid cluster split and map dwarfs in the engine (D-176, D-177): game-thread cost at intergalactic speed with uu.Enable flythrough and travel sensitivity (hitch lines: Submit, Levels, Wake; AwakeByAngle and WakeStep), clusters looking as before up close (uu.GotoCluster rich: bright members around the core, ellipticals in it), uu.GotoGroup and uu.Clusters finding groups (labels, no emitter), dwarfs clumped on nodes (REVIEW_TONIGHT \u00a713k)."
   }
 ]

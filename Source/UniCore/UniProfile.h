@@ -90,6 +90,8 @@ namespace UniCore
 		uint64_t Awake = 0;                // D-168: registered contributors after the wake pass
 		uint64_t Asleep = 0;               // D-168: emitter objects asleep (not registered)
 		uint64_t CellsDeferred = 0;        // D-173: entering cells left waiting for a later frame
+		uint64_t AwakeByAngle = 0;         // D-176: awake for their angle only
+		int WakeStep = 0;                  // D-176: angle threshold step (x 2^(step / 4))
 
 		void BeginFrame()
 		{

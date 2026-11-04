@@ -990,12 +990,12 @@ void UUniSubsystem::LogClusters() const
 		T.EarlyCore, T.EarlyOuter, T.EarlyScale, T.bGroups ? TEXT("on") : TEXT("off"), T.GroupDwarfs);
 	if (!Streamer) { return; }
 	const UniCore::FCoord Cam = Camera.ToCore();
-	// D-168: clusters and groups far from any window they feed sleep (not in Contributors()), so
-	// count the resident objects themselves.
+	// D-168: clusters far from any window they feed sleep (not in Contributors()), so count the
+	// resident objects themselves. D-177: groups are labels (no emitter): every resident object.
 	auto Census = [&](UniCore::u32 Arch, double RichMag, int32& N, int32& Rich, double& Nearest, double& NearestRich)
 	{
 		N = Rich = 0; Nearest = NearestRich = 0.0;
-		Streamer->ForEachEmitterObject(Arch, [&](const UniCore::FCoord& C, const UniCore::FObjectGPU& O)
+		Streamer->ForEachObjectOf(Arch, [&](const UniCore::FCoord& C, const UniCore::FObjectGPU& O)
 		{
 			const double M = double(UniHlsl::Uni_ObjectAbsMag(UniCore::ToHlsl(O)));
 			const double D = UniCore::Length(UniCore::ToDouble(UniCore::Sub(C, Cam)));
@@ -1022,12 +1022,14 @@ bool UUniSubsystem::GoToHost(UniCore::u32 Arch, double BrighterThan, const TCHAR
 	if (!bEnabled || !Streamer || !Model) { return false; }
 	const UniCore::FCoord Cam = Camera.ToCore();
 	const UniCore::FArchetype& A = Model->Definition().Arch(Arch);
-	if (A.Emitters.empty()) { return false; }
-	const UniCore::FUniEmitter& E = A.Emitters[0];
+	// D-177: a group is a label (no emitter): its extent is ~3 radii (its dwarfs and the web's
+	// galaxies there come from the map, not from it).
+	const UniCore::FUniEmitter* E = A.Emitters.empty() ? nullptr : &A.Emitters[0];
+	const double InflMul = E ? E->InfluenceMul : 3.0;
 	bool bFound = false;
 	UniCore::FCoord Best;
 	double BestD = 0.0, BestM = 0.0, BestInfl = 0.0;
-	Streamer->ForEachEmitterObject(Arch, [&](const UniCore::FCoord& C, const UniCore::FObjectGPU& O)
+	Streamer->ForEachObjectOf(Arch, [&](const UniCore::FCoord& C, const UniCore::FObjectGPU& O)
 	{
 		const UniHlsl::FUniObject H = UniCore::ToHlsl(O);
 		const double M = double(UniHlsl::Uni_ObjectAbsMag(H));
@@ -1035,7 +1037,7 @@ bool UUniSubsystem::GoToHost(UniCore::u32 Arch, double BrighterThan, const TCHAR
 		const double D = UniCore::Length(UniCore::ToDouble(UniCore::Sub(C, Cam)));
 		if (bFound && D >= BestD) { return; }
 		bFound = true; Best = C; BestD = D; BestM = M;
-		BestInfl = E.InfluenceMul * std::exp2(double(UniHlsl::Uni_ObjectRadiusLog2(H)));
+		BestInfl = InflMul * std::exp2(double(UniHlsl::Uni_ObjectRadiusLog2(H)));
 	});
 	if (!bFound)
 	{
@@ -1055,9 +1057,15 @@ bool UUniSubsystem::GoToHost(UniCore::u32 Arch, double BrighterThan, const TCHAR
 	SetFlySpeed(0.2 * BestInfl);
 	SetCamera(FUniCoord::Make(To));
 	if (APlayerController* PC = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr) { PC->SetControlRotation(FVector(-Dir.X, -Dir.Y, -Dir.Z).Rotation()); }
-	const double Members = std::isfinite(E.NTotalRefMag) ? E.NTotal * std::pow(10.0, -0.4 * (BestM - E.NTotalRefMag)) : E.NTotal;
+	// Members: a cluster's from its emitter (its fainter members) plus its authored bright ones
+	// (D-177); a group's dwarfs from its light (D-174: its magnitude is their light), now drawn
+	// from the node matter around it.
+	double Members = 0.0;
+	if (E) { Members = std::isfinite(E->NTotalRefMag) ? E->NTotal * std::pow(10.0, -0.4 * (BestM - E->NTotalRefMag)) : E->NTotal; }
+	if (Arch == UniScenes::kCluster) { for (const UniCore::FCatalogue& Cat : Model->Definition().Catalogues) { if (Cat.ArchetypeId == Arch && Cat.bBrightMembers) { Members *= 1.0 + Cat.BrightRatio; } } }
+	if (Arch == UniScenes::kGroup) { Members = std::pow(10.0, -0.4 * BestM) / UniScenes::DwarfMeanFluxV(); }
 	UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: jumped to a %s of M = %.2f (~%.0f %s) that was %s away; now %s from its centre."),
-		What, BestM, Members, Arch == UniScenes::kGroup ? TEXT("dwarfs, plus the web's bright galaxies there") : TEXT("galaxies"), UTF8_TO_TCHAR(UniCore::FormatDistance(BestD).c_str()), UTF8_TO_TCHAR(UniCore::FormatDistance(Out).c_str()));
+		What, BestM, Members, Arch == UniScenes::kGroup ? TEXT("dwarfs' worth of light, plus the web's bright galaxies there") : TEXT("galaxies"), UTF8_TO_TCHAR(UniCore::FormatDistance(BestD).c_str()), UTF8_TO_TCHAR(UniCore::FormatDistance(Out).c_str()));
 	return true;
 }
 

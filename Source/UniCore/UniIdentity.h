@@ -13,6 +13,7 @@ namespace UniCore
 {
 	constexpr u32 kFirstAnchorIndex = 1u << 15;
 	constexpr u32 kFirstCatalogueIndex = 1u << 20;   // D-167: catalogue objects (authored too: IsAnchor holds)
+	constexpr u32 kFirstMemberIndex = 1u << 21;      // D-177: catalogue entries' authored bright members (entry x 64 + rank)
 
 	struct FObjectId
 	{

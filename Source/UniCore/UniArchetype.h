@@ -233,6 +233,16 @@ namespace UniCore
 		u32 ArchetypeId = 0;
 		int PeriodBits = 89;
 		std::vector<FCatalogueEntry> Entries;
+		/** D-177: the entries' brightest children are authored too, not placed by their emitter:
+		 *  children of archetype MemberArchetypeId at its levels >= MemberMinLevel (the coarse,
+		 *  bright ones, whose windows reach ~1 Gpc and kept every cluster awake). Drawn on the CPU
+		 *  from the entry's own field (its contributor: shape, orientation, influence), BrightRatio
+		 *  of them per child its emitter places. The emitter's child archetype must then hold only
+		 *  the fainter ones (UseDeliveredWeb: kMember). */
+		bool bBrightMembers = false;
+		u32 MemberArchetypeId = 0;
+		int MemberMinLevel = 0;
+		double BrightRatio = 0.0;
 	};
 
 	struct FSuppressor

@@ -1,6 +1,6 @@
 // univerify: offline verification CLI for the Unified Universe plugin (D-016).
 //
-//   univerify test [--quick] [--json FILE] [--group NAME]   run registered tests
+//   univerify test [--quick] [--json FILE] [--group NAME]   run registered tests (NAME: a group, or group.test)
 //   univerify fuzzdump N FILE                                coordinate cases for the Python oracle
 //   univerify seeddump                                       seed values for the Python oracle
 //   univerify gen --scene NAME                               run a scene's reference pipeline, print stats
@@ -34,7 +34,7 @@ namespace
 
 		for (const Uni::FTestEntry& T : Uni::Registry())
 		{
-			if (!Group.empty() && T.Group != Group) { continue; }
+			if (!Group.empty() && T.Group != Group && T.Group + "." + T.Name != Group) { continue; }   // a group, or one test as group.name
 			std::printf("[%s.%s]\n", T.Group.c_str(), T.Name.c_str());
 			std::fflush(stdout);
 			const int FailedBefore = Uni::FExpect::Get().Failed;

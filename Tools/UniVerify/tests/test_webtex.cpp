@@ -20,7 +20,9 @@
 #include "UniWebTexture.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <set>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -700,7 +702,7 @@ UNI_TEST(webtex, nodes)
 			else if (Arch == UniScenes::kGalaxy)
 			{
 				const auto It = P.Contributors().find(KV.second.ObjectContributor[I]);
-				const bool bMember = It != P.Contributors().end() && It->second.ParentArchetypeId == UniScenes::kCluster;
+				const bool bMember = (It != P.Contributors().end() && It->second.ParentArchetypeId == UniScenes::kCluster) || KV.second.Indices[I] >= kFirstMemberIndex;   // D-177: authored bright members too
 				if (!bMember)
 				{
 					++WebGal;
@@ -875,7 +877,7 @@ UNI_TEST(webtex, travel)
 		}
 	}
 	const double Gain = Out[0].MeanMs / std::max(Out[1].MeanMs, 1e-6);
-	const double GainMin = 2.5, WorstMax = 90.0;   // on the reference container (2 slow cores)
+	const double GainMin = 1.8, WorstMax = 45.0;   // on the reference container (2 slow cores). D-177: the cluster split made the eager run cheap too (17 ms mean here), so the gain bar is lower and the worst-frame bar tighter
 	size_t Cells = 0, Objects = 0, Differ = 0, NotYet = 0;
 	if (!Only)
 	{
@@ -912,7 +914,7 @@ UNI_TEST(webtex, travel)
 			std::printf(" | gen %.2f mean, %.2f in the worst | woke %u slept %u awake %u asleep %u\n", Out[K].GenMean, Out[K].WorstGen, unsigned(Out[K].Worst.Woken), unsigned(Out[K].Worst.Slept), unsigned(Out[K].Worst.Awake), unsigned(Out[K].Worst.Asleep));
 		}
 	}
-	Uni::Check(2, "T2.webtex.travel", "D-168/D-173 streamer bookkeeping on the flythrough scene (adhesion web, galaxies, stars) from rest to 100 Mpc/s (the whole update less the CPU backend's generation, which the GPU does in the engine), against every emitter object registered and no submission spreading: identical cells and objects through the flight, mean cost at least 2.5x lower, worst frame under 90 ms on the reference (2 slow cores), and a lower peak of cells submitted in one frame")
+	Uni::Check(2, "T2.webtex.travel", "D-168/D-173 streamer bookkeeping on the flythrough scene (adhesion web, galaxies, stars) from rest to 100 Mpc/s (the whole update less the CPU backend's generation, which the GPU does in the engine), against every emitter object registered and no submission spreading: identical cells and objects through the flight, mean cost at least 1.8x lower, worst frame under 45 ms on the reference (2 slow cores; D-177), and a lower peak of cells submitted in one frame")
 		.Metric("mean_ms_eager", Out[0].MeanMs).Metric("mean_ms_lazy", Out[1].MeanMs).Metric("worst_ms_eager", Out[0].WorstMs).Metric("worst_ms_lazy", Out[1].WorstMs)
 		.Metric("awake_peak", double(Out[1].PeakAwake)).Metric("registered_peak_eager", double(Out[0].PeakAwake))
 		.Metric("cells_differ", double(Differ)).Metric("peak_cells_before", double(Out[0].MaxCells)).Metric("peak_cells_after", double(Out[1].MaxCells))
@@ -1039,16 +1041,17 @@ UNI_TEST(webtex, debug)
 
 UNI_TEST(webtex, groups)
 {
-	// D-174: galaxy groups from the node list (owner's option 2). The nodes after the clusters
-	// are group objects; each places only dwarfs (M -16..-12, below the galaxy function), its
-	// count going with its node's mass. Checks: the catalogue (every remaining node, heaviest
-	// brightest); resident groups at their entries' exact positions and magnitudes; every field
-	// galaxy and cluster identical to the scene without groups; dwarfs within their magnitudes;
-	// the dwarfs of one group against its budget (camera at its centre); residency.
+	// D-174, revised by D-177 (owner: groups become labels, dwarfs come from the map). The nodes
+	// after the clusters are group objects: named catalogue entries with no emitter (no contributor,
+	// no bookkeeping). Dwarfs (M -16..-12) come from one root emitter on the web's node matter with
+	// the groups' total. Checks: the catalogue (every remaining node, heaviest brightest); resident
+	// groups at their entries' exact positions and magnitudes, and none of them a contributor;
+	// every field galaxy and cluster identical to the scene without groups; dwarfs within their
+	// magnitudes, at the emitter's density (busiest dwarf level) and on node matter.
 	std::string Err;
 	const FWebTexture& T = Delivered(&Err);
 	std::vector<FWebNode> Nodes;
-	if (!T.IsValid() || !LoadWebNodes(kDeliveredDir, kDeliveredName, Nodes, &Err)) { Uni::Check(2, "T2.webtex.groups", "D-174 galaxy groups").Pass(false, "not loaded: " + Err); return; }
+	if (!T.IsValid() || !LoadWebNodes(kDeliveredDir, kDeliveredName, Nodes, &Err)) { Uni::Check(2, "T2.webtex.groups", "D-174/D-177 galaxy groups").Pass(false, "not loaded: " + Err); return; }
 	FBindScope Bind(T);
 	const H::float4 Mean = T.Mean();
 	const double Share = Mean.z / (double(Mean.x) + Mean.y + Mean.z + Mean.w);
@@ -1063,112 +1066,356 @@ UNI_TEST(webtex, groups)
 	const FUniverseDef DefOn = MakeDef(true), DefOff = MakeDef(false);
 	const FCatalogue* Gc = nullptr;
 	for (const FCatalogue& C : DefOn.Catalogues) { if (C.ArchetypeId == UniScenes::kGroup) { Gc = &C; } }
+	const FUniEmitter* De = nullptr;
+	for (const FUniEmitter& E : DefOn.RootEmitters) { if (E.ChildArchetypeId == UniScenes::kDwarf) { De = &E; } }
 	const size_t Clusters = DefOn.Catalogues.at(0).Entries.size();
 	bool bOrder = Gc != nullptr;
 	if (Gc) { for (size_t I = 1; I < Gc->Entries.size(); ++I) { bOrder = bOrder && Gc->Entries[I].AbsMag >= Gc->Entries[I - 1].AbsMag; } }
-	// Galaxies and clusters with and without groups, from intergalactic space.
-	auto Run = [&](const FUniverseDef& D, const FCoord& Cam, std::map<std::string, std::vector<FObjectGPU>>& OutSnap, size_t& OutGroups, size_t& OutMatched, size_t& OutDwarfs, size_t& OutDwarfBad, std::map<u32, size_t>* OutPerGroup, std::map<u32, double>* OutBudget)
+	const bool bLabel = DefOn.Arch(UniScenes::kGroup).Emitters.empty();
+	struct FRun
+	{
+		std::map<std::string, std::vector<FObjectGPU>> Snap;
+		size_t Groups = 0, Matched = 0, Dwarfs = 0, DwarfBad = 0, GroupContributors = 0;
+		double NodeAtDwarfs = 0.0;
+		std::map<int, std::pair<long long, double>> DwarfByLevel;   // level -> (dwarfs, volume Mpc^3)
+	};
+	auto Run = [&](const FUniverseDef& D, const FCoord& Cam, FRun& R)
 	{
 		FUniverseModel M(D);
 		FRefGenerator G(M);
 		FRefPipeline P(G);
 		P.bVelocityLod = false;
 		P.Update(Cam, FVec3f{});
-		OutGroups = OutMatched = OutDwarfs = OutDwarfBad = 0;
-		const double Tile = std::ldexp(1.0, 89);
+		const int Pb = 89;
+		const double Tile = std::ldexp(1.0, Pb);
+		const std::set<int> DwarfLevels = [&] { std::set<int> S; for (const FSlice& Sl : M.SlicesOf(UniScenes::kDwarf).Slices) { S.insert(Sl.Level); } return S; }();
 		for (const auto& KV : P.CacheRef())
 		{
 			std::vector<FObjectGPU> Keep;
+			long long Dw = 0;
 			for (size_t I = 0; I < KV.second.Objects.size(); ++I)
 			{
 				const FObjectGPU& O = KV.second.Objects[I];
 				const u32 A = O.A[3] & 0xFFFFu;
 				if ((O.A[3] >> 16) & H::UNI_OBJ_FLAG_DELTA_HIDDEN) { continue; }
+				const u32 Off[3] = { O.A[0], O.A[1], O.A[2] };
 				if (A == UniScenes::kGalaxy || A == UniScenes::kCluster) { Keep.push_back(O); }
 				if (A == UniScenes::kDwarf)
 				{
-					++OutDwarfs;
+					++R.Dwarfs; ++Dw;
 					const float Mg = H::Uni_ObjectAbsMag(UniCore::ToHlsl(O));
-					OutDwarfBad += (Mg < -16.01f || Mg > -11.99f) ? 1 : 0;
-					if (OutPerGroup) { ++(*OutPerGroup)[KV.second.ObjectContributor[I]]; }
+					R.DwarfBad += (Mg < -16.01f || Mg > -11.99f) ? 1 : 0;
+					const FCoord C = ObjectCoord(KV.first, Off);
+					float Pf[3];
+					for (int Ax = 0; Ax < 3; ++Ax) { Pf[Ax] = float(U128ToDouble(MaskLow(C.Axis(Ax), Pb)) / Tile); }
+					R.NodeAtDwarfs += H::UniWebTexSample(H::float3(Pf[0], Pf[1], Pf[2]), 0.0f).z;
 				}
 				if (A == UniScenes::kGroup && Gc)
 				{
-					++OutGroups;
-					const u32 Off[3] = { O.A[0], O.A[1], O.A[2] };
+					++R.Groups;
 					const FCoord C = ObjectCoord(KV.first, Off);
 					double Pt[3];
-					for (int Ax = 0; Ax < 3; ++Ax) { Pt[Ax] = U128ToDouble(MaskLow(C.Axis(Ax), 89)) / Tile; }
+					for (int Ax = 0; Ax < 3; ++Ax) { Pt[Ax] = U128ToDouble(MaskLow(C.Axis(Ax), Pb)) / Tile; }
 					const float Mg = H::Uni_ObjectAbsMag(UniCore::ToHlsl(O));
 					for (const FCatalogueEntry& E : Gc->Entries)
 					{
 						double D2 = 0.0;
 						for (int Ax = 0; Ax < 3; ++Ax) { double Dd = std::fabs(Pt[Ax] - E.Pos[Ax]); Dd = std::min(Dd, 1.0 - Dd); D2 += Dd * Dd; }
-						if (D2 < 1e-18 && Mg == RoundToHalf(E.AbsMag)) { ++OutMatched; break; }
+						if (D2 < 1e-18 && Mg == RoundToHalf(E.AbsMag)) { ++R.Matched; break; }
 					}
 				}
 			}
-			const std::string Key = std::to_string(KV.first.Level) + ToHex(KV.first.C[0]) + ToHex(KV.first.C[1]) + ToHex(KV.first.C[2]);
-			if (!Keep.empty()) { OutSnap[Key] = Keep; }
-		}
-		// OutBudget: the group nearest the camera only (every tile copy of an entry has its budget).
-		if (OutBudget)
-		{
-			const FContributor* Near = nullptr;
-			double Dn = 0.0;
-			for (const auto& KV : P.Contributors())
+			if (DwarfLevels.count(KV.first.Level))
 			{
-				if (KV.second.ParentArchetypeId != UniScenes::kGroup) { continue; }
-				const double Dd = Length(ToDouble(Sub(KV.second.Centre, Cam)));
-				if (!Near || Dd < Dn) { Near = &KV.second; Dn = Dd; }
+				const double W = CellWidthCm(KV.first.Level) / Units::Mpc;
+				R.DwarfByLevel[KV.first.Level].first += Dw;
+				R.DwarfByLevel[KV.first.Level].second += W * W * W;
 			}
-			if (Near) { (*OutBudget)[Near->Id] = Near->NTotal; }
+			const std::string Key = std::to_string(KV.first.Level) + ToHex(KV.first.C[0]) + ToHex(KV.first.C[1]) + ToHex(KV.first.C[2]);
+			if (!Keep.empty()) { R.Snap[Key] = Keep; }
 		}
+		for (const auto& KV : P.Contributors()) { R.GroupContributors += KV.second.ParentArchetypeId == UniScenes::kGroup ? 1 : 0; }
 	};
-	std::map<std::string, std::vector<FObjectGPU>> SOn, SOff;
-	size_t GOn = 0, MOn = 0, DOn = 0, BadOn = 0, GOff = 0, MOff = 0, DOff = 0, BadOff = 0;
-	Run(DefOn, UniScenes::VoidCamera(), SOn, GOn, MOn, DOn, BadOn, nullptr, nullptr);
-	Run(DefOff, UniScenes::VoidCamera(), SOff, GOff, MOff, DOff, BadOff, nullptr, nullptr);
+	FRun On, Off;
+	Run(DefOn, UniScenes::VoidCamera(), On);
+	Run(DefOff, UniScenes::VoidCamera(), Off);
 	size_t CellsCmp = 0, CellsDiff = 0;
-	for (const auto& KV : SOff)
+	for (const auto& KV : Off.Snap)
 	{
 		++CellsCmp;
-		auto It = SOn.find(KV.first);
-		if (It == SOn.end() || It->second.size() != KV.second.size() || std::memcmp(It->second.data(), KV.second.data(), KV.second.size() * sizeof(FObjectGPU)) != 0) { ++CellsDiff; }
+		auto It = On.Snap.find(KV.first);
+		if (It == On.Snap.end() || It->second.size() != KV.second.size() || std::memcmp(It->second.data(), KV.second.data(), KV.second.size() * sizeof(FObjectGPU)) != 0) { ++CellsDiff; }
 	}
-	CellsDiff += SOn.size() == SOff.size() ? 0 : 1;
-	// One group's dwarfs: the camera at the heaviest group's copy nearest the void camera.
-	double Ratio = 0.0, Expected = 0.0;
-	size_t Got = 0;
-	if (Gc && !Gc->Entries.empty())
+	CellsDiff += On.Snap.size() == Off.Snap.size() ? 0 : 1;
+	// Dwarf density over every dwarf level against the emitter's (each level's slice share). A
+	// handful of dwarfs are resident in the void, so this is a loose check; the total is checked
+	// exactly: the emitter holds the dwarfs the groups did (their light / the mean dwarf flux).
+	long long NBest = 0; double Want = 0.0, VBest = 0.0;
+	int LBest = 0;
+	double Sum = 0.0, Total = 0.0;
+	if (De)
 	{
-		const double Tile = std::ldexp(1.0, 89);
-		const FCoord V = UniScenes::VoidCamera();
-		FCoord Cg = V;
-		FVec3d Shift{};
-		double Pv[3];
-		for (int Ax = 0; Ax < 3; ++Ax) { Pv[Ax] = U128ToDouble(MaskLow(V.Axis(Ax), 89)) / Tile; }
-		const double Dx = Gc->Entries[0].Pos[0] - Pv[0], Dy = Gc->Entries[0].Pos[1] - Pv[1], Dz = Gc->Entries[0].Pos[2] - Pv[2];
-		auto Wrap = [](double X) { return X - std::round(X); };
-		Shift = FVec3d{ Wrap(Dx) * Tile, Wrap(Dy) * Tile, Wrap(Dz) * Tile };
-		FVec3f Fr{};
-		AddDisplacement(Cg, Fr, Shift);
-		std::map<std::string, std::vector<FObjectGPU>> S;
-		size_t G1, M1, D1, B1;
-		std::map<u32, size_t> Per;
-		std::map<u32, double> Budget;
-		Run(DefOn, Cg, S, G1, M1, D1, B1, &Per, &Budget);
-		u32 Best = 0;
-		for (const auto& KV : Budget) { Expected = KV.second; Best = KV.first; }
-		Got = Per[Best];
-		Ratio = Expected > 0.0 ? double(Got) / Expected : 0.0;
-		BadOn += B1;
+		const FUniverseModel Mm(DefOn);
+		for (const auto& KV : On.DwarfByLevel)
+		{
+			const FSlice* Sl = Mm.SlicesOf(UniScenes::kDwarf).ForLevel(KV.first);
+			if (!Sl) { continue; }
+			NBest += KV.second.first;
+			Want += De->NTotal * Sl->P * std::pow(Units::Mpc, 3.0) * KV.second.second;   // expected count
+			VBest += KV.second.second;
+			if (!LBest || KV.second.first > On.DwarfByLevel[LBest].first) { LBest = KV.first; }
+		}
+		const double F = UniScenes::DwarfMeanFluxV();
+		if (Gc) { for (const FCatalogueEntry& E : Gc->Entries) { Sum += std::pow(10.0, -0.4 * double(E.AbsMag)) / F; } }
+		Total = De->NTotal * std::pow(std::ldexp(1.0, 89), 3.0);
 	}
-	const double Z = Expected > 0.0 ? (double(Got) - Expected) / std::sqrt(Expected) : 99.0;
-	Uni::Check(2, "T2.webtex.groups", "D-174 galaxy groups from the node list: every node after the clusters a group, heaviest brightest; resident groups at their entries' exact positions and magnitudes; field galaxies and clusters identical to the scene without groups; dwarfs within M -16..-12; the heaviest group's dwarfs within 4 sigma of its budget")
-		.Metric("groups_per_tile", Gc ? double(Gc->Entries.size()) : 0.0).Metric("resident_groups", double(GOn)).Metric("dwarfs", double(DOn)).Metric("cells_differ", double(CellsDiff)).Metric("budget_z", Z)
-		.Pass(Gc && bOrder && Gc->Entries.size() + Clusters <= Nodes.size() && Gc->Entries.size() > 1000 && GOn > 0 && MOn == GOn && CellsDiff == 0 && CellsCmp > 0 && BadOn == 0 && GOff == 0 && DOff == 0 && std::abs(Z) < 4.0,
-			Uni::Fmt("%zu groups per tile after %zu clusters (of %zu nodes), magnitudes %.2f .. %.2f, heaviest brightest %s; from intergalactic space %zu groups resident, %zu at their entry exactly, %zu dwarfs (%zu outside M -16..-12); %zu galaxy/cluster cells compared with groups off, %zu differ; heaviest group (camera at its centre): %zu dwarfs for a budget of %.1f (%.2fx, %.1f sigma)",
-				Gc ? Gc->Entries.size() : size_t(0), Clusters, Nodes.size(), Gc && !Gc->Entries.empty() ? double(Gc->Entries.front().AbsMag) : 0.0, Gc && !Gc->Entries.empty() ? double(Gc->Entries.back().AbsMag) : 0.0, bOrder ? "yes" : "NO",
-				GOn, MOn, DOn, BadOn, CellsCmp, CellsDiff, Got, Expected, Ratio, Z));
+	const double Got = double(NBest);
+	const double Sig = std::sqrt(std::max(Want, 1.0));
+	const bool bTotal = Sum > 0.0 && std::abs(Total / Sum - 1.0) < 1e-6;
+	const bool bDensity = Want > 0.0 && NBest > 20 && std::abs(Got - Want) < 4.0 * Sig + 0.05 * Want;
+	const double NodeBias = On.Dwarfs ? On.NodeAtDwarfs / double(On.Dwarfs) / std::max(double(Mean.z), 1e-30) : 0.0;
+	Uni::Check(2, "T2.webtex.groups", "D-174/D-177 galaxy groups from the node list: every node after the clusters a group, heaviest brightest; groups are labels (no emitter, no contributor) at their entries' exact positions and magnitudes; field galaxies and clusters identical to the scene without groups; dwarfs from the node matter: the emitter's total = the groups' dwarfs exactly, within M -16..-12, resident counts at the emitter's density (all dwarf levels, 4 sigma + 5%), on node matter (> 5x its mean)")
+		.Metric("groups_per_tile", Gc ? double(Gc->Entries.size()) : 0.0).Metric("resident_groups", double(On.Groups)).Metric("dwarfs", double(On.Dwarfs)).Metric("cells_differ", double(CellsDiff))
+		.Metric("dwarfs_counted", Got).Metric("dwarfs_expected", Want).Metric("dwarf_total_ratio", Sum > 0.0 ? Total / Sum : 0.0).Metric("dwarf_node_bias", NodeBias)
+		.Pass(Gc && De && bOrder && bLabel && Gc->Entries.size() + Clusters <= Nodes.size() && Gc->Entries.size() > 1000 && On.Groups > 0 && On.Matched == On.Groups && On.GroupContributors == 0
+			&& CellsDiff == 0 && CellsCmp > 0 && On.DwarfBad == 0 && Off.Groups == 0 && Off.Dwarfs == 0 && bTotal && bDensity && NodeBias > 5.0,
+			Uni::Fmt("%zu groups per tile after %zu clusters (of %zu nodes), magnitudes %.2f .. %.2f, heaviest brightest %s, %s; from intergalactic space %zu groups resident, %zu at their entry exactly, %zu group contributors; %zu galaxy/cluster cells compared with groups off, %zu differ; dwarf emitter total %.6g per tile for the groups' %.6g; %zu dwarfs (%zu outside M -16..-12), %.0f counted for %.1f expected over %.3g Mpc^3 (most at L%d), node matter at dwarfs %.1fx its mean",
+				Gc ? Gc->Entries.size() : size_t(0), Clusters, Nodes.size(), Gc && !Gc->Entries.empty() ? double(Gc->Entries.front().AbsMag) : 0.0, Gc && !Gc->Entries.empty() ? double(Gc->Entries.back().AbsMag) : 0.0, bOrder ? "yes" : "NO", bLabel ? "labels" : "STILL EMITTERS",
+				On.Groups, On.Matched, On.GroupContributors, CellsCmp, CellsDiff, Total, Sum, On.Dwarfs, On.DwarfBad, Got, Want, VBest, LBest, NodeBias));
+}
+
+UNI_TEST(webtex, members)
+{
+	// D-177 (owner: hybrid split). A catalogue cluster's brightest members (galaxy levels from
+	// L86, ~5% of its members) are authored around each copy from its own contributor; its
+	// emitter places only the fainter ones (kMember). From the heaviest cluster's copy nearest the
+	// void camera: every authored member inside its cluster's influence and the cut, within the
+	// generator's reach bound; the members' count against their budget (NTotal x BrightRatio,
+	// summed over the clusters within 30 Mpc); authored members bright, emitter members faint;
+	// early types concentrated in cores (D-172); a cell's members identical regenerated and from a
+	// fresh generator (the per-copy cache changes nothing); and the field sampler against plain
+	// rejection on the cluster field (radial distribution).
+	std::string Err;
+	const FWebTexture& T = Delivered(&Err);
+	std::vector<FWebNode> Nodes;
+	if (!T.IsValid() || !LoadWebNodes(kDeliveredDir, kDeliveredName, Nodes, &Err)) { Uni::Check(2, "T2.webtex.members", "D-177 authored bright members").Pass(false, "not loaded: " + Err); return; }
+	FBindScope Bind(T);
+	const UniScenes::FClusterTuning Tun;
+	FUniverseDef Def = UniScenes::WebToGalaxy(Tun);
+	const H::float4 Mean = T.Mean();
+	UniScenes::UseDeliveredWeb(Def, Tun, T.Size, Mean.z / (double(Mean.x) + Mean.y + Mean.z + Mean.w), &Nodes);
+	const FCatalogue& Cat = Def.Catalogues.at(0);
+	FUniverseModel M(Def);
+	FRefGenerator G(M);
+	FRefPipeline P(G);
+	P.bVelocityLod = false;
+	// The camera at the heaviest cluster's copy nearest the void camera.
+	const double Tile = std::ldexp(1.0, Cat.PeriodBits);
+	FCoord Cam = UniScenes::VoidCamera();
+	{
+		double Pv[3];
+		for (int Ax = 0; Ax < 3; ++Ax) { Pv[Ax] = U128ToDouble(MaskLow(Cam.Axis(Ax), Cat.PeriodBits)) / Tile; }
+		auto Wrap = [](double X) { return X - std::round(X); };
+		FVec3f Fr{};
+		AddDisplacement(Cam, Fr, FVec3d{ Wrap(Cat.Entries[0].Pos[0] - Pv[0]) * Tile, Wrap(Cat.Entries[0].Pos[1] - Pv[1]) * Tile, Wrap(Cat.Entries[0].Pos[2] - Pv[2]) * Tile });
+	}
+	P.Update(Cam, FVec3f{});
+	const double Cut = UniScenes::BrightMemberCut();
+	// Authored members by entry (one copy of each entry within 100 Mpc: the tile is 200 Mpc).
+	struct FMem { FCoord Pos; float M; bool bEarly; };
+	std::map<u32, std::vector<FMem>> ByEntry;
+	size_t Members = 0, FaintBad = 0, BrightBad = 0, FaintMembers = 0;
+	std::set<FCellKey, bool (*)(const FCellKey&, const FCellKey&)> MemberCells([](const FCellKey& A, const FCellKey& B) { return HashCell(A) < HashCell(B); });
+	for (const auto& KV : P.CacheRef())
+	{
+		for (size_t I = 0; I < KV.second.Objects.size(); ++I)
+		{
+			const FObjectGPU& O = KV.second.Objects[I];
+			if ((O.A[3] >> 16) & H::UNI_OBJ_FLAG_DELTA_HIDDEN) { continue; }
+			const u32 A = O.A[3] & 0xFFFFu;
+			const float Mg = H::Uni_ObjectAbsMag(UniCore::ToHlsl(O));
+			if (A == UniScenes::kMember) { ++FaintMembers; FaintBad += Mg < float(Cut) - 0.01f ? 1 : 0; }
+			const u32 Ix = KV.second.Indices[I];
+			if (A != UniScenes::kGalaxy || Ix < kFirstMemberIndex) { continue; }
+			++Members;
+			BrightBad += Mg > float(Cut) + 0.01f ? 1 : 0;
+			const u32 Off[3] = { O.A[0], O.A[1], O.A[2] };
+			ByEntry[(Ix - kFirstMemberIndex) / 64u].push_back(FMem{ ObjectCoord(KV.first, Off), Mg, ((O.A[3] >> 16) & H::UNI_OBJ_FLAG_EARLY) != 0u });
+			if (MemberCells.size() < 400) { MemberCells.insert(KV.first); }
+		}
+	}
+	// Clusters within 30 Mpc: members inside their influence and cut, the count against the budget,
+	// early types by radius.
+	size_t Near = 0, Outside = 0, Got = 0;
+	double Want = 0.0, Worst = 0.0;
+	long long CoreN = 0, CoreEarly = 0, OuterN = 0, OuterEarly = 0;
+	for (const auto& KV : P.Contributors())
+	{
+		const FContributor& C = KV.second;
+		if (C.ParentArchetypeId != UniScenes::kCluster || C.Parent.Index < kFirstCatalogueIndex || C.Parent.Index >= kFirstMemberIndex) { continue; }
+		if (Length(ToDouble(Sub(C.Centre, Cam))) > 30.0 * Units::Mpc) { continue; }
+		const u32 Entry = (C.Parent.Index - kFirstCatalogueIndex) % u32(Cat.Entries.size());
+		++Near;
+		Want += std::min(C.NTotal * Cat.BrightRatio, 64.0);
+		const H::FUniFieldParams Fp = C.Params.ToHlsl();
+		const auto It = ByEntry.find(Entry);
+		if (It == ByEntry.end()) { continue; }
+		for (const FMem& Mm : It->second)
+		{
+			const double Dd = Length(ToDouble(Sub(Mm.Pos, C.Centre)));
+			++Got;
+			const double R = Dd / C.InfluenceCm;
+			Worst = std::max(Worst, R / std::max(double(Fp.A.w), 1e-9));
+			Outside += R > double(Fp.A.w) * (1.0 + 1e-4) ? 1 : 0;
+			if (R < 0.15) { ++CoreN; CoreEarly += Mm.bEarly ? 1 : 0; }
+			else if (R > 0.4) { ++OuterN; OuterEarly += Mm.bEarly ? 1 : 0; }
+		}
+	}
+	const double Z = Want > 0.0 ? (double(Got) - Want) / std::sqrt(Want) : 99.0;
+	const double CoreFrac = CoreN ? double(CoreEarly) / double(CoreN) : 0.0;
+	const double OuterFrac = OuterN ? double(OuterEarly) / double(OuterN) : 0.0;
+	// Regenerated and from a fresh generator: identical member cells.
+	size_t CellsCmp = 0, CellsDiff = 0;
+	{
+		FRefGenerator G2(M);
+		for (const FCellKey& K : MemberCells)
+		{
+			FCellContent A, B, Cc;
+			G.GenerateCell(K, {}, A);
+			G.GenerateCell(K, {}, B);
+			G2.GenerateCell(K, {}, Cc);
+			++CellsCmp;
+			auto Same = [](const FCellContent& X, const FCellContent& Y) { return X.Objects.size() == Y.Objects.size() && X.Indices == Y.Indices && (X.Objects.empty() || std::memcmp(X.Objects.data(), Y.Objects.data(), X.Objects.size() * sizeof(FObjectGPU)) == 0); };
+			if (!Same(A, B) || !Same(A, Cc) || A.Hash != Cc.Hash || !G.HasAuthored(K)) { ++CellsDiff; }
+		}
+	}
+	// The sampler against plain rejection on the same field (radial histogram, 10 bins of 0.1).
+	double Ks = 0.0;
+	{
+		H::FUniFieldParams Fp{};
+		Fp.A = H::float4(0.12f, 0.8f, 0.6f, 0.95f);
+		Fp.B = H::float4(3.0f, 0.4f, 0.06f, 17.0f);
+		const H::float3 Cc[4] = { H::Uni_ClusterCentre(Fp, 0u), H::Uni_ClusterCentre(Fp, 1u), H::Uni_ClusterCentre(Fp, 2u), H::Uni_ClusterCentre(Fp, 3u) };
+		const int NB = 10, NS = 40000, NR = 4000;
+		double Hs[NB] = {}, Hr[NB] = {};
+		for (int I = 0; I < NS; ++I)
+		{
+			H::float3 Pf(0, 0, 0);
+			if (FRefGenerator::SampleClusterField(Fp, Cc, H::Uni_SeedMix(0x51u, u32(I)), Pf)) { Hs[std::min(int(std::sqrt(double(H::dot(Pf, Pf))) / 0.1), NB - 1)] += 1.0 / NS; }
+		}
+		const float Env = 1.0f + 3.0f * 0.4f + 0.5f;   // above the field's maximum
+		u32 St = 7u;
+		for (int Gt = 0; Gt < NR; ++St)
+		{
+			const H::float3 Q(2.0f * H::Uni_DrawUnit(St, 1u, 0u) - 1.0f, 2.0f * H::Uni_DrawUnit(St, 1u, 1u) - 1.0f, 2.0f * H::Uni_DrawUnit(St, 1u, 2u) - 1.0f);
+			if (H::dot(Q, Q) >= 1.0f) { continue; }
+			if (H::Uni_DrawUnit(St, 2u, 0u) * Env < H::UniField_ClusterC(Q, Fp, Cc[0], Cc[1], Cc[2], Cc[3])) { Hr[std::min(int(std::sqrt(double(H::dot(Q, Q))) / 0.1), NB - 1)] += 1.0 / NR; ++Gt; }
+		}
+		double Cs = 0.0, Cr = 0.0;
+		for (int B = 0; B < NB; ++B) { Cs += Hs[B]; Cr += Hr[B]; Ks = std::max(Ks, std::abs(Cs - Cr)); }
+	}
+	const double KsMax = 1.63 * std::sqrt(1.0 / 40000.0 + 1.0 / 4000.0);   // KS at 1%
+	Uni::Check(2, "T2.webtex.members", "D-177 authored bright members of catalogue clusters (from the heaviest cluster): inside their cluster's influence and cut, their count within 4 sigma of NTotal x BrightRatio over the clusters within 30 Mpc, authored members brighter than the split and emitter members fainter, more early types in cores (r < 0.15) than outside (r > 0.4), cells identical regenerated and from a fresh generator, and the field sampler's radial distribution = plain rejection's (KS at 1%)")
+		.Metric("clusters_near", double(Near)).Metric("members", double(Got)).Metric("members_expected", Want).Metric("budget_z", Z).Metric("worst_r_over_cut", Worst).Metric("early_core", CoreFrac).Metric("early_outer", OuterFrac).Metric("sampler_ks", Ks)
+		.Pass(Near >= 3 && Got > 50 && std::abs(Z) < 4.0 && Outside == 0 && BrightBad == 0 && FaintBad == 0 && FaintMembers > 0 && CoreN > 10 && OuterN > 10 && CoreFrac > OuterFrac
+			&& CellsCmp > 10 && CellsDiff == 0 && Ks < KsMax,
+			Uni::Fmt("%zu clusters within 30 Mpc: %zu authored members for %.1f expected (%.1f sigma), %zu outside the cut (worst at %.3f of it); %zu authored members resident in all, %zu brighter than M %.2f fails, %zu emitter members of which %zu too bright; early types %.2f in cores (%lld), %.2f outside (%lld); %zu member cells regenerated and from a fresh generator, %zu differ; sampler KS %.4f (1%% bar %.4f)",
+				Near, Got, Want, Z, Outside, Worst, Members, BrightBad, Cut, FaintMembers, FaintBad, CoreFrac, CoreN, OuterFrac, OuterN, CellsCmp, CellsDiff, Ks, KsMax));
+}
+
+UNI_TEST(webtex, catalogue_lookup)
+{
+	// D-174 follow-up (owner's engine log: game-thread spikes of 50-450 ms at speed in Submit and
+	// Batches after groups landed). Every cell submitted, and again at its allocation, looked up
+	// its catalogue objects by walking every entry at its level: 4,012 groups at L86, where a
+	// travel-sensitivity window holds up to 13^3 cells and brings hundreds per shift. Now an
+	// index by tile cell. Checks the lookup against the plain walk (re-implemented here from the
+	// catalogue definition) over the cells around two cameras, and its cost per cell.
+	std::string Err;
+	std::vector<FWebNode> Nodes;
+	if (!LoadWebNodes(kDeliveredDir, kDeliveredName, Nodes, &Err)) { Uni::Check(2, "T2.webtex.catalogue_lookup", "D-174 catalogue lookup").Pass(false, "not loaded: " + Err); return; }
+	UniScenes::FClusterTuning Tun;
+	FUniverseDef D = UniScenes::WebToGalaxy(Tun);
+	UniScenes::UseDeliveredWeb(D, Tun, 256u, 0.094, &Nodes);
+	FUniverseModel M(D);
+	FRefGenerator G(M);
+	struct FHit { u32 Cat, Entry, Off[3], Copy; bool operator==(const FHit& O) const { return Cat == O.Cat && Entry == O.Entry && Off[0] == O.Off[0] && Off[1] == O.Off[1] && Off[2] == O.Off[2] && Copy == O.Copy; } };
+	// The walk: every entry at the level, tested exactly (cells inside one tile only: L <= P), as
+	// the generator did before (levels and tile positions precomputed, as it had them).
+	std::vector<std::vector<int>> Lv(D.Catalogues.size());
+	std::vector<std::vector<std::array<FU128, 3>>> Ev(D.Catalogues.size());
+	for (u32 Ci = 0; Ci < D.Catalogues.size(); ++Ci)
+	{
+		const FCatalogue& Cat = D.Catalogues[Ci];
+		const int P = Cat.PeriodBits;
+		for (const FCatalogueEntry& En : Cat.Entries)
+		{
+			Lv[Ci].push_back(M.LevelOf(Cat.ArchetypeId, En.AbsMag));
+			std::array<FU128, 3> E;
+			for (int Ax = 0; Ax < 3; ++Ax)
+			{
+				const double F = std::clamp(En.Pos[Ax] - std::floor(En.Pos[Ax]), 0.0, 0.9999999999999999);
+				const u64 M53 = u64(F * 9007199254740992.0);
+				E[Ax] = P >= 53 ? Shl(FU128::FromU64(M53), P - 53) : Shr(FU128::FromU64(M53), 53 - P);
+			}
+			Ev[Ci].push_back(E);
+		}
+	}
+	auto Walk = [&](const FCellKey& K)
+	{
+		std::vector<FHit> Out;
+		for (u32 Ci = 0; Ci < D.Catalogues.size(); ++Ci)
+		{
+			const FCatalogue& Cat = D.Catalogues[Ci];
+			const int P = Cat.PeriodBits, L = K.Level;
+			if (L > P) { continue; }
+			for (u32 Ei = 0; Ei < Cat.Entries.size(); ++Ei)
+			{
+				if (Lv[Ci][Ei] != L) { continue; }
+				bool bIn = true;
+				FHit H{ Ci, Ei, { 0, 0, 0 }, 0 };
+				for (int Ax = 0; Ax < 3 && bIn; ++Ax)
+				{
+					const FU128& E = Ev[Ci][Ei][Ax];
+					bIn = MaskLow(K.C[Ax], P - L) == Shr(E, L);
+					const FU128 Rel = MaskLow(E, L);
+					H.Off[Ax] = L >= 32 ? u32(Shr(Rel, L - 32).L[3]) : u32(Shl(Rel, 32 - L).L[3]);
+				}
+				if (bIn) { Out.push_back(H); }
+			}
+		}
+		return Out;
+	};
+	size_t Cells = 0, Hits = 0, Mismatch = 0;
+	double MsIndex = 0.0, MsWalk = 0.0;
+	for (const FCoord& Cam : { UniScenes::VoidCamera(), UniScenes::SolarCamera() })
+	{
+		for (const auto& KV : G.CatalogueLevels())
+		{
+			const int L = KV.first;
+			const FCellKey K0 = CellOf(Cam, L);
+			for (int X = -6; X <= 6; ++X) for (int Y = -6; Y <= 6; ++Y) for (int Z = -6; Z <= 6; ++Z)
+			{
+				FCellKey K = K0;
+				const int O[3] = { X, Y, Z };
+				for (int Ax = 0; Ax < 3; ++Ax) { K.C[Ax] = O[Ax] >= 0 ? Add(K0.C[Ax], FU128::FromU64(u64(O[Ax]))) : Sub(K0.C[Ax], FU128::FromU64(u64(-O[Ax]))); }
+				std::vector<FHit> A;
+				const auto T0 = std::chrono::steady_clock::now();
+				G.ForEachCatalogueObject(K, [&](const auto& R, const u32* Off, u32 Copy) { A.push_back(FHit{ R.Cat, R.Entry, { Off[0], Off[1], Off[2] }, Copy }); });
+				const auto T1 = std::chrono::steady_clock::now();
+				const std::vector<FHit> B = Walk(K);
+				const auto T2 = std::chrono::steady_clock::now();
+				MsIndex += std::chrono::duration<double, std::milli>(T1 - T0).count();
+				MsWalk += std::chrono::duration<double, std::milli>(T2 - T1).count();
+				++Cells;
+				Hits += A.size();
+				if (L <= 89 && !(A == B)) { ++Mismatch; }
+			}
+		}
+	}
+	const double UsPerCell = 1000.0 * MsIndex / double(std::max<size_t>(Cells, 1));
+	Uni::Check(2, "T2.webtex.catalogue_lookup", "D-174 follow-up: a cell's catalogue objects found by tile-cell index are exactly the plain walk's (same entries, offsets and order) over 13^3 cells per catalogue level around two cameras, at least 10x faster than the walk on the reference")
+		.Metric("cells", double(Cells)).Metric("objects", double(Hits)).Metric("mismatch", double(Mismatch)).Metric("us_per_cell", UsPerCell).Metric("us_per_cell_walk", 1000.0 * MsWalk / double(std::max<size_t>(Cells, 1)))
+		.Pass(Cells > 0 && Hits > 0 && Mismatch == 0 && MsWalk > 10.0 * MsIndex,
+			Uni::Fmt("%zu cells, %zu catalogue objects, %zu cells differ from the walk; %.2f us per cell (the walk: %.1f us)", Cells, Hits, Mismatch, UsPerCell, 1000.0 * MsWalk / double(std::max<size_t>(Cells, 1))));
 }

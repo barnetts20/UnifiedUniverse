@@ -28,6 +28,8 @@
 #include <functional>
 #include <map>
 #include <set>
+#include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -157,6 +159,7 @@ namespace UniCore
 	class FRefGenerator
 	{
 	public:
+		struct FCatRef { u32 Cat = 0; u32 Entry = 0; int Level = 0; FU128 E[3]; double MemberReachCm = 0.0; };   // D-167: a catalogue entry at its level (tile-local position); D-177: its members' reach bound
 		explicit FRefGenerator(const FUniverseModel& InModel) : Model(InModel)
 		{
 			const FUniverseDef& D = Model.Definition();
@@ -200,6 +203,81 @@ namespace UniCore
 					CatRefs.push_back(R);
 				}
 			}
+			// D-177: catalogues with authored bright members: their entries indexed at every member
+			// level by their cell within the tile (a member cell looks up its own and 26 neighbours).
+			for (size_t Ri = 0; Ri < CatRefs.size(); ++Ri)
+			{
+				const FCatRef& R = CatRefs[Ri];
+				const FCatalogue& Cat = D.Catalogues[R.Cat];
+				if (!Cat.bBrightMembers) { continue; }
+				// A bound on how far its members can lie from the copy (any copy): the largest radius
+				// its radius model can draw (the scatter is uniform, +-w) x the influence multiplier
+				// x the largest cut (the field is zero outside it), with 1% to spare.
+				{
+					const FArchetype& CA = D.Arch(Cat.ArchetypeId);
+					const double Log10R = double(CA.RadiusModel[0]) + double(CA.RadiusModel[1]) * (double(Cat.Entries[R.Entry].AbsMag) - double(CA.RadiusModel[2])) + std::abs(double(CA.RadiusModel[3]));
+					double Reach = 0.0;
+					for (const FUniEmitter& Em : CA.Emitters)
+					{
+						double CutMax = std::max(1.0, double(Em.Exemplar.V[3]));
+						for (const FParamRange& Pr : Em.Ranges) { if (Pr.Slot == 3) { CutMax = std::max(CutMax, double(Pr.Max)); } }
+						Reach = std::max(Reach, Em.InfluenceMul * CutMax);
+					}
+					CatRefs[Ri].MemberReachCm = 1.01 * Reach * std::exp2(double(float(Log10R * 3.32192809489f)) + 1.0e-3);
+				}
+				// Indexed at each member level under every tile cell its members' reach overlaps (one
+				// to eight at the coarse member levels, where a cell is much larger than a cluster),
+				// with the copy's cell offset from it: a member cell looks up one bucket.
+				std::set<int> Levels;
+				for (const FSlice& Sl : Model.SlicesOf(Cat.MemberArchetypeId).Slices)
+				{
+					if (Sl.Level >= Cat.MemberMinLevel && Cat.PeriodBits - Sl.Level >= 2 && Cat.PeriodBits - Sl.Level <= 21) { Levels.insert(Sl.Level); }
+				}
+				for (const int L : Levels)
+				{
+					FMemberLevelIndex& Ix = MemberIndex[L];
+					const int64_t N = int64_t(1) << (Cat.PeriodBits - L);
+					const double Size = std::exp2(double(L));
+					int64_t Ec[3], Lo[3], Hi[3];
+					for (int Ax = 0; Ax < 3; ++Ax)
+					{
+						Ec[Ax] = int64_t(Shr(CatRefs[Ri].E[Ax], L).L[3]);
+						const double Frac = U128ToDouble(MaskLow(CatRefs[Ri].E[Ax], L)) / Size;
+						const double Rr = CatRefs[Ri].MemberReachCm / Size;
+						Lo[Ax] = Ec[Ax] + int64_t(std::floor(Frac - Rr));
+						Hi[Ax] = Ec[Ax] + int64_t(std::floor(Frac + Rr));
+						Lo[Ax] = std::max(Lo[Ax], Ec[Ax] - (N - 1)); Hi[Ax] = std::min(Hi[Ax], Ec[Ax] + (N - 1));   // never a tile's reach
+					}
+					for (int64_t Z = Lo[2]; Z <= Hi[2]; ++Z) for (int64_t Y = Lo[1]; Y <= Hi[1]; ++Y) for (int64_t X = Lo[0]; X <= Hi[0]; ++X)
+					{
+						const int64_t C[3] = { X, Y, Z };
+						u64 Q[3];
+						FMemberHit Hh;
+						Hh.Ri = Ri;
+						for (int Ax = 0; Ax < 3; ++Ax) { Q[Ax] = u64(((C[Ax] % N) + N) % N); Hh.Dx[Ax] = int(Ec[Ax] - C[Ax]); }
+						Ix.ByCell[CatCellKey(CatRefs[Ri].Cat, Q)].push_back(Hh);
+					}
+					Ix.Cats.insert(CatRefs[Ri].Cat);
+				}
+			}
+			// D-174: per level, the refs by their cell within the tile, so a cell finds its entries
+			// in one lookup (4,000+ group entries per level were walked for every cell). Cells larger
+			// than a tile (L > P) keep the walk; they are few.
+			for (const auto& KV : CatByLevel)
+			{
+				const int L = KV.first;
+				FCatLevelIndex& Ix = CatIndex[L];
+				for (size_t Ri : KV.second)
+				{
+					const FCatRef& R = CatRefs[Ri];
+					const int P = D.Catalogues[R.Cat].PeriodBits;
+					if (L > P || P - L > 21) { Ix.Walk.push_back(Ri); continue; }
+					u64 Cell[3];
+					for (int Ax = 0; Ax < 3; ++Ax) { Cell[Ax] = Shr(R.E[Ax], L).L[3]; }
+					Ix.ByCell[CatCellKey(R.Cat, Cell)].push_back(Ri);
+					Ix.Cats.insert(R.Cat);
+				}
+			}
 		}
 
 		/** D-167: levels at which catalogues place objects, with their archetypes. */
@@ -208,9 +286,10 @@ namespace UniCore
 			std::map<int, std::set<u32>> R;
 			const FUniverseDef& D = Model.Definition();
 			for (const FCatRef& C : CatRefs) { R[C.Level].insert(D.Catalogues[C.Cat].ArchetypeId); }
+			for (const auto& KV : MemberIndex) { for (u32 Ci : KV.second.Cats) { R[KV.first].insert(D.Catalogues[Ci].MemberArchetypeId); } }   // D-177
 			return R;
 		}
-		bool CatalogueAtLevel(int L) const { return CatByLevel.count(L) != 0; }
+		bool CatalogueAtLevel(int L) const { return CatByLevel.count(L) != 0 || MemberIndex.count(L) != 0; }
 
 		/** Authored objects (anchors, catalogue entries) in cell K? */
 		bool HasAuthored(const FCellKey& K) const
@@ -218,6 +297,7 @@ namespace UniCore
 			for (const FCellKey& A : AnchorCells) { if (A == K) { return true; } }
 			bool bAny = false;
 			ForEachCatalogueObject(K, [&](const FCatRef&, const u32*, u32) { bAny = true; });
+			if (!bAny && MemberIndex.count(K.Level)) { bAny = !ForEachCatalogueMember(K, [](const FMemberRec&) { return false; }); }   // D-177: stops at the first; copies are cached
 			return bAny;
 		}
 
@@ -226,18 +306,32 @@ namespace UniCore
 		template <typename F>
 		void ForEachCatalogueObject(const FCellKey& K, F&& Fn) const
 		{
-			const auto It = CatByLevel.find(K.Level);
-			if (It == CatByLevel.end()) { return; }
+			const auto It = CatIndex.find(K.Level);
+			if (It == CatIndex.end()) { return; }
 			const FUniverseDef& D = Model.Definition();
 			const int L = K.Level;
-			for (size_t Ri : It->second)
+			const FCatLevelIndex& Ix = It->second;
+			// The refs this cell can hold, in ref order (the order objects are appended in, as the
+			// full walk before D-174 visited them).
+			std::vector<size_t> Refs = Ix.Walk;
+			for (u32 Ci : Ix.Cats)
+			{
+				const int P = D.Catalogues[Ci].PeriodBits;
+				u64 Cell[3];
+				for (int Ax = 0; Ax < 3; ++Ax) { Cell[Ax] = MaskLow(K.C[Ax], P - L).L[3]; }
+				const auto Bt = Ix.ByCell.find(CatCellKey(Ci, Cell));
+				if (Bt != Ix.ByCell.end()) { Refs.insert(Refs.end(), Bt->second.begin(), Bt->second.end()); }
+			}
+			std::sort(Refs.begin(), Refs.end());
+			Refs.erase(std::unique(Refs.begin(), Refs.end()), Refs.end());   // two catalogues' keys may share a bucket
+			for (size_t Ri : Refs)
 			{
 				const FCatRef& R = CatRefs[Ri];
 				const int P = D.Catalogues[R.Cat].PeriodBits;
 				if (L <= P)
 				{
 					// The cell lies inside one tile: the entry is in it if its cell index within the
-					// tile is the cell's.
+					// tile is the cell's (checked exactly; the index above only narrows the search).
 					bool bIn = true;
 					u32 Off[3];
 					for (int Ax = 0; Ax < 3 && bIn; ++Ax)
@@ -608,23 +702,324 @@ namespace UniCore
 			// objects (Uni_TaskMakeObject), so copies differ.
 			ForEachCatalogueObject(K, [&](const FCatRef& R, const u32* Off, u32 Copy)
 			{
-				const FCatalogue& Cat = D.Catalogues[R.Cat];
-				const FArchetype& AA = D.Arch(Cat.ArchetypeId);
-				const u32 Local = Copy * u32(Cat.Entries.size()) + R.Entry;
-				const u32 Seed = H::Uni_ObjectSeed(CellSeed(D.Seed, K, Cat.ArchetypeId, kCatalogueContributor + R.Cat, 0u), Local);
-				const float M = Cat.Entries[R.Entry].AbsMag;
-				const H::float4 Rm(AA.RadiusModel[0], AA.RadiusModel[1], AA.RadiusModel[2], AA.RadiusModel[3]);
-				const H::float4 Cm(AA.ColourModel[0], AA.ColourModel[1], AA.ColourModel[2], AA.ColourModel[3]);
-				const float RL2 = H::Uni_DrawRadiusLog2(Seed, M, Rm);
-				const H::float3 Rgb = H::Uni_DrawColour(Seed, M, Cm);
-				const bool bExt = AA.Visibility == EUniVisibility::Extended;
-				const u32 Flags = H::UNI_OBJ_FLAG_ANCHOR | (bExt ? H::UNI_OBJ_FLAG_EXTENDED : 0u) | (AA.Emitters.empty() ? 0u : H::UNI_OBJ_FLAG_HAS_CONTRIBUTOR);
-				const float SB = bExt ? SurfaceBrightness(M, RL2) : 0.0f;
-				Out.Objects.push_back(FromHlsl(H::Uni_MakeObject(H::uint3(Off[0], Off[1], Off[2]), Cat.ArchetypeId, Flags, Seed, RL2, M, SB, Rgb)));
+				const u32 Local = Copy * u32(D.Catalogues[R.Cat].Entries.size()) + R.Entry;
+				Out.Objects.push_back(CatalogueObject(R.Cat, R.Entry, K, Off, Copy));
 				Out.Indices.push_back(kFirstCatalogueIndex + Local);
 				Out.ObjectContributor.push_back(0u);
 			});
+			AppendCatalogueMembers(K, Out);   // D-177
 			Out.Hash = HashContent(Out);
+		}
+
+		/** D-167: the record of catalogue entry R's copy in cell Kc (its own level), copy index
+		 *  Copy, as GenerateCell writes it. */
+		FObjectGPU CatalogueObject(u32 CatI, u32 Entry, const FCellKey& Kc, const u32* Off, u32 Copy) const
+		{
+			const FUniverseDef& D = Model.Definition();
+			const FCatalogue& Cat = D.Catalogues[CatI];
+			const FArchetype& AA = D.Arch(Cat.ArchetypeId);
+			const u32 Local = Copy * u32(Cat.Entries.size()) + Entry;
+			const u32 Seed = H::Uni_ObjectSeed(CellSeed(D.Seed, Kc, Cat.ArchetypeId, kCatalogueContributor + CatI, 0u), Local);
+			const float M = Cat.Entries[Entry].AbsMag;
+			const H::float4 Rm(AA.RadiusModel[0], AA.RadiusModel[1], AA.RadiusModel[2], AA.RadiusModel[3]);
+			const H::float4 Cm(AA.ColourModel[0], AA.ColourModel[1], AA.ColourModel[2], AA.ColourModel[3]);
+			const float RL2 = H::Uni_DrawRadiusLog2(Seed, M, Rm);
+			const H::float3 Rgb = H::Uni_DrawColour(Seed, M, Cm);
+			const bool bExt = AA.Visibility == EUniVisibility::Extended;
+			const u32 Flags = H::UNI_OBJ_FLAG_ANCHOR | (bExt ? H::UNI_OBJ_FLAG_EXTENDED : 0u) | (AA.Emitters.empty() ? 0u : H::UNI_OBJ_FLAG_HAS_CONTRIBUTOR);
+			const float SB = bExt ? SurfaceBrightness(M, RL2) : 0.0f;
+			return FromHlsl(H::Uni_MakeObject(H::uint3(Off[0], Off[1], Off[2]), Cat.ArchetypeId, Flags, Seed, RL2, M, SB, Rgb));
+		}
+
+		/** D-177: the authored bright members of catalogue entries in cell K (a member level).
+		 *  For each entry whose copy lies in K's tile cell or a neighbour's: the copy's own object
+		 *  and contributor (exactly as the streamer makes them: shape, orientation, influence),
+		 *  then its members: a Poisson count of BrightRatio x its emitter's count, each with a
+		 *  magnitude from the member archetype's bright slices, a position drawn from the
+		 *  contributor's field (exactly, by a mixture proposal: SampleClusterField), the D-172
+		 *  morphology rule, and radius and colour as generated objects draw them. Kept if its level
+		 *  is K's and it lies in K. All draws are keyed by the copy's object seed and the member's
+		 *  rank. */
+		void AppendCatalogueMembers(const FCellKey& K, FCellContent& Out) const
+		{
+			ForEachCatalogueMember(K, [&](const FMemberRec& Mr)
+			{
+				const int L = K.Level;
+				u32 Off[3];
+				for (int Ax = 0; Ax < 3; ++Ax)
+				{
+					const FU128 Rel = MaskLow(Mr.Pos.Axis(Ax), L);
+					Off[Ax] = L >= 32 ? u32(Shr(Rel, L - 32).L[3]) : u32(Shl(Rel, 32 - L).L[3]);
+				}
+				FObjectGPU O = Mr.Obj;
+				O.A[0] = Off[0]; O.A[1] = Off[1]; O.A[2] = Off[2];
+				Out.Objects.push_back(O);
+				Out.Indices.push_back(Mr.Index);
+				Out.ObjectContributor.push_back(0u);
+				return true;
+			});
+		}
+
+		/** D-177: one authored member: its position, level, cell at its level, index and record
+		 *  (offsets filled per cell). */
+		struct FMemberRec { FCoord Pos; FCellKey Cell; int Level = 0; u32 Index = 0; FObjectGPU Obj; };
+
+		/** D-177: Fn(member) for every authored member in cell K, in a fixed order (catalogue ref,
+		 *  then rank); Fn returns false to stop. Returns false if it was stopped. */
+		template <typename F>
+		bool ForEachCatalogueMember(const FCellKey& K, F&& Fn) const
+		{
+			const auto It = MemberIndex.find(K.Level);
+			if (It == MemberIndex.end()) { return true; }
+			const FUniverseDef& D = Model.Definition();
+			const int L = K.Level;
+			const FMemberLevelIndex& Ix = It->second;
+			// One bucket per catalogue (refs in ref order; a ref may appear more than once, with
+			// different offsets, only when the tile is a few cells across).
+			const std::vector<FMemberHit>* Buckets[8];
+			size_t NB = 0;
+			for (u32 Ci : Ix.Cats)
+			{
+				const int P = D.Catalogues[Ci].PeriodBits;
+				u64 Cell[3];
+				for (int Ax = 0; Ax < 3; ++Ax) { Cell[Ax] = MaskLow(K.C[Ax], P - L).L[3]; }
+				const auto Bt = Ix.ByCell.find(CatCellKey(Ci, Cell));
+				if (Bt != Ix.ByCell.end() && NB < 8) { Buckets[NB++] = &Bt->second; }
+			}
+			std::vector<FMemberHit> Merged;
+			if (NB > 1)
+			{
+				for (size_t Bi = 0; Bi < NB; ++Bi) { Merged.insert(Merged.end(), Buckets[Bi]->begin(), Buckets[Bi]->end()); }
+				std::stable_sort(Merged.begin(), Merged.end(), [](const FMemberHit& A, const FMemberHit& B) { return A.Ri < B.Ri; });
+			}
+			const FMemberHit* Begin = NB == 0 ? nullptr : (NB == 1 ? Buckets[0]->data() : Merged.data());
+			const FMemberHit* End = NB == 0 ? nullptr : (NB == 1 ? Buckets[0]->data() + Buckets[0]->size() : Merged.data() + Merged.size());
+			for (const FMemberHit* Hp = Begin; Hp != End; ++Hp)
+			{
+				const FMemberHit& Hh = *Hp;
+				const FCatRef& R = CatRefs[Hh.Ri];
+				if (R.Level > D.Catalogues[R.Cat].PeriodBits) { continue; }
+				const int P = D.Catalogues[R.Cat].PeriodBits;
+				// The copy's position: K's tile, shifted by a tile where the neighbour wrapped.
+				FCoord Pos;
+				for (int Ax = 0; Ax < 3; ++Ax)
+				{
+					const FU128 Cm = Shl(K.C[Ax], L);                                  // K's origin, cm
+					const FU128 TileBase = Shl(Shr(Cm, P), P);
+					FU128 V = Add(TileBase, R.E[Ax]);
+					const u64 Ck = MaskLow(K.C[Ax], P - L).L[3];
+					const int64_t Q = int64_t(Ck) + Hh.Dx[Ax];
+					if (Q < 0) { V = Sub(V, Shl(FU128::FromU64(1), P)); }
+					else if (Q >= (int64_t(1) << (P - L))) { V = Add(V, Shl(FU128::FromU64(1), P)); }
+					Pos.SetAxis(Ax, V);
+				}
+				// Cheap reject: the copy's members cannot reach K (the 27 cells at the coarser member
+				// levels are far larger than a cluster).
+				{
+					const double Size = std::exp2(double(L));
+					double D2 = 0.0;
+					for (int Ax = 0; Ax < 3; ++Ax)
+					{
+						const double Dv = S128ToDouble(Sub(Pos.Axis(Ax), Shl(K.C[Ax], L)));
+						const double Gap = Dv < 0.0 ? -Dv : std::max(Dv - Size, 0.0);
+						D2 += Gap * Gap;
+					}
+					if (D2 > R.MemberReachCm * R.MemberReachCm) { continue; }
+				}
+				const FCellKey Kc = CellOf(Pos, R.Level);
+				u32 OffC[3];
+				for (int Ax = 0; Ax < 3; ++Ax)
+				{
+					const FU128 Rel = MaskLow(Pos.Axis(Ax), R.Level);
+					OffC[Ax] = R.Level >= 32 ? u32(Shr(Rel, R.Level - 32).L[3]) : u32(Shl(Rel, 32 - R.Level).L[3]);
+				}
+				const std::shared_ptr<const FCopyMembers> Mem = CopyMembers(R, Kc, OffC);
+				// Members are sorted by level (rank order within one): only K's level is visited,
+				// and only those whose cell is K.
+				const auto Lv = Mem->LevelRange.find(L);
+				if (Lv == Mem->LevelRange.end()) { continue; }
+				for (u32 Mi = Lv->second.first; Mi < Lv->second.second; ++Mi)
+				{
+					const FMemberRec& Mr = Mem->Members[Mi];
+					if (!(Mr.Cell == K)) { continue; }
+					if (!Fn(Mr)) { return false; }
+				}
+			}
+			return true;
+		}
+
+		/** D-177: one cluster copy's members, sorted by level (rank order within a level), with
+		 *  each level's range. */
+		struct FCopyMembers { std::vector<FMemberRec> Members; std::map<int, std::pair<u32, u32>> LevelRange; };
+
+		/** D-177: a point drawn from the cluster field UniField_ClusterC (field units), exactly,
+		 *  without the uniform-in-sphere rejection that wasted ~25 field evaluations a point (the
+		 *  body is concentrated: rc ~ 0.1 of the cut). Proposal h = body without its taper (an
+		 *  ellipsoidal beta model on s < Cut, radius by inverse CDF) + clumps without their edge
+		 *  (Plummer spheres, radius in closed form), each chosen by its mass; f <= h everywhere,
+		 *  so accepting with f / h draws f exactly (~85% accepted). Returns false if 64 tries
+		 *  fail (never seen; the member is then dropped). */
+		static bool SampleClusterField(const H::FUniFieldParams& Fp, const H::float3* Cc, u32 S, H::float3& OutP)
+		{
+			const double Pi = 3.14159265358979323846;
+			const double Cut = double(Fp.A.w);
+			if (!(Cut > 0.0)) { return false; }
+			const double Rc = std::max(double(Fp.A.x), 1.0e-4);
+			const double Q1 = std::max(double(Fp.A.y), 0.05), Q2 = std::max(double(Fp.A.z), 0.05);
+			const auto BodyCdf = [](double C) { return std::asinh(C) - C / std::sqrt(1.0 + C * C); };   // integral of s^2 (1 + s^2)^-1.5
+			const double Cmax = Cut / Rc;
+			const double Fmax = BodyCdf(Cmax);
+			const double WBody = Q1 * Q2 * 4.0 * Pi * Rc * Rc * Rc * Fmax;
+			const u32 NClumps = std::min(u32(std::max(Fp.B.x, 0.0f)), u32(H::UNI_CLUSTER_MAX_CLUMPS));
+			const double Wc = double(Fp.B.y);
+			const double A = std::max(double(Fp.B.z), 1.0e-4);
+			const double WClump = (NClumps > 0u && Wc > 0.0) ? Wc * 4.0 / 3.0 * Pi * A * A * A : 0.0;
+			const double WTotal = WBody + double(NClumps) * WClump;
+			if (!(WTotal > 0.0)) { return false; }
+			for (u32 T = 0; T < 64u; ++T)
+			{
+				const double Uc = double(H::Uni_DrawUnit(S, H::UNI_CH_PLACE, 4u * T + 0u)) * WTotal;
+				const double Ur = std::clamp(double(H::Uni_DrawUnit(S, H::UNI_CH_PLACE, 4u * T + 1u)), 1.0e-12, 1.0 - 1.0e-12);
+				const double Ct = 2.0 * double(H::Uni_DrawUnit(S, H::UNI_CH_PLACE, 4u * T + 2u)) - 1.0;
+				const double Ph = 2.0 * Pi * double(H::Uni_DrawUnit(S, H::UNI_CH_PLACE, 4u * T + 3u));
+				const double St = std::sqrt(std::max(1.0 - Ct * Ct, 0.0));
+				const double Dir[3] = { St * std::cos(Ph), St * std::sin(Ph), Ct };
+				double Pt[3];
+				if (Uc < WBody)
+				{
+					// Body: x = s / rc from BodyCdf(x) = Ur Fmax (safeguarded Newton; BodyCdf' = x^2 (1 + x^2)^-1.5).
+					const double Tgt = Ur * Fmax;
+					double Lo = 0.0, Hi = Cmax;
+					double X = std::min(Cmax, Tgt < 0.3 ? std::cbrt(3.0 * Tgt) : 0.5 * std::exp(Tgt + 1.0));
+					for (int I = 0; I < 40; ++I)
+					{
+						const double Fx = BodyCdf(X) - Tgt;
+						if (Fx > 0.0) { Hi = X; } else { Lo = X; }
+						if (std::abs(Fx) < 1.0e-12 * std::max(Tgt, 1.0e-30)) { break; }
+						const double X2 = 1.0 + X * X; const double Dx = X * X / (X2 * std::sqrt(X2));
+						double Xn = Dx > 0.0 ? X - Fx / Dx : 0.5 * (Lo + Hi);
+						if (!(Xn > Lo && Xn < Hi)) { Xn = 0.5 * (Lo + Hi); }
+						if (std::abs(Xn - X) < 1.0e-13 * std::max(X, 1.0e-30)) { X = Xn; break; }
+						X = Xn;
+					}
+					const double Sr = X * Rc;
+					Pt[0] = Sr * Dir[0]; Pt[1] = Sr * Dir[1] * Q1; Pt[2] = Sr * Dir[2] * Q2;
+				}
+				else
+				{
+					// Clump k: Plummer radius r = a / sqrt(u^(-2/3) - 1).
+					const u32 Kk = std::min(u32((Uc - WBody) / WClump), NClumps - 1u);
+					const double Rr = A / std::sqrt(std::max(1.0 / std::cbrt(Ur * Ur) - 1.0, 1.0e-300));
+					Pt[0] = double(Cc[Kk].x) + Rr * Dir[0]; Pt[1] = double(Cc[Kk].y) + Rr * Dir[1]; Pt[2] = double(Cc[Kk].z) + Rr * Dir[2];
+				}
+				const H::float3 Pf(static_cast<float>(Pt[0]), static_cast<float>(Pt[1]), static_cast<float>(Pt[2]));
+				// h at the point (the proposal's density up to its normaliser).
+				const double Sy = double(Pf.y) / Q1, Sz = double(Pf.z) / Q2;
+				const double S2 = double(Pf.x) * double(Pf.x) + Sy * Sy + Sz * Sz;
+				double Hp = 0.0;
+				if (S2 < Cut * Cut) { const double Xb = 1.0 + S2 / (Rc * Rc); Hp = 1.0 / (Xb * std::sqrt(Xb)); }
+				if (WClump > 0.0)
+				{
+					for (u32 K = 0; K < NClumps; ++K)
+					{
+						const double Dv[3] = { double(Pf.x) - double(Cc[K].x), double(Pf.y) - double(Cc[K].y), double(Pf.z) - double(Cc[K].z) };
+						const double Y = 1.0 + (Dv[0] * Dv[0] + Dv[1] * Dv[1] + Dv[2] * Dv[2]) / (A * A);
+						Hp += Wc / (Y * Y * std::sqrt(Y));
+					}
+				}
+				if (!(Hp > 0.0)) { continue; }
+				const double Fv = double(H::UniField_ClusterC(Pf, Fp, Cc[0], Cc[1], Cc[2], Cc[3]));
+				if (double(H::Uni_DrawUnit(S, H::UNI_CH_ACCEPT, T)) * Hp < Fv) { OutP = Pf; return true; }
+			}
+			return false;
+		}
+
+		/** D-177: every authored bright member of one cluster copy (its catalogue cell Kc and
+		 *  offsets), computed once and cached by the copy: the up to 27 cells around it at each
+		 *  member level ask for the same copy twice each (submission, allocation). */
+		std::shared_ptr<const FCopyMembers> CopyMembers(const FCatRef& R, const FCellKey& Kc, const u32* OffC) const
+		{
+			u64 Key = (u64(R.Cat) << 48) ^ (u64(R.Entry) << 24);
+			for (int Ax = 0; Ax < 3; ++Ax) { Key ^= u64(Kc.C[Ax].L[3]) * (0x9E3779B97F4A7C15ull + u64(Ax) * 0x632BE59BD9B4E019ull); }
+			Key ^= u64(Kc.Level) << 56;
+			{
+				std::lock_guard<std::mutex> Lock(MemberCacheMutex);
+				auto It = MemberCache.find(Key);
+				if (It != MemberCache.end() && It->second.Kc == Kc && It->second.Entry == R.Entry && It->second.Cat == R.Cat) { return It->second.Members; }
+			}
+			auto Out = std::make_shared<FCopyMembers>();
+			const FUniverseDef& D = Model.Definition();
+			const FCatalogue& Cat = D.Catalogues[R.Cat];
+			FCellContent Host;
+			Host.Key = Kc;
+			Host.Objects.push_back(CatalogueObject(R.Cat, R.Entry, Kc, OffC, 0u));
+			Host.Indices.push_back(kFirstCatalogueIndex + R.Entry);
+			Host.ObjectContributor.push_back(0u);
+			std::vector<FContributor> Cs;
+			MakeContributorsFor(Host, 0, Cs);
+			if (!Cs.empty())
+			{
+				const FContributor& C = Cs[0];
+				const H::FUniFieldParams Fp = C.Params.ToHlsl();
+				const u32 ObjSeed = Host.Objects[0].B[0];
+				const u32 Ms = H::Uni_SeedMix(ObjSeed, H::UNI_CH_MEMBER);
+				const u32 Count = std::min(H::Uni_PoissonCount(float(C.NTotal * Cat.BrightRatio), Ms), 64u);
+				const FSliceTable& St = Model.SlicesOf(Cat.MemberArchetypeId);
+				double PBright = 0.0;
+				for (const FSlice& Sl : St.Slices) { if (Sl.Level >= Cat.MemberMinLevel) { PBright += Sl.P; } }
+				const FArchetype& MA = D.Arch(Cat.MemberArchetypeId);
+				const H::float4 Rm(MA.RadiusModel[0], MA.RadiusModel[1], MA.RadiusModel[2], MA.RadiusModel[3]);
+				const H::float3 Cc[4] = { H::Uni_ClusterCentre(Fp, 0u), H::Uni_ClusterCentre(Fp, 1u), H::Uni_ClusterCentre(Fp, 2u), H::Uni_ClusterCentre(Fp, 3u) };
+				Out->Members.reserve(Count);
+				for (u32 Kk = 0; Kk < Count; ++Kk)
+				{
+					const u32 S = H::Uni_SeedMix(Ms, Kk);
+					// Magnitude: a bright slice by its share, then the slice's own inverse CDF.
+					double U = double(H::Uni_DrawUnit(S, H::UNI_CH_MAG, 0u)) * PBright;
+					const FSlice* Pick = nullptr;
+					for (const FSlice& Sl : St.Slices) { if (Sl.Level < Cat.MemberMinLevel) { continue; } Pick = &Sl; if (U < Sl.P) { break; } U -= Sl.P; }
+					if (!Pick) { continue; }
+					const double Uf = std::clamp(double(H::Uni_DrawUnit(S, H::UNI_CH_MAG, 1u)), 0.0, 1.0) * double(FSlice::kSliceLut - 1);
+					const size_t J = std::min(size_t(Uf), size_t(FSlice::kSliceLut - 2));
+					const float M = float(double(Pick->InvCdf[J]) + (Uf - double(J)) * (double(Pick->InvCdf[J + 1]) - double(Pick->InvCdf[J])));
+					// Position: drawn from the cluster's field.
+					H::float3 Pf(0, 0, 0);
+					if (!SampleClusterField(Fp, Cc, S, Pf)) { continue; }
+					// Field -> world: Rot rows map world to field; world = Rot^T p x influence.
+					const double Wv[3] = {
+						(double(C.Rot[0]) * Pf.x + double(C.Rot[3]) * Pf.y + double(C.Rot[6]) * Pf.z) * C.InfluenceCm,
+						(double(C.Rot[1]) * Pf.x + double(C.Rot[4]) * Pf.y + double(C.Rot[7]) * Pf.z) * C.InfluenceCm,
+						(double(C.Rot[2]) * Pf.x + double(C.Rot[5]) * Pf.y + double(C.Rot[8]) * Pf.z) * C.InfluenceCm };
+					FMemberRec Mr;
+					Mr.Pos = C.Centre;
+					FVec3f Fr{};
+					AddDisplacement(Mr.Pos, Fr, FVec3d{ Wv[0], Wv[1], Wv[2] });
+					Mr.Level = Pick->Level;
+					Mr.Cell = CellOf(Mr.Pos, Mr.Level);
+					Mr.Index = kFirstMemberIndex + R.Entry * 64u + Kk;
+					const bool bEarly = Fp.C.x > 0.0f && H::Uni_DrawUnit(S, H::UNI_CH_MORPH, 0u) < H::Uni_ClusterEarlyFraction(Fp, std::sqrt(H::dot(Pf, Pf)));
+					H::float4 Cm(MA.ColourModel[0], MA.ColourModel[1], MA.ColourModel[2], MA.ColourModel[3]);
+					if (bEarly) { Cm.x = Cm.x + Fp.C.w; }
+					const float RL2 = H::Uni_DrawRadiusLog2(S, M, Rm);
+					const H::float3 Rgb = H::Uni_DrawColour(S, M, Cm);
+					const bool bExt = MA.Visibility == EUniVisibility::Extended;
+					const u32 Flags = H::UNI_OBJ_FLAG_ANCHOR | (bExt ? H::UNI_OBJ_FLAG_EXTENDED : 0u) | (MA.Emitters.empty() ? 0u : H::UNI_OBJ_FLAG_HAS_CONTRIBUTOR) | (bEarly ? H::UNI_OBJ_FLAG_EARLY : 0u);
+					const float SB = bExt ? SurfaceBrightness(M, RL2) : 0.0f;
+					Mr.Obj = FromHlsl(H::Uni_MakeObject(H::uint3(0u, 0u, 0u), Cat.MemberArchetypeId, Flags, S, RL2, M, SB, Rgb));
+					Out->Members.push_back(Mr);
+				}
+				std::stable_sort(Out->Members.begin(), Out->Members.end(), [](const FMemberRec& A, const FMemberRec& B) { return A.Level < B.Level; });
+				for (u32 I = 0; I < u32(Out->Members.size()); ++I)
+				{
+					auto& Rg = Out->LevelRange.try_emplace(Out->Members[I].Level, I, I).first->second;
+					Rg.second = I + 1;
+				}
+			}
+			std::lock_guard<std::mutex> Lock(MemberCacheMutex);
+			if (MemberCache.size() > 65536) { MemberCache.clear(); }
+			FMemberCacheEntry& E = MemberCache[Key];
+			E.Kc = Kc; E.Cat = R.Cat; E.Entry = R.Entry; E.Members = Out;
+			return Out;
 		}
 
 		/** Contributors created by the objects of a generated cell (pass 4). */
@@ -716,9 +1111,17 @@ namespace UniCore
 		std::vector<int> AnchorLevels;
 		std::vector<FCellKey> AnchorCells;
 		// D-167: catalogue entries and their levels.
-		struct FCatRef { u32 Cat = 0; u32 Entry = 0; int Level = 0; FU128 E[3]; };
 		std::vector<FCatRef> CatRefs;
 		std::map<int, std::vector<size_t>> CatByLevel;
+		struct FCatLevelIndex { std::unordered_map<u64, std::vector<size_t>> ByCell; std::set<u32> Cats; std::vector<size_t> Walk; };
+		std::map<int, FCatLevelIndex> CatIndex;   // D-174
+		struct FMemberHit { size_t Ri = 0; int Dx[3] = { 0, 0, 0 }; };   // a ref, and its copy's tile cell offset from the bucket's
+		struct FMemberLevelIndex { std::unordered_map<u64, std::vector<FMemberHit>> ByCell; std::set<u32> Cats; };
+		std::map<int, FMemberLevelIndex> MemberIndex;   // D-177: catalogue entries with authored members, at each member level
+		struct FMemberCacheEntry { FCellKey Kc; u32 Cat = 0, Entry = 0; std::shared_ptr<const FCopyMembers> Members; };
+		mutable std::unordered_map<u64, FMemberCacheEntry> MemberCache;   // D-177: by cluster copy
+		mutable std::mutex MemberCacheMutex;
+		static u64 CatCellKey(u32 Cat, const u64 Cell[3]) { return (u64(Cat) << 63) ^ (u64(Cat) * 0x9E3779B97F4A7C15ull) ^ (Cell[0] | (Cell[1] << 21) | (Cell[2] << 42)); }
 		static constexpr u32 kCatalogueContributor = 0xCA7A0000u;   // the "contributor" in a catalogue copy's cell seed
 	};
 

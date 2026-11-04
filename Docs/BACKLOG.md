@@ -102,7 +102,7 @@ Glare grows only with log flux, so every star crosses over at about the same on-
 - Sprite flux equals actor emissive flux at the swap (needs UE, UE-7).
 - Hysteresis gives no flicker.
 
-## B-004: Galaxy groups (owner, 2026-11-02) — DONE (D-174, option 2)
+## B-004: Galaxy groups (owner, 2026-11-02) — DONE (D-174, option 2; revised by D-177: groups are labels, dwarfs come from the node matter)
 
 **Owner decision (2026-11-03): option 2, groups from the node list** (next heaviest nodes after the clusters become group objects that emit only faint members; bright members stay web field galaxies; reach a few Mpc). **Status:** not started. Most real galaxies live in groups of a few bright galaxies plus dwarfs. D-151 makes rich and poor clusters (M ≤ −24.5) explicit and leaves groups as field galaxies.
 
@@ -142,3 +142,5 @@ Inside a rich core the volume marches up to 12 galaxies per ray and 128 per fram
 ## B-012: Port the mature spiral galaxy density generator from UltraLargeScale (owner, 2026-11-03)
 Our galaxy field is the basic one (exponential disc, n = 2 bulge, log-spiral arms, D-160/D-163 prefilters, D-172 early types). UltraLargeScale's galaxy density generator (`GalaxyDensityCore.ush`, `GalaxyDensityRaymarch.ush`, ULS_REFERENCE_INDEX) has concepts to keep: warp fields that make discs and arms organic (the noise project's warp textures), and disc-level deformations (warps, lopsidedness and similar) that add variance between galaxies. Read-only reference (CLAUDE.md rule 1): its folder needs to be connected for reading when this starts. Lands with the warp textures; rerolls galaxies' stars (their field changes), so it is a content decision per parameter. Couples with B-011 (a costlier galaxy sample is what makes impostors worth it).
 
+## B-013: Members for procedural clusters, and member generation on the GPU (D-177 follow-up)
+D-177 authors bright members only for catalogue clusters (node list), on the CPU, cached per copy (~15 µs per copy cold on the reference). Scenes without a node list keep the old emitter split (all members from the emitter, cluster reach ~330 Mpc). If a scene ever needs many procedural clusters, the same split could run from the cluster emitter's own placement (members of generated clusters drawn on the GPU in the place pass). Worth it only if such a scene matters.

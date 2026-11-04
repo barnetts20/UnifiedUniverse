@@ -185,6 +185,7 @@ namespace UniCore
 			FCoord ScanCamera;
 			double ScanSlackCm = -1.0;
 			double ScanTheta = 0.0;
+			size_t AngleAwake = 0;                   // D-176: objects awake for their angle only (at the last scan)
 			FCellContent Readback;                   // emitter objects with indices (for contributors)
 			FCellContent Anchors;                    // authored objects of this cell (anchors), CPU-known
 			size_t ReadOffset = 0;                   // where this cell's read-back objects start in its batch's ReadObjects
@@ -300,6 +301,9 @@ namespace UniCore
 		 *  the volume builder finds them (it asks for those above its reject angle: the engine sets
 		 *  this to half of it every frame). 1/480: half the reject angle at 960 px. */
 		double WakeTheta = 1.0 / 480.0;
+		/** D-176: objects to keep awake for their angle alone, about (the volume uses the largest
+		 *  MaxCarriers = 128); 0: no adaptation (every object above WakeTheta, as D-168). */
+		size_t WakeAngleTarget = 512;
 		/** D-173: entering cells not needed within the latency plus SubmitSlackFrames are built at
 		 *  most this many per level per frame (negative: no limit, as before D-173). */
 		int SubmitDeferPerLevel = 48;
@@ -611,6 +615,28 @@ namespace UniCore
 					{
 						const FObjectGPU& O = C.Readback.Objects[I];
 						if ((O.A[3] & 0xFFFFu) != ArchId) { continue; }
+						const u32 Off[3] = { O.A[0], O.A[1], O.A[2] };
+						Fn(ObjectCoord(C.Key, Off), O);
+					}
+				}
+			}
+		}
+
+		/** D-177: every resident object of archetype ArchId (Ready cells), emitter or not (groups
+		 *  are labels with no emitter now), as Fn(centre, object). Walks every object of the levels
+		 *  the archetype is placed at: for console commands, not per frame. */
+		template <typename F>
+		void ForEachObjectOf(u32 ArchId, F&& Fn) const
+		{
+			for (const auto& LKV : Levels)
+			{
+				for (const auto& CKV : LKV.second.Cells)
+				{
+					const FCell& C = CKV.second;
+					if (C.State != ECellState::Ready) { continue; }
+					for (const FObjectGPU& O : C.Readback.Objects)
+					{
+						if ((O.A[3] & 0xFFFFu) != ArchId || ((O.A[3] >> 16) & UniHlsl::UNI_OBJ_FLAG_DELTA_HIDDEN) != 0u) { continue; }
 						const u32 Off[3] = { O.A[0], O.A[1], O.A[2] };
 						Fn(ObjectCoord(C.Key, Off), O);
 					}
@@ -1305,7 +1331,12 @@ namespace UniCore
 		 *  only shrink by what the camera moves, so a skipped cell would have changed nothing. */
 		void UpdateWake()
 		{
-			const double Th = std::max(WakeTheta, 1.0e-9);
+			// D-176: the angle threshold rises in quarter-octave steps while more than
+			// 2 x WakeAngleTarget objects are awake only for their angle (the volume keeps at most
+			// MaxCarriers, the largest, D-161), and falls again below half the target. Never below
+			// WakeTheta. The window-reach criterion (what generation needs) is untouched.
+			const double Th = std::max(WakeTheta, 1.0e-9) * std::exp2(0.25 * double(WakeStep));
+			size_t AngleAwake = 0;
 			for (auto& LKV : Levels)
 			{
 				for (auto& CKV : LKV.second.Cells)
@@ -1325,13 +1356,23 @@ namespace UniCore
 						&& Length(ToDouble(Sub(Camera, C.ScanCamera))) < C.ScanSlackCm)
 					{
 						Profile.Asleep += C.EmitterObjects.size() - C.AwakeCount;
+						AngleAwake += C.AngleAwake;
 						continue;
 					}
 					ScanWake(C, Th);
 					Profile.Asleep += C.EmitterObjects.size() - C.AwakeCount;
+					AngleAwake += C.AngleAwake;
 				}
 			}
 			Profile.Awake = Registered.size();
+			Profile.AwakeByAngle = AngleAwake;
+			Profile.WakeStep = WakeStep;
+			if (bLazyWake && WakeAngleTarget > 0)
+			{
+				if (WakeStepHold > 0) { --WakeStepHold; }
+				else if (AngleAwake > 2 * WakeAngleTarget && WakeStep < 64) { ++WakeStep; WakeStepHold = 4; }
+				else if (AngleAwake < WakeAngleTarget / 2 && WakeStep > 0) { --WakeStep; WakeStepHold = 4; }
+			}
 		}
 
 		/** One cell of UpdateWake: wakes and sleeps its objects, and records its slack. */
@@ -1354,9 +1395,11 @@ namespace UniCore
 			{
 				if (C.AwakeCount > 0) { for (FCell::FSleeper& Sl : C.Sleepers) { if (Sl.bAwake) { Sleep(C, Sl); } } }
 				C.ScanSlackCm = 0.999 * (Dc - NearD);
+				C.AngleAwake = 0;
 				return;
 			}
 			FillSleepers(C);
+			C.AngleAwake = 0;
 			double Slack = std::numeric_limits<double>::infinity();
 			for (size_t K = 0; K < C.Sleepers.size(); ++K)
 			{
@@ -1370,6 +1413,7 @@ namespace UniCore
 				const double SleepD = std::max(Sl.InfluenceCm + 1.5 * Rl + Margin, 1.5 * Sl.InfluenceCm / Th);
 				if (!Sl.bAwake && Dist <= WakeD) { WakeUp(C, K); }
 				else if (Sl.bAwake && Dist > SleepD) { Sleep(C, Sl); }
+				if (Sl.bAwake && Dist > Sl.InfluenceCm + 1.5 * Rl + Margin) { ++C.AngleAwake; }   // D-176: awake for its angle only
 				Slack = std::min(Slack, Sl.bAwake ? SleepD - Dist : Dist - WakeD);
 			}
 			// The margin absorbs the coordinate rounding; a non-positive slack rescans next frame.
@@ -1483,6 +1527,7 @@ namespace UniCore
 		u64 NextTicket = 0;
 		u64 FrameNo = 0;
 		FVec3d FrameMove{ 0.0, 0.0, 0.0 };   // D-173: this frame's camera move (cm)
+		int WakeStep = 0, WakeStepHold = 0;   // D-176: angle threshold = WakeTheta x 2^(step / 4)
 		double LatencyEst = 6.0;   // D-139: frames, submit to Ready; starts at the GPU's order
 		struct FIntegralJob { std::atomic<bool> bDone{ false }; double Value = 0.0; };
 		mutable std::map<u32, std::shared_ptr<FIntegralJob>> IntegralJobs;   // D-140 (mutable: the volume builder requests jobs through a const streamer)
