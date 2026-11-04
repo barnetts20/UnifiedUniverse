@@ -83,6 +83,7 @@ namespace UniClusterCVars
 // D-154: travel sensitivity. Speeds in cm/s (100 kpc/s = 3.09e23, 10 Mpc/s = 3.09e25).
 static TAutoConsoleVariable<float> CVarUniTravelSensitivity(TEXT("uu.TravelSensitivity"), 2.5f, TEXT("Most sensitivity (mag) added while travelling fast (0: off). D-154."));
 static TAutoConsoleVariable<float> CVarUniTravelStart(TEXT("uu.TravelStart"), 3.0857e23f, TEXT("Speed (cm/s) where travel sensitivity starts (default 100 kpc/s)."));
+static TAutoConsoleVariable<int32> CVarUniSubmitDefer(TEXT("uu.SubmitDeferPerLevel"), 48, TEXT("D-173: entering cells not needed within the latency (plus a margin) are built at most this many per level per frame; -1: no limit (before D-173)."));
 static TAutoConsoleVariable<float> CVarUniTravelFull(TEXT("uu.TravelFull"), 3.0857e25f, TEXT("Speed (cm/s) where travel sensitivity is full (default 10 Mpc/s)."));
 
 // D-157: instrumentation and volume march quality.
@@ -582,6 +583,7 @@ void UUniSubsystem::Tick(float DeltaTime)
 		bCameraJumped = false;
 	}
 	Streamer->DeltaMag = EffectiveDeltaMag;
+	Streamer->SubmitDeferPerLevel = CVarUniSubmitDefer.GetValueOnGameThread();   // D-173
 	{
 		// D-168: contributors the volume builder will ask for (above its reject angle) stay awake:
 		// half that angle, from last frame's pixel size (as the builder uses).
@@ -634,8 +636,8 @@ FString UUniSubsystem::StreamBreakdown(const UniCore::FStreamProfile& P) const
 		const char* Name = UniCore::StreamPhaseName(UniCore::EStreamPhase(I));
 		S += FString::Printf(TEXT("%s%s %.1f"), S.IsEmpty() ? TEXT("") : TEXT(", "), UTF8_TO_TCHAR(Name + 11), P.Ms[I]);   // drop "Uni.Stream."
 	}
-	S += FString::Printf(TEXT(" | cells submitted %llu (tasks %llu), overlap tests %llu, growth checks %llu, read back %llu objects, contributors +%llu -%llu (awake %llu, asleep %llu; woke %llu, slept %llu), gathered %llu, batch-cell scans %llu, cell table %llu"),
-		P.CellsSubmitted, P.TasksSubmitted, P.OverlapTests, P.GrowthChecks, P.ObjectsReadBack, P.ContributorsAdded, P.ContributorsRemoved, P.Awake, P.Asleep, P.Woken, P.Slept, P.Gathered, P.BatchCellScans, P.CellTableEntries);
+	S += FString::Printf(TEXT(" | cells submitted %llu (tasks %llu), overlap tests %llu, growth checks %llu, read back %llu objects, contributors +%llu -%llu (awake %llu, asleep %llu; woke %llu, slept %llu), cells deferred %llu, gathered %llu, batch-cell scans %llu, cell table %llu"),
+		P.CellsSubmitted, P.TasksSubmitted, P.OverlapTests, P.GrowthChecks, P.ObjectsReadBack, P.ContributorsAdded, P.ContributorsRemoved, P.Awake, P.Asleep, P.Woken, P.Slept, P.CellsDeferred, P.Gathered, P.BatchCellScans, P.CellTableEntries);
 	return S;
 }
 

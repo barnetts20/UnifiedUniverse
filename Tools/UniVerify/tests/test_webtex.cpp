@@ -802,7 +802,7 @@ UNI_TEST(webtex, travel)
 	UniScenes::UseDeliveredWeb(Def, Tun, T.Size, Mean.z / (double(Mean.x) + Mean.y + Mean.z + Mean.w), &Nodes);
 	FUniverseModel M(Def);
 	FRefGenerator G(M);
-	struct FOut { double MeanMs = 0, WorstMs = 0, MeasureWorst = 0; size_t PeakAwake = 0, PeakAll = 0; double PhMean[int(EStreamPhase::Count)] = {}; FStreamProfile Worst; double GenMean = 0, WorstGen = 0; };
+	struct FOut { double MeanMs = 0, WorstMs = 0, MeasureWorst = 0; size_t PeakAwake = 0, PeakAll = 0; double PhMean[int(EStreamPhase::Count)] = {}; FStreamProfile Worst; double GenMean = 0, WorstGen = 0; std::vector<double> FrameMs; u64 MaxCells = 0, MaxTasks = 0, MaxOverlap = 0, MaxGrowth = 0, Deferred = 0; };
 	FOut Out[2];
 	// D-168's claim: an object sleeps only while its influence cannot reach any window, so the
 	// streamer generates exactly what it did with everything registered. Ready cells' objects at
@@ -830,6 +830,8 @@ UNI_TEST(webtex, travel)
 		FUniStreamer S(G, Be);
 		S.bAsyncIntegrals = false;
 		S.bLazyWake = K == 1;
+		S.SubmitDeferPerLevel = K == 1 ? S.SubmitDeferPerLevel : -1;   // D-173 on with D-168, off for the before-run
+		if (const char* Df = std::getenv("UNI_DEFER")) { S.SubmitDeferPerLevel = std::atoi(Df); }
 		FCoord C = UniScenes::SolarCamera();
 		FVec3f F{};
 		S.Update(C); ++Be.Frame;
@@ -849,12 +851,19 @@ UNI_TEST(webtex, travel)
 			S.Update(C); ++Be.Frame;
 			const double Ms = std::max(S.Profile.Ms[int(EStreamPhase::Update)] - Be.GenMs, 0.0);
 			Out[K].MeanMs += Ms / Frames;
+			Out[K].FrameMs.push_back(Ms);
+			Out[K].MaxCells = std::max<u64>(Out[K].MaxCells, S.Profile.CellsSubmitted);
+			Out[K].MaxTasks = std::max<u64>(Out[K].MaxTasks, S.Profile.TasksSubmitted);
+			Out[K].MaxOverlap = std::max<u64>(Out[K].MaxOverlap, S.Profile.OverlapTests);
+			Out[K].MaxGrowth = std::max<u64>(Out[K].MaxGrowth, S.Profile.GrowthChecks);
+			Out[K].Deferred += S.Profile.CellsDeferred;
 			for (int P = 0; P < int(EStreamPhase::Count); ++P) { Out[K].PhMean[P] += S.Profile.Ms[P] / Frames; }
 			Out[K].GenMean += Be.GenMs / Frames;
 			if (std::getenv("UNI_TRAVEL_DUMP") && Ms > 25.0)
 			{
 				std::printf("    %s frame %d (%.2g Mpc/s, +%.2f mag): %.1f ms bookkeeping, gen %.1f |", K ? "lazy" : "eager", Fr, Speed / Units::Mpc, S.DeltaMag, Ms, Be.GenMs);
 				for (int P = 0; P < int(EStreamPhase::Count); ++P) { if (S.Profile.Ms[P] > 0.5) { std::printf(" %s %.1f", StreamPhaseName(EStreamPhase(P)) + 11, S.Profile.Ms[P]); } }
+				std::printf(" | Submit-own %.1f Batches-own %.1f deferred %u", S.Profile.Ms[int(EStreamPhase::Submit)] - S.Profile.Ms[int(EStreamPhase::Backend)], S.Profile.Ms[int(EStreamPhase::Batches)] - S.Profile.Ms[int(EStreamPhase::BackendPlace)], unsigned(S.Profile.CellsDeferred));
 				std::printf(" | woke %u slept %u awake %u, +%u -%u, cells %u\n", unsigned(S.Profile.Woken), unsigned(S.Profile.Slept), unsigned(S.Profile.Awake), unsigned(S.Profile.ContributorsAdded), unsigned(S.Profile.ContributorsRemoved), unsigned(S.Profile.CellsSubmitted));
 			}
 			if (Ms > Out[K].WorstMs) { Out[K].Worst = S.Profile; Out[K].WorstGen = Be.GenMs; }
@@ -867,28 +876,35 @@ UNI_TEST(webtex, travel)
 	}
 	const double Gain = Out[0].MeanMs / std::max(Out[1].MeanMs, 1e-6);
 	const double GainMin = 2.5, WorstMax = 90.0;   // on the reference container (2 slow cores)
-	size_t Cells = 0, Objects = 0, Differ = 0;
+	size_t Cells = 0, Objects = 0, Differ = 0, NotYet = 0;
 	if (!Only)
 	{
 		for (size_t I = 0; I < Snaps[0].size() && I < Snaps[1].size(); ++I)
 		{
+			// D-173: spreading changes when a cell becomes Ready (a deferred one is not in the table
+			// yet), never what it holds: cells Ready in both runs must be identical.
 			const FSnap& A = Snaps[0][I];
 			const FSnap& B = Snaps[1][I];
-			if (A.size() != B.size()) { Differ += std::max(A.size(), B.size()) - std::min(A.size(), B.size()); }
 			for (const auto& KV : A)
 			{
+				auto It = B.find(KV.first);
+				if (It == B.end()) { ++NotYet; continue; }
 				++Cells;
 				Objects += KV.second.size();
-				auto It = B.find(KV.first);
-				if (It == B.end() || It->second.size() != KV.second.size()
+				if (It->second.size() != KV.second.size()
 					|| (!KV.second.empty() && std::memcmp(It->second.data(), KV.second.data(), KV.second.size() * sizeof(FObjectGPU)) != 0)) { ++Differ; }
 			}
+			for (const auto& KV : B) { if (!A.count(KV.first)) { ++NotYet; } }
 		}
 	}
 	if (std::getenv("UNI_TRAVEL_DUMP"))
 	{
 		for (int K = 0; K < 2; ++K)
 		{
+			std::vector<double> Fs = Out[K].FrameMs;
+			std::sort(Fs.begin(), Fs.end());
+			if (!Fs.empty()) { std::printf("    %s bookkeeping: p50 %.1f p90 %.1f p95 %.1f max %.1f ms; frames over 33 ms: %zu\n", K ? "lazy" : "eager", Fs[Fs.size() / 2], Fs[size_t(0.9 * double(Fs.size() - 1))], Fs[size_t(0.95 * double(Fs.size() - 1))], Fs.back(), size_t(std::count_if(Fs.begin(), Fs.end(), [](double V) { return V > 33.0; }))); }
+			std::printf("    %s per-frame peaks: cells submitted %llu, tasks %llu, overlap tests %llu, growth checks %llu; cell-frames deferred %llu\n", K ? "lazy" : "eager", (unsigned long long)Out[K].MaxCells, (unsigned long long)Out[K].MaxTasks, (unsigned long long)Out[K].MaxOverlap, (unsigned long long)Out[K].MaxGrowth, (unsigned long long)Out[K].Deferred);
 			std::printf("    %s mean:", K ? "lazy" : "eager");
 			for (int P = 0; P < int(EStreamPhase::Count); ++P) { if (Out[K].PhMean[P] > 0.05) { std::printf(" %s %.2f", StreamPhaseName(EStreamPhase(P)), Out[K].PhMean[P]); } }
 			std::printf("\n    %s worst:", K ? "lazy" : "eager");
@@ -896,13 +912,13 @@ UNI_TEST(webtex, travel)
 			std::printf(" | gen %.2f mean, %.2f in the worst | woke %u slept %u awake %u asleep %u\n", Out[K].GenMean, Out[K].WorstGen, unsigned(Out[K].Worst.Woken), unsigned(Out[K].Worst.Slept), unsigned(Out[K].Worst.Awake), unsigned(Out[K].Worst.Asleep));
 		}
 	}
-	Uni::Check(2, "T2.webtex.travel", "D-168 streamer bookkeeping on the flythrough scene (adhesion web, galaxies, stars) from rest to 100 Mpc/s (the whole update less the CPU backend's generation, which the GPU does in the engine): contributors woken by distance cut the mean cost at least 5x against registering every emitter object, the worst frame under 30 ms on the reference")
+	Uni::Check(2, "T2.webtex.travel", "D-168/D-173 streamer bookkeeping on the flythrough scene (adhesion web, galaxies, stars) from rest to 100 Mpc/s (the whole update less the CPU backend's generation, which the GPU does in the engine), against every emitter object registered and no submission spreading: identical cells and objects through the flight, mean cost at least 2.5x lower, worst frame under 90 ms on the reference (2 slow cores), and a lower peak of cells submitted in one frame")
 		.Metric("mean_ms_eager", Out[0].MeanMs).Metric("mean_ms_lazy", Out[1].MeanMs).Metric("worst_ms_eager", Out[0].WorstMs).Metric("worst_ms_lazy", Out[1].WorstMs)
 		.Metric("awake_peak", double(Out[1].PeakAwake)).Metric("registered_peak_eager", double(Out[0].PeakAwake))
-		.Metric("cells_differ", double(Differ))
-		.Pass(Gain >= GainMin && Out[1].WorstMs < WorstMax && Differ == 0 && Cells > 0,
-			Uni::Fmt("%zu cells / %zu objects at 4 frames of the flight compared, %zu differ; everything registered: %.1f ms mean, %.1f worst (measure up to %.1f), %zu contributors; woken by distance: %.2f ms mean, %.1f worst (measure up to %.2f), %zu awake of %zu emitter objects (%.1fx less per frame)",
-				Cells, Objects, Differ, Out[0].MeanMs, Out[0].WorstMs, Out[0].MeasureWorst, Out[0].PeakAwake, Out[1].MeanMs, Out[1].WorstMs, Out[1].MeasureWorst, Out[1].PeakAwake, Out[1].PeakAll, Gain));
+		.Metric("cells_differ", double(Differ)).Metric("peak_cells_before", double(Out[0].MaxCells)).Metric("peak_cells_after", double(Out[1].MaxCells))
+		.Pass(Gain >= GainMin && Out[1].WorstMs < WorstMax && Differ == 0 && Cells > 0 && Out[1].MaxCells < Out[0].MaxCells && NotYet * 10 < Cells,
+			Uni::Fmt("%zu cells / %zu objects Ready in both runs at 4 frames of the flight compared, %zu differ (%zu Ready in one run only); peak cells submitted in a frame %llu -> %llu (D-173, %llu cell-frames deferred); everything registered: %.1f ms mean, %.1f worst (measure up to %.1f), %zu contributors; woken by distance: %.2f ms mean, %.1f worst (measure up to %.2f), %zu awake of %zu emitter objects (%.1fx less per frame)",
+				Cells, Objects, Differ, NotYet, (unsigned long long)Out[0].MaxCells, (unsigned long long)Out[1].MaxCells, (unsigned long long)Out[1].Deferred, Out[0].MeanMs, Out[0].WorstMs, Out[0].MeasureWorst, Out[0].PeakAwake, Out[1].MeanMs, Out[1].WorstMs, Out[1].MeasureWorst, Out[1].PeakAwake, Out[1].PeakAll, Gain));
 }
 
 UNI_TEST(webtex, debug)

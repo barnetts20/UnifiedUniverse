@@ -354,7 +354,7 @@ UNI_TEST(stream, responsive)
 		Failures += S.Stats().AllocFailures;
 	}
 	Detail += Uni::Fmt("; steady-flight holes %lld; holes in the %d frames after a standing start %lld (reported, not required)", Holes, AccelFrames, AccelHoles);
-	Uni::Check(2, "T2.stream.responsive", "In flight with 3-frame backend phases: every cell Ready within 6 frames of entering per depth of its parent chain (1 for galaxy -> stars, 2 with clusters); in steady flight every cell inside N_eff of an active level is Ready on every frame")
+	Uni::Check(2, "T2.stream.responsive", "In flight with 3-frame backend phases: every cell Ready within 6 frames of entering (not counting frames D-173 deferred it while not needed) per depth of its parent chain (1 for galaxy -> stars, 2 with clusters); in steady flight every cell inside N_eff of an active level is Ready on every frame")
 		.Metric("worst_latency_frames", double(WorstLatency)).Metric("worst_visible_ready", WorstVisible).Metric("visible_holes", double(Holes)).Metric("accel_holes", double(AccelHoles)).Metric("update_ms_upper_bound", WorstMs).Metric("pool_peak", double(WorstPool))
 		.Pass(LatencyOver <= 0 && Holes == 0 && Failures == 0, Detail);
 }

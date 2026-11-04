@@ -459,3 +459,9 @@ A reviewer read the uncompiled engine code against UE 5.3–5.6 without seeing i
 - **Test steps:** `uu.GotoCluster rich`, fly into the core: mostly smooth, round or lens-shaped, yellower galaxies at the centre, spirals more common toward the edge. ProfileGPU `Uni.Volume.March` inside the core: no costlier than before (offline ~8% fewer galaxy steps).
 - **Failure looks like:** spirals in the core as before (the cluster parameters not reaching the place pass: C of the cluster's field), all members elliptical, or galaxies whose stars no longer line up with their glow (CPU and GPU disagreeing on the flag).
 
+## 13i. Spreading entering cells (D-173, UE-15)
+- **What changes:** cells entering a window that will not be needed for a while (by the current speed) are built at most 48 per level per frame instead of all at once; anything needed within the latency, anything a finer level waits on, and regenerated cells still go at once. `uu.SubmitDeferPerLevel -1` turns it off. The hitch line gains "cells deferred".
+- **Offline:** the worst burst 1,493 → 1,167 cells in one frame, identical content; frame-time percentiles within noise on the 2-core reference. Most of a burst during acceleration is the travel-sensitivity ramp widening the visible radius, which is needed at once.
+- **Test steps:** fly the flythrough from a star to intergalactic speed with `uu.PerfHud 1`; compare hitch lines with `uu.SubmitDeferPerLevel -1`. Submit spikes should be smaller or rarer; no pop-in ahead of the camera.
+- **Failure looks like:** pop-in or holes ahead at speed (a cell deferred too long: report the level and speed).
+

@@ -189,6 +189,7 @@ namespace UniCore
 			FCellContent Anchors;                    // authored objects of this cell (anchors), CPU-known
 			size_t ReadOffset = 0;                   // where this cell's read-back objects start in its batch's ReadObjects
 			u32 Frames = 0;                          // frames since entering (latency stats)
+			u32 DeferredFrames = 0;                  // D-173: of those, frames it was left waiting while not needed
 			bool bGrowthChecked = false;             // D-138: checked against the level's current gathered set
 			u64 SubmittedAt = 0;                     // D-139: frame its probe was submitted
 		};
@@ -299,6 +300,10 @@ namespace UniCore
 		 *  the volume builder finds them (it asks for those above its reject angle: the engine sets
 		 *  this to half of it every frame). 1/480: half the reject angle at 960 px. */
 		double WakeTheta = 1.0 / 480.0;
+		/** D-173: entering cells not needed within the latency plus SubmitSlackFrames are built at
+		 *  most this many per level per frame (negative: no limit, as before D-173). */
+		int SubmitDeferPerLevel = 48;
+		double SubmitSlackFrames = 4.0;
 		/** D-168: false registers every emitter object as soon as its cell is Ready (the earlier
 		 *  behaviour), for A/B checks. */
 		bool bLazyWake = true;
@@ -326,6 +331,7 @@ namespace UniCore
 			Profile.BeginFrame();
 			FProfileScope ScopeUpdate(Profile, EStreamPhase::Update);
 			const FVec3d MoveVec = bHasCamera ? ToDouble(Sub(Coord, Camera)) : FVec3d{ 0.0, 0.0, 0.0 };
+			FrameMove = MoveVec;
 			Camera = Coord; bHasCamera = true;
 			const double Reach = double(UniHlsl::Uni_WindowReach(float(DeltaMag)));   // D-162: 2 cells at dm 0 (5^3)
 			++FrameNo;
@@ -458,6 +464,7 @@ namespace UniCore
 				if (bParentsReady)
 				{
 					std::vector<FCell*> ToBuild;
+					std::vector<FCell*> Regenerated;
 					FCellBins Bins;
 					bool bBinned = false;
 					auto EnsureBins = [&]() -> const FCellBins& { if (!bBinned) { Bins = BinGathered(Next, Gathered, Boxes); bBinned = true; } return Bins; };
@@ -471,10 +478,12 @@ namespace UniCore
 							const bool bDelta = C.bGrowthChecked;
 							C.bGrowthChecked = true;
 							++Profile.GrowthChecks;
-							if (ContributorsGrew(C, EnsureBins(), Next, bDelta ? &NewIds : nullptr)) { ++Regenerations; Release(C); C.State = ECellState::Waiting; C.bGrowthChecked = false; ToBuild.push_back(&C); }
+							if (ContributorsGrew(C, EnsureBins(), Next, bDelta ? &NewIds : nullptr)) { ++Regenerations; Release(C); C.State = ECellState::Waiting; C.bGrowthChecked = false; Regenerated.push_back(&C); }
 						}
 					}
 					Lv.GatherIds = std::move(Ids);   // every Ready cell is now checked against it
+					DeferSubmissions(Lv, Next, ToBuild);   // D-173
+					ToBuild.insert(ToBuild.end(), Regenerated.begin(), Regenerated.end());   // never deferred: they were drawn
 					if (!ToBuild.empty()) { FProfileScope S(Profile, EStreamPhase::Submit); SubmitCells(ToBuild, EnsureBins(), Next); }
 				}
 				for (auto& KV : Lv.Cells) { ++KV.second.Frames; }
@@ -884,13 +893,6 @@ namespace UniCore
 		 *  contributor at Lp lies inside its cell and reaches at most LevelMaxInfluence[Lp]. */
 		bool ParentReadyFor(const FLevel& Lp, int LpLevel, int L) const
 		{
-			auto It = LevelMaxInfluence.find(LpLevel);
-			const double Reach = It == LevelMaxInfluence.end() ? std::numeric_limits<double>::infinity() : It->second;
-			const double W = CellWidthCm(L), Wp = CellWidthCm(LpLevel);
-			const FVec3d Oc = ToDouble(Sub(CellOrigin(CellOf(Camera, L)), Camera));
-			const double N = double(UniHlsl::UNI_WINDOW_N_MAX + UNI_WINDOW_LEAD_MAX);   // D-162: the widest a stretched window gets
-			const double CLo[3] = { Oc.X - N * W, Oc.Y - N * W, Oc.Z - N * W };
-			const double CHi[3] = { Oc.X + (N + 1.0) * W, Oc.Y + (N + 1.0) * W, Oc.Z + (N + 1.0) * W };
 			if (!Lp.bPendingValid)
 			{
 				Lp.Pending.clear();
@@ -904,10 +906,19 @@ namespace UniCore
 				}
 				Lp.bPendingValid = true;
 			}
-			const double LenOc = Length(Oc);
-			for (const FLevel::FPendingCell& Pc : Lp.Pending)
+			const FParentReach Pr = ParentReachOf(LpLevel, L);
+			for (const FLevel::FPendingCell& Pc : Lp.Pending) { if (Pr.Reaches(Pc.Off, Pc.Len)) { return false; } }
+			return true;
+		}
+
+		/** D-155: the box of level L's widest possible window around the camera, and how far a
+		 *  contributor at level LpLevel can reach (its level's largest influence): a parent cell
+		 *  whose box comes within that reach can hold something L needs. */
+		struct FParentReach
+		{
+			double CLo[3], CHi[3], Wp, NW, LenOc, Reach;
+			bool Reaches(const FVec3d& Op, double LenOp) const
 			{
-				const FVec3d& Op = Pc.Off;
 				const double PLo[3] = { Op.X, Op.Y, Op.Z };
 				double D2 = 0.0;
 				for (int A = 0; A < 3; ++A)
@@ -915,10 +926,77 @@ namespace UniCore
 					const double Gap = std::max({ 0.0, CLo[A] - (PLo[A] + Wp), PLo[A] - CHi[A] });
 					D2 += Gap * Gap;
 				}
-				const double Margin = 1.0e-9 * (Pc.Len + LenOc + Wp + N * W) + 1.0;
-				if (D2 <= (Reach + Margin) * (Reach + Margin)) { return false; }
+				const double Margin = 1.0e-9 * (LenOp + LenOc + Wp + NW) + 1.0;
+				return D2 <= (Reach + Margin) * (Reach + Margin);
 			}
-			return true;
+		};
+		FParentReach ParentReachOf(int LpLevel, int L) const
+		{
+			FParentReach R;
+			auto It = LevelMaxInfluence.find(LpLevel);
+			R.Reach = It == LevelMaxInfluence.end() ? std::numeric_limits<double>::infinity() : It->second;
+			const double W = CellWidthCm(L);
+			R.Wp = CellWidthCm(LpLevel);
+			const FVec3d Oc = ToDouble(Sub(CellOrigin(CellOf(Camera, L)), Camera));
+			const double N = double(UniHlsl::UNI_WINDOW_N_MAX + UNI_WINDOW_LEAD_MAX);   // D-162: the widest a stretched window gets
+			R.NW = N * W;
+			R.CLo[0] = Oc.X - N * W; R.CLo[1] = Oc.Y - N * W; R.CLo[2] = Oc.Z - N * W;
+			R.CHi[0] = Oc.X + (N + 1.0) * W; R.CHi[1] = Oc.Y + (N + 1.0) * W; R.CHi[2] = Oc.Z + (N + 1.0) * W;
+			R.LenOc = Length(Oc);
+			return R;
+		}
+
+		/** D-173: spread entering cells over frames. A window shift, a sensitivity resize or the
+		 *  stretch growing brings in hundreds of cells per level, and several levels shift on the
+		 *  same frame (their boundaries nest), so task building and, a few frames later, their
+		 *  readiness came in bursts of 500-1,100 cells. A waiting cell's slack is how many frames
+		 *  the camera needs, at this frame's speed, to bring it inside the visible radius (its
+		 *  Chebyshev gap beyond the radius over the fastest axis's cells per frame: no faster than
+		 *  that). Cells with slack within the measured latency plus SubmitSlackFrames go now;
+		 *  of the rest, at most SubmitDeferPerLevel per level per frame, least slack first; the
+		 *  others stay Waiting (undrawn: they were never Ready). Content is unchanged (a cell's
+		 *  objects do not depend on when it is built). Regenerated cells are never deferred. */
+		void DeferSubmissions(const FLevel& Lv, const FWindowGeometry& G, std::vector<FCell*>& InOut)
+		{
+			if (SubmitDeferPerLevel < 0 || InOut.empty()) { return; }
+			const double SensScale = double(UniHlsl::Uni_SensitivityScale(float(DeltaMag)));
+			const int64_t R = int64_t(std::ceil(double(UniHlsl::UNI_WINDOW_N_EFF) * SensScale - 1.0e-5));
+			const double W = CellWidthCm(G.Level);
+			const double Sp = std::max(std::abs(FrameMove.X), std::max(std::abs(FrameMove.Y), std::abs(FrameMove.Z))) / W;
+			const double Urgent = LatencyEst + SubmitSlackFrames;
+			// A cell a finer level's parent gate would wait on is needed now too (deferring it would
+			// stall that level: D-137/D-155).
+			std::vector<FParentReach> Children;
+			for (const auto& KV : Levels)
+			{
+				if (KV.first == G.Level || KV.second.Lod.bSuspended) { continue; }
+				if (std::find(KV.second.Parents.begin(), KV.second.Parents.end(), G.Level) != KV.second.Parents.end()) { Children.push_back(ParentReachOf(G.Level, KV.first)); }
+			}
+			std::vector<FCell*> Now;
+			std::vector<std::pair<double, FCell*>> Later;
+			for (FCell* C : InOut)
+			{
+				const int64_t Gap = std::max<int64_t>(CentreJump(G, C->Key) - R, 0);
+				double Slack = Gap == 0 ? 0.0 : (Sp > 1.0e-12 ? double(Gap) / Sp : 1.0e30);
+				if (Slack > Urgent && !Children.empty())
+				{
+					const FVec3d Op = ToDouble(Sub(CellOrigin(C->Key), Camera));
+					const double LenOp = Length(Op);
+					for (const FParentReach& Pr : Children) { if (Pr.Reaches(Op, LenOp)) { Slack = 0.0; break; } }
+				}
+				if (Slack <= Urgent) { Now.push_back(C); }
+				else { Later.push_back({ Slack, C }); }
+			}
+			(void)Lv;
+			if (Later.size() > size_t(SubmitDeferPerLevel))
+			{
+				std::stable_sort(Later.begin(), Later.end(), [](const auto& A, const auto& B) { return A.first < B.first; });
+				Profile.CellsDeferred += Later.size() - size_t(SubmitDeferPerLevel);
+				for (size_t I = size_t(SubmitDeferPerLevel); I < Later.size(); ++I) { ++Later[I].second->DeferredFrames; }
+				Later.resize(size_t(SubmitDeferPerLevel));
+			}
+			for (const auto& Lt : Later) { Now.push_back(Lt.second); }
+			InOut = std::move(Now);
 		}
 
 		/** Does a gathered contributor overlap C that C was not generated with? OnlyNew (sorted):
@@ -973,7 +1051,7 @@ namespace UniCore
 				if (C->Tasks.empty() && !bHasAnchor)
 				{
 					C->Batch.reset(); C->PoolCount = 0; C->State = ECellState::Ready; C->bGrowthChecked = false;
-					MaxLatency = std::max<size_t>(MaxLatency, C->Frames);
+					MaxLatency = std::max<size_t>(MaxLatency, C->Frames - std::min(C->Frames, C->DeferredFrames));   // D-173: deferral is not latency
 					continue;
 				}
 				C->Batch = B;
@@ -1079,7 +1157,7 @@ namespace UniCore
 					}
 					// Tasks of failed cells write nothing.
 					for (FCell* C : Mine) { if (C->State == ECellState::Failed) { for (size_t T = 0; T < C->Tasks.size(); ++T) { B->Tasks[C->BatchTaskIndex[T]].PoolCapacity = 0; } } }
-					{ FProfileScope S(Profile, EStreamPhase::Backend); Backend.SubmitPlace(B); }
+					{ FProfileScope S(Profile, EStreamPhase::BackendPlace); Backend.SubmitPlace(B); }
 					++It;
 					continue;
 				}
@@ -1122,7 +1200,7 @@ namespace UniCore
 					C->State = ECellState::Ready;
 					C->bGrowthChecked = false;
 					C->Batch.reset();
-					MaxLatency = std::max<size_t>(MaxLatency, C->Frames);
+					MaxLatency = std::max<size_t>(MaxLatency, C->Frames - std::min(C->Frames, C->DeferredFrames));   // D-173: deferral is not latency
 					// D-139: fast attack, slow decay, clamped so one stall cannot widen every window.
 					const double Obs = std::min(double(FrameNo - C->SubmittedAt), 16.0);
 					LatencyEst = Obs > LatencyEst ? Obs : std::max(1.0, 0.99 * LatencyEst + 0.01 * Obs);
@@ -1382,6 +1460,7 @@ namespace UniCore
 		bool bHasCamera = false, bFirstFrame = true;
 		u64 NextTicket = 0;
 		u64 FrameNo = 0;
+		FVec3d FrameMove{ 0.0, 0.0, 0.0 };   // D-173: this frame's camera move (cm)
 		double LatencyEst = 6.0;   // D-139: frames, submit to Ready; starts at the GPU's order
 		struct FIntegralJob { std::atomic<bool> bDone{ false }; double Value = 0.0; };
 		mutable std::map<u32, std::shared_ptr<FIntegralJob>> IntegralJobs;   // D-140 (mutable: the volume builder requests jobs through a const streamer)

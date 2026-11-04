@@ -104,7 +104,7 @@ Glare grows only with log flux, so every star crosses over at about the same on-
 
 ## B-004: Galaxy groups (owner, 2026-11-02)
 
-**Status:** not started. Most real galaxies live in groups of a few bright galaxies plus dwarfs. D-151 makes rich and poor clusters (M ≤ −24.5) explicit and leaves groups as field galaxies.
+**Owner decision (2026-11-03): option 2, groups from the node list** (next heaviest nodes after the clusters become group objects that emit only faint members; bright members stay web field galaxies; reach a few Mpc). **Status:** not started. Most real galaxies live in groups of a few bright galaxies plus dwarfs. D-151 makes rich and poor clusters (M ≤ −24.5) explicit and leaves groups as field galaxies.
 
 **Why not the same way:** a group as a parent of galaxies must be resident wherever its brightest member can be seen (D-152): about 330 Mpc. Groups are 10–100× more numerous than clusters. At FaintMag −23 that is about 130,000 resident groups (measured: 1.16M before D-152), each a contributor the streamer measures every frame.
 
@@ -113,7 +113,7 @@ Glare grows only with log flux, so every star crosses over at about the same on-
 2. **Group parents for faint members only.** Groups place only galaxies fainter than about −20; their bright members come from the web. Group reach then drops to a few Mpc.
 3. **Spatial index for contributors.** A coarse grid instead of per-frame measurement of every contributor, so 10⁵ contributors cost what 10⁴ do now. Also a performance-pass item.
 
-## B-005: Sampling boxes for galaxies' coarse star levels (D-153 follow-up)
+## B-005: Sampling boxes for galaxies' coarse star levels (D-153 follow-up) — MEASURED (2026-11-03): L75 0.92x, L74 1.01x, L73 1.01x of expected with no envelope clipping (0.2%) or shortfall; boxes give 0.98 / 0.97 / 1.00 but reroll every galaxy's stars. Recommend closing; owner to confirm
 
 The coarsest star levels (the brightest stars) have cells comparable to a galaxy's influence sphere, so the same probe miss can under-place them. Turning `bSampleBox` on for the galaxy emitter would fix it, but rerolls stars. Measure first (a T2 member census per galaxy, like T2.cluster.members), and decide before content.
 
@@ -130,7 +130,7 @@ The noise project's `*_nodes.json` lists every node cluster (position in tile un
 ## B-008: March the textured web farther (D-165 follow-up) — CLOSED (D-170: measured, no visible gain)
 The analytic tail past the march (0.5 periods) is ~99% of the background's light and uniform, so the adhesion web's structure barely shows in a full frame. With the texture, far samples can read the mip matching the step (not just the pixel) and take log steps, so marching several periods costs tens of steps. Measure the look and the cost; then the per-pixel background at speed.
 
-## B-009: Spread cell submissions over frames (D-168 follow-up)
+## B-009: Spread cell submissions over frames (D-168 follow-up) — DONE (D-173: modest; remaining bursts are urgent work)
 After D-168 the game thread's remaining spikes at speed are cells entering at once: a coarse window shift or a travel-sensitivity resize brings 500–1,000 cells in one frame, and task building (Submit) plus eviction (Window) cost 20–40 ms on the reference for them. A per-frame budget on cells submitted (nearest the camera first, never one inside the visible radius left waiting) would spread them; T2.stream.responsive bounds what the delay may cost.
 
 ## B-010: How visible should the web be in the sky? (owner, art direction; D-170 follow-up)
@@ -138,4 +138,7 @@ Physically, the integrated light of unresolved galaxies is isotropic to a few pe
 
 ## B-011: Galaxy impostors in cluster interiors (D-172 follow-up)
 Inside a rich core the volume marches up to 12 galaxies per ray and 128 per frame (D-161 caps), ~36 steps per ray of which 31 are the cluster's own glow. Cheap now; when warp textures go into the galaxy density each galaxy sample costs more. Then: galaxies under N pixels drawn from a cached impostor (a small view-dependent image per galaxy, re-rendered when the view direction changes by a few degrees) instead of marched. Measure with the warp textures first.
+
+## B-012: Port the mature spiral galaxy density generator from UltraLargeScale (owner, 2026-11-03)
+Our galaxy field is the basic one (exponential disc, n = 2 bulge, log-spiral arms, D-160/D-163 prefilters, D-172 early types). UltraLargeScale's galaxy density generator (`GalaxyDensityCore.ush`, `GalaxyDensityRaymarch.ush`, ULS_REFERENCE_INDEX) has concepts to keep: warp fields that make discs and arms organic (the noise project's warp textures), and disc-level deformations (warps, lopsidedness and similar) that add variance between galaxies. Read-only reference (CLAUDE.md rule 1): its folder needs to be connected for reading when this starts. Lands with the warp textures; rerolls galaxies' stars (their field changes), so it is a content decision per parameter. Couples with B-011 (a costlier galaxy sample is what makes impostors worth it).
 

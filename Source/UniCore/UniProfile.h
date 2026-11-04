@@ -32,7 +32,8 @@ namespace UniCore
 		Window,        //   recentring, evicting, entering cells
 		Growth,        //   D-113 re-checks of Ready cells against new contributors
 		Submit,        //   building generation tasks for waiting cells
-		Backend,       // D-168 backend submits, nested in Batches or Submit (the GPU's enqueue; the CPU reference's whole generation)
+		Backend,       // D-168 backend probe submits, nested in Submit (the GPU's enqueue; the CPU reference's generation)
+		BackendPlace,  // D-173 backend place submits, nested in Batches
 		CellTable,     // the per-frame cell table for project-and-cull
 		Count
 	};
@@ -55,6 +56,7 @@ namespace UniCore
 		case EStreamPhase::Growth: return "Uni.Stream.Growth";
 		case EStreamPhase::Submit: return "Uni.Stream.Submit";
 		case EStreamPhase::Backend: return "Uni.Stream.Backend";
+		case EStreamPhase::BackendPlace: return "Uni.Stream.BackendPlace";
 		case EStreamPhase::CellTable: return "Uni.Stream.CellTable";
 		default: return "Uni.Stream.?";
 		}
@@ -87,13 +89,14 @@ namespace UniCore
 		uint64_t Slept = 0;                // D-168: contributors put back to sleep
 		uint64_t Awake = 0;                // D-168: registered contributors after the wake pass
 		uint64_t Asleep = 0;               // D-168: emitter objects asleep (not registered)
+		uint64_t CellsDeferred = 0;        // D-173: entering cells left waiting for a later frame
 
 		void BeginFrame()
 		{
 			for (double& M : Ms) { M = 0.0; }
 			CellsSubmitted = TasksSubmitted = OverlapTests = ObjectsReadBack = 0;
 			ContributorsAdded = ContributorsRemoved = Gathered = GrowthChecks = BatchCellScans = CellTableEntries = 0;
-			Woken = Slept = Awake = Asleep = 0;
+			Woken = Slept = Awake = Asleep = CellsDeferred = 0;
 		}
 	};
 
