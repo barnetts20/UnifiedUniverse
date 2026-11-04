@@ -56,6 +56,7 @@ static const uint UNI_CH_SYSTEM = 0x3FBAD1DCu;      // ChannelId("SYSTEM")      
 static const uint UNI_CH_CLUMP = 0x2CEDF020u;       // ChannelId("CLUMP")       cluster sub-clump positions (D-151)
 static const uint UNI_CH_MORPH = 0x645635E5u;       // ChannelId("MORPH")       member galaxy morphology (D-172)
 static const uint UNI_CH_MEMBER = 0x66BFD5C3u;      // ChannelId("MEMBER")      authored bright members of catalogue clusters (D-177)
+static const uint UNI_CH_DISCMODE = 0x519B432Fu;    // ChannelId("DISCMODE")    galaxy disc modes and per-arm asymmetry from the shape seed (D-178)
 
 // ------------------------------------------------------------------------------------------
 // ProcSeed port

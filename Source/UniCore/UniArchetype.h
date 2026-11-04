@@ -31,10 +31,11 @@ namespace UniCore
 
 	struct FFieldParams
 	{
-		float V[16] = { 0 };
+		float V[32] = { 0 };   // D-178: 32 (was 16)
 
-		/** THE marshal site. Field cores read A = V[0..3], B = V[4..7], C = V[8..11], D = V[12..15]. */
-		FFieldParamsGPU Pack() const { FFieldParamsGPU G; for (int I = 0; I < 16; ++I) { G.V[I] = V[I]; } return G; }
+		/** THE marshal site. Field cores read A = V[0..3], B = V[4..7], C = V[8..11], D = V[12..15],
+		 *  E = V[16..19], F = V[20..23], G = V[24..27], H = V[28..31]. */
+		FFieldParamsGPU Pack() const { FFieldParamsGPU G; for (int I = 0; I < 32; ++I) { G.V[I] = V[I]; } return G; }
 
 		UniHlsl::FUniFieldParams ToHlsl() const
 		{
@@ -43,6 +44,10 @@ namespace UniCore
 			P.B = UniHlsl::float4(V[4], V[5], V[6], V[7]);
 			P.C = UniHlsl::float4(V[8], V[9], V[10], V[11]);
 			P.D = UniHlsl::float4(V[12], V[13], V[14], V[15]);
+			P.E = UniHlsl::float4(V[16], V[17], V[18], V[19]);
+			P.F = UniHlsl::float4(V[20], V[21], V[22], V[23]);
+			P.G = UniHlsl::float4(V[24], V[25], V[26], V[27]);
+			P.H = UniHlsl::float4(V[28], V[29], V[30], V[31]);
 			return P;
 		}
 
@@ -385,7 +390,7 @@ namespace UniCore
 						if (R.Min > R.Max) { P.push_back(A.Name + ": range " + R.Name + " has Min > Max"); }
 						if (R.Bias <= 0.0f) { P.push_back(A.Name + ": range " + R.Name + " has Bias <= 0"); }
 						if (R.Quantize > 0.0f && R.Quantize > R.Max - R.Min) { P.push_back(A.Name + ": range " + R.Name + " quantize exceeds span"); }
-						if (R.Slot < 0 || R.Slot > 15) { P.push_back(A.Name + ": range " + R.Name + " slot out of range"); }
+						if (R.Slot < 0 || R.Slot > 31) { P.push_back(A.Name + ": range " + R.Name + " slot out of range"); }
 					}
 					// Child levels strictly finer than every parent level.
 					const FSliceTable& Child = Slices.at(E.ChildArchetypeId);

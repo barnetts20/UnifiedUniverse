@@ -22,7 +22,7 @@ bool UniShadersEnabled();
 namespace UniGpuLayout
 {
 	inline constexpr uint32 ObjectBytes = sizeof(UniCore::FObjectGPU);          // 32
-	inline constexpr uint32 TaskBytes = sizeof(UniCore::FGenTaskGPU);           // 208 (D-153 sampling box)
+	inline constexpr uint32 TaskBytes = sizeof(UniCore::FGenTaskGPU);           // 272 (D-153 sampling box, D-178 field params 128)
 	inline constexpr uint32 TaskCountBytes = sizeof(UniCore::FTaskCountGPU);    // 16
 	inline constexpr uint32 SliceBytes = sizeof(UniCore::FSliceGPU);            // 64
 	inline constexpr uint32 CellBytes = sizeof(UniCore::FCellGPU);              // 64
@@ -38,7 +38,7 @@ namespace UniGpuLayout
 	inline constexpr double ReadbackTimeoutSeconds = 2.0;                       // lesson #24 safety valve
 	inline constexpr uint32 CarrierBytes = sizeof(UniCore::FCarrierGPU);        // 112
 	inline constexpr uint32 VolumeViewBytes = sizeof(UniCore::FVolumeViewGPU);  // 48
-	inline constexpr uint32 FieldParamsBytes = sizeof(UniCore::FFieldParamsGPU); // 64
+	inline constexpr uint32 FieldParamsBytes = sizeof(UniCore::FFieldParamsGPU); // 128 (D-178)
 	inline constexpr uint32 VolumeSlices = 8;                                   // UNI_VOL_SLICES (UniVolume.ush)
 	inline constexpr uint32 VolumeLutEntries = 256;                             // UNI_VOL_LUT_SIZE
 	inline constexpr uint32 MaxCarriers = 128;                                  // D-161

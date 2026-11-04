@@ -66,5 +66,9 @@
   {
     "id": "UE-17",
     "what": "The hybrid cluster split and map dwarfs in the engine (D-176, D-177): game-thread cost at intergalactic speed with uu.Enable flythrough and travel sensitivity (hitch lines: Submit, Levels, Wake; AwakeByAngle and WakeStep), clusters looking as before up close (uu.GotoCluster rich: bright members around the core, ellipticals in it), uu.GotoGroup and uu.Clusters finding groups (labels, no emitter), dwarfs clumped on nodes (REVIEW_TONIGHT \u00a713k)."
+  },
+  {
+    "id": "UE-18",
+    "what": "Galaxy disc modes in the engine (D-178): the 128-byte field parameters and 272-byte generation task on the GPU (automation struct sizes, placement unchanged in kind), rolled warps, lopsidedness and uneven arms visible on galaxies at a few degrees, the Milky Way band as before with a gentle outer warp (REVIEW_TONIGHT \u00a714)."
   }
 ]

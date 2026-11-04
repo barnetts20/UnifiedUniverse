@@ -946,3 +946,39 @@ Reroll impact:
 - Dwarfs reroll: they now come from the map, not per group. Groups keep their positions, names and magnitudes.
 - Scenes with procedural clusters (no node list) are unchanged.
 Status: Provisional (UE-17)
+
+D-178 — Galaxy disc-level modes and per-arm asymmetry (SPRITE_PASS_PLAN §3 A1; B-012)
+Question: Owner's art direction: realistic pulled towards stylised, and no two galaxies alike. Every galaxy gets a seeded config; the home galaxy may keep one fixed plausible set. UltraLargeScale's galaxy generator (read-only, connected 2026-11-04) varies shape beyond the spiral's parameters with modes that come almost free with the spiral math. Our arms were one m-fold cos wave, perfectly symmetric.
+Decision:
+- **Field parameters grow to eight float4** (FUniFieldParams A..H, FFieldParams V[32], 128 bytes; FGenTaskGPU 208 → 272). E..H are zero for every existing field, and every field treats zero as off.
+- **Galaxy field** (`UniField_GalaxyFiltered`):
+  - E = (warp amplitude, warp twist, lopsidedness, flare), F = (arm asymmetry, pitch tightening, shape seed).
+  - Warp: the disc and arms move vertically by A rn² sin(θ − φ − twist·rn), rn = r / cut. The node line precesses with radius; the bulge is not warped.
+  - Lopsidedness: the disc's density × max(1 + a·rn·cos(θ − φ), 0). Its azimuthal mean is 1, so the disc's light is unchanged.
+  - Flare: the scale height × (1 + f·rn), with the face-on surface density kept.
+  - Per-arm asymmetry (`Uni_GalaxyArmsAsym`), all from one hash of the shape seed per arm:
+    - each arm has its own pitch factor (1 ± 0.3a), phase jitter (± a quarter spacing), strength (1 ± 0.6a) and end radius;
+    - each arm's profile is the symmetric wave's own lobe, so at zero asymmetry this is the old wave;
+    - arms merge by max;
+    - pitch tightening winds arms tighter inward: (u + T u²/2) / tan p.
+  - Seed channel DISCMODE (new) derives the phases and per-arm values.
+  - Prefilter (D-160):
+    - the blend uses the local winding rate;
+    - asymmetric arms blend to their own mean (strength and end fade averaged over the arms);
+    - Foot = 0 is the placement field, as before.
+- **Ranges.**
+  - Galaxies: warp 0–0.14 (skewed small), twist ±1.2 rad, lopsidedness 0–0.35, flare 0–1.2, asymmetry 0.1–0.7, tightening 0–0.5, shape seed. A warp of 0.14 is ~1.2 kpc at the visible edge of a 15 kpc galaxy; the Milky Way's is ~1 kpc.
+  - Dwarfs: more irregular (lopsidedness 0.1–0.6, asymmetry 0.3–0.9).
+  - Early types keep none of these.
+  - The Milky Way anchor has one fixed plausible set (owner): warp 0.09, twist 0.4, lopsidedness 0.08, flare 0.5, asymmetry 0.2, tightening 0.15.
+- **Owner, for A5 (palette):** each galaxy gets its own colour or palette, plausible but stylised.
+Rationale: T2.galaxy.shape:
+- With every new parameter at zero the field is the D-172 field bit for bit (0 of 48,000 points over 24 rolled galaxies, filtered and not).
+- Arms at asymmetry 1e-7 are within 8.5e-6 of the symmetric wave.
+- The warp moves the density-weighted mid-plane by its formula (correlation 1.000, gain 0.994).
+- Light with lopsidedness 0.35: 1.0000 of the plain disc; with flare 1.2: 1.0004.
+- Prefiltered light within 1.08% for rolled galaxies at a 0.03 footprint (0.53% with their modes off). It was 2.8% before the asymmetric mean.
+- Contact sheets: still_galaxy_modes_off / _on.
+- T2.gen.slicing at one probe seed went from 0.9975 to 0.9711 at 16 cells per axis. Over 16 seeds the 128-probe estimator is unbiased there (mean 1.001, std 0.027; 1.016 / 0.033 with the modes off), so the old pass was one lucky draw (D-103's coarse-cell noise). The check now tests the 16-seed mean (within 1% or 3 standard errors).
+Reroll impact: Yes, every galaxy's and dwarf's stars (their field changes; the Milky Way's too). Counts are normalised by each contributor's integral, so totals hold. Positions and magnitudes of the galaxies themselves are unchanged, and so is everything outside galaxies.
+Status: Provisional

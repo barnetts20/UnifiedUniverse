@@ -580,6 +580,10 @@ namespace UniCore
 			R.Params.B = H::float4(T.Params.V[4], T.Params.V[5], T.Params.V[6], T.Params.V[7]);
 			R.Params.C = H::float4(T.Params.V[8], T.Params.V[9], T.Params.V[10], T.Params.V[11]);
 			R.Params.D = H::float4(T.Params.V[12], T.Params.V[13], T.Params.V[14], T.Params.V[15]);
+			R.Params.E = H::float4(T.Params.V[16], T.Params.V[17], T.Params.V[18], T.Params.V[19]);
+			R.Params.F = H::float4(T.Params.V[20], T.Params.V[21], T.Params.V[22], T.Params.V[23]);
+			R.Params.G = H::float4(T.Params.V[24], T.Params.V[25], T.Params.V[26], T.Params.V[27]);
+			R.Params.H = H::float4(T.Params.V[28], T.Params.V[29], T.Params.V[30], T.Params.V[31]);
 			R.CellSeed = T.CellSeed; R.FieldId = T.FieldId; R.ChildArchetypeId = T.ChildArchetypeId; R.SliceIndex = T.SliceIndex;
 			R.LambdaScale = T.LambdaScale; R.PoolBase = T.PoolBase; R.PoolCapacity = T.PoolCapacity; R.IndexBase = T.IndexBase;
 			R.Suppress = H::float4(T.Suppress[0], T.Suppress[1], T.Suppress[2], T.Suppress[3]);

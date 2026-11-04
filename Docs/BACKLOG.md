@@ -32,7 +32,7 @@
 - *Interplay:* with the volume on, a late cell's light is already carried as glow until its sprites arrive (D-128). The streak should take its energy from the same budget, so the sum stays conserved, or be explicitly decorative (decide).
 - *Verification:* an offline T3 check. Streak candidates in the flythrough match the pop counter's would-be pops. Tails land on the camera path within a pixel. No streak at normal speeds (0 candidates with D-118).
 
-## B-002: Star systems emitting planets (owner request, 2026-11-01)
+## B-002: Star systems emitting planets (owner request, 2026-11-01) — DONE (D-142..D-145)
 
 **Status (2026-11-01, 22:50):** v1 built on the volumetrics branch (D-142 to D-145). It covers activation, generation, Kepler orbits on rails, the clock, reflected-light photometry and drawing through the existing sprite path. It is verified offline (6 checks) and needs UE testing (REVIEW_TONIGHT §9). Still to do: lit discs and the promoted planet actor (M3, with B-003), moons, binaries (later, at the system level), and planets in the volume's light budget.
 
@@ -139,7 +139,7 @@ Physically, the integrated light of unresolved galaxies is isotropic to a few pe
 ## B-011: Galaxy impostors in cluster interiors (D-172 follow-up)
 Inside a rich core the volume marches up to 12 galaxies per ray and 128 per frame (D-161 caps), ~36 steps per ray of which 31 are the cluster's own glow. Cheap now; when warp textures go into the galaxy density each galaxy sample costs more. Then: galaxies under N pixels drawn from a cached impostor (a small view-dependent image per galaxy, re-rendered when the view direction changes by a few degrees) instead of marched. Measure with the warp textures first.
 
-## B-012: Port the mature spiral galaxy density generator from UltraLargeScale (owner, 2026-11-03)
+## B-012: Port the mature spiral galaxy density generator from UltraLargeScale (owner, 2026-11-03) — INVESTIGATED (2026-11-04; plan in SPRITE_PASS_PLAN §3 A)
 Our galaxy field is the basic one (exponential disc, n = 2 bulge, log-spiral arms, D-160/D-163 prefilters, D-172 early types). UltraLargeScale's galaxy density generator (`GalaxyDensityCore.ush`, `GalaxyDensityRaymarch.ush`, ULS_REFERENCE_INDEX) has concepts to keep: warp fields that make discs and arms organic (the noise project's warp textures), and disc-level deformations (warps, lopsidedness and similar) that add variance between galaxies. Read-only reference (CLAUDE.md rule 1): its folder needs to be connected for reading when this starts. Lands with the warp textures; rerolls galaxies' stars (their field changes), so it is a content decision per parameter. Couples with B-011 (a costlier galaxy sample is what makes impostors worth it).
 
 ## B-013: Members for procedural clusters, and member generation on the GPU (D-177 follow-up)

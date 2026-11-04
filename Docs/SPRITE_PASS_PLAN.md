@@ -24,14 +24,30 @@ Known gaps: galaxies are round blobs until the volume takes over (no inclination
 
 ## 3. Workstreams
 
-### A. Galaxy look foundation (B-012, content)
-**Goal.** Galaxies that look organic and varied, as UltraLargeScale's mature generator does.
-- Port from `GalaxyDensityCore.ush` / `GalaxyDensityRaymarch.ush` (read-only reference; the folder needs connecting): warp fields (domain warp of disc and arms by the noise project's warp textures: `warp fine` 64→128³ per TEXTURE_SPECS), disc-level deformations (warps, lopsidedness, flaring, arm irregularity), and whatever else it varies per galaxy.
-- Same shared-core rule as everything: placement (stars follow the field) and the volume march read one function; the warp texture is sampled like the web texture (D-164 pattern).
-- **Cost:** each galaxy sample gains one or two texture reads. Prefiltering (D-160/163) must extend to the warp (blend the warp amplitude out as the footprint passes its scale), or distant galaxies alias.
-- **Reroll:** every galaxy's stars (their field changes). Per parameter, one decision.
-- **Verification:** the existing T2.vol.equivalence / continuity / members-style census per galaxy (light and count against the budget), plus stills.
-- **Owner questions:** which ULS features to keep (a list once the folder is readable); whether the Milky Way anchor keeps its fixed exemplar or gets warps too.
+### A. Galaxy look foundation (B-012, content) — investigated 2026-11-04
+**Goal.** Galaxies that never look "samey": realistic physics (luminance, dust lanes) pulled towards a stylised palette, with variance from disc-level shape modes and texture warps rather than only from the spiral's parameters (owner's direction). Not a 1:1 port: our light and obscuration march stays (UltraLargeScale's march is "flat white: structure only", and it composes layers by max, which would break our light budget).
+
+**What UltraLargeScale has (`GalaxyDensityCore.ush`, read-only, folder now connected) and what we take:**
+
+| ULS feature | What it does | Take? | Cost | Reroll |
+|---|---|---|---|---|
+| Disc warp (m = 1 vertical) | z −= A rn² sin(θ − φ − twist·rn): the outer disc bends up on one side, down on the other, node line precessing | **Yes** | a sin per sample | stars |
+| Lopsidedness (m = 1 in-plane) | density × (1 + a·rn·cos(θ − φ)): one side denser | **Yes** (azimuthal mean 1, so the light budget holds) | a cos | stars |
+| Flare | scale height grows outward | **Yes** | none | stars |
+| Per-arm asymmetry | each arm its own pitch factor, phase jitter, strength and length (end fade), from a hash | **Yes**: our arms are one m-fold cos wave, perfectly symmetric; this is the biggest "samey" fix | a loop over ≤ 4 arms (with ULS's angular early reject) | stars |
+| Pitch tightening | arms wind tighter inward | **Yes** | none | stars |
+| Domain warp from textures, in a frame that winds with the spiral | disc and arms displaced by a curl field; halo by a second one | **Yes**, our `warp_fine` (disc/arms) and `warp_large` (bulge/halo): divergence-free, so volume (and the normalising integral) is preserved | 1–2 texture reads | stars |
+| Multiplicative modulation noise per layer | density × max(1 + a·n, 0) | **Yes**, `galaxy_detail` B (fBm) on the disc, G (Perlin-Worley clumps) as star-forming knots in the arms | 1 read, gated on density | stars |
+| Central void | clears the very centre | No (looks artificial at our scales; a bar would be the better addition later) | | |
+| Compact (1 − x²)^p profiles, max composition | | No (ours: exponential disc, n = 2 bulge, summed light) | | |
+
+**Dust and colour (render-only, no reroll):** dust lanes become cloud-like: the dust field (D-132) × `galaxy_detail` R (ridged lanes), eroded by `ism_shape` / `ism_erode` (Nubis-style edges) and holed by `galaxy_detail` A (superbubbles). Colour: per-galaxy palette rolled from the seed (hue shift, saturation boost, arm/bulge contrast), arms bluer with pink knots (where the knot channel is high), bulge gold; the sprite's colour is the volume's integrated tint so the D-129 hand-off stays seamless. Physics stays: luminance from the budget, dust absorption and reddening as now.
+
+**Rules kept:** one field source (placement, CPU integrals and the march read the same function; warp textures bound like the web texture, D-164, half-exact on the CPU); every new term prefiltered (the warp amplitude and modulation blend out as the pixel footprint passes their scale, D-160 pattern), so distant galaxies don't alias and the light is unchanged; Foot = 0 is the exact placement field.
+
+**Steps:** A1 the analytic modes (warp, lopsidedness, flare, per-arm asymmetry, tightening): no textures, the cheapest big win. A2 load and bind `warp_fine`, `warp_large`, `galaxy_detail` (CPU loader generalised from FWebTexture; GPU bindings in the gen and volume passes). A3 texture warp and modulation in the field. A4 cloud dust. A5 palette. Each with offline checks (light against the budget per galaxy, T2.vol.equivalence / continuity, star census, stills before/after) and an engine pass.
+
+**Reroll:** A1 and A3 move every galaxy's stars (their field changes; positions, counts per cell); A4 and A5 none. One decision entry each.
 
 ### B. Galaxies at a few pixels (new; render-only)
 **Goal.** A distant galaxy reads as a disc at its inclination, not a round dot, before the volume takes over.
@@ -80,10 +96,10 @@ Each step ends as now: offline checks (equivalence and continuity of light where
 
 ## 5. Decisions needed from the owner
 
-1. A: which UltraLargeScale galaxy features to keep (once the folder is connected), and connecting it.
-2. A: the warp textures for galaxies: which sets and sizes (TEXTURE_SPECS lists warp fine 64→128 as a candidate).
+1. ~~A: which UltraLargeScale features to keep; connecting it~~ (connected 2026-11-04; proposal in §3 A).
+2. ~~A: the warp textures~~ (delivered: warp_fine, warp_large, galaxy_detail, ism_shape, ism_erode, curl_2d).
 3. B: oriented galaxy sprites at all distances, or above a size?
 4. D: glare kept as a corona, or handed to bloom; diffraction spikes yes/no.
 5. E: streaks decorative or conserved; aberration and Doppler on all sprites or streaks only; onset speed.
 6. G: physical sky, near-web glow, or dimmed tail.
-7. Art references: a few images of the look you want (sky from inside a galaxy, a galaxy at a few degrees, warp travel) would anchor every one of these choices.
+7. ~~Art direction~~ (owner, 2026-11-04): realistic, pulled towards stylised/fantasy: more vibrant colours and more colour variation than real life, physics-based dust lanes and luminance, no two galaxies alike. Art references still welcome: a few images of the look you want (sky from inside a galaxy, a galaxy at a few degrees, warp travel) would anchor every one of these choices.

@@ -54,10 +54,10 @@ namespace UniCore
 	// GPU-MIRROR
 	struct FFieldParamsGPU
 	{
-		// Mirrors FUniFieldParams in UniFields.ush: four float4.
-		float V[16];
+		// Mirrors FUniFieldParams in UniFields.ush: eight float4 (D-178: was four).
+		float V[32];
 	};
-	static_assert(sizeof(FFieldParamsGPU) == 64, "FFieldParamsGPU must match FUniFieldParams (UniFields.ush)");
+	static_assert(sizeof(FFieldParamsGPU) == 128, "FFieldParamsGPU must match FUniFieldParams (UniFields.ush)");
 
 	// GPU-MIRROR
 	struct FGenTaskGPU
@@ -66,7 +66,7 @@ namespace UniCore
 		// the shader probes the field and derives envelope, integral, lambda and count itself
 		// (UltraLargeScale's FUniverseGenCell rule: nothing about the field is filled in here).
 		FFieldFrameGPU Frame;            // 64
-		FFieldParamsGPU Params;          // 64
+		FFieldParamsGPU Params;          // 128 (D-178)
 		uint32_t CellSeed;               // Uni_CellSeed(...)
 		uint32_t FieldId;
 		uint32_t ChildArchetypeId;
@@ -79,7 +79,7 @@ namespace UniCore
 		uint32_t BoxLo[4];               // D-153: sampling box, in-cell offsets (xyz); Span 0 = whole axis
 		uint32_t BoxSpan[4];
 	};
-	static_assert(sizeof(FGenTaskGPU) == 208, "FGenTaskGPU must match FUniGenTask (UniGenTask.ush)");
+	static_assert(sizeof(FGenTaskGPU) == 272, "FGenTaskGPU must match FUniGenTask (UniGenTask.ush)");
 
 	// GPU-MIRROR
 	struct FTaskCountGPU

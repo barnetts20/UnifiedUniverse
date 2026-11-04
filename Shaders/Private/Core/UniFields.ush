@@ -43,6 +43,10 @@ struct FUniFieldParams
 	float4 B;
 	float4 C;
 	float4 D;
+	float4 E;   // D-178: galaxy disc modes (and room for later fields); zero = off everywhere
+	float4 F;
+	float4 G;
+	float4 H;
 };
 
 /** Where a cell sits in its field's normalised space. One per (cell, contributor). */
@@ -353,7 +357,9 @@ UNI_FN float UniField_Cluster(float3 InP, FUniFieldParams InPar)
  *  A = (disc scale length, disc scale height, disc weight, bulge effective radius)
  *  B = (bulge flattening q, bulge weight, arm count, tan(pitch))
  *  C = (arm amplitude, arm sharpness, arm phase, unused)
- *  D = (cut radius, unused, unused, unused)
+ *  D = (cut radius, dust sigma (dust carriers only), unused, unused)
+ *  E = (disc warp amplitude, warp twist (rad), lopsidedness, flare)     D-178; zero = off
+ *  F = (arm asymmetry 0..1, pitch tightening, shape seed (integer-valued float), unused)
  *  Zero outside the cut radius, so no child is ever placed outside its contributor's
  *  influence (T2 contributor coverage). Each layer early-outs when its weight is zero. */
 /** D-160: the galaxy field prefiltered over a footprint (field units; the volume passes the
@@ -383,6 +389,74 @@ UNI_FN float Uni_BulgeInCut(float InRe, float InCut)
 	return saturate(1.0f - exp(-Y) * Sum);
 }
 
+/** D-178: per-arm shape of a galaxy with arm asymmetry or pitch tightening (UltraLargeScale's
+ *  GalaxyDensityCore ideas, on our cos-wave arms). Each arm i of M has its own pitch factor,
+ *  phase jitter, strength and end radius, from one hash of the galaxy's shape seed; its profile
+ *  is the symmetric wave's own lobe, ((1 + cos(M d)) / 2)^s for |d| < pi / M (d: angle from the
+ *  arm's centre line), so with no asymmetry the arms are the symmetric wave exactly. Arms merge
+ *  by max (a smooth union: no seam where two arms meet). Winding: theta_c = -k (u + T u^2 / 2) /
+ *  tan(p) - phase + 2 pi i / M + jitter, u = -ln r (field units), T the tightening. */
+UNI_FN float Uni_GalaxyArmsAsym(float InTheta, float InR, FUniFieldParams InPar, uint InSeed)
+{
+	const float M = max(floor(InPar.B.z + 0.5f), 1.0f);
+	const float TanP = max(InPar.B.w, 1.0e-3f);
+	const float S = max(InPar.C.y, 0.1f);
+	const float Asym = saturate(InPar.F.x);
+	const float T = max(InPar.F.y, 0.0f);
+	const float U = -log(max(InR, 1.0e-4f));
+	const float Wind = (U + 0.5f * T * U * U) / TanP;
+	const float Lobe = 3.14159265f / M;
+	const float Cut = max(InPar.D.x, 1.0e-6f);
+	float Best = 0.0f;
+	for (uint I = 0u; I < 8u; ++I)
+	{
+		if (float(I) >= M) { break; }
+		const uint H = Uni_SeedMix(Uni_SeedMix(InSeed, UNI_CH_DISCMODE), 8u + I);
+		const float H0 = float(H & 0xFFu) * (1.0f / 255.0f);
+		const float H1 = float((H >> 8u) & 0xFFu) * (1.0f / 255.0f);
+		const float H2 = float((H >> 16u) & 0xFFu) * (1.0f / 255.0f);
+		const float H3 = float((H >> 24u) & 0xFFu) * (1.0f / 255.0f);
+		const float K = 1.0f + 0.3f * Asym * (2.0f * H0 - 1.0f);            // pitch factor
+		const float Jit = 0.5f * Asym * Lobe * (2.0f * H1 - 1.0f);          // phase jitter, up to a quarter spacing
+		const float Str = max(1.0f + 0.6f * Asym * (2.0f * H2 - 1.0f), 0.0f);
+		const float REnd = Cut * max(1.0f - 1.2f * Asym * H3, 0.15f);       // where its end fade starts
+		const float Centre = -K * Wind - InPar.C.z + float(I) * 2.0f * Lobe + Jit;
+		float D = InTheta - Centre;
+		D = D - 6.2831853f * floor(D * (1.0f / 6.2831853f) + 0.5f);       // wrapped to [-pi, pi]
+		const float Ad = abs(D);
+		if (Ad >= Lobe) { continue; }
+		float Fade = 1.0f;
+		if (InR > REnd) { const float Tf = saturate((InR - REnd) / (0.2f * Cut)); Fade = 1.0f - Tf * Tf * (3.0f - 2.0f * Tf); }
+		const float W = pow(0.5f + 0.5f * cos(M * Ad), S) * Str * Fade;
+		Best = max(Best, W);
+	}
+	return Best;
+}
+
+/** D-178: the azimuthal mean of Uni_GalaxyArmsAsym at radius InR, for the prefilter's blend:
+ *  the symmetric wave's mean x the arms' mean strength and end fade there (exact while lobes do
+ *  not overlap; the phase jitter makes them overlap a little, where max is below the sum). */
+UNI_FN float Uni_GalaxyArmsAsymMean(float InR, FUniFieldParams InPar, uint InSeed)
+{
+	const float M = max(floor(InPar.B.z + 0.5f), 1.0f);
+	const float Asym = saturate(InPar.F.x);
+	const float Cut = max(InPar.D.x, 1.0e-6f);
+	float Sum = 0.0f;
+	for (uint I = 0u; I < 8u; ++I)
+	{
+		if (float(I) >= M) { break; }
+		const uint H = Uni_SeedMix(Uni_SeedMix(InSeed, UNI_CH_DISCMODE), 8u + I);
+		const float H2 = float((H >> 16u) & 0xFFu) * (1.0f / 255.0f);
+		const float H3 = float((H >> 24u) & 0xFFu) * (1.0f / 255.0f);
+		const float Str = max(1.0f + 0.6f * Asym * (2.0f * H2 - 1.0f), 0.0f);
+		const float REnd = Cut * max(1.0f - 1.2f * Asym * H3, 0.15f);
+		float Fade = 1.0f;
+		if (InR > REnd) { const float Tf = saturate((InR - REnd) / (0.2f * Cut)); Fade = 1.0f - Tf * Tf * (3.0f - 2.0f * Tf); }
+		Sum += Str * Fade;
+	}
+	return Uni_GalaxyArmMean(InPar.C.y) * Sum / M;
+}
+
 UNI_FN float UniField_GalaxyFiltered(float3 InP, FUniFieldParams InPar, float InFoot)
 {
 	const float Cut = InPar.D.x;
@@ -390,23 +464,46 @@ UNI_FN float UniField_GalaxyFiltered(float3 InP, FUniFieldParams InPar, float In
 	if (R2 >= Cut * Cut) { return 0.0f; }
 
 	const float Rcyl = sqrt(InP.x * InP.x + InP.y * InP.y);
-	const float Z = abs(InP.z);
+	float Z = abs(InP.z);
 	float Rho = 0.0f;
 
 	const float DiscW = InPar.A.z;
 	if (DiscW > 0.0f)
 	{
+		// D-178: disc-level modes (UltraLargeScale's m = 1 modes): a vertical warp of the outer
+		// disc, z - A rn^2 sin(theta - phase - twist rn), whose node line precesses with radius;
+		// lopsidedness, density x (1 + a rn cos(theta - phase)) (azimuthal mean 1); and a flare,
+		// scale height x (1 + f rn) with the face-on surface density kept. rn = r / cut. Phases
+		// from the galaxy's shape seed (F.z) on channel DISCMODE. All zero: the field as before,
+		// exactly. The bulge is not warped (it holds the inner disc rigid).
+		const uint Seed = (uint)max(InPar.F.z, 0.0f);
+		const bool bModes = InPar.E.x != 0.0f || InPar.E.z != 0.0f || InPar.E.w > 0.0f;
+		const bool bArmsAsym = InPar.F.x > 0.0f || InPar.F.y > 0.0f;
+		float Theta = 0.0f;
+		if (bModes || bArmsAsym) { Theta = atan2(InP.y, InP.x); }
+		float Lop = 1.0f, Flare = 1.0f;
+		if (bModes)
+		{
+			const float Rn = saturate(Rcyl / max(Cut, 1.0e-6f));
+			const uint Hp = Uni_SeedMix(Uni_SeedMix(Seed, UNI_CH_DISCMODE), 0u);
+			const float PhW = 6.2831853f * float(Hp & 0xFFFFu) * (1.0f / 65536.0f);
+			const float PhL = 6.2831853f * float(Hp >> 16u) * (1.0f / 65536.0f);
+			if (InPar.E.x != 0.0f) { Z = abs(InP.z - InPar.E.x * Rn * Rn * sin(Theta - PhW - InPar.E.y * Rn)); }
+			if (InPar.E.z != 0.0f) { Lop = max(1.0f + InPar.E.z * Rn * cos(Theta - PhL), 0.0f); }
+			if (InPar.E.w > 0.0f) { Flare = 1.0f + InPar.E.w * Rn; }
+		}
 		float Disc;
+		const float H = max(InPar.A.y, 1.0e-6f) * Flare;
 		if (InFoot > 0.0f)
 		{
-			const float H = max(InPar.A.y, 1.0e-6f);
 			const float He = sqrt(H * H + 0.25f * InFoot * InFoot);
 			Disc = DiscW * exp(-Rcyl / max(InPar.A.x, 1.0e-5f)) * exp(-Z / He) * (H / He);
 		}
 		else
 		{
-			Disc = DiscW * exp(-Rcyl / max(InPar.A.x, 1.0e-5f)) * exp(-Z / max(InPar.A.y, 1.0e-6f));
+			Disc = DiscW * exp(-Rcyl / max(InPar.A.x, 1.0e-5f)) * exp(-Z / H);
 		}
+		if (bModes) { Disc = Disc * (Lop / Flare); }
 		const float ArmAmp = InPar.C.x;
 		if (ArmAmp > 0.0f && InPar.B.z > 0.0f)
 		{
@@ -414,21 +511,40 @@ UNI_FN float UniField_GalaxyFiltered(float3 InP, FUniFieldParams InPar, float In
 			if (InFoot > 0.0f)
 			{
 				const float TanP = max(InPar.B.w, 1.0e-3f);
-				const float Grad = InPar.B.z / max(Rcyl, 0.5f * max(InPar.A.x, 1.0e-4f)) * sqrt(1.0f + 1.0f / (TanP * TanP));
+				// The local winding rate: (1 + T u) / tan(p), the steepest arm 1 + 0.3 asym of it (D-178).
+				float Wind2 = 1.0f / (TanP * TanP);
+				if (bArmsAsym)
+				{
+					const float Kw = (1.0f + max(InPar.F.y, 0.0f) * (-log(max(Rcyl, 1.0e-4f)))) * (1.0f + 0.3f * saturate(InPar.F.x)) / TanP;
+					Wind2 = Kw * Kw;
+				}
+				const float Grad = InPar.B.z / max(Rcyl, 0.5f * max(InPar.A.x, 1.0e-4f)) * sqrt(1.0f + Wind2);
 				Blend = saturate((InFoot * Grad - 1.0f) * (1.0f / 3.0f));   // footprint / arm scale, past 1: toward the mean by 4
 			}
 			float Wave = 0.0f;
 			if (Blend < 1.0f)
 			{
-				const float Theta = atan2(InP.y, InP.x);
-				const float Phi = InPar.B.z * (Theta - log(max(Rcyl, 1.0e-4f)) / max(InPar.B.w, 1.0e-3f) + InPar.C.z);
-				Wave = pow(0.5f + 0.5f * cos(Phi), max(InPar.C.y, 0.1f));
+				if (bArmsAsym)
+				{
+					Wave = Uni_GalaxyArmsAsym(Theta, Rcyl, InPar, Seed);
+				}
+				else
+				{
+					const float Th = atan2(InP.y, InP.x);
+					const float Phi = InPar.B.z * (Th - log(max(Rcyl, 1.0e-4f)) / max(InPar.B.w, 1.0e-3f) + InPar.C.z);
+					Wave = pow(0.5f + 0.5f * cos(Phi), max(InPar.C.y, 0.1f));
+				}
 			}
-			if (Blend > 0.0f) { Wave = Wave + (Uni_GalaxyArmMean(InPar.C.y) - Wave) * Blend; }
+			if (Blend > 0.0f)
+			{
+				const float Mean = bArmsAsym ? Uni_GalaxyArmsAsymMean(Rcyl, InPar, Seed) : Uni_GalaxyArmMean(InPar.C.y);
+				Wave = Wave + (Mean - Wave) * Blend;
+			}
 			Disc = Disc * ((1.0f - ArmAmp) + ArmAmp * Wave * (1.0f + InPar.C.y));
 		}
 		Rho += Disc;
 	}
+	Z = abs(InP.z);   // the bulge is never warped
 
 	const float BulgeW = InPar.B.y;
 	if (BulgeW > 0.0f)

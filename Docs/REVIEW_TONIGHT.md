@@ -498,3 +498,16 @@ A reviewer read the uncompiled engine code against UE 5.3–5.6 without seeing i
   3. `uu.GotoCluster rich`: the cluster should look as before: bright galaxies concentrated to the core, ellipticals (redder, round) in it, fainter members around. Fly through: no pop when the bright members' cells load (they come with L86/L87 cells, which are resident far out).
   4. `uu.Clusters`: both lines (clusters, groups) list resident counts; `uu.GotoGroup rich` lands at a group (3 radii out). Dwarfs there are clumped on the node (they no longer belong to the group object, so the jump message reports the group's light in dwarfs' worth).
 - **Failure looks like:** clusters missing their bright galaxies (member levels not filling), bright members far outside a cluster (a frame mismatch: report it), or uu.GotoGroup saying no group is resident (the new object walk not finding labels).
+
+## 14. Galaxy look, step A1: disc modes and uneven arms (D-178, UE-18)
+*Owner: realistic pulled towards stylised, no two galaxies alike; every galaxy seeded, the home galaxy one fixed set. Verified offline: T2.galaxy.shape (stills still_galaxy_modes_off / _on).*
+
+- **What changes:** every galaxy (and dwarf) rolls a disc warp, lopsidedness, flare, uneven arms (each arm its own pitch, phase, strength and length) and pitch tightening. The Milky Way has a fixed gentle set. Light totals are unchanged; the shapes vary. The texture warps (A2/A3) and cloud dust (A4) come next and add the organic small-scale variance; this step is the large-scale shape.
+- **GPU layout change:** field parameters are 128 bytes (eight float4), the generation task 272 bytes. The C++ sizes drive the buffer strides; the automation test expects 272. A mismatch would show as garbage placement or a GPU fault on the first generation.
+- **Content:** every galaxy's stars reroll (their field changed). Nothing else.
+- **Test steps:**
+  1. Build (UniFields.ush, UniSeed.ush, UniGenTask.ush, UniGpuTypes.h, UniArchetype.h, UniGenRef.h, UniDemoScenes.h, UniShaders.h, the automation test).
+  2. Run the UnifiedUniverse automation tests (struct sizes).
+  3. `uu.Enable web`, fly past a few galaxies at a few degrees: arms of uneven length and strength, some discs visibly lopsided, edge-on ones showing an S-shaped warp at the rim.
+  4. Inside the Milky Way (`uu.Enable flythrough` from rest): the band should look as before, with a slight warp towards the outer disc.
+- **Failure looks like:** stars in a sheet or scattered everywhere (a layout mismatch between C++ and HLSL), galaxies blank (fail-closed generation), or arms that end abruptly (an end fade at too small a radius: report the galaxy).

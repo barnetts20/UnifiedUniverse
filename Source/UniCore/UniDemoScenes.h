@@ -143,6 +143,16 @@ namespace UniScenes
 			{ "Arms.TanPitch", 7, 0.15f, 0.45f, 1.0f, 0.0f },
 			{ "Arms.Amplitude", 8, 0.3f, 0.8f, 1.0f, 0.0f },
 			{ "Arms.Phase", 10, 0.0f, 6.2831853f, 1.0f, 0.0f },
+			// D-178: disc-level modes and per-arm asymmetry (UltraLargeScale's ideas), so no two
+			// galaxies share a shape. Warp at the visible edge (r ~ 0.6 of the influence radius)
+			// ~0.36 x its amplitude: up to ~1.2 kpc for a 15 kpc galaxy, the Milky Way's ~1 kpc.
+			{ "Disc.WarpAmplitude", 16, 0.0f, 0.14f, 1.6f, 0.0f },
+			{ "Disc.WarpTwist", 17, -1.2f, 1.2f, 1.0f, 0.0f },
+			{ "Disc.Lopsided", 18, 0.0f, 0.35f, 1.6f, 0.0f },
+			{ "Disc.Flare", 19, 0.0f, 1.2f, 1.0f, 0.0f },
+			{ "Arms.Asymmetry", 20, 0.1f, 0.7f, 1.0f, 0.0f },
+			{ "Arms.Tightening", 21, 0.0f, 0.5f, 1.3f, 0.0f },
+			{ "Disc.ShapeSeed", 22, 0.0f, 16777215.0f, 1.0f, 1.0f },
 		};
 		// D-172: early types (cluster members drawn as such): a dominant, rounder, larger
 		// spheroid, little or no disc (elliptical to lenticular), no arms. Their stars follow it.
@@ -206,6 +216,13 @@ namespace UniScenes
 			{ "Dwarf.Arms", 6, 0.0f, 2.0f, 1.0f, 1.0f },
 			{ "Dwarf.ArmAmplitude", 8, 0.0f, 0.3f, 1.0f, 0.0f },
 			{ "Dwarf.ArmPhase", 10, 0.0f, 6.2831853f, 1.0f, 0.0f },
+			// D-178: dwarfs are the most irregular: strongly lopsided, ragged arms when they have any.
+			{ "Dwarf.WarpAmplitude", 16, 0.0f, 0.10f, 1.3f, 0.0f },
+			{ "Dwarf.WarpTwist", 17, -1.5f, 1.5f, 1.0f, 0.0f },
+			{ "Dwarf.Lopsided", 18, 0.1f, 0.6f, 1.0f, 0.0f },
+			{ "Dwarf.Flare", 19, 0.0f, 0.6f, 1.0f, 0.0f },
+			{ "Dwarf.ArmAsymmetry", 20, 0.3f, 0.9f, 1.0f, 0.0f },
+			{ "Dwarf.ShapeSeed", 22, 0.0f, 16777215.0f, 1.0f, 1.0f },
 		};
 		A.Volume.bDust = false;
 		A.Volume.DustTau = 0.0f;
@@ -611,7 +628,18 @@ namespace UniScenes
 		A.ArchetypeId = kGalaxy;
 		A.AbsMag = -21.0f;
 		A.RadiusLog2 = float(std::log2(15.0 * Units::Kpc));
-		A.EmitterParams = { GalaxyExemplar() };
+		// D-178 (owner): one fixed, plausible parameter set for the home galaxy; every other galaxy
+		// rolls its own. A gentle warp (~0.9 kpc at the solar circle's outer disc), slight
+		// lopsidedness and flare, mildly uneven arms.
+		FFieldParams P = GalaxyExemplar();
+		P.V[16] = 0.09f;        // warp amplitude
+		P.V[17] = 0.4f;         // warp twist
+		P.V[18] = 0.08f;        // lopsidedness
+		P.V[19] = 0.5f;         // flare
+		P.V[20] = 0.2f;         // arm asymmetry
+		P.V[21] = 0.15f;        // pitch tightening
+		P.V[22] = 5313203.0f;   // shape seed
+		A.EmitterParams = { P };
 		A.bFixedOrientation = true;
 		A.Seed = 0xA2C40001u;
 		return A;
