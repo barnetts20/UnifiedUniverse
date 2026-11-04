@@ -54,6 +54,8 @@ namespace UniClusterCVars
 	TAutoConsoleVariable<float> EarlyCore(TEXT("uu.Cluster.EarlyCore"), float(Defaults.EarlyCore), TEXT("D-172: share of members that are early types (elliptical / lenticular) at a cluster's centre (0: off, members as before D-172)."));
 	TAutoConsoleVariable<float> EarlyOuter(TEXT("uu.Cluster.EarlyOuter"), float(Defaults.EarlyOuter), TEXT("D-172: early-type share far from the centre (the field's, ~0.2)."));
 	TAutoConsoleVariable<float> EarlyScale(TEXT("uu.Cluster.EarlyScale"), float(Defaults.EarlyScale), TEXT("D-172: radius over which the early-type share falls from EarlyCore toward EarlyOuter, in influence radii (~0.25 = the virial radius)."));
+	TAutoConsoleVariable<int32> Groups(TEXT("uu.Group.Enable"), 1, TEXT("D-174: galaxy groups from the web's node list (each places dwarfs; 0: none). Needs the node list."));
+	TAutoConsoleVariable<float> GroupDwarfs(TEXT("uu.Group.Dwarfs"), float(Defaults.GroupDwarfs), TEXT("D-174: dwarfs (M -16..-12) in the median-mass group; each group's count goes with its node's mass."));
 	TAutoConsoleVariable<float> EarlyColour(TEXT("uu.Cluster.EarlyColour"), float(Defaults.EarlyColourShift), TEXT("D-172: early types' colour shift in log10 K (negative: redder)."));
 
 	UniScenes::FClusterTuning Read()
@@ -76,6 +78,8 @@ namespace UniClusterCVars
 		T.EarlyOuter = FMath::Clamp(double(EarlyOuter.GetValueOnGameThread()), 0.0, 1.0);
 		T.EarlyScale = FMath::Clamp(double(EarlyScale.GetValueOnGameThread()), 0.01, 2.0);
 		T.EarlyColourShift = FMath::Clamp(double(EarlyColour.GetValueOnGameThread()), -0.5, 0.5);
+		T.bGroups = Groups.GetValueOnGameThread() != 0;
+		T.GroupDwarfs = FMath::Clamp(double(GroupDwarfs.GetValueOnGameThread()), 0.0, 1000.0);
 		return T;
 	}
 }
@@ -293,6 +297,9 @@ void UUniSubsystem::SetupWebTexture(UniCore::FUniverseDef& Def)
 		if (bNodes && !Def.Catalogues.empty())
 		{
 			UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: clusters: the %d heaviest of %d nodes per tile (rank-mapped to the cluster luminosity function; members uu.Cluster.Fraction of galaxies)"), int32(Def.Catalogues[0].Entries.size()), int32(Nodes.size()));
+			int32 GroupCount = 0;
+			for (const UniCore::FCatalogue& C : Def.Catalogues) { if (C.ArchetypeId == UniScenes::kGroup) { GroupCount += int32(C.Entries.size()); } }
+			UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: groups: %d per tile (the remaining nodes; dwarfs by node mass, %.0f at the median; uu.Group.Enable %d) (D-174)"), GroupCount, ClusterTuning.GroupDwarfs, ClusterTuning.bGroups ? 1 : 0);
 		}
 		else
 		{
@@ -978,64 +985,79 @@ void UUniSubsystem::UpdateLightRig()
 void UUniSubsystem::LogClusters() const
 {
 	const UniScenes::FClusterTuning& T = ClusterTuning;
-	UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: clusters %s (scene '%s') | fraction %.3f, LF M* %.2f alpha %.2f over %.1f..%.1f, bias power %.2f, node weight %.2f, radius x%.2f, core %.2f..%.2f, clumps <= %d (weight %.2f)"),
-		T.bEnabled ? TEXT("on") : TEXT("off"), *SceneName, T.Fraction, T.MStar, T.Alpha, T.BrightMag, T.FaintMag, T.BiasPower, T.NodeWeight, T.RadiusScale, T.CoreMin, T.CoreMax, T.MaxClumps, T.ClumpWeight);
+	UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: clusters %s (scene '%s') | fraction %.3f, LF M* %.2f alpha %.2f over %.1f..%.1f, bias power %.2f, node weight %.2f, radius x%.2f, core %.2f..%.2f, clumps <= %d (weight %.2f) | early types %.2f -> %.2f over %.2f | groups %s (%.0f dwarfs at the median)"),
+		T.bEnabled ? TEXT("on") : TEXT("off"), *SceneName, T.Fraction, T.MStar, T.Alpha, T.BrightMag, T.FaintMag, T.BiasPower, T.NodeWeight, T.RadiusScale, T.CoreMin, T.CoreMax, T.MaxClumps, T.ClumpWeight,
+		T.EarlyCore, T.EarlyOuter, T.EarlyScale, T.bGroups ? TEXT("on") : TEXT("off"), T.GroupDwarfs);
 	if (!Streamer) { return; }
 	const UniCore::FCoord Cam = Camera.ToCore();
+	// D-168: clusters and groups far from any window they feed sleep (not in Contributors()), so
+	// count the resident objects themselves.
+	auto Census = [&](UniCore::u32 Arch, double RichMag, int32& N, int32& Rich, double& Nearest, double& NearestRich)
+	{
+		N = Rich = 0; Nearest = NearestRich = 0.0;
+		Streamer->ForEachEmitterObject(Arch, [&](const UniCore::FCoord& C, const UniCore::FObjectGPU& O)
+		{
+			const double M = double(UniHlsl::Uni_ObjectAbsMag(UniCore::ToHlsl(O)));
+			const double D = UniCore::Length(UniCore::ToDouble(UniCore::Sub(C, Cam)));
+			++N;
+			if (N == 1 || D < Nearest) { Nearest = D; }
+			if (M < RichMag) { ++Rich; if (Rich == 1 || D < NearestRich) { NearestRich = D; } }
+		});
+	};
 	int32 N = 0, Rich = 0;
 	double Nearest = 0.0, NearestRich = 0.0;
-	for (const auto& KV : Streamer->Contributors())
-	{
-		const UniCore::FContributor& C = KV.second;
-		if (C.ParentArchetypeId != UniScenes::kCluster) { continue; }
-		const UniCore::FObjectGPU* O = Streamer->FindObject(C.Parent);
-		const double M = O ? double(UniHlsl::Uni_ObjectAbsMag(UniCore::ToHlsl(*O))) : 0.0;
-		const double D = UniCore::Length(UniCore::ToDouble(UniCore::Sub(C.Centre, Cam)));
-		++N;
-		if (N == 1 || D < Nearest) { Nearest = D; }
-		if (M < -25.5) { ++Rich; if (Rich == 1 || D < NearestRich) { NearestRich = D; } }
-	}
+	Census(UniScenes::kCluster, -25.5, N, Rich, Nearest, NearestRich);
 	UE_LOG(LogUnifiedUniverse, Log, TEXT("  %d clusters resident (%d rich, M < -25.5); nearest %s, nearest rich %s. uu.GotoCluster [rich] jumps to one."),
+		N, Rich, N ? UTF8_TO_TCHAR(UniCore::FormatDistance(Nearest).c_str()) : TEXT("-"), Rich ? UTF8_TO_TCHAR(UniCore::FormatDistance(NearestRich).c_str()) : TEXT("-"));
+	Census(UniScenes::kGroup, -18.0, N, Rich, Nearest, NearestRich);
+	UE_LOG(LogUnifiedUniverse, Log, TEXT("  %d groups resident (%d rich, M < -18: ~50+ dwarfs); nearest %s, nearest rich %s. uu.GotoGroup [rich] jumps to one."),
 		N, Rich, N ? UTF8_TO_TCHAR(UniCore::FormatDistance(Nearest).c_str()) : TEXT("-"), Rich ? UTF8_TO_TCHAR(UniCore::FormatDistance(NearestRich).c_str()) : TEXT("-"));
 }
 
-bool UUniSubsystem::GoToCluster(bool bRich)
+bool UUniSubsystem::GoToCluster(bool bRich) { return GoToHost(UniScenes::kCluster, bRich ? -25.5 : 99.0, TEXT("cluster")); }
+bool UUniSubsystem::GoToGroup(bool bRich) { return GoToHost(UniScenes::kGroup, bRich ? -18.0 : 99.0, TEXT("group")); }
+
+bool UUniSubsystem::GoToHost(UniCore::u32 Arch, double BrighterThan, const TCHAR* What)
 {
-	if (!bEnabled || !Streamer) { return false; }
+	if (!bEnabled || !Streamer || !Model) { return false; }
 	const UniCore::FCoord Cam = Camera.ToCore();
-	const UniCore::FContributor* Best = nullptr;
-	double BestD = 0.0, BestM = 0.0;
-	for (const auto& KV : Streamer->Contributors())
+	const UniCore::FArchetype& A = Model->Definition().Arch(Arch);
+	if (A.Emitters.empty()) { return false; }
+	const UniCore::FUniEmitter& E = A.Emitters[0];
+	bool bFound = false;
+	UniCore::FCoord Best;
+	double BestD = 0.0, BestM = 0.0, BestInfl = 0.0;
+	Streamer->ForEachEmitterObject(Arch, [&](const UniCore::FCoord& C, const UniCore::FObjectGPU& O)
 	{
-		const UniCore::FContributor& C = KV.second;
-		if (C.ParentArchetypeId != UniScenes::kCluster) { continue; }
-		const UniCore::FObjectGPU* O = Streamer->FindObject(C.Parent);
-		if (!O) { continue; }
-		const double M = double(UniHlsl::Uni_ObjectAbsMag(UniCore::ToHlsl(*O)));
-		if (bRich && M >= -25.5) { continue; }
-		const double D = UniCore::Length(UniCore::ToDouble(UniCore::Sub(C.Centre, Cam)));
-		if (!Best || D < BestD) { Best = &C; BestD = D; BestM = M; }
-	}
-	if (!Best)
+		const UniHlsl::FUniObject H = UniCore::ToHlsl(O);
+		const double M = double(UniHlsl::Uni_ObjectAbsMag(H));
+		if (!(M < BrighterThan)) { return; }
+		const double D = UniCore::Length(UniCore::ToDouble(UniCore::Sub(C, Cam)));
+		if (bFound && D >= BestD) { return; }
+		bFound = true; Best = C; BestD = D; BestM = M;
+		BestInfl = E.InfluenceMul * std::exp2(double(UniHlsl::Uni_ObjectRadiusLog2(H)));
+	});
+	if (!bFound)
 	{
-		UE_LOG(LogUnifiedUniverse, Warning, TEXT("UnifiedUniverse: no %scluster resident yet (uu.Enable web or flythrough, then give the cluster level a moment to fill)."), bRich ? TEXT("rich ") : TEXT(""));
+		UE_LOG(LogUnifiedUniverse, Warning, TEXT("UnifiedUniverse: no %s%s resident yet (uu.Enable web or flythrough, then give its level a moment to fill)."), BrighterThan < 90.0 ? TEXT("rich ") : TEXT(""), What);
 		return false;
 	}
 	// 3 influence radii out along the current direction from it (or +x), facing its centre; free
-	// flight at a speed that crosses the cluster in about 10 s.
-	UniCore::FVec3d Dir = UniCore::ToDouble(UniCore::Sub(Cam, Best->Centre));
+	// flight at a speed that crosses it in about 10 s.
+	UniCore::FVec3d Dir = UniCore::ToDouble(UniCore::Sub(Cam, Best));
 	const double L = UniCore::Length(Dir);
 	Dir = L > 0.0 ? UniCore::FVec3d{ Dir.X / L, Dir.Y / L, Dir.Z / L } : UniCore::FVec3d{ 1.0, 0.0, 0.0 };
-	const double Out = 3.0 * Best->InfluenceCm;
-	UniCore::FCoord To = Best->Centre;
+	const double Out = 3.0 * BestInfl;
+	UniCore::FCoord To = Best;
 	UniCore::FVec3f Frac{};
 	UniCore::AddDisplacement(To, Frac, UniCore::FVec3d{ Dir.X * Out, Dir.Y * Out, Dir.Z * Out });
-	SetFreeFly(true, 0.2 * Best->InfluenceCm);
-	SetFlySpeed(0.2 * Best->InfluenceCm);
+	SetFreeFly(true, 0.2 * BestInfl);
+	SetFlySpeed(0.2 * BestInfl);
 	SetCamera(FUniCoord::Make(To));
 	if (APlayerController* PC = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr) { PC->SetControlRotation(FVector(-Dir.X, -Dir.Y, -Dir.Z).Rotation()); }
-	UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: jumped to a cluster of M = %.2f (~%.0f galaxies) that was %s away; now %s from its centre."),
-		BestM, Best->NTotal, UTF8_TO_TCHAR(UniCore::FormatDistance(BestD).c_str()), UTF8_TO_TCHAR(UniCore::FormatDistance(Out).c_str()));
+	const double Members = std::isfinite(E.NTotalRefMag) ? E.NTotal * std::pow(10.0, -0.4 * (BestM - E.NTotalRefMag)) : E.NTotal;
+	UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: jumped to a %s of M = %.2f (~%.0f %s) that was %s away; now %s from its centre."),
+		What, BestM, Members, Arch == UniScenes::kGroup ? TEXT("dwarfs, plus the web's bright galaxies there") : TEXT("galaxies"), UTF8_TO_TCHAR(UniCore::FormatDistance(BestD).c_str()), UTF8_TO_TCHAR(UniCore::FormatDistance(Out).c_str()));
 	return true;
 }
 
@@ -1249,6 +1271,11 @@ namespace
 			if (UUniSubsystem* S = Sub(World)) { S->LogClusters(); }
 		}));
 
+	FAutoConsoleCommandWithWorldAndArgs CmdGotoGroup(TEXT("uu.GotoGroup"), TEXT("uu.GotoGroup [rich]: jump to 3 influence radii from the nearest resident galaxy group (rich: M < -18, ~50+ dwarfs). D-174."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
+		{
+			if (UUniSubsystem* S = Sub(World)) { S->GoToGroup(Args.Num() > 0 && Args[0].Equals(TEXT("rich"), ESearchCase::IgnoreCase)); }
+		}));
 	FAutoConsoleCommandWithWorldAndArgs CmdGotoCluster(TEXT("uu.GotoCluster"), TEXT("uu.GotoCluster [rich]: jump to 3 influence radii from the nearest resident cluster (rich: M < -25.5)."),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
 		{

@@ -465,3 +465,15 @@ A reviewer read the uncompiled engine code against UE 5.3–5.6 without seeing i
 - **Test steps:** fly the flythrough from a star to intergalactic speed with `uu.PerfHud 1`; compare hitch lines with `uu.SubmitDeferPerLevel -1`. Submit spikes should be smaller or rarer; no pop-in ahead of the camera.
 - **Failure looks like:** pop-in or holes ahead at speed (a cell deferred too long: report the level and speed).
 
+## 13j. Galaxy groups and dwarfs (D-174, UE-16)
+*Owner chose option 2 for B-004. Verified offline: T2.webtex.groups.*
+
+- **What changes:** every web node after the 113 clusters is now a galaxy group (4,012 per 200 Mpc tile). A group places dwarf galaxies (M −16..−12, fainter than any galaxy before, so nothing is duplicated): ~20 for a median group, up to ~140 for the heaviest. Its bright galaxies are the web's field galaxies there, as before. Groups are resident only within ~20 Mpc and their dwarfs show within a few Mpc, so the cost should be small.
+- **Content:** nothing existing changes (field galaxies, clusters and stars identical); groups, dwarfs and the dwarfs' stars are new. `uu.Group.Enable 0` + `uu.Enable` removes them; `uu.Group.Dwarfs` scales them.
+- **Test steps:**
+  1. Build (new archetypes in UniDemoScenes.h; new subsystem functions GoToGroup / GoToHost; `ForEachEmitterObject` in the streamer).
+  2. `uu.Enable web` (or flythrough), `uu.Clusters`: a second line lists resident groups. `uu.GotoGroup rich`: you land 3 influence radii from a group (~2 Mpc) and should see a knot of small faint galaxies around a few bright ones. `uu.WebDebug 4` there: the group sits on a (lighter) node.
+  3. uu.GotoCluster should still work everywhere (it now finds sleeping clusters too).
+  4. Check the hitch lines and ProfileGPU at a group for any new cost.
+- **Failure looks like:** no groups listed (node list missing: the log says how many groups were added), dwarfs nowhere (group level not filling), or dwarfs scattered everywhere rather than clumped at groups.
+

@@ -37,6 +37,7 @@
 //   uu.Systems                          log active star systems and their planets
 //   uu.Clusters                         log the cluster tuning and the resident clusters (D-151)
 //   uu.GotoCluster [rich]               jump to 3 influence radii from the nearest resident cluster
+//   uu.GotoGroup [rich]                 the same for the nearest galaxy group (D-174)
 //                                       (rich: M < -25.5), facing it
 //   uu.Cluster.<handle> <value>         cluster tuning (Enable, Fraction, MStar, Alpha, BrightMag,
 //                                       FaintMag, BiasPower, NodeWeight, RadiusScale, CoreMin,
@@ -159,6 +160,8 @@ public:
 	void LogClusters() const;
 	/** Jump to 3 influence radii from the nearest resident cluster (bRich: M < -25.5). */
 	bool GoToCluster(bool bRich);
+	bool GoToGroup(bool bRich);   // D-174
+	bool GoToHost(UniCore::u32 Arch, double BrighterThan, const TCHAR* What);
 	/** Resolve the nearest star (within 100 pc) whose system has a gas giant, and jump into it
 	 *  in free flight, facing the star. */
 	bool GoToSystem(bool bToPlanet = false);

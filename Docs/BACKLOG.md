@@ -102,7 +102,7 @@ Glare grows only with log flux, so every star crosses over at about the same on-
 - Sprite flux equals actor emissive flux at the swap (needs UE, UE-7).
 - Hysteresis gives no flicker.
 
-## B-004: Galaxy groups (owner, 2026-11-02)
+## B-004: Galaxy groups (owner, 2026-11-02) — DONE (D-174, option 2)
 
 **Owner decision (2026-11-03): option 2, groups from the node list** (next heaviest nodes after the clusters become group objects that emit only faint members; bright members stay web field galaxies; reach a few Mpc). **Status:** not started. Most real galaxies live in groups of a few bright galaxies plus dwarfs. D-151 makes rich and poor clusters (M ≤ −24.5) explicit and leaves groups as field galaxies.
 
@@ -113,7 +113,7 @@ Glare grows only with log flux, so every star crosses over at about the same on-
 2. **Group parents for faint members only.** Groups place only galaxies fainter than about −20; their bright members come from the web. Group reach then drops to a few Mpc.
 3. **Spatial index for contributors.** A coarse grid instead of per-frame measurement of every contributor, so 10⁵ contributors cost what 10⁴ do now. Also a performance-pass item.
 
-## B-005: Sampling boxes for galaxies' coarse star levels (D-153 follow-up) — MEASURED (2026-11-03): L75 0.92x, L74 1.01x, L73 1.01x of expected with no envelope clipping (0.2%) or shortfall; boxes give 0.98 / 0.97 / 1.00 but reroll every galaxy's stars. Recommend closing; owner to confirm
+## B-005: Sampling boxes for galaxies' coarse star levels (D-153 follow-up) — MEASURED (2026-11-03): L75 0.92x, L74 1.01x, L73 1.01x of expected with no envelope clipping (0.2%) or shortfall; boxes give 0.98 / 0.97 / 1.00 but reroll every galaxy's stars. CLOSED (owner, 2026-11-03)
 
 The coarsest star levels (the brightest stars) have cells comparable to a galaxy's influence sphere, so the same probe miss can under-place them. Turning `bSampleBox` on for the galaxy emitter would fix it, but rerolls stars. Measure first (a T2 member census per galaxy, like T2.cluster.members), and decide before content.
 

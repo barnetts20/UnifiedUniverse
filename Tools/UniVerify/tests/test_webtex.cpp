@@ -1036,3 +1036,139 @@ UNI_TEST(webtex, debug)
 			Uni::Fmt("%lld clusters in view at %.1fx the node view's mean brightness, %lld field galaxies at %.2fx the placement view's; %.0f steps per ray (most %u), coverage %.2f; 3 views of %d x %d in %.1f s; unbound %s",
 				NClusters, NodeRatio, NGal, PlaceRatio, StepsPerRay, MaxSteps, Coverage, Cm.Width, Cm.Height, Secs, bUnbound ? "dark magenta" : "NOT flagged"));
 }
+
+UNI_TEST(webtex, groups)
+{
+	// D-174: galaxy groups from the node list (owner's option 2). The nodes after the clusters
+	// are group objects; each places only dwarfs (M -16..-12, below the galaxy function), its
+	// count going with its node's mass. Checks: the catalogue (every remaining node, heaviest
+	// brightest); resident groups at their entries' exact positions and magnitudes; every field
+	// galaxy and cluster identical to the scene without groups; dwarfs within their magnitudes;
+	// the dwarfs of one group against its budget (camera at its centre); residency.
+	std::string Err;
+	const FWebTexture& T = Delivered(&Err);
+	std::vector<FWebNode> Nodes;
+	if (!T.IsValid() || !LoadWebNodes(kDeliveredDir, kDeliveredName, Nodes, &Err)) { Uni::Check(2, "T2.webtex.groups", "D-174 galaxy groups").Pass(false, "not loaded: " + Err); return; }
+	FBindScope Bind(T);
+	const H::float4 Mean = T.Mean();
+	const double Share = Mean.z / (double(Mean.x) + Mean.y + Mean.z + Mean.w);
+	auto MakeDef = [&](bool bGroups)
+	{
+		UniScenes::FClusterTuning Tun;
+		Tun.bGroups = bGroups;
+		FUniverseDef D = UniScenes::WebToGalaxy(Tun);
+		UniScenes::UseDeliveredWeb(D, Tun, T.Size, Share, &Nodes);
+		return D;
+	};
+	const FUniverseDef DefOn = MakeDef(true), DefOff = MakeDef(false);
+	const FCatalogue* Gc = nullptr;
+	for (const FCatalogue& C : DefOn.Catalogues) { if (C.ArchetypeId == UniScenes::kGroup) { Gc = &C; } }
+	const size_t Clusters = DefOn.Catalogues.at(0).Entries.size();
+	bool bOrder = Gc != nullptr;
+	if (Gc) { for (size_t I = 1; I < Gc->Entries.size(); ++I) { bOrder = bOrder && Gc->Entries[I].AbsMag >= Gc->Entries[I - 1].AbsMag; } }
+	// Galaxies and clusters with and without groups, from intergalactic space.
+	auto Run = [&](const FUniverseDef& D, const FCoord& Cam, std::map<std::string, std::vector<FObjectGPU>>& OutSnap, size_t& OutGroups, size_t& OutMatched, size_t& OutDwarfs, size_t& OutDwarfBad, std::map<u32, size_t>* OutPerGroup, std::map<u32, double>* OutBudget)
+	{
+		FUniverseModel M(D);
+		FRefGenerator G(M);
+		FRefPipeline P(G);
+		P.bVelocityLod = false;
+		P.Update(Cam, FVec3f{});
+		OutGroups = OutMatched = OutDwarfs = OutDwarfBad = 0;
+		const double Tile = std::ldexp(1.0, 89);
+		for (const auto& KV : P.CacheRef())
+		{
+			std::vector<FObjectGPU> Keep;
+			for (size_t I = 0; I < KV.second.Objects.size(); ++I)
+			{
+				const FObjectGPU& O = KV.second.Objects[I];
+				const u32 A = O.A[3] & 0xFFFFu;
+				if ((O.A[3] >> 16) & H::UNI_OBJ_FLAG_DELTA_HIDDEN) { continue; }
+				if (A == UniScenes::kGalaxy || A == UniScenes::kCluster) { Keep.push_back(O); }
+				if (A == UniScenes::kDwarf)
+				{
+					++OutDwarfs;
+					const float Mg = H::Uni_ObjectAbsMag(UniCore::ToHlsl(O));
+					OutDwarfBad += (Mg < -16.01f || Mg > -11.99f) ? 1 : 0;
+					if (OutPerGroup) { ++(*OutPerGroup)[KV.second.ObjectContributor[I]]; }
+				}
+				if (A == UniScenes::kGroup && Gc)
+				{
+					++OutGroups;
+					const u32 Off[3] = { O.A[0], O.A[1], O.A[2] };
+					const FCoord C = ObjectCoord(KV.first, Off);
+					double Pt[3];
+					for (int Ax = 0; Ax < 3; ++Ax) { Pt[Ax] = U128ToDouble(MaskLow(C.Axis(Ax), 89)) / Tile; }
+					const float Mg = H::Uni_ObjectAbsMag(UniCore::ToHlsl(O));
+					for (const FCatalogueEntry& E : Gc->Entries)
+					{
+						double D2 = 0.0;
+						for (int Ax = 0; Ax < 3; ++Ax) { double Dd = std::fabs(Pt[Ax] - E.Pos[Ax]); Dd = std::min(Dd, 1.0 - Dd); D2 += Dd * Dd; }
+						if (D2 < 1e-18 && Mg == RoundToHalf(E.AbsMag)) { ++OutMatched; break; }
+					}
+				}
+			}
+			const std::string Key = std::to_string(KV.first.Level) + ToHex(KV.first.C[0]) + ToHex(KV.first.C[1]) + ToHex(KV.first.C[2]);
+			if (!Keep.empty()) { OutSnap[Key] = Keep; }
+		}
+		// OutBudget: the group nearest the camera only (every tile copy of an entry has its budget).
+		if (OutBudget)
+		{
+			const FContributor* Near = nullptr;
+			double Dn = 0.0;
+			for (const auto& KV : P.Contributors())
+			{
+				if (KV.second.ParentArchetypeId != UniScenes::kGroup) { continue; }
+				const double Dd = Length(ToDouble(Sub(KV.second.Centre, Cam)));
+				if (!Near || Dd < Dn) { Near = &KV.second; Dn = Dd; }
+			}
+			if (Near) { (*OutBudget)[Near->Id] = Near->NTotal; }
+		}
+	};
+	std::map<std::string, std::vector<FObjectGPU>> SOn, SOff;
+	size_t GOn = 0, MOn = 0, DOn = 0, BadOn = 0, GOff = 0, MOff = 0, DOff = 0, BadOff = 0;
+	Run(DefOn, UniScenes::VoidCamera(), SOn, GOn, MOn, DOn, BadOn, nullptr, nullptr);
+	Run(DefOff, UniScenes::VoidCamera(), SOff, GOff, MOff, DOff, BadOff, nullptr, nullptr);
+	size_t CellsCmp = 0, CellsDiff = 0;
+	for (const auto& KV : SOff)
+	{
+		++CellsCmp;
+		auto It = SOn.find(KV.first);
+		if (It == SOn.end() || It->second.size() != KV.second.size() || std::memcmp(It->second.data(), KV.second.data(), KV.second.size() * sizeof(FObjectGPU)) != 0) { ++CellsDiff; }
+	}
+	CellsDiff += SOn.size() == SOff.size() ? 0 : 1;
+	// One group's dwarfs: the camera at the heaviest group's copy nearest the void camera.
+	double Ratio = 0.0, Expected = 0.0;
+	size_t Got = 0;
+	if (Gc && !Gc->Entries.empty())
+	{
+		const double Tile = std::ldexp(1.0, 89);
+		const FCoord V = UniScenes::VoidCamera();
+		FCoord Cg = V;
+		FVec3d Shift{};
+		double Pv[3];
+		for (int Ax = 0; Ax < 3; ++Ax) { Pv[Ax] = U128ToDouble(MaskLow(V.Axis(Ax), 89)) / Tile; }
+		const double Dx = Gc->Entries[0].Pos[0] - Pv[0], Dy = Gc->Entries[0].Pos[1] - Pv[1], Dz = Gc->Entries[0].Pos[2] - Pv[2];
+		auto Wrap = [](double X) { return X - std::round(X); };
+		Shift = FVec3d{ Wrap(Dx) * Tile, Wrap(Dy) * Tile, Wrap(Dz) * Tile };
+		FVec3f Fr{};
+		AddDisplacement(Cg, Fr, Shift);
+		std::map<std::string, std::vector<FObjectGPU>> S;
+		size_t G1, M1, D1, B1;
+		std::map<u32, size_t> Per;
+		std::map<u32, double> Budget;
+		Run(DefOn, Cg, S, G1, M1, D1, B1, &Per, &Budget);
+		u32 Best = 0;
+		for (const auto& KV : Budget) { Expected = KV.second; Best = KV.first; }
+		Got = Per[Best];
+		Ratio = Expected > 0.0 ? double(Got) / Expected : 0.0;
+		BadOn += B1;
+	}
+	const double Z = Expected > 0.0 ? (double(Got) - Expected) / std::sqrt(Expected) : 99.0;
+	Uni::Check(2, "T2.webtex.groups", "D-174 galaxy groups from the node list: every node after the clusters a group, heaviest brightest; resident groups at their entries' exact positions and magnitudes; field galaxies and clusters identical to the scene without groups; dwarfs within M -16..-12; the heaviest group's dwarfs within 4 sigma of its budget")
+		.Metric("groups_per_tile", Gc ? double(Gc->Entries.size()) : 0.0).Metric("resident_groups", double(GOn)).Metric("dwarfs", double(DOn)).Metric("cells_differ", double(CellsDiff)).Metric("budget_z", Z)
+		.Pass(Gc && bOrder && Gc->Entries.size() + Clusters <= Nodes.size() && Gc->Entries.size() > 1000 && GOn > 0 && MOn == GOn && CellsDiff == 0 && CellsCmp > 0 && BadOn == 0 && GOff == 0 && DOff == 0 && std::abs(Z) < 4.0,
+			Uni::Fmt("%zu groups per tile after %zu clusters (of %zu nodes), magnitudes %.2f .. %.2f, heaviest brightest %s; from intergalactic space %zu groups resident, %zu at their entry exactly, %zu dwarfs (%zu outside M -16..-12); %zu galaxy/cluster cells compared with groups off, %zu differ; heaviest group (camera at its centre): %zu dwarfs for a budget of %.1f (%.2fx, %.1f sigma)",
+				Gc ? Gc->Entries.size() : size_t(0), Clusters, Nodes.size(), Gc && !Gc->Entries.empty() ? double(Gc->Entries.front().AbsMag) : 0.0, Gc && !Gc->Entries.empty() ? double(Gc->Entries.back().AbsMag) : 0.0, bOrder ? "yes" : "NO",
+				GOn, MOn, DOn, BadOn, CellsCmp, CellsDiff, Got, Expected, Ratio, Z));
+}

@@ -26,7 +26,7 @@ namespace UniScenes
 	using namespace UniCore;
 	namespace H = UniHlsl;
 
-	constexpr u32 kStar = 1, kGalaxy = 2, kCluster = 3;
+	constexpr u32 kStar = 1, kGalaxy = 2, kCluster = 3, kDwarf = 4, kGroup = 5;   // D-174: dwarfs and groups
 
 	/** D-151: the tuning handles for galaxy groups and clusters. Defaults are the realistic
 	 *  distribution; every value here changes generated content (it is a content definition), so
@@ -63,6 +63,13 @@ namespace UniScenes
 		 *  ~20% in the field. EarlyCore 0: off (members as before D-172). */
 		double EarlyCore = 0.8, EarlyOuter = 0.2, EarlyScale = 0.25;
 		double EarlyColourShift = -0.07;   // log10 K: ~5600 K -> ~4800 K at the reference magnitude
+		/** D-174, galaxy groups from the web's node list (owner's option 2): the nodes after the
+		 *  clusters become group objects. A group places only dwarfs (fainter than the galaxy
+		 *  function's -16, so nothing is counted twice); its bright galaxies are the web's field
+		 *  galaxies, as before. GroupDwarfs: the dwarfs (M -16..-12) of the median-mass group;
+		 *  each group's count goes with its node's mass. */
+		bool bGroups = true;
+		double GroupDwarfs = 20.0;
 	};
 
 	/** The galaxy number density over the galaxy luminosity function (the D-012 placeholder). */
@@ -176,6 +183,54 @@ namespace UniScenes
 		return Value;
 	}
 
+	/** D-174: dwarf galaxies, M -16..-12 (below the galaxy function's faint end, so new content,
+	 *  never a second copy of a galaxy). Placed only by groups. A steeper faint end (alpha -1.3),
+	 *  4 kpc at M = -16 to ~1.3 kpc at -12 (R ~ L^0.3), bluer and more diffuse than spirals:
+	 *  thick discs, weak arms, small bulges, no dust. Their stars follow them, as galaxies'. */
+	inline FArchetype MakeDwarf()
+	{
+		FArchetype A = MakeGalaxy();
+		A.Id = kDwarf;
+		A.Name = "Dwarf";
+		A.AbsMag = FMagnitudeLut::Schechter(-21.0, -1.3, -16.0, -12.0);
+		A.RadiusModel[0] = 22.09f; A.RadiusModel[1] = -0.122f; A.RadiusModel[2] = -16.0f; A.RadiusModel[3] = 0.12f;
+		A.ColourModel[0] = 3.78f; A.ColourModel[1] = 0.01f; A.ColourModel[2] = -16.0f; A.ColourModel[3] = 0.10f;
+		FUniEmitter& E = A.Emitters[0];
+		E.Exemplar.V[1] = 0.04f;    // thick disc
+		E.Exemplar.V[3] = 0.06f;    // small bulge
+		E.bEarlyShape = false;
+		E.EarlyRanges.clear();
+		E.Ranges = {
+			{ "Dwarf.ScaleLength", 0, 0.14f, 0.26f, 1.0f, 0.0f },
+			{ "Dwarf.BulgeWeight", 5, 0.0f, 0.3f, 1.5f, 0.0f },
+			{ "Dwarf.Arms", 6, 0.0f, 2.0f, 1.0f, 1.0f },
+			{ "Dwarf.ArmAmplitude", 8, 0.0f, 0.3f, 1.0f, 0.0f },
+			{ "Dwarf.ArmPhase", 10, 0.0f, 6.2831853f, 1.0f, 0.0f },
+		};
+		A.Volume.bDust = false;
+		A.Volume.DustTau = 0.0f;
+		return A;
+	}
+
+	/** D-174: mean V-band flux per dwarf as the generator draws it (as GalaxyMeanFluxV). */
+	inline double DwarfMeanFluxV()
+	{
+		static const double Value = []()
+		{
+			FUniverseDef D;
+			D.Seed = 69;
+			D.Archetypes.resize(5);
+			D.Archetypes[0].Id = 0; D.Archetypes[0].Name = "Root";
+			D.Archetypes[kStar] = MakeStar();
+			D.Archetypes[kGalaxy] = MakeGalaxy();
+			D.Archetypes[3].Id = 3; D.Archetypes[3].Name = "Unused";
+			D.Archetypes[kDwarf] = MakeDwarf();
+			const FUniverseModel M(D);
+			return FUnresolvedTable::Build(M, kDwarf).MeanFluxV();
+		}();
+		return Value;
+	}
+
 	/** Group / cluster field exemplar (units of the influence radius, 4 x the cluster radius). */
 	inline FFieldParams ClusterExemplar()
 	{
@@ -258,6 +313,40 @@ namespace UniScenes
 			Norm += L.Pdf[I];
 		}
 		return Norm > 0.0 ? Sum / Norm : 0.0;
+	}
+
+	/** D-174: a galaxy group: its own light is its dwarfs' (so its magnitude sets their number,
+	 *  budget-consistent as clusters' members are); 0.25 Mpc at M = -17, R ~ L^(1/3); its
+	 *  dwarfs reach 3 radii. Its glow is far below any surface-brightness limit, so in practice
+	 *  it is seen only through its galaxies; ThetaMin 0.02 keeps it resident only within ~20 Mpc
+	 *  (its dwarfs are visible to a few Mpc). Placed only from the node list (UseDeliveredWeb). */
+	inline FArchetype MakeGroup()
+	{
+		FArchetype A;
+		A.Id = kGroup;
+		A.Name = "Group";
+		A.Visibility = EUniVisibility::Extended;
+		A.AbsMag = FMagnitudeLut::Schechter(-17.0, -1.0, -20.0, -13.0);   // unused by the catalogue (entries carry magnitudes); keeps the model valid
+		A.RadiusModel[0] = float(std::log10(0.25 * Units::Mpc)); A.RadiusModel[1] = -0.1333f; A.RadiusModel[2] = -17.0f; A.RadiusModel[3] = 0.08f;
+		A.ColourModel[0] = 3.76f; A.ColourModel[1] = 0.0f; A.ColourModel[2] = -17.0f; A.ColourModel[3] = 0.04f;
+		A.ThetaMin = 0.02;
+		FUniEmitter E;
+		E.ChildArchetypeId = kDwarf;
+		E.FieldId = H::UNI_FIELD_CLUSTER;
+		E.Exemplar = ClusterExemplar();
+		E.Exemplar.V[0] = 0.15f;   // core
+		E.Exemplar.V[8] = 0.0f;    // no morphology rule (D-172 is for cluster members)
+		E.NTotalRefMag = -17.0;
+		E.NTotal = std::pow(10.0, -0.4 * E.NTotalRefMag) / DwarfMeanFluxV();
+		E.InfluenceMul = 3.0;
+		E.bSampleBox = true;   // D-153: a ~1 Mpc group inside dwarf cells of a few Mpc
+		E.Ranges = {
+			{ "Group.Core", 0, 0.10f, 0.25f, 1.0f, 0.0f },
+			{ "Group.AxisB", 1, 0.6f, 1.0f, 1.0f, 0.0f },
+			{ "Group.AxisC", 2, 0.45f, 0.9f, 1.0f, 0.0f },
+		};
+		A.Emitters.push_back(E);
+		return A;
 	}
 
 	inline FUniEmitter WebEmitter()
@@ -345,6 +434,30 @@ namespace UniScenes
 				TopMass += (*Nodes)[I].Mass;
 			}
 			D.Catalogues.push_back(Cat);
+			// D-174: the remaining nodes are groups; each node's dwarfs go with its mass (the
+			// median-mass group holds T.GroupDwarfs), and the group's magnitude is their light.
+			if (T.bGroups && T.GroupDwarfs > 0.0 && K < Nodes->size())
+			{
+				std::vector<double> Ms;
+				for (size_t I = K; I < Nodes->size(); ++I) { Ms.push_back((*Nodes)[I].Mass); }
+				std::vector<double> Sorted = Ms;
+				std::nth_element(Sorted.begin(), Sorted.begin() + Sorted.size() / 2, Sorted.end());
+				const double Median = std::max(Sorted[Sorted.size() / 2], 1.0e-30);
+				const double F = DwarfMeanFluxV();
+				FCatalogue Groups;
+				Groups.ArchetypeId = kGroup;
+				Groups.PeriodBits = P;
+				for (size_t I = K; I < Nodes->size(); ++I)
+				{
+					const double N = T.GroupDwarfs * (*Nodes)[I].Mass / Median;
+					if (!(N * F > 0.0)) { continue; }
+					FCatalogueEntry E;
+					for (int Ax = 0; Ax < 3; ++Ax) { E.Pos[Ax] = (*Nodes)[I].Pos[Ax]; }
+					E.AbsMag = float(-2.5 * std::log10(N * F));
+					Groups.Entries.push_back(E);
+				}
+				if (!Groups.Entries.empty()) { D.Catalogues.push_back(Groups); }
+			}
 			D.RootEmitters.erase(std::remove_if(D.RootEmitters.begin(), D.RootEmitters.end(),
 				[](const FUniEmitter& E) { return E.FieldId == H::UNI_FIELD_WEB && E.ChildArchetypeId == kCluster; }), D.RootEmitters.end());
 			int N = 0;
@@ -397,11 +510,13 @@ namespace UniScenes
 	{
 		FUniverseDef D;
 		D.Seed = 69;   // UltraLargeScale's universe root seed
-		D.Archetypes.resize(4);
+		D.Archetypes.resize(6);
 		D.Archetypes[0].Id = 0; D.Archetypes[0].Name = "Root";
 		D.Archetypes[kStar] = MakeStar();
 		D.Archetypes[kGalaxy] = MakeGalaxy();
 		D.Archetypes[kCluster] = MakeCluster();   // placed only by web scenes (AddWeb, with their tuning)
+		D.Archetypes[kDwarf] = MakeDwarf();       // D-174: placed only by groups
+		D.Archetypes[kGroup] = MakeGroup();       // D-174: placed only from the node list
 		return D;
 	}
 
@@ -449,6 +564,12 @@ namespace UniScenes
 		S.RadiusCm = 300.0 * Units::Kpc;
 		S.ArchetypeId = kGalaxy;
 		D.Suppressors.push_back(S);
+		// D-174: no group dwarf inside the anchor's disc (satellites beyond 50 kpc are fine).
+		FSuppressor Sd;
+		Sd.Centre = FCoord::Origin();
+		Sd.RadiusCm = 50.0 * Units::Kpc;
+		Sd.ArchetypeId = kDwarf;
+		D.Suppressors.push_back(Sd);
 		return D;
 	}
 

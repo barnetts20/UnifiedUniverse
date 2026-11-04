@@ -596,6 +596,28 @@ namespace UniCore
 			std::sort(Out.begin(), Out.end(), [](const FContributor* A, const FContributor* B) { return A->Id < B->Id; });
 			return Out;
 		}
+		/** D-174: every resident emitter object of archetype ArchId (Ready cells), asleep or awake
+		 *  (D-168: Contributors() holds only the awake ones), as Fn(centre, object). */
+		template <typename F>
+		void ForEachEmitterObject(u32 ArchId, F&& Fn) const
+		{
+			for (const auto& LKV : Levels)
+			{
+				for (const auto& CKV : LKV.second.Cells)
+				{
+					const FCell& C = CKV.second;
+					if (C.State != ECellState::Ready) { continue; }
+					for (u32 I : C.EmitterObjects)
+					{
+						const FObjectGPU& O = C.Readback.Objects[I];
+						if ((O.A[3] & 0xFFFFu) != ArchId) { continue; }
+						const u32 Off[3] = { O.A[0], O.A[1], O.A[2] };
+						Fn(ObjectCoord(C.Key, Off), O);
+					}
+				}
+			}
+		}
+
 		float LevelFade(int L) const { auto It = Levels.find(L); return It == Levels.end() ? 0.0f : It->second.Fade; }
 		const FObjectGPU* FindObject(const FObjectId& Id) const
 		{
