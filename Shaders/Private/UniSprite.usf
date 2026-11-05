@@ -50,6 +50,8 @@ struct FSpriteVSOut
 	nointerpolation float HaloPx : TEXCOORD7;     // D-156: halo sigma, pixels (0: none)
 	nointerpolation float HaloRatio : TEXCOORD8;  // D-156: halo energy / core energy
 	nointerpolation float CoreWeight : TEXCOORD9; // D-158: 0 for a promoted star (its actor draws the disc)
+	nointerpolation float EllipseAngle : TEXCOORD10; // D-183: the core ellipse's minor axis in the quad basis
+	nointerpolation float EllipseQ : TEXCOORD11;     // D-183: its effective axis ratio (1: round)
 };
 
 void MainVS(uint VertexId : SV_VertexID, uint InstanceId : SV_InstanceID, out FSpriteVSOut Out)
@@ -82,6 +84,8 @@ void MainVS(uint VertexId : SV_VertexID, uint InstanceId : SV_InstanceID, out FS
 	Out.HaloPx = S.HaloRatio > 0.0f ? max(S.HaloRadius * PixelsPerRadian, 0.5f) : 0.0f;
 	Out.HaloRatio = S.HaloRatio;
 	Out.CoreWeight = Uni_SpriteCoreWeight(S);
+	Out.EllipseAngle = S.EllipseAngle;
+	Out.EllipseQ = Uni_SpriteEllipseQ(S, Out.SigmaPx);
 }
 
 float SceneDistance(float2 PixelPos, float CosToForward)
@@ -104,7 +108,8 @@ void MainPS(in FSpriteVSOut In, out float4 OutColor : SV_Target0)
 	// body, disc + fading glare halo, D-148) and the D-156 halo a wider Gaussian; normalised per
 	// PIXEL so the energy summed over the covered pixels is Radiance x (1 + HaloRatio) whatever
 	// the sprite's size.
-	const float W = Uni_SpriteProfileHalo(length(In.Corner) * In.FootPx, In.SigmaPx, In.DiscFrac, In.HaloPx, In.HaloRatio, In.CoreWeight);
+	// D-183: Corner is in the quad's (Side, Up) basis, the basis of the ellipse's angle.
+	const float W = Uni_SpriteProfileEllipse(In.Corner.x * In.FootPx, In.Corner.y * In.FootPx, In.SigmaPx, In.DiscFrac, In.HaloPx, In.HaloRatio, In.CoreWeight, In.EllipseAngle, In.EllipseQ);
 	float T = 1.0f;
 	if (bVolume != 0u)
 	{

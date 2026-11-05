@@ -43,6 +43,7 @@ static const uint UNI_OBJ_FLAG_DELTA_HIDDEN = 2u;
 static const uint UNI_OBJ_FLAG_HAS_CONTRIBUTOR = 4u;
 static const uint UNI_OBJ_FLAG_EXTENDED = 8u;
 static const uint UNI_OBJ_FLAG_ANCHOR = 16u;
+static const uint UNI_SLICE_FLAG_PALETTE = 0x10000u;   // D-182: a slice flag (never in a record: Uni_MakeObject keeps the low 16 bits): its children carry a palette
 static const uint UNI_OBJ_FLAG_EARLY = 32u;           // D-172: an early-type (elliptical / lenticular) cluster member
 
 // ------------------------------------------------------------------------------------------

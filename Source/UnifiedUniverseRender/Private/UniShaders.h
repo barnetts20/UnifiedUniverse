@@ -59,8 +59,8 @@ struct FUniSpriteGPU
 	float PhysAngularRadius;
 	float HaloRadius;     // D-156
 	float HaloRatio;
-	float Pad0;
-	float Pad1;
+	float EllipseAngle;   // D-183
+	float EllipseAxis;
 };
 static_assert(sizeof(FUniSpriteGPU) == UniGpuLayout::SpriteBytes, "FUniSpriteGPU must match FUniSprite (UniProject.ush)");
 
@@ -77,6 +77,9 @@ public:
 		SHADER_PARAMETER(uint32, DispatchGroupsX)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniWebTexture)   // D-164 (UniWebTexture.ush)
 		SHADER_PARAMETER_SAMPLER(SamplerState, UniWebSampler)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalWarpFine)    // D-179 (UniWebTexture.ush)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalWarpLarge)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalDetail)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
@@ -104,6 +107,9 @@ public:
 		SHADER_PARAMETER(uint32, DispatchGroupsX)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniWebTexture)   // D-164
 		SHADER_PARAMETER_SAMPLER(SamplerState, UniWebSampler)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalWarpFine)    // D-179 (UniWebTexture.ush)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalWarpLarge)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalDetail)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
@@ -158,6 +164,8 @@ public:
 		SHADER_PARAMETER(uint32, MaxPromote)
 		SHADER_PARAMETER(uint32, MaxActivate)
 		SHADER_PARAMETER(uint32, SystemArchetypeMask)
+		SHADER_PARAMETER(uint32, DiscArchetypeMask)   // D-183
+		SHADER_PARAMETER(FUintVector4, FixedDiscSeeds)   // D-183
 		SHADER_PARAMETER(FVector3f, ViewForward)
 		SHADER_PARAMETER(float, TanHalfFovX)
 		SHADER_PARAMETER(FVector3f, ViewRight)
@@ -193,6 +201,9 @@ BEGIN_SHADER_PARAMETER_STRUCT(FUniVolumeCommonParameters, )
 	SHADER_PARAMETER(float, Pad0)
 	SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniWebTexture)   // D-164
 	SHADER_PARAMETER_SAMPLER(SamplerState, UniWebSampler)
+	SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalWarpFine)    // D-179
+	SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalWarpLarge)
+	SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalDetail)
 END_SHADER_PARAMETER_STRUCT()
 
 class FUniVolumeMarchCS : public FGlobalShader
@@ -214,8 +225,11 @@ public:
 		SHADER_PARAMETER(float, WebDebugDepthCm)
 		SHADER_PARAMETER(float, WebDebugThreshold)
 		SHADER_PARAMETER(float, WebDebugOpacity)
+		SHADER_PARAMETER(uint32, bSliceMarch)         // D-184
+		SHADER_PARAMETER(FUintVector2, SliceOffset)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutVolume)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float>, OutSlices)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float2>, OutDepth)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
@@ -223,6 +237,47 @@ public:
 	{
 		FGlobalShader::ModifyCompilationEnvironment(P, Env);
 		Env.SetDefine(TEXT("UNI_VOL_PASS"), 0);
+	}
+};
+
+/** D-184: temporal slicing's reconstruction (UNI_VOL_PASS 3). */
+class FUniVolumeReconstructCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FUniVolumeReconstructCS);
+	SHADER_USE_PARAMETER_STRUCT(FUniVolumeReconstructCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_STRUCT_INCLUDE(FUniVolumeCommonParameters, Common)
+		SHADER_PARAMETER(FVector4f, InvDeviceZToWorldZTransform)
+		SHADER_PARAMETER(FVector4f, MarchToDepthUV)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneDepthTexture)
+		SHADER_PARAMETER_SAMPLER(SamplerState, SceneDepthSampler)
+		SHADER_PARAMETER(FUintVector2, MarchSize)
+		SHADER_PARAMETER(FVector3f, PrevForward)
+		SHADER_PARAMETER(float, PrevTanX)
+		SHADER_PARAMETER(FVector3f, PrevRight)
+		SHADER_PARAMETER(float, PrevTanY)
+		SHADER_PARAMETER(FVector3f, PrevUp)
+		SHADER_PARAMETER(uint32, TemporalPhase)
+		SHADER_PARAMETER(FVector3f, CamStep)
+		SHADER_PARAMETER(uint32, bHistory)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float4>, FreshVolume)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float>, FreshSlices)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float2>, FreshDepth)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float4>, HistVolume)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float>, HistSlices)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float2>, HistDepth)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutVolume)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float>, OutSlices)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float2>, OutDepth)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& P, FShaderCompilerEnvironment& Env)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(P, Env);
+		Env.SetDefine(TEXT("UNI_VOL_PASS"), 3);
 	}
 };
 

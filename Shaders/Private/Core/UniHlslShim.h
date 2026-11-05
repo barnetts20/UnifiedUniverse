@@ -331,6 +331,31 @@ namespace UniHlsl
 		return float4(UniHalfToFloat(H[0]), UniHalfToFloat(H[1]), UniHalfToFloat(H[2]), UniHalfToFloat(H[3]));
 	}
 
+	/** D-179: the galaxy textures (slots: warp_fine, warp_large, galaxy_detail), bound by
+	 *  UniCore::BindGalaxyTexture; the same filter as the web texture. Unbound: NaN. */
+	static const int UNI_GAL_TEX_COUNT = 3;
+	inline FWebTexView UniGalaxyTextureViews[UNI_GAL_TEX_COUNT];
+
+	inline float4 UniGalaxyTexSample(int Slot, const float3& P, float Mip)
+	{
+		const FWebTexView& V = UniGalaxyTextureViews[Slot];
+		if (!V.Mips || V.NumMips == 0u)
+		{
+			const float N = std::nanf("");
+			return float4(N, N, N, N);
+		}
+		const float M = clamp(Mip, 0.0f, float(V.NumMips - 1u));
+		const uint M0 = uint(M);
+		const float T = M - float(M0);
+		const float4 A = UniWebTexTrilinear(V, M0, P);
+		if (T <= 0.0f || M0 + 1u >= V.NumMips) { return A; }
+		const float4 B = UniWebTexTrilinear(V, M0 + 1u, P);
+		return float4(A.x + (B.x - A.x) * T, A.y + (B.y - A.y) * T, A.z + (B.z - A.z) * T, A.w + (B.w - A.w) * T);
+	}
+
 } // namespace UniHlsl
 
 #define UNI_WEB_TEX_SAMPLE(P, Mip) UniWebTexSample(P, Mip)
+#define UNI_GAL_WARP_FINE(P, Mip) UniGalaxyTexSample(0, P, Mip)
+#define UNI_GAL_WARP_LARGE(P, Mip) UniGalaxyTexSample(1, P, Mip)
+#define UNI_GAL_DETAIL(P, Mip) UniGalaxyTexSample(2, P, Mip)

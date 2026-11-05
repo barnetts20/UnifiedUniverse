@@ -82,6 +82,54 @@ namespace UniRender
 		return C;
 	}
 
+	/** One march-grid pixel, as the GPU march pass does it: supersampled where a small
+	 *  carrier's finest feature is under half a pixel (D-130), the light's depth averaged by
+	 *  the sub-rays' light (D-184). */
+	template <class TC, class TP, class TL>
+	inline H::FUniVolumeResult MarchPixel(const TC& Cb, const TP& Pb, const TL& Lb, const H::FUniVolumeView& V, const FCamera& Cam, int Wd, int Ht, int X, int Y, float TScene, bool& bOutSuper)
+	{
+		bOutSuper = false;
+		const FV3 D = PixelDir(Cam, Wd, Ht, X + 0.5, Y + 0.5);
+		const H::float3 Dc(float(D.X), float(D.Y), float(D.Z));
+		// Supersampling where a small carrier's finest feature is under half a pixel.
+		u32 SS = 1u;
+		for (u32 C = 0; C < V.NumCarriers; ++C)
+		{
+			const H::FUniCarrier Ca = Cb[C];
+			float T0, T1;
+			const H::float3 Ld = H::Uni_CarrierLocalDir(Ca, Dc);
+			if (Ca.Weight > 0.0f && H::Uni_CarrierInterval(Ca, Ld, TScene, T0, T1)) { SS = std::max(SS, H::Uni_CarrierSubsamplesRay(Ca, V.ThetaPixel)); }   // D-160, D-163
+		}
+		SS = H::Uni_ClampSubsamples(SS, V);   // D-157
+		H::FUniVolumeResult R;
+		if (SS == 1u)
+		{
+			R = H::Uni_VolumeMarch(Dc, TScene, Cb, Pb, Lb, V);
+		}
+		else
+		{
+			H::float3 Acc(0, 0, 0), AccT(0, 0, 0);
+			H::float3 AccS[H::UNI_VOL_SLICES];
+			u32 Steps = 0, Tr = 0, Act = 0;
+			float Dw = 0.0f, Dwl = 0.0f;
+			for (u32 J = 0; J < SS; ++J) for (u32 I = 0; I < SS; ++I)
+			{
+				const FV3 Ds = PixelDir(Cam, Wd, Ht, X + (I + 0.5) / SS, Y + (J + 0.5) / SS);
+				const H::FUniVolumeResult Rs = H::Uni_VolumeMarch(H::float3(float(Ds.X), float(Ds.Y), float(Ds.Z)), TScene, Cb, Pb, Lb, V);
+				Acc += Rs.Radiance; AccT += Rs.Transmittance; Steps += Rs.Steps; Tr += Rs.Truncated; Act = std::max(Act, Rs.Active);
+				Dw += Rs.DepthWeight; Dwl += Rs.DepthWeight * Rs.LnDepth;
+				for (u32 K = 0; K < H::UNI_VOL_SLICES; ++K) { AccS[K] = (I == 0 && J == 0) ? Rs.SliceT[K] : AccS[K] + Rs.SliceT[K]; }
+			}
+			const float Inv = 1.0f / float(SS * SS);
+			R.Radiance = Acc * Inv; R.Transmittance = AccT * Inv; R.Steps = Steps; R.Truncated = Tr ? 1u : 0u; R.Active = Act; R.Pad = 0u;
+			for (u32 K = 0; K < H::UNI_VOL_SLICES; ++K) { R.SliceT[K] = AccS[K] * Inv; }
+			R.DepthWeight = Dw * Inv;
+			R.LnDepth = Dw > 0.0f ? Dwl / Dw : H::UNI_VOL_LN_DEPTH_NONE;
+			bOutSuper = true;
+		}
+		return R;
+	}
+
 	/** March every pixel; adds B * Omega to Img and returns per-pixel slices if asked. With a
 	 *  cube, Sc holds the local carriers only and the background comes from the cube. */
 	inline FVolumeStats RenderVolume(const FVolumeScene& Sc, const FCamera& Cam, FImage& Img, std::vector<H::float3>* SlicesOut = nullptr, int Threads = 2, const FBackgroundCube* Cube = nullptr)
@@ -105,38 +153,9 @@ namespace UniRender
 					const double Scene = Img.SceneDist[size_t(Y) * Img.W + X];
 					const float TScene = std::isfinite(Scene) ? H::Uni_SceneTrueDistance(float(Scene)) : 3.0e38f;   // render space -> true (D-146)
 					const H::float3 Dc(float(D.X), float(D.Y), float(D.Z));
-					// Supersampling where a small carrier's finest feature is under half a pixel.
-					u32 SS = 1u;
-					for (u32 C = 0; C < V.NumCarriers; ++C)
-					{
-						const H::FUniCarrier Ca = Cb[C];
-						float T0, T1;
-						const H::float3 Ld = H::Uni_CarrierLocalDir(Ca, Dc);
-						if (Ca.Weight > 0.0f && H::Uni_CarrierInterval(Ca, Ld, TScene, T0, T1)) { SS = std::max(SS, H::Uni_CarrierSubsamplesRay(Ca, V.ThetaPixel)); }   // D-160, D-163
-					}
-					SS = H::Uni_ClampSubsamples(SS, V);   // D-157
-					H::FUniVolumeResult R;
-					if (SS == 1u)
-					{
-						R = H::Uni_VolumeMarch(Dc, TScene, Cb, Pb, Lb, V);
-					}
-					else
-					{
-						H::float3 Acc(0, 0, 0), AccT(0, 0, 0);
-						H::float3 AccS[H::UNI_VOL_SLICES];
-						u32 Steps = 0, Tr = 0, Act = 0;
-						for (u32 J = 0; J < SS; ++J) for (u32 I = 0; I < SS; ++I)
-						{
-							const FV3 Ds = PixelDir(Cam, Img.W, Img.H, X + (I + 0.5) / SS, Y + (J + 0.5) / SS);
-							const H::FUniVolumeResult Rs = H::Uni_VolumeMarch(H::float3(float(Ds.X), float(Ds.Y), float(Ds.Z)), TScene, Cb, Pb, Lb, V);
-							Acc += Rs.Radiance; AccT += Rs.Transmittance; Steps += Rs.Steps; Tr += Rs.Truncated; Act = std::max(Act, Rs.Active);
-							for (u32 K = 0; K < H::UNI_VOL_SLICES; ++K) { AccS[K] = (I == 0 && J == 0) ? Rs.SliceT[K] : AccS[K] + Rs.SliceT[K]; }
-						}
-						const float Inv = 1.0f / float(SS * SS);
-						R.Radiance = Acc * Inv; R.Transmittance = AccT * Inv; R.Steps = Steps; R.Truncated = Tr ? 1u : 0u; R.Active = Act;
-						for (u32 K = 0; K < H::UNI_VOL_SLICES; ++K) { R.SliceT[K] = AccS[K] * Inv; }
-						++S.Supersampled;
-					}
+					bool bSuper = false;
+					H::FUniVolumeResult R = MarchPixel(Cb, Pb, Lb, V, Cam, Img.W, Img.H, X, Y, TScene, bSuper);
+					if (bSuper) { ++S.Supersampled; }
 					if (Cube && TScene > Cube->StartCm) { R.Radiance = R.Radiance + R.Transmittance * Cube->Sample(Dc); }
 					const double Om = PixelSolidAngle(Cam, Img.W, Img.H, X + 0.5, Y + 0.5);
 					float* P = &Img.Rgb[(size_t(Y) * Img.W + X) * 3];
@@ -163,6 +182,173 @@ namespace UniRender
 		}
 		return St;
 	}
+
+	/** D-184: the GPU's temporally sliced march (UniVolume.usf, passes 0 and 3) on the CPU. Per
+	 *  frame it marches the phase's fresh pixel of every 2 x 2 block and reconstructs the others
+	 *  from the previous frame's output through the shared core's rules, then keeps the output
+	 *  as the next frame's history. bTemporal false, or no usable history, marches every pixel
+	 *  (and still keeps history).
+	 *  The march grid has no scene surfaces here (sky everywhere), as in the volume checks. */
+	struct FTemporalVolume
+	{
+		int W = 0, Ht = 0;
+		std::vector<H::float4> Vol;      // radiance rgb (exposure units per sr), luminance transmittance a
+		std::vector<float> Slices;       // luminance transmittance at the slice boundaries
+		std::vector<H::float2> Depth;    // ln depth of the light, ln scene distance
+		bool bHave = false;
+		FCamera Prev;
+		u32 Frame = 0;
+		size_t Marched = 0, FromHistory = 0, FromFresh = 0, Steps = 0;
+
+		static float Lum(const H::float4& V) { return H::Uni_Luminance(H::float3(V.x, V.y, V.z)); }
+
+		void Step(const FVolumeScene& Sc, const FCamera& Cam, const FV3& CamStepCm, bool bStepValid, bool bTemporal, int Threads = 2)
+		{
+			if (Cam.Width != W || Cam.Height != Ht) { W = Cam.Width; Ht = Cam.Height; bHave = false; }
+			const size_t N = size_t(W) * Ht;
+			const u32 Phase = Frame & 3u;
+			H::FUniTemporalView TV;
+			TV.PrevForward = H::float3(float(Prev.Forward.X), float(Prev.Forward.Y), float(Prev.Forward.Z));
+			TV.PrevRight = H::float3(float(Prev.Right.X), float(Prev.Right.Y), float(Prev.Right.Z));
+			TV.PrevUp = H::float3(float(Prev.Up.X), float(Prev.Up.Y), float(Prev.Up.Z));
+			TV.PrevTanX = float(Prev.TanX()); TV.PrevTanY = float(Prev.TanY());
+			TV.Phase = Phase;
+			TV.CamStep = H::float3(float(CamStepCm.X), float(CamStepCm.Y), float(CamStepCm.Z));
+			TV.bHistory = (bHave && bStepValid && bTemporal) ? 1u : 0u;
+			// Without usable history (first frame, a jump, a new size) every pixel is marched, as the
+			// renderer does.
+			const bool bSlice = bTemporal && TV.bHistory != 0u;
+			const H::FUniVolumeView V = ToHlsl(Sc.View);
+			const auto Cb = Sc.CarrierBuf(); const auto Pb = Sc.ParamBuf(); const auto Lb = Sc.LutBuf();
+			const float TScene = 3.0e38f, LnTp = std::log(TScene);
+			// Pass 0: the fresh pixels (all of them without slicing).
+			std::vector<H::float4> FVol(N, H::float4(0, 0, 0, 1));
+			std::vector<float> FSl(N * H::UNI_VOL_SLICES, 1.0f);
+			std::vector<H::float2> FDep(N, H::float2(H::UNI_VOL_LN_DEPTH_NONE, LnTp));
+			std::atomic<int> NextRow{ 0 };
+			std::atomic<size_t> MarchedA{ 0 }, StepsA{ 0 };
+			auto Work = [&]()
+			{
+				for (int Y = NextRow++; Y < Ht; Y = NextRow++)
+				{
+					for (int X = 0; X < W; ++X)
+					{
+						if (bSlice && !H::Uni_TemporalFresh(H::uint2(u32(X), u32(Y)), Phase)) { continue; }
+						bool bSuper = false;
+						const H::FUniVolumeResult R = MarchPixel(Cb, Pb, Lb, V, Cam, W, Ht, X, Y, TScene, bSuper);
+						const size_t I = size_t(Y) * W + X;
+						FVol[I] = H::float4(R.Radiance.x, R.Radiance.y, R.Radiance.z, H::Uni_Luminance(R.Transmittance));
+						for (u32 K = 0; K < H::UNI_VOL_SLICES; ++K) { FSl[I * H::UNI_VOL_SLICES + K] = H::Uni_Luminance(R.SliceT[K]); }
+						FDep[I] = H::float2(R.LnDepth, LnTp);
+						++MarchedA; StepsA += R.Steps;
+					}
+				}
+			};
+			std::vector<std::thread> Ts;
+			for (int T = 1; T < Threads; ++T) { Ts.emplace_back(Work); }
+			Work();
+			for (std::thread& T : Ts) { T.join(); }
+			Marched += MarchedA; Steps += StepsA;
+			// Pass 3: reconstruct the rest.
+			std::vector<H::float4> OVol = FVol;
+			std::vector<float> OSl = FSl;
+			std::vector<H::float2> ODep = FDep;
+			if (bSlice)
+			{
+				const H::uint2 Size = H::uint2(u32(W), u32(Ht));
+				const H::float2 SizeF = H::float2(float(W), float(Ht));
+				for (int Y = 0; Y < Ht; ++Y) for (int X = 0; X < W; ++X)
+				{
+					const H::uint2 Px = H::uint2(u32(X), u32(Y));
+					if (H::Uni_TemporalFresh(Px, Phase)) { continue; }
+					const size_t I = size_t(Y) * W + X;
+					const H::FUniTemporalTaps Tp = H::Uni_TemporalTaps(Px, Phase, Size);
+					const size_t Q[4] = { size_t(Tp.Q0.y) * W + Tp.Q0.x, size_t(Tp.Q1.y) * W + Tp.Q1.x, size_t(Tp.Q2.y) * W + Tp.Q2.x, size_t(Tp.Q3.y) * W + Tp.Q3.x };
+					const H::float4 Ws = H::Uni_TemporalSpatialW(Tp.W, LnTp, H::float4(FDep[Q[0]].y, FDep[Q[1]].y, FDep[Q[2]].y, FDep[Q[3]].y));
+					const float Wsa[4] = { Ws.x, Ws.y, Ws.z, Ws.w };
+					const float Wba[4] = { Tp.W.x, Tp.W.y, Tp.W.z, Tp.W.w };
+					const float Sw = Ws.x + Ws.y + Ws.z + Ws.w;
+					H::float4 Sp(0, 0, 0, 0);
+					float Lo = 3.0e38f, Hi = 0.0f;
+					for (int K = 0; K < 4; ++K)
+					{
+						Sp = Sp + FVol[Q[K]] * (Wsa[K] / Sw);
+						if (Wba[K] > 0.0f) { Lo = std::min(Lo, Lum(FVol[Q[K]])); Hi = std::max(Hi, Lum(FVol[Q[K]])); }
+					}
+					const float LnD = H::Uni_TemporalLightLnDepth(Ws, H::float4(FDep[Q[0]].x, FDep[Q[1]].x, FDep[Q[2]].x, FDep[Q[3]].x));
+					bool bHist = false;
+					H::float4 Hv(0, 0, 0, 0);
+					float Hsl[H::UNI_VOL_SLICES] = {};
+					float HDep = 0.0f;
+					if (TV.bHistory != 0u)
+					{
+						const FV3 Dd = PixelDir(Cam, W, Ht, X + 0.5, Y + 0.5);
+						H::float2 Pp(0, 0);
+						if (H::Uni_TemporalPrevPixel(H::float3(float(Dd.X), float(Dd.Y), float(Dd.Z)), LnD, TV, SizeF, Pp))
+						{
+							const H::FUniTemporalTaps Ht4 = H::Uni_TemporalHistTaps(Pp, Size);
+							const size_t Qh[4] = { size_t(Ht4.Q0.y) * W + Ht4.Q0.x, size_t(Ht4.Q1.y) * W + Ht4.Q1.x, size_t(Ht4.Q2.y) * W + Ht4.Q2.x, size_t(Ht4.Q3.y) * W + Ht4.Q3.x };
+							const H::float4 Wh = H::Uni_TemporalHistW(Ht4.W, LnTp, H::float4(Depth[Qh[0]].y, Depth[Qh[1]].y, Depth[Qh[2]].y, Depth[Qh[3]].y));
+							const float Wha[4] = { Wh.x, Wh.y, Wh.z, Wh.w };
+							const float Shw = Wh.x + Wh.y + Wh.z + Wh.w;
+							if (Shw >= 0.5f)
+							{
+								for (int K = 0; K < 4; ++K)
+								{
+									const float Wk = Wha[K] / Shw;
+									Hv = Hv + Vol[Qh[K]] * Wk;
+									for (u32 S = 0; S < H::UNI_VOL_SLICES; ++S) { Hsl[S] += Slices[Qh[K] * H::UNI_VOL_SLICES + S] * Wk; }
+									HDep += Depth[Qh[K]].x * Wk;
+								}
+								// Radiance and transmittance by Catmull-Rom where all 16 texels are on the grid and
+								// on this pixel's surface (the shader's rule: Uni_CatmullRomWeights).
+								const float Fx = Pp.x - 0.5f, Fy = Pp.y - 0.5f;
+								const int X0 = int(std::floor(Fx)), Y0 = int(std::floor(Fy));
+								if (X0 - 1 >= 0 && Y0 - 1 >= 0 && X0 + 2 < W && Y0 + 2 < Ht)
+								{
+									const H::float4 Cx = H::Uni_CatmullRomWeights(Fx - float(X0)), Cy = H::Uni_CatmullRomWeights(Fy - float(Y0));
+									const float Cxa[4] = { Cx.x, Cx.y, Cx.z, Cx.w }, Cya[4] = { Cy.x, Cy.y, Cy.z, Cy.w };
+									H::float4 Cr(0, 0, 0, 0);
+									bool bSame = true;
+									for (int J = 0; J < 4; ++J) for (int K = 0; K < 4; ++K)
+									{
+										const size_t Qc = size_t(Y0 - 1 + J) * W + size_t(X0 - 1 + K);
+										bSame = bSame && H::Uni_TemporalDepthWeight(LnTp, Depth[Qc].y) > 0.9f;
+										Cr = Cr + Vol[Qc] * (Cxa[K] * Cya[J]);
+									}
+									if (bSame) { Hv = H::float4(std::max(Cr.x, 0.0f), std::max(Cr.y, 0.0f), std::max(Cr.z, 0.0f), std::min(std::max(Cr.w, 0.0f), 1.0f)); }
+								}
+								bHist = H::Uni_TemporalAccept(Lum(Hv), Lo, Hi);
+							}
+						}
+					}
+					if (bHist)
+					{
+						OVol[I] = Hv;
+						for (u32 S = 0; S < H::UNI_VOL_SLICES; ++S) { OSl[I * H::UNI_VOL_SLICES + S] = Hsl[S]; }
+						ODep[I] = H::float2(HDep, LnTp);
+						++FromHistory;
+					}
+					else
+					{
+						OVol[I] = Sp;
+						for (u32 S = 0; S < H::UNI_VOL_SLICES; ++S)
+						{
+							float A = 0.0f;
+							for (int K = 0; K < 4; ++K) { A += FSl[Q[K] * H::UNI_VOL_SLICES + S] * (Wsa[K] / Sw); }
+							OSl[I * H::UNI_VOL_SLICES + S] = A;
+						}
+						ODep[I] = H::float2(LnD, LnTp);
+						++FromFresh;
+					}
+				}
+			}
+			Vol.swap(OVol); Slices.swap(OSl); Depth.swap(ODep);
+			Prev = Cam;
+			bHave = true;
+			++Frame;
+		}
+	};
 
 	/** RenderFrame with the volume: promoted bodies, then the volume (it needs their distance),
 	 *  then sprites attenuated by the slice transmittance at their true distance. */

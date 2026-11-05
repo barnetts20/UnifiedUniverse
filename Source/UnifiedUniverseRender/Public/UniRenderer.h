@@ -40,12 +40,19 @@ struct FUniFrameData
 	float SceneColourScale = 1.0f; // exposure units -> scene colour (lesson #36), tuned in UE
 	bool bEnabled = false;
 	uint64 FrameNumber = 0;
+	// D-184: the camera's move since the previous frame (cm, now minus then), for the volume's
+	// temporal reprojection; not valid across a jump (teleport, goto, uu.Enable).
+	FVector3f CameraStepCm = FVector3f::ZeroVector;
+	bool bCameraStepValid = false;
 
 	// Star systems (D-142, D-143). Planet records for the reserved pool tail
 	// (UniGpuLayout::DynamicPoolBase..), rewritten every frame, and the archetype mask the
 	// project pass tests for system activation. Their dynamic cells are appended to Cells.
 	TArray<UniCore::FObjectGPU> DynamicRecords;
 	uint32 SystemArchetypeMask = 0;
+	// D-183: archetypes (id < 32) whose sprites are inclined ellipses (disc galaxies); 0: all round.
+	uint32 DiscArchetypeMask = 0;
+	uint32 FixedDiscSeeds[4] = { 0, 0, 0, 0 };   // D-183: fixed-orientation anchors' seeds (their disc normal is world z)
 
 	// Volume pass (Docs/VOLUMETRICS.md, UniCore::FVolumeBuilder). Local carriers are marched per
 	// pixel; background (periodic) carriers into the direction map whenever BackgroundVersion
@@ -122,6 +129,14 @@ public:
 	 *  after SetWebTexture), or the NaN dummy. */
 	FRDGTextureRef RegisterWebTexture_RenderThread(FRDGBuilder& GraphBuilder);
 
+	/** Game thread (D-179): one galaxy texture (Slot 0 warp_fine, 1 warp_large, 2 galaxy_detail),
+	 *  every mip, packed as SetWebTexture's. Size 0 clears it (the NaN dummy is bound). */
+	void SetGalaxyTexture_GameThread(int32 Slot, uint32 Size, TArray<TArray<FUintVector2>> Mips);
+
+	/** Render thread (D-179): galaxy texture Slot registered into a graph (uploaded on first use
+	 *  after SetGalaxyTexture), or the NaN dummy. */
+	FRDGTextureRef RegisterGalaxyTexture_RenderThread(FRDGBuilder& GraphBuilder, int32 Slot);
+
 	/** Render thread: draws the backdrop additively into Output (a render-targetable copy of
 	 *  scene colour, made by the view extension). Called from the view extension. */
 	void RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& View, const FScreenPassRenderTarget& Output,
@@ -156,6 +171,16 @@ private:
 	TRefCountPtr<IPooledRenderTarget> WebTexture;
 	TRefCountPtr<IPooledRenderTarget> WebDummy;
 
+	// D-179: the galaxy textures (render thread), by slot.
+	static constexpr int32 GalaxyTextureSlots = 3;
+	TArray<TArray<FUintVector2>> GalMipsRT[GalaxyTextureSlots];
+	uint32 GalSizeRT[GalaxyTextureSlots] = { 0, 0, 0 };
+	bool bGalDirty[GalaxyTextureSlots] = { false, false, false };
+	TRefCountPtr<IPooledRenderTarget> GalTexture[GalaxyTextureSlots];
+
+	/** The 1^3 NaN dummy any unbound field texture reads (fail closed). */
+	FRDGTextureRef RegisterNanDummy_RenderThread(FRDGBuilder& GraphBuilder);
+
 	// Volume: the background direction map persists across frames (D-136). D-159: triple
 	// buffered. A refresh marches all six faces of the BACK map from one snapshot of the
 	// background's carriers, parameters, LUT and view (a few faces per frame), then rotates it to
@@ -164,6 +189,15 @@ private:
 	// first faces were re-marched forever and the rest kept stale light: one face brighter than
 	// its neighbours, an "inside a cube" read.
 	TRefCountPtr<IPooledRenderTarget> BackgroundMaps[3];
+	// D-184: temporal slicing of the march. The previous frame's reconstructed output (radiance +
+	// transmittance, slices, light depth + scene depth) and its view, for the reprojection.
+	TRefCountPtr<IPooledRenderTarget> TemporalVolume, TemporalSlices, TemporalDepth;
+	FIntPoint TemporalSize = FIntPoint(0, 0);
+	FVector3f TemporalPrevForward = FVector3f::ZeroVector, TemporalPrevRight = FVector3f::ZeroVector, TemporalPrevUp = FVector3f::ZeroVector;
+	float TemporalPrevTanX = 1.0f, TemporalPrevTanY = 1.0f;
+	uint64 TemporalLastFrame = 0;
+	uint32 TemporalPhase = 0;
+	bool bTemporalHave = false;
 	int32 BgPrev = 0, BgCur = 1, BgBack = 2;
 	bool bBgHaveCur = false;
 	bool bBgFilling = false;

@@ -14,6 +14,10 @@
 //   UNI_VOL_PASS 2  COMPOSITE (full-screen triangle, additive): depth-aware upsample of the
 //                   march, plus T_near x background(dir), times the pixel's solid angle, into
 //                   the scene-colour copy the view extension made (before the sprites).
+//   UNI_VOL_PASS 3  RECONSTRUCT (compute, D-184): with temporal slicing the march marches one
+//                   pixel of every 2 x 2 block (SliceOffset); this pass fills the others from
+//                   the previous frame's output, reprojected (Catmull-Rom where it can), or from
+//                   the fresh neighbours. Its output is the frame's volume and next frame's history.
 //
 // DEBUG VIEWS (uu.VolumeDebug, lesson #37; exposure-independent false colour, no background):
 //   1 steps         mean steps per ray / MaxSteps as a heat ramp; truncated rays magenta
@@ -65,7 +69,7 @@ float3 PixelDir(float2 InPx, float2 InSize)
 	return normalize(ViewForward + ViewRight * Nx + ViewUp * Ny);
 }
 
-#if UNI_VOL_PASS == 0 || UNI_VOL_PASS == 2
+#if UNI_VOL_PASS == 0 || UNI_VOL_PASS == 2 || UNI_VOL_PASS == 3
 
 float4 InvDeviceZToWorldZTransform;
 float4 MarchToDepthUV;     // march pixel coordinate -> scene-depth UV: uv = p * xy + zw
@@ -94,25 +98,32 @@ uint WebDebugMode;          // D-169: 1 channels, 2 walls, 3 filaments, 4 nodes,
 float WebDebugDepthCm;
 float WebDebugThreshold;    // x the mean
 float WebDebugOpacity;      // per texel at full strength
+uint bSliceMarch;            // D-184: march one pixel of every 2 x 2 block, at SliceOffset
+uint2 SliceOffset;
 RWTexture2D<float4> OutVolume;
 RWTexture2DArray<float> OutSlices;
+RWTexture2D<float2> OutDepth;   // D-184: ln depth of the light, ln scene distance (the reconstruction's)
 
 [numthreads(8, 8, 1)]
-void MarchCS(uint3 Id : SV_DispatchThreadID)
+void MarchCS(uint3 DispatchId : SV_DispatchThreadID)
 {
 	// No group-shared memory and no barriers in this pass, so an early return is safe.
+	const uint2 Pix = bSliceMarch != 0u ? DispatchId.xy * 2u + SliceOffset : DispatchId.xy;
+	const uint3 Id = uint3(Pix, 0u);
 	if (Id.x >= MarchSize.x || Id.y >= MarchSize.y) { return; }
 	const FUniVolumeView V = InVolumeView[0];
 	const float2 Size = float2((float)MarchSize.x, (float)MarchSize.y);
 	const float2 Px = float2((float)Id.x + 0.5f, (float)Id.y + 0.5f);
 	const float3 Dir = PixelDir(Px, Size);
 	const float TScene = SceneDistanceAtUV(Px * MarchToDepthUV.xy + MarchToDepthUV.zw, dot(Dir, ViewForward));
+	const float LnScene = log(max(TScene, 1.0f));
 	if (DebugMode == 5u)
 	{
 		// D-169: one ray per pixel, the web only; no dust, so the slices are clear.
 		uint WebSteps;
 		const float4 W = Uni_WebDebugMarch(Dir, TScene, InCarriers, InParams, V, WebDebugMode, WebDebugDepthCm, WebDebugThreshold, WebDebugOpacity, WebSteps);
 		OutVolume[Id.xy] = float4(W.rgb, 0.0f);
+		OutDepth[Id.xy] = float2(UNI_VOL_LN_DEPTH_NONE, LnScene);
 		for (uint K5 = 0u; K5 < UNI_VOL_SLICES; ++K5) { OutSlices[uint3(Id.x, Id.y, K5)] = 1.0f; }
 		return;
 	}
@@ -130,6 +141,7 @@ void MarchCS(uint3 Id : SV_DispatchThreadID)
 	float3 B = float3(0.0f, 0.0f, 0.0f);
 	float3 T = float3(0.0f, 0.0f, 0.0f);
 	uint StepSum = 0u, ActiveMax = 0u, AnyTruncated = 0u;
+	float DepthW = 0.0f, DepthWL = 0.0f;   // D-184
 	float Slice[UNI_VOL_SLICES];
 	for (uint K = 0u; K < UNI_VOL_SLICES; ++K) { Slice[K] = 0.0f; }
 	[loop]
@@ -145,6 +157,8 @@ void MarchCS(uint3 Id : SV_DispatchThreadID)
 			StepSum += R.Steps;
 			ActiveMax = max(ActiveMax, R.Active);
 			AnyTruncated = max(AnyTruncated, R.Truncated);
+			DepthW += R.DepthWeight;
+			DepthWL += R.DepthWeight * R.LnDepth;
 			for (uint K2 = 0u; K2 < UNI_VOL_SLICES; ++K2) { Slice[K2] += Uni_Luminance(R.SliceT[K2]); }
 		}
 	}
@@ -170,6 +184,7 @@ void MarchCS(uint3 Id : SV_DispatchThreadID)
 		Out = float4(Tl, Tl, Tl, 0.0f);
 	}
 	OutVolume[Id.xy] = Out;
+	OutDepth[Id.xy] = float2(DepthW > 0.0f ? DepthWL / DepthW : UNI_VOL_LN_DEPTH_NONE, LnScene);
 	for (uint K3 = 0u; K3 < UNI_VOL_SLICES; ++K3) { OutSlices[uint3(Id.x, Id.y, K3)] = Slice[K3] * Inv; }
 }
 
@@ -189,6 +204,132 @@ void BackgroundCS(uint3 Id : SV_DispatchThreadID)
 	const float3 Dir = Uni_CubeTexelDir(Face, (float)Id.x + 0.5f, (float)Id.y + 0.5f, (float)CubeSize);
 	const FUniVolumeResult R = Uni_VolumeMarch(Dir, 3.0e38f, InCarriers, InParams, InLut, V);
 	OutCube[uint3(Id.x, Id.y, Face)] = float4(R.Radiance, 1.0f);
+}
+
+#elif UNI_VOL_PASS == 3
+
+uint2 MarchSize;
+float3 PrevForward;
+float PrevTanX;
+float3 PrevRight;
+float PrevTanY;
+float3 PrevUp;
+uint TemporalPhase;
+float3 CamStep;             // camera now minus then, cm
+uint bHistory;
+Texture2D<float4> FreshVolume;
+Texture2DArray<float> FreshSlices;
+Texture2D<float2> FreshDepth;
+Texture2D<float4> HistVolume;
+Texture2DArray<float> HistSlices;
+Texture2D<float2> HistDepth;
+RWTexture2D<float4> OutVolume;
+RWTexture2DArray<float> OutSlices;
+RWTexture2D<float2> OutDepth;
+
+float LumOf(float4 InV) { return Uni_Luminance(InV.rgb); }
+
+[numthreads(8, 8, 1)]
+void ReconstructCS(uint3 Id : SV_DispatchThreadID)
+{
+	if (Id.x >= MarchSize.x || Id.y >= MarchSize.y) { return; }
+	const uint2 Px = Id.xy;
+	if (Uni_TemporalFresh(Px, TemporalPhase))
+	{
+		OutVolume[Px] = FreshVolume.Load(int3(int2(Px), 0));
+		OutDepth[Px] = FreshDepth.Load(int3(int2(Px), 0));
+		for (uint K0 = 0u; K0 < UNI_VOL_SLICES; ++K0) { OutSlices[uint3(Px, K0)] = FreshSlices.Load(int4(int2(Px), (int)K0, 0)); }
+		return;
+	}
+	FUniTemporalView TV;
+	TV.PrevForward = PrevForward; TV.PrevTanX = PrevTanX;
+	TV.PrevRight = PrevRight; TV.PrevTanY = PrevTanY;
+	TV.PrevUp = PrevUp; TV.Phase = TemporalPhase;
+	TV.CamStep = CamStep; TV.bHistory = bHistory;
+	const float2 Size = float2((float)MarchSize.x, (float)MarchSize.y);
+	const float2 Pc = float2((float)Px.x + 0.5f, (float)Px.y + 0.5f);
+	const float3 Dir = PixelDir(Pc, Size);
+	const float LnTp = log(max(SceneDistanceAtUV(Pc * MarchToDepthUV.xy + MarchToDepthUV.zw, dot(Dir, ViewForward)), 1.0f));
+
+	// The fresh neighbours.
+	const FUniTemporalTaps Tp = Uni_TemporalTaps(Px, TemporalPhase, MarchSize);
+	const float4 F0 = FreshVolume.Load(int3(int2(Tp.Q0), 0)), F1 = FreshVolume.Load(int3(int2(Tp.Q1), 0)), F2 = FreshVolume.Load(int3(int2(Tp.Q2), 0)), F3 = FreshVolume.Load(int3(int2(Tp.Q3), 0));
+	const float2 D0 = FreshDepth.Load(int3(int2(Tp.Q0), 0)), D1 = FreshDepth.Load(int3(int2(Tp.Q1), 0)), D2 = FreshDepth.Load(int3(int2(Tp.Q2), 0)), D3 = FreshDepth.Load(int3(int2(Tp.Q3), 0));
+	const float4 Ws = Uni_TemporalSpatialW(Tp.W, LnTp, float4(D0.y, D1.y, D2.y, D3.y));
+	const float Sw = Ws.x + Ws.y + Ws.z + Ws.w;
+	const float4 Sp = (F0 * Ws.x + F1 * Ws.y + F2 * Ws.z + F3 * Ws.w) / Sw;
+	float Lo = 3.0e38f, Hi = 0.0f;
+	if (Tp.W.x > 0.0f) { Lo = min(Lo, LumOf(F0)); Hi = max(Hi, LumOf(F0)); }
+	if (Tp.W.y > 0.0f) { Lo = min(Lo, LumOf(F1)); Hi = max(Hi, LumOf(F1)); }
+	if (Tp.W.z > 0.0f) { Lo = min(Lo, LumOf(F2)); Hi = max(Hi, LumOf(F2)); }
+	if (Tp.W.w > 0.0f) { Lo = min(Lo, LumOf(F3)); Hi = max(Hi, LumOf(F3)); }
+	const float LnD = Uni_TemporalLightLnDepth(Ws, float4(D0.x, D1.x, D2.x, D3.x));
+
+	// The history, reprojected.
+	bool bHist = false;
+	float4 Hv = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	float HDep = 0.0f;
+	FUniTemporalTaps Ht = Tp;
+	float4 Wn = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	float2 Pp = float2(0.0f, 0.0f);
+	if (bHistory != 0u && Uni_TemporalPrevPixel(Dir, LnD, TV, Size, Pp))
+	{
+		Ht = Uni_TemporalHistTaps(Pp, MarchSize);
+		const float2 H0 = HistDepth.Load(int3(int2(Ht.Q0), 0)), H1 = HistDepth.Load(int3(int2(Ht.Q1), 0)), H2 = HistDepth.Load(int3(int2(Ht.Q2), 0)), H3 = HistDepth.Load(int3(int2(Ht.Q3), 0));
+		const float4 Wh = Uni_TemporalHistW(Ht.W, LnTp, float4(H0.y, H1.y, H2.y, H3.y));
+		const float Shw = Wh.x + Wh.y + Wh.z + Wh.w;
+		if (Shw >= 0.5f)
+		{
+			Wn = Wh / Shw;
+			Hv = HistVolume.Load(int3(int2(Ht.Q0), 0)) * Wn.x + HistVolume.Load(int3(int2(Ht.Q1), 0)) * Wn.y + HistVolume.Load(int3(int2(Ht.Q2), 0)) * Wn.z + HistVolume.Load(int3(int2(Ht.Q3), 0)) * Wn.w;
+			HDep = H0.x * Wn.x + H1.x * Wn.y + H2.x * Wn.z + H3.x * Wn.w;
+			// Catmull-Rom where all 16 texels are on the grid and on this pixel's surface.
+			const float Fx = Pp.x - 0.5f, Fy = Pp.y - 0.5f;
+			const int X0 = (int)floor(Fx), Y0 = (int)floor(Fy);
+			if (X0 - 1 >= 0 && Y0 - 1 >= 0 && X0 + 2 < (int)MarchSize.x && Y0 + 2 < (int)MarchSize.y)
+			{
+				const float4 Cx = Uni_CatmullRomWeights(Fx - (float)X0);
+				const float4 Cy = Uni_CatmullRomWeights(Fy - (float)Y0);
+				float4 Cr = float4(0.0f, 0.0f, 0.0f, 0.0f);
+				bool bSame = true;
+				UNI_UNROLL
+				for (int J = 0; J < 4; ++J)
+				{
+					const float Wy = J == 0 ? Cy.x : (J == 1 ? Cy.y : (J == 2 ? Cy.z : Cy.w));
+					UNI_UNROLL
+					for (int K = 0; K < 4; ++K)
+					{
+						const float Wx = K == 0 ? Cx.x : (K == 1 ? Cx.y : (K == 2 ? Cx.z : Cx.w));
+						const int3 Qc = int3(X0 - 1 + K, Y0 - 1 + J, 0);
+						bSame = bSame && Uni_TemporalDepthWeight(LnTp, HistDepth.Load(Qc).y) > 0.9f;
+						Cr += HistVolume.Load(Qc) * (Wx * Wy);
+					}
+				}
+				if (bSame) { Hv = float4(max(Cr.xyz, float3(0.0f, 0.0f, 0.0f)), saturate(Cr.w)); }
+			}
+			bHist = Uni_TemporalAccept(LumOf(Hv), Lo, Hi);
+		}
+	}
+	if (bHist)
+	{
+		OutVolume[Px] = Hv;
+		OutDepth[Px] = float2(HDep, LnTp);
+		for (uint K1 = 0u; K1 < UNI_VOL_SLICES; ++K1)
+		{
+			OutSlices[uint3(Px, K1)] = HistSlices.Load(int4(int2(Ht.Q0), (int)K1, 0)) * Wn.x + HistSlices.Load(int4(int2(Ht.Q1), (int)K1, 0)) * Wn.y
+				+ HistSlices.Load(int4(int2(Ht.Q2), (int)K1, 0)) * Wn.z + HistSlices.Load(int4(int2(Ht.Q3), (int)K1, 0)) * Wn.w;
+		}
+	}
+	else
+	{
+		OutVolume[Px] = Sp;
+		OutDepth[Px] = float2(LnD, LnTp);
+		for (uint K2 = 0u; K2 < UNI_VOL_SLICES; ++K2)
+		{
+			OutSlices[uint3(Px, K2)] = (FreshSlices.Load(int4(int2(Tp.Q0), (int)K2, 0)) * Ws.x + FreshSlices.Load(int4(int2(Tp.Q1), (int)K2, 0)) * Ws.y
+				+ FreshSlices.Load(int4(int2(Tp.Q2), (int)K2, 0)) * Ws.z + FreshSlices.Load(int4(int2(Tp.Q3), (int)K2, 0)) * Ws.w) / Sw;
+		}
+	}
 }
 
 #else // UNI_VOL_PASS == 2: composite

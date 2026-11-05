@@ -695,7 +695,8 @@ namespace UniCore
 				const FArchetype& AA = D.Arch(A.ArchetypeId);
 				const u32 Flags = H::UNI_OBJ_FLAG_ANCHOR | (AA.Visibility == EUniVisibility::Extended ? H::UNI_OBJ_FLAG_EXTENDED : 0u) | (AA.Emitters.empty() ? 0u : H::UNI_OBJ_FLAG_HAS_CONTRIBUTOR);
 				const float SB = AA.Visibility == EUniVisibility::Extended ? SurfaceBrightness(A.AbsMag, A.RadiusLog2) : 0.0f;
-				const H::float3 Rgb = H::Uni_TemperatureColour(std::pow(10.0f, AA.ColourModel[0]));
+				H::float3 Rgb = H::Uni_TemperatureColour(std::pow(10.0f, AA.ColourModel[0]));
+				if (AA.bPalette) { Rgb = H::Uni_TintRecordColour(Rgb, H::Uni_GalaxyFarTint(H::Uni_GalaxyPalette(H::Uni_PaletteSeed(A.Seed)))); }   // D-182
 				Out.Objects.push_back(FromHlsl(H::Uni_MakeObject(H::uint3(Off[0], Off[1], Off[2]), A.ArchetypeId, Flags, A.Seed, A.RadiusLog2, A.AbsMag, SB, Rgb)));
 				Out.Indices.push_back(kFirstAnchorIndex + u32(I));
 				Out.ObjectContributor.push_back(0u);
@@ -1005,7 +1006,8 @@ namespace UniCore
 					H::float4 Cm(MA.ColourModel[0], MA.ColourModel[1], MA.ColourModel[2], MA.ColourModel[3]);
 					if (bEarly) { Cm.x = Cm.x + Fp.C.w; }
 					const float RL2 = H::Uni_DrawRadiusLog2(S, M, Rm);
-					const H::float3 Rgb = H::Uni_DrawColour(S, M, Cm);
+					H::float3 Rgb = H::Uni_DrawColour(S, M, Cm);
+					if (MA.bPalette) { Rgb = H::Uni_TintRecordColour(Rgb, H::Uni_GalaxyFarTint(H::Uni_GalaxyPalette(H::Uni_PaletteSeed(S)))); }   // D-182
 					const bool bExt = MA.Visibility == EUniVisibility::Extended;
 					const u32 Flags = H::UNI_OBJ_FLAG_ANCHOR | (bExt ? H::UNI_OBJ_FLAG_EXTENDED : 0u) | (MA.Emitters.empty() ? 0u : H::UNI_OBJ_FLAG_HAS_CONTRIBUTOR) | (bEarly ? H::UNI_OBJ_FLAG_EARLY : 0u);
 					const float SB = bExt ? SurfaceBrightness(M, RL2) : 0.0f;
@@ -1084,6 +1086,8 @@ namespace UniCore
 							Ct.Params.V[R.Slot] = H::Uni_RollRange(O.B[0], ChannelIdUpper(R.Name), R.Min, R.Max, R.Bias, R.Quantize);
 						}
 					}
+					// D-182: a galaxy's palette seed, from its object seed (as its record's colour takes it).
+					if (A.bPalette && Em.FieldId == H::UNI_FIELD_GALAXY) { Ct.Params.V[23] = float(H::Uni_PaletteSeed(O.B[0])); }
 					Ct.NTotal = std::isfinite(Em.NTotalRefMag) ? Em.NTotal * std::pow(10.0, -0.4 * (double(M) - Em.NTotalRefMag)) : Em.NTotal;
 					if (Em.bRandomOrientation && !(Anc && Anc->bFixedOrientation)) { RandomRotation(O.B[0], Ct.Rot); }
 					Out.push_back(Ct);

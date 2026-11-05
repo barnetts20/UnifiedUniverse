@@ -188,6 +188,12 @@ namespace UniCore
 		float DustTau = 0.0f;           // face-on optical depth through the centre (V band)
 		float DustHeightRatio = 0.5f;   // dust scale height / stellar scale height
 		float DustArmPhase = -0.35f;    // rad: dust lanes on the inner (trailing) edge of the arms
+		// D-180: cloud-like dust from galaxy_detail (only where the galaxy reads its textures):
+		// the dust density x max(1 + Lanes (2 ridged - 1), 0) (filamentary lanes; linear, so its
+		// mean is kept where it does not clip, and a mip's mean is the texels' mean) x max(1 -
+		// Bubbles (2 A - 1)+, 0) (holes where the superbubble channel is high); no knots for dust.
+		float DustLanes = 2.2f;
+		float DustBubbles = 0.8f;
 	};
 
 	struct FArchetype
@@ -202,6 +208,7 @@ namespace UniCore
 		std::vector<FUniEmitter> Emitters;
 		bool bDefaultsOnly = false;          // lesson #16
 		FVolumeProfile Volume;               // render only
+		bool bPalette = false;               // D-182: its objects (galaxies) carry a colour palette their stars and glow take
 		bool bSystems = false;               // D-142: its objects have star systems (planets), activated near the camera
 
 		double RadiusMaxCm(double M) const
@@ -418,7 +425,8 @@ namespace UniCore
 			for (const auto& KV : Slices)
 			{
 				const FArchetype& A = Def.Arch(KV.first);
-				const u32 Flags = (A.Visibility == EUniVisibility::Extended ? UniHlsl::UNI_OBJ_FLAG_EXTENDED : 0u) | (A.Emitters.empty() ? 0u : UniHlsl::UNI_OBJ_FLAG_HAS_CONTRIBUTOR);
+				const u32 Flags = (A.Visibility == EUniVisibility::Extended ? UniHlsl::UNI_OBJ_FLAG_EXTENDED : 0u) | (A.Emitters.empty() ? 0u : UniHlsl::UNI_OBJ_FLAG_HAS_CONTRIBUTOR)
+					| (A.bPalette ? UniHlsl::UNI_SLICE_FLAG_PALETTE : 0u);   // D-182 (slice-only: above the object's 16 flag bits)
 				for (const FSlice& S : KV.second.Slices)
 				{
 					FSliceGPU G{};

@@ -511,3 +511,57 @@ A reviewer read the uncompiled engine code against UE 5.3–5.6 without seeing i
   3. `uu.Enable web`, fly past a few galaxies at a few degrees: arms of uneven length and strength, some discs visibly lopsided, edge-on ones showing an S-shaped warp at the rim.
   4. Inside the Milky Way (`uu.Enable flythrough` from rest): the band should look as before, with a slight warp towards the outer disc.
 - **Failure looks like:** stars in a sheet or scattered everywhere (a layout mismatch between C++ and HLSL), galaxies blank (fail-closed generation), or arms that end abruptly (an end fade at too small a radius: report the galaxy).
+
+## 15. Galaxy look, steps A2/A3: galaxy textures (D-179, UE-19)
+*Owner: warp volumes for local variance. Verified offline: T2.galaxy.textures (still still_galaxy_textured).*
+
+- **What changes:**
+  - Galaxies read `warp_fine` (disc and arm warp), `warp_large` (bulge warp) and `galaxy_detail` (disc noise, star-forming knots) from Data/Noise.
+  - Each galaxy rolls its own amounts and frequencies and reads a different region of each texture.
+  - The disc's noise winds with its arms.
+  - The asymmetric arms from D-178 now add where they overlap, instead of taking the brighter. This is a small change that makes the light totals exact.
+  - The disc warp range is wider, as you asked.
+- **Engine plumbing:**
+  - three more Texture3D bindings in the generation probe and place passes and the volume pass (`UniShaders.h`, `UniRenderer.cpp`);
+  - uploads through the web texture's upload pass;
+  - `UUniSubsystem::SetupGalaxyTextures` at uu.Enable;
+  - `uu.GalaxyTextures` (1).
+- **Content:** every galaxy's stars reroll again (textures, and the additive arms).
+- **Test steps:**
+  1. Build (`UniFields.ush`, `UniWebTexture.ush`, `UniHlslShim.h`, `UniWebTexture.h`, `UniDemoScenes.h`, `UniRenderer.h/.cpp`, `UniShaders.h`, `UniSubsystem.h/.cpp`).
+  2. `uu.Enable web`. The log should say "galaxy textures warp_fine, warp_large, galaxy_detail 128^3 loaded ... textured".
+  3. Fly past galaxies at a few degrees: patchy discs, knots of light along the arms, arms that wiggle rather than being perfect spirals.
+  4. Fly into the Milky Way: stars as before in kind, with a slightly patchier band.
+  5. `uu.GalaxyTextures 0`, then `uu.Enable web` again, for an A/B.
+  6. `ProfileGPU` at a galaxy a few tens of pixels across: `Uni.Volume.March` cost against before (three texture reads per galaxy sample near the disc).
+- **Failure looks like:**
+  - galaxies with no stars or no glow (a texture not bound: the NaN dummy; check the log);
+  - streaks or a sheared look (the warp folding: report the galaxy);
+  - a missing-texture error in the log (the files not in Data/Noise).
+- **D-180 (cloud dust, render only), same build:** a textured galaxy's dust lanes are broken into ridged filaments with holes (galaxy_detail's ridged and superbubble channels). Look at a galaxy at 60–70° inclination: the lanes should read as clumpy, filamentary dust rather than smooth bands. Strength is `FVolumeProfile::DustLanes` (2.2) and `DustBubbles` (0.8) in UniArchetype.h; say if you want them as console variables.
+
+## 16. Galaxy look, step A5: palettes (D-182, UE-20)
+*Owner: each galaxy its own palette, plausible but stylised; stars take it too; per component. Verified offline: T2.galaxy.palette (still still_galaxy_palettes).*
+
+- **What changes:** every galaxy rolls four colours (bulge, disc, arms, knots). Its glow is tinted by the component at each point, its stars by the component they sit in, and its sprite by its whole-body tint. Brightness is unchanged everywhere; only colour changes.
+- **Content:** star and galaxy colours only (positions, magnitudes, counts identical).
+- **Test steps:**
+  1. Build (`UniFields.ush`, `UniGenTask.ush`, `UniPlacement.ush`, `UniSeed.ush`, `UniVolume.ush`, `UniArchetype.h`, `UniVolume.h`, `UniGenRef.h`, `UniDemoScenes.h`, `UniSubsystem.cpp`). Watch the shader compile: the C++ build cannot catch HLSL-only errors (like the struct conditional fixed this afternoon).
+  2. `uu.Enable web`: galaxies in varied colours. Fly into one: its stars keep the colours of its arms and bulge.
+  3. `uu.Enable flythrough`: the Milky Way's own band is tinted by its palette (one fixed set from its seed).
+  4. `uu.GalaxyPalettes 0` + `uu.Enable` for an A/B.
+- **Tuning:** the families and the strength (0.9) are in `Uni_GalaxyPalette` (UniFields.ush). Say if you want them as console variables, or a curated palette for the Milky Way.
+- **Failure looks like:** white or grey galaxies (palette off: the log; or the slice flag missing), stars with different colours from their galaxy's glow, or colour jumping at the sprite-to-glow hand-off.
+
+## 17. Galaxies at a few pixels: inclined sprites (D-183, UE-21)
+*Plan step B, render-only. Verified offline: T2.galaxy.sprites (still still_galaxy_sprites).*
+
+- **What changes:** a galaxy's sprite is an ellipse at its disc's inclination (the same orientation its glow is marched with), with the same brightness. Below about two pixels it stays round. Its glare halo stays round.
+- **Content:** none.
+- **Test steps:**
+  1. Build (`UniProject.ush`, `UniProject.usf`, `UniSprite.usf`, `UniShaders.h`, `UniRenderer.h/.cpp`, `UniSubsystem.h/.cpp`). Watch the shader compile (two new sprite interpolants, a `uint4` parameter in the project pass).
+  2. `uu.Enable web`, raise sensitivity: galaxies of a few to tens of pixels show as needles, ovals and discs.
+  3. Fly toward one until the glow takes over: the ellipse should line up with the glow (no rotation or squash jump).
+  4. `uu.SpriteEllipses 0` (live) for an A/B.
+- **Tuning:** thickness q0 (0.2 discs, 0.65 early types) in `Uni_ProjectObject`; the round-below threshold (0.7 px minor sigma) in `Uni_SpriteEllipseQ`.
+- **Failure looks like:** all galaxies round (mask empty: check the log for archetypes, or the CVar), ellipses rotating as the camera turns (basis mismatch between the project pass and the sprite vertex shader), galaxies dimmer or brighter with the switch, or the Milky Way's sprite (seen from far outside) not lining up with its band.

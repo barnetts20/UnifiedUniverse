@@ -80,6 +80,8 @@ struct FUniView
 	float HaloGain;           // halo energy per doubling of intensity over saturation, in units of saturation
 	float HaloGrowthPx;       // halo sigma growth per doubling over saturation, pixels
 	float HaloMaxPx;          // halo sigma cap for an unresolved source, pixels
+	uint DiscArchetypeMask;   // D-183: archetypes (id < 32) whose objects are disc galaxies: their sprites are inclined ellipses
+	uint4 FixedDiscSeeds;     // D-183: object seeds of anchors with a fixed (identity) orientation: disc normal world z (0: unused)
 };
 
 struct FUniSprite
@@ -94,8 +96,8 @@ struct FUniSprite
 	float PhysAngularRadius;  // R / r, rad (promotion, volumetric hand-off)
 	float HaloRadius;         // D-156: halo sigma, rad (0: no halo)
 	float HaloRatio;          // D-156: halo energy / core energy (0: no halo)
-	float Pad0;
-	float Pad1;
+	float EllipseAngle;       // D-183: a disc galaxy's minor axis in the quad's (Side, Up) basis, rad
+	float EllipseAxis;        // D-183: its projected axis ratio (minor / major); 0: round
 };
 
 /** D-156: FUniView with the default sprite style. */
@@ -165,6 +167,39 @@ UNI_FN bool Uni_SceneDepthKeep(float InTrueDistance, float InSceneDistance)
 	return InTrueDistance < Uni_SceneTrueDistance(InSceneDistance);
 }
 
+/** D-183: the disc normal (world) of a galaxy from its object seed: the third row of
+ *  UniGenRef's RandomRotation (rows map world to field; the disc is the field's xy plane), in
+ *  float. Anchors with a fixed orientation (the Milky Way) take world z instead: their seeds
+ *  are in FUniView::FixedDiscSeeds. */
+UNI_FN float3 Uni_DiscNormal(uint InSeed)
+{
+	const float U1 = Uni_DrawUnit(InSeed, UNI_CH_ORIENT, 0u), U2 = Uni_DrawUnit(InSeed, UNI_CH_ORIENT, 1u), U3 = Uni_DrawUnit(InSeed, UNI_CH_ORIENT, 2u);
+	const float A = sqrt(1.0f - U1), B = sqrt(U1);
+	const float X = A * sin(6.2831853f * U2), Y = A * cos(6.2831853f * U2);
+	const float Z = B * sin(6.2831853f * U3), W = B * cos(6.2831853f * U3);
+	return float3(2.0f * (X * Z - Y * W), 2.0f * (Y * Z + X * W), 1.0f - 2.0f * (X * X + Y * Y));
+}
+
+/** D-183: the effective axis ratio of a sprite's ellipse at SigmaPx pixels of core sigma: never
+ *  thinner than ~0.7 px along the minor axis, so small sprites stay round (orientation shows
+ *  only once a galaxy is a few pixels across) and the Gaussian is never undersampled. */
+UNI_FN float Uni_SpriteEllipseQ(FUniSprite InS, float InSigmaPx)
+{
+	if (!(InS.EllipseAxis > 0.0f)) { return 1.0f; }
+	return clamp(max(InS.EllipseAxis, 0.7f / max(InSigmaPx, 1.0e-3f)), 0.0f, 1.0f);
+}
+
+/** D-183: the radius (pixels) at which to evaluate the round profile for a pixel at offset
+ *  (InX, InY) pixels in the quad's (Side, Up) basis: squashed along the minor axis. The profile
+ *  is then divided by Q, so the energy is unchanged. */
+UNI_FN float Uni_SpriteEllipseR(float InX, float InY, float InAngle, float InQ)
+{
+	const float Ca = cos(InAngle), Sa = sin(InAngle);
+	const float V = InX * Ca + InY * Sa;      // along the minor axis
+	const float U = -InX * Sa + InY * Ca;     // along the major axis
+	return sqrt(U * U + (V / InQ) * (V / InQ));
+}
+
 /** Project one object. Returns the sprite; Flags says whether it is visible and whether it is
  *  a promotion candidate (candidates are reported even when culled for being promoted). */
 UNI_FN FUniSprite Uni_ProjectObject(uint4 InCellDeltaX, uint4 InCellDeltaY, uint4 InCellDeltaZ, uint InLevel,
@@ -181,8 +216,8 @@ UNI_FN FUniSprite Uni_ProjectObject(uint4 InCellDeltaX, uint4 InCellDeltaY, uint
 	S.PhysAngularRadius = 0.0f;
 	S.HaloRadius = 0.0f;
 	S.HaloRatio = 0.0f;
-	S.Pad0 = 0.0f;
-	S.Pad1 = 0.0f;
+	S.EllipseAngle = 0.0f;
+	S.EllipseAxis = 0.0f;
 
 	const uint3 Off = uint3(InObj.A.x, InObj.A.y, InObj.A.z);
 	const float3 Rel = Uni_ObjectRelative(InCellDeltaX, InCellDeltaY, InCellDeltaZ, Off, InLevel, InView.CameraFraction);
@@ -272,6 +307,25 @@ UNI_FN FUniSprite Uni_ProjectObject(uint4 InCellDeltaX, uint4 InCellDeltaY, uint
 	const float3 Col = Uni_UnpackColour(InObj.B.w);
 	S.Radiance = Col * (CoreE / max(Uni_Luminance(Col), 1.0e-3f));   // the core's light; luminance = core energy (D-135)
 	S.Flags = S.Flags | UNI_SPRITE_VISIBLE | (bExtended ? UNI_SPRITE_EXTENDED : 0u) | (bBody ? UNI_SPRITE_BODY : 0u) | (bPromoted ? UNI_SPRITE_HALO_ONLY : 0u);
+	// D-183: a disc galaxy reads as an ellipse at its inclination: the disc normal is its
+	// contributor's (the object seed's random rotation, UniGenRef RandomRotation), the axis ratio
+	// sqrt(cos^2 i + q0^2 sin^2 i) (q0 0.2 for a disc, 0.65 for an early type: the rolled fields'
+	// light-weighted thickness, 0.11-0.31 for discs, D-183), the minor axis
+	// along the normal's projection. Expressed in the quad's basis, as the vertex shader builds it.
+	const uint DiscArch = Uni_ObjectArchetype(InObj);
+	if (bExtended && DiscArch < 32u && ((InView.DiscArchetypeMask >> DiscArch) & 1u) != 0u)
+	{
+		const uint Sd = InObj.B.x;
+		const bool bFixed = Sd != 0u && (InView.FixedDiscSeeds.x == Sd || InView.FixedDiscSeeds.y == Sd || InView.FixedDiscSeeds.z == Sd || InView.FixedDiscSeeds.w == Sd);
+		const float3 N = bFixed ? float3(0.0f, 0.0f, 1.0f) : Uni_DiscNormal(Sd);
+		const float Ci = dot(N, Dir);
+		const float Q0 = (ObjFlags & UNI_OBJ_FLAG_EARLY) != 0u ? 0.65f : 0.2f;
+		S.EllipseAxis = sqrt(saturate(Ci * Ci + Q0 * Q0 * (1.0f - Ci * Ci)));
+		const float3 Side = normalize(cross(Dir, InView.Up + InView.Right * 1.0e-3f));
+		const float3 Up = cross(Side, Dir);
+		const float3 Np = N - Dir * Ci;
+		S.EllipseAngle = atan2(dot(Np, Up), dot(Np, Side));
+	}
 	return S;
 }
 
@@ -321,6 +375,18 @@ UNI_FN float Uni_SpriteProfileHalo(float InRPx, float InSigmaPx, float InDiscFra
 		W += InHaloRatio * exp(-0.5f * (InRPx * InRPx) / (InHaloSigmaPx * InHaloSigmaPx)) / (6.2831853f * InHaloSigmaPx * InHaloSigmaPx);
 	}
 	return W;
+}
+
+/** D-183: Uni_SpriteProfileHalo for a sprite whose core is an ellipse: the pixel at (InX, InY)
+ *  pixels in the quad's (Side, Up) basis. The core is the round profile at the squashed radius
+ *  divided by Q (its energy unchanged: the area shrinks by Q); the D-156 halo is optical glare
+ *  and stays round. Q = 1 is Uni_SpriteProfileHalo exactly. */
+UNI_FN float Uni_SpriteProfileEllipse(float InX, float InY, float InSigmaPx, float InDiscFrac, float InHaloSigmaPx, float InHaloRatio, float InCoreWeight, float InAngle, float InQ)
+{
+	const float R = sqrt(InX * InX + InY * InY);
+	if (!(InQ < 1.0f)) { return Uni_SpriteProfileHalo(R, InSigmaPx, InDiscFrac, InHaloSigmaPx, InHaloRatio, InCoreWeight); }
+	float W = InCoreWeight > 0.0f ? InCoreWeight * Uni_SpriteProfile(Uni_SpriteEllipseR(InX, InY, InAngle, InQ), InSigmaPx, InDiscFrac) / InQ : 0.0f;
+	return W + Uni_SpriteProfileHalo(R, InSigmaPx, InDiscFrac, InHaloSigmaPx, InHaloRatio, 0.0f);
 }
 
 #endif // UNI_PROJECT_USH

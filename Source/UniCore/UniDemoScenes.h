@@ -145,8 +145,9 @@ namespace UniScenes
 			{ "Arms.Phase", 10, 0.0f, 6.2831853f, 1.0f, 0.0f },
 			// D-178: disc-level modes and per-arm asymmetry (UltraLargeScale's ideas), so no two
 			// galaxies share a shape. Warp at the visible edge (r ~ 0.6 of the influence radius)
-			// ~0.36 x its amplitude: up to ~1.2 kpc for a 15 kpc galaxy, the Milky Way's ~1 kpc.
-			{ "Disc.WarpAmplitude", 16, 0.0f, 0.14f, 1.6f, 0.0f },
+			// ~0.36 x its amplitude: up to ~2 kpc for a 15 kpc galaxy (the Milky Way's ~1 kpc;
+			// owner, after the first engine pass: a slightly wider range).
+			{ "Disc.WarpAmplitude", 16, 0.0f, 0.22f, 1.4f, 0.0f },
 			{ "Disc.WarpTwist", 17, -1.2f, 1.2f, 1.0f, 0.0f },
 			{ "Disc.Lopsided", 18, 0.0f, 0.35f, 1.6f, 0.0f },
 			{ "Disc.Flare", 19, 0.0f, 1.2f, 1.0f, 0.0f },
@@ -443,6 +444,60 @@ namespace UniScenes
 		if (bClusters) { Field.NTotal *= std::clamp(1.0 - T.Fraction, 0.0, 1.0); }
 		D.RootEmitters.push_back(Field);
 		if (bClusters) { D.RootEmitters.push_back(ClusterWebEmitter(T)); }
+	}
+
+	/** D-182 (owner): every galaxy (field, cluster member, dwarf) its own colour palette, which
+	 *  its stars and its glow take (render chroma only: luminance kept). Returns the archetypes. */
+	inline int UseGalaxyPalettes(FUniverseDef& D)
+	{
+		int N = 0;
+		for (FArchetype& A : D.Archetypes) { if (A.Id == kGalaxy || A.Id == kMember || A.Id == kDwarf) { A.bPalette = true; ++N; } }
+		return N;
+	}
+
+	/** D-179 (SPRITE_PASS_PLAN §3 A3): galaxies read the noise project's galaxy textures:
+	 *  warp_fine displaces discs and arms, warp_large bulges, galaxy_detail modulates discs (fBm)
+	 *  and arms (star-forming knots). Every galaxy rolls its amounts and frequencies by name;
+	 *  dwarfs are more irregular; early types stay smooth; the Milky Way anchor has one fixed set.
+	 *  TexSize: texels per texture period (all three textures the same size). Call only with the
+	 *  textures bound (UniCore::BindGalaxyTexture): unbound, the terms read NaN and the galaxies
+	 *  place nothing (fail closed). Returns the number of emitters and anchors switched. */
+	inline int UseGalaxyTextures(FUniverseDef& D, uint32_t TexSize)
+	{
+		int N = 0;
+		auto Add = [&](FUniEmitter& E, bool bDwarf)
+		{
+			if (E.FieldId != H::UNI_FIELD_GALAXY) { return; }
+			E.Exemplar.V[31] = float(TexSize);
+			const std::string P = bDwarf ? "DwarfTex." : "Tex.";
+			// The warp moves the disc by about a tenth of its own wavelength (1 / (4 x freq): warp_fine
+			// has 4 curl periods a tile), so the displacement bends structure without folding it
+			// (folding would make the warp compress or stretch the disc, and its light with it).
+			E.Ranges.push_back({ P + "DiscWarp", 24, bDwarf ? 0.012f : 0.008f, bDwarf ? 0.03f : 0.022f, 1.0f, 0.0f });
+			E.Ranges.push_back({ P + "BulgeWarp", 25, 0.0f, 0.012f, 1.0f, 0.0f });
+			E.Ranges.push_back({ P + "WarpFreq", 26, 0.8f, 1.6f, 1.0f, 0.0f });
+			E.Ranges.push_back({ P + "DetailFreq", 27, 2.0f, 4.0f, 1.0f, 0.0f });
+			E.Ranges.push_back({ P + "DiscNoise", 28, bDwarf ? 0.4f : 0.2f, bDwarf ? 0.8f : 0.6f, 1.0f, 0.0f });
+			E.Ranges.push_back({ P + "Knots", 29, bDwarf ? 0.5f : 0.3f, bDwarf ? 1.0f : 0.9f, 1.0f, 0.0f });
+			E.Ranges.push_back({ P + "Twist", 30, 0.5f, 1.0f, 1.0f, 0.0f });
+			++N;
+		};
+		for (FArchetype& A : D.Archetypes)
+		{
+			if (A.Id != kGalaxy && A.Id != kMember && A.Id != kDwarf) { continue; }
+			for (FUniEmitter& E : A.Emitters) { Add(E, A.Id == kDwarf); }
+		}
+		for (FAnchor& A : D.Anchors)
+		{
+			if (A.ArchetypeId != kGalaxy) { continue; }
+			for (FFieldParams& P : A.EmitterParams)
+			{
+				P.V[24] = 0.015f; P.V[25] = 0.006f; P.V[26] = 1.2f; P.V[27] = 3.0f;   // the home galaxy's fixed set
+				P.V[28] = 0.35f;  P.V[29] = 0.6f;   P.V[30] = 0.8f; P.V[31] = float(TexSize);
+				++N;
+			}
+		}
+		return N;
 	}
 
 	/** D-165: switch a web scene's root emitters to a delivered texture (the texture project's

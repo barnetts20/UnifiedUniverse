@@ -41,6 +41,8 @@ uint MaxSprites;
 uint MaxPromote;
 uint MaxActivate;
 uint SystemArchetypeMask;                        // bit per archetype id < 32 whose objects have systems
+uint DiscArchetypeMask;                          // D-183: bit per archetype id < 32 whose objects are disc galaxies (inclined elliptical sprites)
+uint4 FixedDiscSeeds;                            // D-183: seeds of fixed-orientation anchors (disc normal world z)
 
 float3 ViewForward;
 float TanHalfFovX;
@@ -83,6 +85,8 @@ void MainCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
 	V.HaloGrowthPx = SpriteHaloGrowthPx;
 	V.HaloMaxPx = SpriteHaloMaxPx;
 	V.SystemArchetypeMask = SystemArchetypeMask;
+	V.DiscArchetypeMask = DiscArchetypeMask;
+	V.FixedDiscSeeds = FixedDiscSeeds;
 
 	const float LevelFade = (float)((Cell.Flags >> 8u) & 255u) / 255.0f;
 	for (uint I = GroupIndex; I < Cell.PoolCount; I += 64)

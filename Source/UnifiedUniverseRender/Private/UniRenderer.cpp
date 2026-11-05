@@ -28,6 +28,7 @@ static TAutoConsoleVariable<float> CVarUniSpriteSaturation(TEXT("uu.Sprite.Satur
 static TAutoConsoleVariable<float> CVarUniSpriteHaloGain(TEXT("uu.Sprite.HaloGain"), UniHlsl::UNI_SPRITE_HALO_GAIN, TEXT("Halo light per doubling of brightness over saturation, in units of the saturation level (0: no halo)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<float> CVarUniSpriteHaloGrowth(TEXT("uu.Sprite.HaloGrowth"), UniHlsl::UNI_SPRITE_HALO_GROWTH_PX, TEXT("Halo size growth per doubling of brightness over saturation (pixels of Gaussian sigma)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<float> CVarUniSpriteHaloMax(TEXT("uu.Sprite.HaloMax"), UniHlsl::UNI_SPRITE_HALO_MAX_PX, TEXT("Largest halo of an unresolved sprite (Gaussian sigma, pixels)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<int32> CVarUniVolumeTemporal(TEXT("uu.VolumeTemporal"), 1, TEXT("D-184: temporal slicing of the volume march: each frame marches one pixel of every 2 x 2 block and reprojects the rest from the previous frame (about a quarter of the march's cost). 0: march every pixel every frame. Off in the debug views."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniVolumeDivisor(TEXT("uu.VolumeDivisor"), 2, TEXT("Volume march resolution divisor (1 = full, 2 = half, 4 = quarter)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniBackgroundSize(TEXT("uu.BackgroundSize"), 256, TEXT("Background direction-map face size (texels)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniVolumeDebug(TEXT("uu.VolumeDebug"), 0, TEXT("Volume debug view (lesson #37): 0 off, 1 steps per ray (magenta = truncated), 2 coverage (R carriers, G supersampling, B truncated), 3 emission (log10 heat), 4 dust transmittance."), ECVF_RenderThreadSafe);
@@ -225,18 +226,86 @@ FRDGTextureRef FUniRenderer::RegisterWebTexture_RenderThread(FRDGBuilder& GraphB
 		WebMipsRT.Empty();
 	}
 	if (WebTexture.IsValid()) { return GraphBuilder.RegisterExternalTexture(WebTexture, TEXT("UniWebTexture")); }
+	return RegisterNanDummy_RenderThread(GraphBuilder);
+}
+
+/** One mip of a field texture from a buffer of packed half texels (UniWebTexUpload.usf). */
+static void UniUploadFieldMip(FRDGBuilder& GraphBuilder, FRDGTextureRef Tex, int32 Mip, uint32 MipSize, const TArray<FUintVector2>& Texels)
+{
+	FUniWebTexUploadCS::FParameters* P = GraphBuilder.AllocParameters<FUniWebTexUploadCS::FParameters>();
+	P->InTexels = GraphBuilder.CreateSRV(UploadStructured(GraphBuilder, TEXT("UniFieldTexels"), Texels));
+	P->OutMip = GraphBuilder.CreateUAV(FRDGTextureUAVDesc(Tex, uint8(Mip)));
+	P->MipSize = MipSize;
+	const int32 G = FMath::DivideAndRoundUp(int32(MipSize), 4);
+	TShaderMapRef<FUniWebTexUploadCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.FieldTexture.Upload mip %d (%u^3)", Mip, MipSize), CS, P, FIntVector(G, G, G));
+}
+
+FRDGTextureRef FUniRenderer::RegisterNanDummy_RenderThread(FRDGBuilder& GraphBuilder)
+{
+	check(IsInRenderingThread());
 	if (!WebDummy.IsValid())
 	{
-		// Fail closed: a textured web sampled without its texture reads NaN (nothing passes a
+		// Fail closed: a field texture sampled without its texture reads NaN (nothing passes a
 		// density test), never a plausible value (lesson #1).
 		FRDGTextureRef D = GraphBuilder.CreateTexture(FRDGTextureDesc::Create3D(FIntVector(1, 1, 1), PF_FloatRGBA, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV, 1), TEXT("UniWebTextureDummy"));
 		TArray<FUintVector2> Nan;
 		Nan.Add(FUintVector2(0x7E007E00u, 0x7E007E00u));   // four half quiet NaNs
-		Upload(D, 0, 1u, Nan);
+		UniUploadFieldMip(GraphBuilder, D, 0, 1u, Nan);
 		WebDummy = GraphBuilder.ConvertToExternalTexture(D);
 		return D;
 	}
 	return GraphBuilder.RegisterExternalTexture(WebDummy, TEXT("UniWebTextureDummy"));
+}
+
+void FUniRenderer::SetGalaxyTexture_GameThread(int32 Slot, uint32 Size, TArray<TArray<FUintVector2>> Mips)
+{
+	check(IsInGameThread());
+	if (Slot < 0 || Slot >= GalaxyTextureSlots) { return; }
+	struct FGal { int32 Slot = 0; uint32 Size = 0; TArray<TArray<FUintVector2>> Mips; };
+	TSharedRef<FGal, ESPMode::ThreadSafe> Payload = MakeShared<FGal, ESPMode::ThreadSafe>();
+	Payload->Slot = Slot;
+	Payload->Size = Size;
+	Payload->Mips = MoveTemp(Mips);
+	ENQUEUE_RENDER_COMMAND(UniSetGalaxyTexture)([Payload](FRHICommandListImmediate&)
+	{
+		FUniRenderer& R = FUniRenderer::Get();
+		R.GalSizeRT[Payload->Slot] = Payload->Size;
+		R.GalMipsRT[Payload->Slot] = MoveTemp(Payload->Mips);
+		R.bGalDirty[Payload->Slot] = true;
+	});
+}
+
+FRDGTextureRef FUniRenderer::RegisterGalaxyTexture_RenderThread(FRDGBuilder& GraphBuilder, int32 Slot)
+{
+	check(IsInRenderingThread());
+	if (Slot < 0 || Slot >= GalaxyTextureSlots) { return RegisterNanDummy_RenderThread(GraphBuilder); }
+	static const TCHAR* Names[GalaxyTextureSlots] = { TEXT("UniGalWarpFine"), TEXT("UniGalWarpLarge"), TEXT("UniGalDetail") };
+	if (bGalDirty[Slot])
+	{
+		bGalDirty[Slot] = false;
+		GalTexture[Slot].SafeRelease();
+		const uint32 Size = GalSizeRT[Slot];
+		TArray<TArray<FUintVector2>>& Mips = GalMipsRT[Slot];
+		if (Size > 0u && Mips.Num() > 0)
+		{
+			const FRDGTextureDesc Desc = FRDGTextureDesc::Create3D(FIntVector(int32(Size)), PF_FloatRGBA, FClearValueBinding::Black,
+				TexCreate_ShaderResource | TexCreate_UAV, uint8(Mips.Num()));
+			FRDGTextureRef Tex = GraphBuilder.CreateTexture(Desc, Names[Slot]);
+			for (int32 M = 0; M < Mips.Num(); ++M)
+			{
+				const uint32 S = FMath::Max(Size >> M, 1u);
+				if (uint64(Mips[M].Num()) != uint64(S) * S * S) { UE_LOG(LogTemp, Error, TEXT("UnifiedUniverse: galaxy texture %d mip %d has %d texels, expected %u^3"), Slot, M, Mips[M].Num(), S); continue; }
+				UniUploadFieldMip(GraphBuilder, Tex, M, S, Mips[M]);   // UploadStructured copies the texels into the graph
+			}
+			Mips.Empty();
+			GalTexture[Slot] = GraphBuilder.ConvertToExternalTexture(Tex);
+			return Tex;
+		}
+		Mips.Empty();
+	}
+	if (GalTexture[Slot].IsValid()) { return GraphBuilder.RegisterExternalTexture(GalTexture[Slot], Names[Slot]); }
+	return RegisterNanDummy_RenderThread(GraphBuilder);
 }
 
 FRDGBufferRef FUniRenderer::RegisterPool_RenderThread(FRDGBuilder& GraphBuilder)
@@ -285,6 +354,7 @@ void FUniRenderer::Release_RenderThread()
 	WebTexture.SafeRelease();
 	WebDummy.SafeRelease();
 	WebMipsRT.Empty();
+	for (int32 S = 0; S < GalaxyTextureSlots; ++S) { GalTexture[S].SafeRelease(); GalMipsRT[S].Empty(); }   // D-179
 	PromoteRing.Empty();
 	ActivateRing.Empty();
 	{
@@ -292,6 +362,8 @@ void FUniRenderer::Release_RenderThread()
 		ActivationsReady.Reset();
 	}
 	for (TRefCountPtr<IPooledRenderTarget>& M : BackgroundMaps) { M.SafeRelease(); }
+	TemporalVolume.SafeRelease(); TemporalSlices.SafeRelease(); TemporalDepth.SafeRelease();   // D-184
+	bTemporalHave = false;
 	bBgHaveCur = bBgFilling = false;
 	BgFillMask = 0u;
 	BgFilledVersion = ~0u;
@@ -321,11 +393,16 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 	FRDGBufferRef ParamBuf = UploadStructured(GraphBuilder, TEXT("UniVolumeParams"), F.VolumeParams);
 	FRDGBufferRef LutBuf = UploadStructured(GraphBuilder, TEXT("UniVolumeLut"), F.VolumeLut);
 	FRDGTextureRef WebTex = RegisterWebTexture_RenderThread(GraphBuilder);   // D-164
+	FRDGTextureRef GalTex[GalaxyTextureSlots];
+	for (int32 S = 0; S < GalaxyTextureSlots; ++S) { GalTex[S] = RegisterGalaxyTexture_RenderThread(GraphBuilder, S); }   // D-179
 	FRHISamplerState* WebSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Wrap>::GetRHI();
 	auto FillCommonWith = [&](FUniVolumeCommonParameters& C, const TArray<UniCore::FCarrierGPU>& Carriers, const UniCore::FVolumeViewGPU& V, FRDGBufferRef InParamBuf, FRDGBufferRef InLutBuf)
 	{
 		C.UniWebTexture = WebTex;
 		C.UniWebSampler = WebSampler;
+		C.UniGalWarpFine = GalTex[0];   // D-179
+		C.UniGalWarpLarge = GalTex[1];
+		C.UniGalDetail = GalTex[2];
 		TArray<UniCore::FVolumeViewGPU> One; One.Add(V);
 		One[0].NumCarriers = uint32(Carriers.Num());
 		C.InCarriers = GraphBuilder.CreateSRV(UploadStructured(GraphBuilder, TEXT("UniVolumeCarriers"), Carriers));
@@ -473,6 +550,25 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 	const TArray<UniCore::FCarrierGPU>& MarchCarriers = bPerPixelBackground ? PerPixelCarriers : F.VolumeCarriers;
 	FRDGTextureRef VolumeTex = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(MarchSize, PF_A32B32G32R32F, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV), TEXT("UniVolume"));   // float32: see the cube
 	FRDGTextureRef Slices = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(MarchSize, PF_R16F, FClearValueBinding::White, TexCreate_ShaderResource | TexCreate_UAV, UniGpuLayout::VolumeSlices), TEXT("UniVolumeSlices"));
+	FRDGTextureRef DepthTex = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(MarchSize, PF_G32R32F, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV), TEXT("UniVolumeDepth"));
+
+	// D-184: temporal slicing. With a usable history (same march size, consecutive frames, no
+	// camera jump) the march marches one pixel of every 2 x 2 block into the fresh textures and
+	// the reconstruct pass fills the frame's volume from them and the reprojected history.
+	// Without it every pixel is marched straight into the frame's volume (which becomes the
+	// history). Debug views march every pixel.
+	const bool bTemporalOn = CVarUniVolumeTemporal.GetValueOnRenderThread() != 0 && VolDebugMode == 0u && MarchSize.X >= 4 && MarchSize.Y >= 4;
+	const bool bSlice = bTemporalOn && bTemporalHave && TemporalSize == MarchSize && F.bCameraStepValid && F.FrameNumber == TemporalLastFrame + 1
+		&& TemporalVolume.IsValid() && TemporalSlices.IsValid() && TemporalDepth.IsValid();
+	const uint32 Phase = bSlice ? (TemporalPhase + 1u) & 3u : 0u;
+	const FUintVector2 SliceOffset(Phase == 1u || Phase == 2u ? 1u : 0u, Phase == 1u || Phase == 3u ? 1u : 0u);   // Uni_TemporalOffset
+	FRDGTextureRef MarchVol = VolumeTex, MarchSlices = Slices, MarchDepth = DepthTex;
+	if (bSlice)
+	{
+		MarchVol = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(MarchSize, PF_A32B32G32R32F, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV), TEXT("UniVolumeFresh"));
+		MarchSlices = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(MarchSize, PF_R16F, FClearValueBinding::White, TexCreate_ShaderResource | TexCreate_UAV, UniGpuLayout::VolumeSlices), TEXT("UniVolumeFreshSlices"));
+		MarchDepth = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(MarchSize, PF_G32R32F, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV), TEXT("UniVolumeFreshDepth"));
+	}
 	{
 		FUniVolumeMarchCS::FParameters* P = GraphBuilder.AllocParameters<FUniVolumeMarchCS::FParameters>();
 		FillCommon(P->Common, MarchCarriers, VV);
@@ -487,10 +583,57 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		P->WebDebugDepthCm = float(double(FMath::Max(CVarUniWebDebugDepth.GetValueOnRenderThread(), 0.1f)) * 3.0856775814913673e24);
 		P->WebDebugThreshold = FMath::Max(CVarUniWebDebugThreshold.GetValueOnRenderThread(), 1.0e-3f);
 		P->WebDebugOpacity = FMath::Max(CVarUniWebDebugOpacity.GetValueOnRenderThread(), 0.0f);
+		P->bSliceMarch = bSlice ? 1u : 0u;
+		P->SliceOffset = SliceOffset;
+		P->OutVolume = GraphBuilder.CreateUAV(MarchVol);
+		P->OutSlices = GraphBuilder.CreateUAV(MarchSlices);
+		P->OutDepth = GraphBuilder.CreateUAV(MarchDepth);
+		TShaderMapRef<FUniVolumeMarchCS> CS(GetGlobalShaderMap(View.GetFeatureLevel()));
+		const FIntPoint Grid = bSlice ? FIntPoint((MarchSize.X + 1) / 2, (MarchSize.Y + 1) / 2) : MarchSize;
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Volume.March %dx%d, %d carriers%s%s", MarchSize.X, MarchSize.Y, MarchCarriers.Num(), bPerPixelBackground ? TEXT(" (with the background)") : TEXT(""), bSlice ? TEXT(", 1/4 sliced") : TEXT("")), CS, P, FComputeShaderUtils::GetGroupCount(Grid, 8));
+	}
+	if (bSlice)
+	{
+		FUniVolumeReconstructCS::FParameters* P = GraphBuilder.AllocParameters<FUniVolumeReconstructCS::FParameters>();
+		FillCommon(P->Common, MarchCarriers, VV);
+		P->InvDeviceZToWorldZTransform = FVector4f(View.InvDeviceZToWorldZTransform);
+		P->MarchToDepthUV = MarchToDepthUV;
+		P->SceneDepthTexture = SceneDepth;
+		P->SceneDepthSampler = PointClamp;
+		P->MarchSize = FUintVector2(uint32(MarchSize.X), uint32(MarchSize.Y));
+		P->PrevForward = TemporalPrevForward; P->PrevTanX = TemporalPrevTanX;
+		P->PrevRight = TemporalPrevRight; P->PrevTanY = TemporalPrevTanY;
+		P->PrevUp = TemporalPrevUp; P->TemporalPhase = Phase;
+		P->CamStep = F.CameraStepCm; P->bHistory = 1u;
+		P->FreshVolume = MarchVol; P->FreshSlices = MarchSlices; P->FreshDepth = MarchDepth;
+		P->HistVolume = GraphBuilder.RegisterExternalTexture(TemporalVolume, TEXT("UniVolumeHistory"));
+		P->HistSlices = GraphBuilder.RegisterExternalTexture(TemporalSlices, TEXT("UniVolumeHistorySlices"));
+		P->HistDepth = GraphBuilder.RegisterExternalTexture(TemporalDepth, TEXT("UniVolumeHistoryDepth"));
 		P->OutVolume = GraphBuilder.CreateUAV(VolumeTex);
 		P->OutSlices = GraphBuilder.CreateUAV(Slices);
-		TShaderMapRef<FUniVolumeMarchCS> CS(GetGlobalShaderMap(View.GetFeatureLevel()));
-		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Volume.March %dx%d, %d carriers%s", MarchSize.X, MarchSize.Y, MarchCarriers.Num(), bPerPixelBackground ? TEXT(" (with the background)") : TEXT("")), CS, P, FComputeShaderUtils::GetGroupCount(MarchSize, 8));
+		P->OutDepth = GraphBuilder.CreateUAV(DepthTex);
+		TShaderMapRef<FUniVolumeReconstructCS> CS(GetGlobalShaderMap(View.GetFeatureLevel()));
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Volume.Reconstruct %dx%d", MarchSize.X, MarchSize.Y), CS, P, FComputeShaderUtils::GetGroupCount(MarchSize, 8));
+	}
+	// D-184: this frame's volume is the next frame's history.
+	if (bTemporalOn)
+	{
+		GraphBuilder.QueueTextureExtraction(VolumeTex, &TemporalVolume);
+		GraphBuilder.QueueTextureExtraction(Slices, &TemporalSlices);
+		GraphBuilder.QueueTextureExtraction(DepthTex, &TemporalDepth);
+		TemporalSize = MarchSize;
+		TemporalPrevForward = FVector3f(View.GetViewDirection());
+		TemporalPrevRight = FVector3f(View.GetViewRight());
+		TemporalPrevUp = FVector3f(View.GetViewUp());
+		TemporalPrevTanX = TanX;
+		TemporalPrevTanY = TanY;
+		TemporalLastFrame = F.FrameNumber;
+		TemporalPhase = Phase;
+		bTemporalHave = true;
+	}
+	else
+	{
+		bTemporalHave = false;
 	}
 
 	// 3. Composite: upsample + background, additive into the output (before the sprites).
@@ -632,6 +775,8 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 		P->MaxPromote = UniGpuLayout::MaxPromote;
 		P->MaxActivate = UniGpuLayout::MaxActivate;
 		P->SystemArchetypeMask = F.SystemArchetypeMask;
+		P->DiscArchetypeMask = F.DiscArchetypeMask;   // D-183
+		P->FixedDiscSeeds = FUintVector4(F.FixedDiscSeeds[0], F.FixedDiscSeeds[1], F.FixedDiscSeeds[2], F.FixedDiscSeeds[3]);
 		P->ViewForward = Forward; P->ViewRight = Right; P->ViewUp = Up;
 		P->TanHalfFovX = TanX; P->TanHalfFovY = TanY;
 		P->LimitingMag = LimitingMag;
@@ -868,6 +1013,9 @@ void FUniGpuGenBackend::SubmitProbe(std::shared_ptr<UniCore::FGenBatch> Batch)
 		P->NumTasks = NumTasks;
 		P->UniWebTexture = FUniRenderer::Get().RegisterWebTexture_RenderThread(GraphBuilder);   // D-164
 		P->UniWebSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Wrap>::GetRHI();
+		P->UniGalWarpFine = FUniRenderer::Get().RegisterGalaxyTexture_RenderThread(GraphBuilder, 0);   // D-179
+		P->UniGalWarpLarge = FUniRenderer::Get().RegisterGalaxyTexture_RenderThread(GraphBuilder, 1);
+		P->UniGalDetail = FUniRenderer::Get().RegisterGalaxyTexture_RenderThread(GraphBuilder, 2);
 		uint32 GroupsX = 1;
 		const FIntVector Groups = WrappedGroups(NumTasks, GroupsX);
 		P->DispatchGroupsX = GroupsX;
@@ -929,6 +1077,9 @@ void FUniGpuGenBackend::SubmitPlace(std::shared_ptr<UniCore::FGenBatch> Batch)
 			P->NumTasks = NumTasks;
 			P->UniWebTexture = R.RegisterWebTexture_RenderThread(GraphBuilder);   // D-164
 			P->UniWebSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Wrap>::GetRHI();
+			P->UniGalWarpFine = R.RegisterGalaxyTexture_RenderThread(GraphBuilder, 0);   // D-179
+			P->UniGalWarpLarge = R.RegisterGalaxyTexture_RenderThread(GraphBuilder, 1);
+			P->UniGalDetail = R.RegisterGalaxyTexture_RenderThread(GraphBuilder, 2);
 			uint32 GroupsX = 1;
 			const FIntVector Groups = WrappedGroups(NumTasks, GroupsX);
 			P->DispatchGroupsX = GroupsX;

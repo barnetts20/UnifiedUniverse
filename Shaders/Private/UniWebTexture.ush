@@ -1,5 +1,5 @@
 // UniWebTexture.ush
-// D-164: the web density texture, the one texture the shared cores may sample. Every .usf that
+// D-164: the web density texture (and, D-179, the galaxy textures): the only textures the shared cores may sample. Every .usf that
 // includes a core includes this first (after Platform.ush). Cores never name the texture; they
 // call UNI_WEB_TEX_SAMPLE(P, Mip), which the C++ shim (UniHlslShim.h) defines as the same
 // filter over the CPU copy of the same texels, so placement and rendering stay one source.
@@ -17,5 +17,17 @@ Texture3D<float4> UniWebTexture;
 SamplerState UniWebSampler;
 
 #define UNI_WEB_TEX_SAMPLE(P, Mip) UniWebTexture.SampleLevel(UniWebSampler, (P), (Mip))
+
+// D-179: the galaxy textures, sampled by the galaxy field only (UniField_GalaxyFiltered), with the
+// same wrap / trilinear sampler: warp_fine and warp_large (curl displacement in RGB, fBm in A),
+// galaxy_detail (R ridged lanes, G star-forming knots, B fBm, A superbubbles). RGBA16F with full
+// mips, uploaded like the web texture (UniWebTexUpload.usf); unbound: a 1^3 NaN dummy.
+Texture3D<float4> UniGalWarpFine;
+Texture3D<float4> UniGalWarpLarge;
+Texture3D<float4> UniGalDetail;
+
+#define UNI_GAL_WARP_FINE(P, Mip) UniGalWarpFine.SampleLevel(UniWebSampler, (P), (Mip))
+#define UNI_GAL_WARP_LARGE(P, Mip) UniGalWarpLarge.SampleLevel(UniWebSampler, (P), (Mip))
+#define UNI_GAL_DETAIL(P, Mip) UniGalDetail.SampleLevel(UniWebSampler, (P), (Mip))
 
 #endif // UNI_WEB_TEXTURE_USH

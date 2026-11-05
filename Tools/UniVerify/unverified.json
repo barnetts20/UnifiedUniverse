@@ -70,5 +70,17 @@
   {
     "id": "UE-18",
     "what": "Galaxy disc modes in the engine (D-178): the 128-byte field parameters and 272-byte generation task on the GPU (automation struct sizes, placement unchanged in kind), rolled warps, lopsidedness and uneven arms visible on galaxies at a few degrees, the Milky Way band as before with a gentle outer warp (REVIEW_TONIGHT \u00a714)."
+  },
+  {
+    "id": "UE-19",
+    "what": "Galaxy textures in the engine (D-179): uu.Enable logs the three galaxy textures loaded; the generation and volume passes bind them (no NaN dummy while loaded: galaxies place stars and glow); galaxies at a few degrees show patchy discs, clumpy arms and wiggled lanes; uu.GalaxyTextures 0 + uu.Enable gives the D-178 look; game-thread cost unchanged and GPU cost of Uni.Volume.March with three more texture reads per galaxy sample (REVIEW_TONIGHT \u00a715)."
+  },
+  {
+    "id": "UE-20",
+    "what": "Galaxy palettes in the engine (D-182): galaxies at a few degrees in their own colours (gold bulges, teal / warm / violet discs, blue-violet arms, pink knots), the same colours carried into their stars as you fly in (no shift back to white as stars resolve), the galaxy sprite's colour matching its glow at the hand-off, uu.GalaxyPalettes 0 for an A/B; shader compile of the palette code (HLSL only rejects some forms the C++ build accepts) (REVIEW_TONIGHT \u00a716)."
+  },
+  {
+    "id": "UE-21",
+    "what": "Inclined galaxy sprites in the engine (D-183): galaxies a few to tens of pixels across read as ellipses at their discs' inclinations (edge-on needles, face-on discs) with no change in brightness; the ellipse lines up with the volume's glow at the hand-off (no rotation or squash jump); one- or two-pixel galaxies stay round; uu.SpriteEllipses 0 for an A/B; shader compile of the new sprite interpolants and the project pass's FixedDiscSeeds (REVIEW_TONIGHT \u00a717)."
   }
 ]

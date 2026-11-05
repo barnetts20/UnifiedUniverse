@@ -265,53 +265,71 @@ namespace UniCore
 		}
 
 		/** D-165: a texture delivered by the texture project (NoiseVolumeTile): <Dir>/<Name>.bin is
-		 *  mip 0 and <Name>_mips.bin levels 1.. concatenated, both raw little-endian RGBA16F, x
-		 *  fastest, cubic, power of two (the sidecar <Name>.json documents the same). The size is
-		 *  taken from the file and the mip chain must be complete and exact in length. The texels
-		 *  are kept as delivered (halves), so the GPU and CPU read the same values. Returns false
-		 *  with a reason. */
+		 *  mip 0 and <Name>_mips.bin levels 1.. concatenated, raw little-endian, x fastest, cubic,
+		 *  power of two (the sidecar <Name>.json documents the same). D-179: RGBA16F (8 bytes a
+		 *  texel), RGBA8_UNORM (4) or RGB8_UNORM (3, alpha 0), told apart by the size (a cube of
+		 *  one is never a cube of another); UNORM texels become halves of k / 255, so the GPU and
+		 *  CPU read the same values from the same halves. The size is taken from the file and the
+		 *  mip chain must be complete and exact in length. Returns false with a reason. */
 		static bool LoadDelivered(const std::string& Dir, const std::string& InName, FWebTexture& Out, std::string* Err = nullptr)
 		{
 			Out = FWebTexture();
 			auto Fail = [&](const std::string& Why) { if (Err) { *Err = Why; } Out = FWebTexture(); return false; };
-			auto ReadAll = [](const std::string& Path, std::vector<uint16_t>& Data) -> bool
+			auto ReadAll = [](const std::string& Path, std::vector<uint8_t>& Data) -> bool
 			{
 				FILE* F = UniFOpen(Path.c_str(), "rb");
 				if (!F) { return false; }
 				std::fseek(F, 0, SEEK_END);
 				const long Bytes = std::ftell(F);
 				std::fseek(F, 0, SEEK_SET);
-				bool bOk = Bytes > 0 && (Bytes % 8) == 0;
-				if (bOk) { Data.resize(size_t(Bytes) / 2u); bOk = std::fread(Data.data(), 2, Data.size(), F) == Data.size(); }
+				bool bOk = Bytes > 0;
+				if (bOk) { Data.resize(size_t(Bytes)); bOk = std::fread(Data.data(), 1, Data.size(), F) == Data.size(); }
 				std::fclose(F);
 				return bOk;
 			};
-			std::vector<uint16_t> M0, Rest;
+			auto IsCube = [](size_t Texels, uint32_t& N) { N = 1u; while (size_t(N) * N * N < Texels) { N *= 2u; } return size_t(N) * N * N == Texels; };
+			std::vector<uint8_t> B0, BRest;
 			const std::string Base = Dir + "/" + InName;
-			if (!ReadAll(Base + ".bin", M0)) { return Fail("cannot read " + Base + ".bin"); }
-			const size_t Texels = M0.size() / 4u;
-			uint32_t N = 1u;
-			while (size_t(N) * N * N < Texels) { N *= 2u; }
-			if (size_t(N) * N * N != Texels) { return Fail(Base + ".bin is not a power-of-two cube of RGBA16F texels"); }
-			if (N > 1u && !ReadAll(Base + "_mips.bin", Rest)) { return Fail("cannot read " + Base + "_mips.bin"); }
-			size_t Want = 0;
-			for (uint32_t S = N / 2u; S >= 1u; S /= 2u) { Want += size_t(S) * S * S * 4u; if (S == 1u) { break; } }
-			if (Rest.size() != Want) { return Fail(Base + "_mips.bin has the wrong length for a full chain below " + std::to_string(N) + "^3"); }
-			for (const std::vector<uint16_t>* V : { &M0, &Rest })
+			if (!ReadAll(Base + ".bin", B0)) { return Fail("cannot read " + Base + ".bin"); }
+			uint32_t N = 0u, Bpt = 0u;
+			for (const uint32_t Try : { 8u, 4u, 3u })
 			{
-				for (uint16_t H : *V) { if ((H & 0x7C00u) == 0x7C00u) { return Fail(InName + ": non-finite texel"); } }
+				uint32_t Nt = 0u;
+				if (B0.size() % Try == 0u && IsCube(B0.size() / Try, Nt)) { N = Nt; Bpt = Try; break; }
 			}
+			if (Bpt == 0u) { return Fail(Base + ".bin is not a power-of-two cube of RGBA16F, RGBA8 or RGB8 texels"); }
+			if (N > 1u && !ReadAll(Base + "_mips.bin", BRest)) { return Fail("cannot read " + Base + "_mips.bin"); }
+			size_t Want = 0;
+			for (uint32_t S = N / 2u; S >= 1u; S /= 2u) { Want += size_t(S) * S * S * Bpt; if (S == 1u) { break; } }
+			if (BRest.size() != Want) { return Fail(Base + "_mips.bin has the wrong length for a full chain below " + std::to_string(N) + "^3"); }
+			auto ToHalves = [Bpt](const uint8_t* Src, size_t Texels, std::vector<uint16_t>& Dst)
+			{
+				Dst.resize(Texels * 4u);
+				if (Bpt == 8u) { std::memcpy(Dst.data(), Src, Texels * 8u); return; }
+				uint16_t Lut[256];
+				for (int K = 0; K < 256; ++K) { Lut[K] = FloatToHalf(float(K) / 255.0f); }
+				for (size_t I = 0; I < Texels; ++I)
+				{
+					for (uint32_t C = 0; C < 4u; ++C) { Dst[I * 4u + C] = C < Bpt ? Lut[Src[I * Bpt + C]] : uint16_t(0u); }
+				}
+			};
 			Out.Name = InName;
 			Out.Size = N;
 			Out.Key.Size = N;
-			Out.Mips.push_back(std::move(M0));
+			Out.Mips.emplace_back();
+			ToHalves(B0.data(), size_t(N) * N * N, Out.Mips.back());
 			size_t Off = 0;
 			for (uint32_t S = N / 2u; S >= 1u; S /= 2u)
 			{
-				const size_t C = size_t(S) * S * S * 4u;
-				Out.Mips.emplace_back(Rest.begin() + std::ptrdiff_t(Off), Rest.begin() + std::ptrdiff_t(Off + C));
-				Off += C;
+				const size_t C = size_t(S) * S * S;
+				Out.Mips.emplace_back();
+				ToHalves(BRest.data() + Off, C, Out.Mips.back());
+				Off += C * Bpt;
 				if (S == 1u) { break; }
+			}
+			for (const std::vector<uint16_t>& V : Out.Mips)
+			{
+				for (uint16_t H : V) { if ((H & 0x7C00u) == 0x7C00u) { return Fail(InName + ": non-finite texel"); } }
 			}
 			return true;
 		}
@@ -387,6 +405,31 @@ namespace UniCore
 		View.Size = T->Size;
 		View.NumMips = T->NumMips();
 		UniHlsl::UniWebTextureView = View;
+	}
+
+	/** D-179: the galaxy textures the galaxy field samples (UNI_GAL_WARP_FINE / _WARP_LARGE /
+	 *  _DETAIL): the noise project's warp_fine and warp_large (curl displacement, RGB, RMS 1;
+	 *  A fBm) and galaxy_detail (R ridged lanes, G star-forming knots, B fBm, A superbubbles).
+	 *  nullptr unbinds one (a galaxy whose texture terms are on then reads NaN and places
+	 *  nothing: fail closed). Each must outlive every sample. */
+	inline void BindGalaxyTexture(int Slot, const FWebTexture* T)
+	{
+		if (Slot < 0 || Slot >= UniHlsl::UNI_GAL_TEX_COUNT) { return; }
+		if (!T || !T->IsValid()) { UniHlsl::UniGalaxyTextureViews[Slot] = UniHlsl::FWebTexView(); return; }
+		T->MipPtrs.clear();
+		for (const auto& V : T->Mips) { T->MipPtrs.push_back(V.data()); }
+		UniHlsl::FWebTexView View;
+		View.Mips = T->MipPtrs.data();
+		View.Size = T->Size;
+		View.NumMips = T->NumMips();
+		UniHlsl::UniGalaxyTextureViews[Slot] = View;
+	}
+
+	/** D-179: the delivered names of the galaxy textures, by slot. */
+	inline const char* GalaxyTextureName(int Slot)
+	{
+		static const char* Names[] = { "warp_fine", "warp_large", "galaxy_detail" };
+		return (Slot >= 0 && Slot < UniHlsl::UNI_GAL_TEX_COUNT) ? Names[Slot] : "";
 	}
 
 	/** Switch every web emitter of a universe that this texture bakes to the textured field

@@ -184,6 +184,7 @@ public:
 private:
 	void PushFrame();
 	void SetupWebTexture(UniCore::FUniverseDef& Def);   // D-164
+	void SetupGalaxyTextures(UniCore::FUniverseDef& Def);   // D-179
 	FVector GetViewLocation(FRotator* OutRotation = nullptr) const;
 
 	bool bEnabled = false;
@@ -191,6 +192,9 @@ private:
 	/** D-164: the web texture of the current universe (bound to the CPU sampler; outlives the
 	 *  generator and the streamer's integral jobs, so it is released after them). */
 	TUniquePtr<UniCore::FWebTexture> WebTexture;
+	/** D-179: the galaxy textures (warp_fine, warp_large, galaxy_detail), bound to the CPU sampler
+	 *  like the web texture and released with it. */
+	TUniquePtr<UniCore::FWebTexture> GalaxyTextures[3];
 	TUniquePtr<UniCore::FUniverseModel> Model;
 	TUniquePtr<UniCore::FRefGenerator> Generator;
 	TUniquePtr<UniCore::IGenBackend> Backend;
@@ -206,6 +210,8 @@ private:
 	float EffectiveDeltaMag = 0.0f;
 	FUniCoord PrevCamera;
 	bool bCameraJumped = true;
+	FVector3d CameraStepCm = FVector3d::ZeroVector;   // D-184: camera move this frame (cm), for the volume's reprojection
+	bool bCameraStepValid = false;
 
 	// Instrumentation (D-157). Game-thread phases of the universe's frame, in ms.
 	static const TCHAR* PerfPhaseName(int32 Phase);
@@ -228,6 +234,8 @@ private:
 	// Star systems (D-142..D-145)
 	TUniquePtr<UniCore::FSystemManager> Systems;
 	uint32 SystemArchetypeMask = 0;
+	uint32 DiscArchetypeMask = 0;   // D-183: archetypes emitting through the galaxy field (inclined sprites)
+	uint32 FixedDiscSeeds[4] = { 0, 0, 0, 0 };   // D-183: seeds of fixed-orientation anchors (up to four)
 	double UniverseTime = 0.0;
 	double TimeScale = 1.0;
 	TMap<uint64, std::vector<UniCore::FCellKey>> CellKeysByFrame;   // the last few frames' cell tables, for activation readbacks

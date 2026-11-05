@@ -980,5 +980,136 @@ Rationale: T2.galaxy.shape:
 - Prefiltered light within 1.08% for rolled galaxies at a 0.03 footprint (0.53% with their modes off). It was 2.8% before the asymmetric mean.
 - Contact sheets: still_galaxy_modes_off / _on.
 - T2.gen.slicing at one probe seed went from 0.9975 to 0.9711 at 16 cells per axis. Over 16 seeds the 128-probe estimator is unbiased there (mean 1.001, std 0.027; 1.016 / 0.033 with the modes off), so the old pass was one lucky draw (D-103's coarse-cell noise). The check now tests the 16-seed mean (within 1% or 3 standard errors).
+- The volume march's galaxy step hint widens the disc slab by the flare and by the warp reachable within one step (it stepped over warped discs: T3.vol.march face-on 8.0% → 0.46%, 85 → 91 steps per ray).
 Reroll impact: Yes, every galaxy's and dwarf's stars (their field changes; the Milky Way's too). Counts are normalised by each contributor's integral, so totals hold. Positions and magnitudes of the galaxies themselves are unchanged, and so is everything outside galaxies.
 Status: Provisional
+
+D-179 — Galaxy textures: warps, disc noise and star-forming knots (SPRITE_PASS_PLAN §3 A2/A3; amends D-178)
+Question: Owner: galaxies should not look samey; the delivered warp volumes can carry the local variance, with disc-level modes (D-178) for the overall shape.
+Decision:
+- **Textures.** The galaxy field may sample three of the noise project's textures (`Data/Noise`, not tracked in git):
+  - `warp_fine` (curl displacement RGB, RMS 1, 4 periods a tile; A fBm) displaces discs and arms;
+  - `warp_large` (2 periods a tile) displaces bulges;
+  - `galaxy_detail` (R ridged lanes, G star-forming knots, B fBm, A superbubbles) modulates discs (B) and arms (G).
+- **Loader.** `FWebTexture::LoadDelivered` also reads RGBA8 and RGB8 UNORM (as halves of k / 255). The size tells the format apart. Every texture is RGBA16F on the GPU and halves on the CPU, so both read the same values.
+- **Binding.** CPU: `BindGalaxyTexture(slot)`, `UNI_GAL_WARP_FINE` / `_WARP_LARGE` / `_DETAIL` in the shim. HLSL: three Texture3D in UniWebTexture.ush, sharing its wrap / trilinear sampler. Engine:
+  - `FUniRenderer::SetGalaxyTexture` / `RegisterGalaxyTexture`, uploaded by the web texture's upload pass;
+  - bound in the generation probe and place passes and the volume pass;
+  - unbound: the 1³ NaN dummy (fail closed);
+  - `UUniSubsystem::SetupGalaxyTextures` at uu.Enable;
+  - `uu.GalaxyTextures` (1).
+- **Field** (G, H slots):
+  - G = (disc warp, bulge warp, warp frequency, detail frequency); H = (disc fBm, arm knots, frame twist share, texels per period).
+  - The disc family reads its textures in a frame rotated with the spiral's winding × rn × twist share (UltraLargeScale's noise frame), with z at twice the lateral rate (features read as sheets).
+  - Texture offsets come from the shape seed.
+  - Each read takes the mip whose texels match the footprint: mips are means, so this is the prefilter. Placement reads mip 0.
+  - The bulge warp fades out between 0.3 and 0.5.
+  - Disc reads happen only within 12 flared scale heights of the plane, plus the warps' reach. Beyond that the disc term is dropped (below e^-12 of its peak). This keeps a textured galaxy's normalising integral at ~0.7 s on the reference (2.2 s ungated); it runs on worker threads in the engine.
+  - The march's step hint widens for the texture warp.
+- **Amounts.**
+  - The disc warp is about a tenth of its own wavelength (amount 0.008–0.022 at frequency 0.8–1.6). Larger amounts fold the structure, compressing and stretching the disc and its light.
+  - Bulge warp 0–0.012; detail frequency 2–4; disc noise 0.2–0.6; knots 0.3–0.9; twist share 0.5–1.
+  - Dwarfs are stronger (warp 0.012–0.03, noise 0.4–0.8, knots 0.5–1).
+  - Early types stay smooth. The Milky Way has one fixed set.
+  - `UniScenes::UseGalaxyTextures` adds the ranges; it is called only with the textures loaded.
+- **Amends D-178:**
+  - Asymmetric arm lobes now add instead of merging by max. Each lobe still ends smoothly at zero, and jittered arms brighten where they overlap. The prefilter's arm mean is now exact: a max had under-counted it by up to 3% for strongly asymmetric galaxies (prefiltered light 1.4% → 0.48% over T2.galaxy.shape's galaxies).
+  - The disc warp range is widened at the owner's request (amplitude 0–0.22, bias 1.4: up to ~2 kpc at the visible edge).
+Rationale: T2.galaxy.textures:
+- Formats: textures 128³ with 8 mips; 2,048 RGBA8 texels equal k / 255 as halves; warp_fine identical to its raw bytes.
+- A textured galaxy reads NaN with the textures unbound.
+- Bound, over 6 rolled galaxies: prefiltered light within 1.00%; light with versus without the textures within 3.2%; the disc-plane correlation with the untextured field is 0.84, so the shape changes.
+- Normalising integral 669 ms.
+- The textured Milky Way from the solar camera places 46,737 stars against 47,051 untextured (0.993×), none non-finite.
+- Still: still_galaxy_textured (patchy discs, clumpy arms, wiggled lanes).
+T2.galaxy.shape still passes, prefiltered light within 0.48%.
+Reroll impact:
+- Yes: every galaxy's and dwarf's stars where textures are on (the engine by default; offline scenes only when UseGalaxyTextures is called).
+- D-178's asymmetric arms reroll stars a second time (sum instead of max).
+- uu.GalaxyTextures 0 gives the D-178 field (with the additive lobes).
+Status: Provisional (UE-19)
+
+D-180 — Cloud-like dust lanes (SPRITE_PASS_PLAN §3 A4; render only)
+Question: Owner: cloud-like textures could shape the obscuring of light and the dust lanes, with physically based absorption kept.
+Decision: The dust carrier of a textured galaxy (D-179) reads galaxy_detail's ridged channel (R) and superbubble channel (A) through two dust-only parameters, D.z and D.w, set by `DustFrom` from the archetype's volume profile:
+- Lanes: dust density × max(1 + Lanes (2R − 1), 0). Linear, so a mip's mean is the texels' mean.
+- Holes: dust density × max(1 − Bubbles (2A − 1)⁺, 0).
+- The dust gets no star-forming knots. It follows the emission's warps and fBm as before.
+- Defaults: Lanes 2.2, Bubbles 0.8 (`FVolumeProfile::DustLanes`, `DustBubbles`).
+- Absorption and reddening are unchanged (D-132), and so is the emission field.
+Rationale: T2.galaxy.dust, 4 rolled galaxies:
+- Emission parameters carry no dust terms.
+- The face-on dust column's mean is within 22% of the smooth dust's. Clipping the lanes at zero raises it.
+- The cloud column over the smooth one varies by 34% rms or more across the disc.
+- Still: still_galaxy_dust (smooth above, cloud below).
+- Lower amplitudes (0.9) gave 19% rms and were hard to see.
+Reroll impact: None (render only).
+Status: Provisional (UE-19; the owner may want stronger or weaker lanes: the profile values)
+
+D-181 — Galaxy march cost after D-178..D-180: one evaluation for emission and dust
+Question: Owner, in the engine after D-179: GPU at 63 ms inside a galaxy, the march much dearer. Reproduced on the CPU reference (T2.galaxy.march_cost, Milky Way, solar camera along the disc, 242 × 159):
+- D-177: 2.4 s, 170 steps per ray;
+- with the D-178 modes: 3.5–4.0 s, 188 steps;
+- with the D-179 textures and D-180 cloud dust: 11.7 s, 212 steps.
+So the steps grew 25% and the per-sample cost grew ~4×. A dusty galaxy was evaluated twice per step, emission then dust, each with its own warp and detail reads, angle, hashes and mode terms.
+Decision:
+- **Shared state.** The galaxy field is split into `Uni_GalaxyShared` and `Uni_GalaxyFromShared`. The shared part holds the texture warps and detail texel, the cylindrical radius, the angle, the per-arm hashes, and the mode warp, lopsidedness and flare. All of it depends only on parameters that emission and dust share (DustFrom).
+- **Pair.** `UniField_GalaxyPair` evaluates both from one shared state. The march's dusty galaxy carriers use it. It is bit for bit the two separate evaluations.
+- **Coarse mips.** The texture warps fade out between mips 4 and 5 of their footprint (the curl field's mean there is ~0), so distant galaxies skip those reads. Placement (footprint 0) always reads.
+- **Step hint.** The disc slab is centred on the mode-warped plane at the sample, with a margin for how far that plane moves within one step, instead of being widened on both sides. The texture-warp margin is 2.5 RMS (was 3).
+- **Arms.** At most 4 arms; every archetype rolls 0–4.
+Rationale:
+- T2.galaxy.dust: pair = separate, 0 of 12,000 samples differ.
+- T2.galaxy.shape: modes-off field still the D-172 field bit for bit.
+- T2.galaxy.march_cost (reference, quiet machine), textured Milky Way along the disc: 11.7 → 8.9 s. From 60 kpc: 1.0 → 0.53 s, 76 → 65 steps per ray.
+- T3.vol.march worst 0.67% (bar 1%). T2.vol.equivalence galaxies +7.45% with dust (bar 8%), +2.02% without. T2.vol.continuity 9.2%.
+- The CPU reference emulates the trilinear texture reads, so it overstates their share. On the GPU the halved reads should matter more.
+Not done: temporal slicing of the march (a quarter of the volume pixels per frame, reprojected), the larger lever, pending the owner's engine numbers.
+Reroll impact: None for placement (footprint 0 is unchanged). Rendering: distant textured galaxies lose their sub-pixel warp (which averaged out anyway).
+Status: Provisional (UE-19)
+
+D-182 — Galaxy colour palettes (SPRITE_PASS_PLAN §3 A5; owner: stars too, per component)
+Question: Owner: each galaxy its own colour or palette, plausible but stylised, with more vibrant colour and more variation than real life. Asked: should a galaxy's stars take its palette too, or only its glow and sprite (glow-only shifts back to physical star colours as stars resolve)? Owner: **stars too**, **per component**.
+Decision:
+- **Palette.** Four colours per galaxy: bulge, disc, arms, knots (`Uni_GalaxyPalette`, UniFields.ush, one source for CPU and GPU). They are rolled from the palette seed, which is the galaxy's object seed on the new channel PALETTE, within families:
+  - bulges gold to amber (hue 28–52°);
+  - discs teal-azure (50%), warm-neutral (30%) or violet (20%);
+  - arms blue to violet (80%) or teal (20%);
+  - knots pink-magenta (70%) or HII red-orange (30%).
+  - Saturations are scaled by a per-galaxy vibrance (0.9–1.3).
+  - Each colour is mixed with white by 0.9 and normalised to luminance 1, so a tint changes chroma only. Every sprite's and the volume's light is unchanged (D-135).
+- **Whole-body tint.** Fixed shares 0.3 bulge / 0.45 disc / 0.2 arms / 0.05 knots. The galaxy's record colour carries it, so its sprite and the volume agree at the hand-off (D-129).
+- **Where it applies** (all luminance-kept):
+  - The galaxy field reports its components (bulge, disc, arms, knots; `Uni_GalaxyFromSharedC`, `UniField_GalaxyFilteredC`, `UniField_GalaxyPairC`).
+  - A star placed by a galaxy with a palette (contributor F.w = palette seed) takes the tint of the components at its position (`Uni_TaskMakeObject`).
+  - A galaxy record (slice flag `UNI_SLICE_FLAG_PALETTE`) takes the whole-body tint. So do the authored Milky Way anchor and the authored bright cluster members.
+  - The volume tints each galaxy carrier's light by the components at the sample. It blends toward the whole-body tint as the footprint passes the disc's scale length.
+  - The palette's colours are computed once per carrier on the CPU, into a parameter block (`FCarrierGPU::PaletteIndex`, flag `UNI_CARRIER_PALETTE`), not per sample.
+- **Scope and switch.** `UniScenes::UseGalaxyPalettes` turns it on for galaxies, cluster members and dwarfs. `uu.GalaxyPalettes` (1) applies it at uu.Enable. Offline scenes use it only when asked.
+Rationale: T2.galaxy.palette:
+- 2,000 palettes: every colour at luminance 1 and in its family; consecutive galaxies' whole-body tints 0.33 apart (RGB at luminance 1).
+- Milky Way from the solar camera: all 47,051 stars tinted, none differing in position, seed, magnitude or radius.
+- The volume inside it: luminance 0.997× of the untinted, chroma shift 0.37.
+- Still: still_galaxy_palettes.
+- T2.stream.parity, volume_parity and T3.vol.march unchanged.
+Reroll impact: Colours only: star and galaxy record colours with palettes on (the engine by default). Positions, magnitudes and counts are unchanged. uu.GalaxyPalettes 0 gives physical colours.
+Status: Provisional (UE-20; tuning the families and strength is art direction, in Uni_GalaxyPalette)
+
+D-183 — Inclined galaxy sprites (SPRITE_PASS_PLAN §3 B; render-only)
+Question: A distant galaxy is drawn as a round Gaussian until the volume takes it over (D-129), whatever its inclination. Plan step B: draw it as a disc at its inclination, energy unchanged, matching the volume at the hand-off. Owner question (B: "worth it at all distances, or only above N px?") answered by construction: orientation shows only once the sprite is a few pixels across.
+Decision:
+- **Disc normal.** A galaxy contributor's orientation is a pure function of its object seed (UniGenRef `RandomRotation`, UNI_CH_ORIENT). `Uni_DiscNormal` (UniProject.ush) computes its third row (the field's z axis in world) in float, on the GPU, from the record alone. Fixed-orientation anchors (the Milky Way) keep identity: their seeds travel in `FUniView::FixedDiscSeeds` (up to four) and take world z.
+- **Which objects.** Archetypes with a galaxy-field emitter (`FUniView::DiscArchetypeMask`, built at uu.Enable from the definition): galaxies, cluster members, dwarfs. Records are unchanged (no new object flag): render-only.
+- **Shape.** The sprite's core is an elliptical Gaussian whose major sigma is the round sprite's and whose axis ratio is that of an oblate Gaussian of thickness q0 seen at inclination i, sqrt(cos² i + q0² sin² i), minor axis along the projected normal. q0 = 0.2 for discs and 0.65 for early types: the rolled fields' light-weighted thickness, measured at 0.11–0.31 for the disc galaxies of the web scene. The angle and ratio are computed in the project pass in the sprite quad's own basis (Side, Up), into the two free sprite slots (`FUniSprite::EllipseAngle`, `EllipseAxis`; the struct stays 64 B).
+- **Energy.** The pixel shader evaluates the round profile at the squashed radius and divides by the effective ratio, so the energy is unchanged; the D-156 halo (glare) stays round. The effective ratio is never thinner than 0.7 px along the minor axis (`Uni_SpriteEllipseQ`), so sprites of a pixel or two stay round and the Gaussian is never undersampled.
+- **Switch.** `uu.SpriteEllipses` (1), live. The reference renderer's camera has the mask off by default (stills and render tests unchanged bit for bit).
+Rationale: T2.galaxy.sprites, 160 galaxies of the web scene, each looked at head on from 300 radii in a random direction:
+- normal against the contributor's: worst 5.7e-7;
+- sprite axis ratio and angle against the projected oblate disc: 3e-7, 8e-7 rad;
+- splatted at 16 px: second-moment axis ratio within 0.007, angle within 0.011 rad, energy 3e-8; at 0.8 px the ratio stays above 0.87;
+- hand-off: against the field's own projected light (light-weighted moments of the rolled field along the same view), axis ratio mean error 0.042, worst 0.125 (the thickest and thinnest discs edge-on);
+- mask off: every other sprite field bit-identical, sprites round; 14,063 other objects never elliptical.
+- Still: still_galaxy_sprites (32 galaxies at 16 px).
+Known limits: per-galaxy thickness is not carried (worst edge-on mismatch at the hand-off ~0.1 in axis ratio); a per-galaxy q0 from the rolled parameters would need the emitter ranges on the GPU. Bulge-dominated galaxies read slightly too thin edge-on.
+Reroll impact: None (render-only; no record, seed or placement change).
+Status: Provisional (UE-21)

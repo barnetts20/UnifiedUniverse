@@ -192,7 +192,17 @@ UNI_FN FUniObject Uni_TaskMakeObject(FUniGenTask InT, FUniSlice InS, StructuredB
 	const bool bEarly = Uni_TaskEarlyType(InT, ObjSeed, InOffset);
 	float4 Cm = InS.ColourModel;
 	if (bEarly) { Cm.x = Cm.x + InT.Params.C.w; }
-	const float3 Rgb = Uni_DrawColour(ObjSeed, M, Cm);
+	float3 Rgb = Uni_DrawColour(ObjSeed, M, Cm);
+	// D-182: a galaxy carries its palette's whole-body tint (its sprite's colour); a star of a
+	// galaxy with a palette takes the tint of the component it sits in (bulge, disc, arm, knot).
+	// Luminance kept: only chroma changes.
+	if ((InS.ChildFlags & UNI_SLICE_FLAG_PALETTE) != 0u) { Rgb = Uni_TintRecordColour(Rgb, Uni_GalaxyFarTint(Uni_GalaxyPalette(Uni_PaletteSeed(ObjSeed)))); }
+	if (InT.FieldId == UNI_FIELD_GALAXY && InT.Params.F.w > 0.0f)
+	{
+		float4 Comp = float4(0.0f, 0.0f, 0.0f, 0.0f);
+		UniField_GalaxyFilteredC(Uni_FieldFramePoint(InT.Frame, Uni_OffsetUnit(InOffset)), InT.Params, 0.0f, Comp);
+		Rgb = Uni_TintRecordColour(Rgb, Uni_GalaxyTint(Uni_GalaxyPalette((uint)InT.Params.F.w), Comp, 0.0f));
+	}
 	const float SB = ((InS.ChildFlags & UNI_OBJ_FLAG_EXTENDED) != 0u) ? Uni_SurfaceBrightness(M, RL2) : 0.0f;
 	return Uni_MakeObject(InOffset, InT.ChildArchetypeId, InS.ChildFlags | (bEarly ? UNI_OBJ_FLAG_EARLY : 0u), ObjSeed, RL2, M, SB, Rgb);
 }

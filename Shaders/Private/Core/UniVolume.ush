@@ -36,11 +36,13 @@ static const float UNI_VOL_LN_T_LO = 34.538776f;    // ln(1e15 cm): below, entry
 static const float UNI_VOL_LN_T_HI = 71.383884f;    // ln(1e31 cm): above, last entry
 static const uint UNI_VOL_MAX_ACTIVE = 12u;         // carriers marched by one ray (D-161: 8 -> 12; past it, the least significant are faded out, not cut)
 static const uint UNI_VOL_SLICES = 8u;              // transmittance slices
+static const float UNI_VOL_LN_DEPTH_NONE = 87.0f;   // D-184: ln t of a ray with no light (beyond any distance: reprojects by direction)
 
 static const uint UNI_CARRIER_PERIODIC = 1u;        // root field: p = frac(...), unbounded chord
 static const uint UNI_CARRIER_DUST = 2u;            // has an absorbing field
 static const uint UNI_CARRIER_TAIL = 4u;            // add the analytic tail past TEnd (background)
 static const uint UNI_CARRIER_PREFILTER = 8u;       // D-160: sample the field prefiltered over the pixel footprint (galaxies)
+static const uint UNI_CARRIER_PALETTE = 16u;        // D-182: a galaxy with a palette (PaletteIndex)
 
 /** One marched volume. 112 bytes (UniCore::FCarrierGPU, static_assert). */
 struct FUniCarrier
@@ -63,7 +65,7 @@ struct FUniCarrier
 	float TEnd;             // cm (local carriers: the chord bounds it; periodic: march extent)
 	float ResolveScale;     // field units: smallest feature to resolve (supersampling)
 	float StepRatio;        // D-164: this carrier's log step ratio (0: the view's); a step takes the smallest of the active carriers'
-	float Pad1;
+	uint PaletteIndex;      // D-182: its palette's parameter block (A..D bulge, disc, arms, knots; E whole body), with UNI_CARRIER_PALETTE
 	float Pad2;
 };
 
@@ -90,6 +92,8 @@ struct FUniVolumeResult
 	uint Active;            // carriers intersected
 	uint Pad;
 	float3 SliceT[UNI_VOL_SLICES];
+	float LnDepth;          // D-184: ln t of the light, weighted by each step's luminance reaching the camera (UNI_VOL_LN_DEPTH_NONE: no light)
+	float DepthWeight;      // D-184: that luminance (the weight's sum)
 };
 
 /** Emission LUT lookup: linear in ln t over UNI_VOL_LUT_SIZE entries. */
@@ -151,6 +155,8 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 	Res.Truncated = 0u;
 	Res.Active = 0u;
 	Res.Pad = 0u;
+	Res.LnDepth = UNI_VOL_LN_DEPTH_NONE;
+	Res.DepthWeight = 0.0f;
 	for (uint K = 0u; K < UNI_VOL_SLICES; ++K) { Res.SliceT[K] = float3(1.0f, 1.0f, 1.0f); }
 
 	// Gather the carriers this ray intersects.
@@ -222,6 +228,7 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 	float T = TMin;
 	float3 Tr = float3(1.0f, 1.0f, 1.0f);
 	float3 B = float3(0.0f, 0.0f, 0.0f);
+	float DepthW = 0.0f, DepthWL = 0.0f;   // D-184
 	bool bDone = false;
 	UNI_LOOP
 	for (uint Step = 0u; Step < InView.MaxSteps; ++Step)
@@ -285,7 +292,25 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 			}
 			// D-160: a prefiltered carrier samples its field over the pixel's transverse footprint.
 			const float FootS = (Ca.Flags & UNI_CARRIER_PREFILTER) != 0u ? Tm * InView.ThetaPixel * Ca.InvRadius : 0.0f;
-			if (Blend < 1.0f)
+			// D-181: a dusty galaxy's emission and dust in one evaluation (warps, texture reads,
+			// angle and hashes shared; exactly the two separate samples).
+			const bool bPair = Ca.FieldId == UNI_FIELD_GALAXY && (Ca.Flags & UNI_CARRIER_DUST) != 0u;
+			// D-182: a galaxy with a palette tints its light by the component it is in.
+			const bool bPalette = (Ca.Flags & UNI_CARRIER_PALETTE) != 0u;
+			float4 Comp = float4(0.0f, 0.0f, 0.0f, 0.0f);
+			float RdPair = 0.0f;
+			if (bPair)
+			{
+				float Re = 0.0f;
+				UniField_GalaxyPairC(P, Par, InParams[Ca.DustParamIndex], FootS, Re, RdPair, Comp);
+				Rho = Blend < 1.0f ? Re + (Ca.MeanDensity - Re) * Blend : Ca.MeanDensity;
+			}
+			else if (bPalette && Blend < 1.0f)
+			{
+				Rho = UniField_GalaxyFilteredC(P, Par, FootS, Comp);
+				Rho = Rho + (Ca.MeanDensity - Rho) * Blend;
+			}
+			else if (Blend < 1.0f)
 			{
 				Rho = J == ClusterSlot ? UniField_ClusterC(P, Par, Cc0, Cc1, Cc2, Cc3) : Uni_FieldSampleFoot(Ca.FieldId, P, Par, FootS);
 				Rho = Rho + (Ca.MeanDensity - Rho) * Blend;
@@ -296,14 +321,26 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 			}
 			if (Rho > 0.0f)
 			{
-				const float3 L = Uni_VolumeLut(InLut, Ca.LutIndex, Tm);
+				float3 L = Uni_VolumeLut(InLut, Ca.LutIndex, Tm);
+				if (bPalette)
+				{
+					// Toward the whole-body tint (the sprite's) as the footprint passes the disc scale length.
+					const FUniFieldParams Pc = InParams[Ca.PaletteIndex];
+					FUniGalaxyPalette Pal;
+					Pal.Bulge = float3(Pc.A.x, Pc.A.y, Pc.A.z);
+					Pal.Disc = float3(Pc.B.x, Pc.B.y, Pc.B.z);
+					Pal.Arm = float3(Pc.C.x, Pc.C.y, Pc.C.z);
+					Pal.Knot = float3(Pc.D.x, Pc.D.y, Pc.D.z);
+					const float Far = saturate(2.0f * FootS / max(Par.A.x, 1.0e-4f) - 1.0f);
+					L = Uni_TintKeepLuminance(L, Uni_GalaxyTintFar(Pal, Comp, Far, float3(Pc.E.x, Pc.E.y, Pc.E.z)));
+				}
 				const float K = (Ca.Amplitude * Ca.Weight * AFade[J] * Rho) * Du;
 				E = E + L * K;
 			}
 			if ((Ca.Flags & UNI_CARRIER_DUST) != 0u)
 			{
 				const FUniFieldParams DPar = InParams[Ca.DustParamIndex];
-				const float Rd = Uni_FieldSampleFoot(Ca.FieldId, P, DPar, FootS);
+				const float Rd = bPair ? RdPair : Uni_FieldSampleFoot(Ca.FieldId, P, DPar, FootS);
 				if (Rd > 0.0f) { Tau = Tau + InView.DustSigmaRgb * (DPar.D.y * Rd * Du * AFade[J]); }
 			}
 		}
@@ -312,8 +349,13 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 		const float3 W = float3(Tau.x > 1.0e-5f ? (1.0f - Ex.x) / Tau.x : 1.0f - 0.5f * Tau.x,
 			Tau.y > 1.0e-5f ? (1.0f - Ex.y) / Tau.y : 1.0f - 0.5f * Tau.y,
 			Tau.z > 1.0e-5f ? (1.0f - Ex.z) / Tau.z : 1.0f - 0.5f * Tau.z);
-		B = B + Tr * (E * W);
+		const float3 Bs = Tr * (E * W);
+		B = B + Bs;
 		Tr = Tr * Ex;
+		// D-184: where the light comes from (the temporal reprojection's depth).
+		const float Ls = Uni_Luminance(Bs);
+		DepthW = DepthW + Ls;
+		DepthWL = DepthWL + Ls * log(Tm);
 		T = T + S;
 		Res.Steps = Step + 1u;
 
@@ -349,7 +391,178 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 	}
 	Res.Radiance = B;
 	Res.Transmittance = Tr;
+	Res.DepthWeight = DepthW;
+	Res.LnDepth = DepthW > 0.0f ? DepthWL / DepthW : UNI_VOL_LN_DEPTH_NONE;
 	return Res;
+}
+
+// ------------------------------------------------------------------------------------------
+// D-184: temporal slicing. Each frame marches one pixel of every 2 x 2 block of the march grid
+// (the phase cycles through the four in a Bayer order), so a pixel is fresh every fourth frame.
+// The others are reconstructed: the previous frame's output reprojected through the camera's
+// rotation and its move, at the depth the light comes from (FUniVolumeResult::LnDepth, from
+// the fresh neighbours), accepted while it lands on the same scene surface and stays within
+// a factor of 4 of the fresh neighbours' luminance; otherwise the fresh neighbours, bilinear
+// (depth-aware like the composite's upsample). The renderer and the CPU reference load the
+// textures; the decisions are here.
+// ------------------------------------------------------------------------------------------
+
+/** The previous frame's view and the camera's move since, for the reprojection. */
+struct FUniTemporalView
+{
+	float3 PrevForward;
+	float PrevTanX;          // tan of the previous frame's half field of view, x
+	float3 PrevRight;
+	float PrevTanY;
+	float3 PrevUp;
+	uint Phase;              // this frame's fresh pixel of each 2 x 2 block (0..3)
+	float3 CamStep;          // camera position now minus then, cm
+	uint bHistory;           // 0: no usable history (first frame, a jump, a new size): fresh neighbours only
+};
+
+/** The fresh pixel of each 2 x 2 block at a phase: (0,0), (1,1), (1,0), (0,1). */
+UNI_FN uint2 Uni_TemporalOffset(uint InPhase)
+{
+	const uint P = InPhase & 3u;
+	return uint2(P == 1u || P == 2u ? 1u : 0u, P == 1u || P == 3u ? 1u : 0u);
+}
+
+UNI_FN bool Uni_TemporalFresh(uint2 InPx, uint InPhase)
+{
+	const uint2 O = Uni_TemporalOffset(InPhase);
+	return (InPx.x & 1u) == O.x && (InPx.y & 1u) == O.y;
+}
+
+/** The four fresh pixels around InPx (bilinear on the fresh lattice, clamped to the grid) and
+ *  their bilinear weights. */
+struct FUniTemporalTaps
+{
+	uint2 Q0;
+	uint2 Q1;
+	uint2 Q2;
+	uint2 Q3;
+	float4 W;
+};
+
+/** One axis: the fresh lattice coordinate below a pixel and the fraction to the next. */
+UNI_FN uint Uni_TemporalAxis(uint InP, uint InO, uint InSize, UNI_OUT(uint) OutHi, UNI_OUT(float) OutFrac)
+{
+	// Fresh pixels are O, O + 2, ...; the last below InSize is O + 2 * ((InSize - 1 - O) / 2).
+	const uint Last = InSize > InO ? InO + 2u * ((InSize - 1u - InO) / 2u) : InO;
+	uint Lo = InP >= InO ? InO + 2u * ((InP - InO) / 2u) : InO;
+	Lo = min(Lo, Last);
+	OutHi = min(Lo + 2u, Last);
+	OutFrac = OutHi > Lo ? ((float)InP - (float)Lo) * 0.5f : 0.0f;
+	OutFrac = InP < Lo ? 0.0f : OutFrac;
+	return Lo;
+}
+
+UNI_FN FUniTemporalTaps Uni_TemporalTaps(uint2 InPx, uint InPhase, uint2 InSize)
+{
+	const uint2 O = Uni_TemporalOffset(InPhase);
+	uint Xh = 0u, Yh = 0u;
+	float Fx = 0.0f, Fy = 0.0f;
+	const uint Xl = Uni_TemporalAxis(InPx.x, O.x, InSize.x, Xh, Fx);
+	const uint Yl = Uni_TemporalAxis(InPx.y, O.y, InSize.y, Yh, Fy);
+	FUniTemporalTaps Tp;
+	Tp.Q0 = uint2(Xl, Yl);
+	Tp.Q1 = uint2(Xh, Yl);
+	Tp.Q2 = uint2(Xl, Yh);
+	Tp.Q3 = uint2(Xh, Yh);
+	Tp.W = float4((1.0f - Fx) * (1.0f - Fy), Fx * (1.0f - Fy), (1.0f - Fx) * Fy, Fx * Fy);
+	return Tp;
+}
+
+/** Weight of a sample on a scene surface at ln distance InLnTq for a pixel at InLnTp: 1 on the
+ *  same surface, small across a promoted body's edge (the composite's rule). */
+UNI_FN float Uni_TemporalDepthWeight(float InLnTp, float InLnTq)
+{
+	return 1.0f / (1.0f + 8.0f * abs(InLnTq - InLnTp));
+}
+
+/** Where a direction's light was on the previous frame's march grid (pixel coordinates, the
+ *  PixelDir convention: centres at i + 0.5), given the ln distance of its light. False when it
+ *  was behind the previous view. */
+UNI_FN bool Uni_TemporalPrevPixel(float3 InDir, float InLnDepth, FUniTemporalView InTV, float2 InSize, UNI_OUT(float2) OutPx)
+{
+	float3 D = InDir;
+	if (InLnDepth < UNI_VOL_LN_DEPTH_NONE - 1.0f)
+	{
+		// The light's point relative to the camera now, seen from where the camera was.
+		D = InDir * exp(InLnDepth) + InTV.CamStep;
+	}
+	const float Fz = dot(D, InTV.PrevForward);
+	OutPx = float2(-1.0f, -1.0f);
+	if (!(Fz > 0.0f)) { return false; }
+	const float Nx = dot(D, InTV.PrevRight) / (Fz * InTV.PrevTanX);
+	const float Ny = dot(D, InTV.PrevUp) / (Fz * InTV.PrevTanY);
+	OutPx = float2((Nx * 0.5f + 0.5f) * InSize.x, (0.5f - Ny * 0.5f) * InSize.y);
+	return true;
+}
+
+/** Is a reprojected history luminance plausible against the fresh neighbours' (lowest and
+ *  highest)? Within a factor of 4 either way (a carrier appearing, a surface uncovered: fall
+ *  back to the fresh neighbours). */
+UNI_FN bool Uni_TemporalAccept(float InHist, float InLo, float InHi)
+{
+	return InHist >= 0.25f * InLo - 1.0e-30f && InHist <= 4.0f * InHi + 1.0e-30f;
+}
+
+/** The fresh taps' weights for a pixel on a scene surface at InLnTp: bilinear x depth-aware. */
+UNI_FN float4 Uni_TemporalSpatialW(float4 InWb, float InLnTp, float4 InLnSceneQ)
+{
+	return float4(InWb.x * Uni_TemporalDepthWeight(InLnTp, InLnSceneQ.x) + (InWb.x > 0.0f ? 1.0e-6f : 0.0f),
+		InWb.y * Uni_TemporalDepthWeight(InLnTp, InLnSceneQ.y) + (InWb.y > 0.0f ? 1.0e-6f : 0.0f),
+		InWb.z * Uni_TemporalDepthWeight(InLnTp, InLnSceneQ.z) + (InWb.z > 0.0f ? 1.0e-6f : 0.0f),
+		InWb.w * Uni_TemporalDepthWeight(InLnTp, InLnSceneQ.w) + (InWb.w > 0.0f ? 1.0e-6f : 0.0f));
+}
+
+/** The ln depth of a pixel's light from its fresh taps: their weighted mean over the taps with
+ *  light (UNI_VOL_LN_DEPTH_NONE if none has any). */
+UNI_FN float Uni_TemporalLightLnDepth(float4 InW, float4 InLnDepthQ)
+{
+	const float Lim = UNI_VOL_LN_DEPTH_NONE - 1.0f;
+	const float4 Wl = float4(InLnDepthQ.x < Lim ? InW.x : 0.0f, InLnDepthQ.y < Lim ? InW.y : 0.0f, InLnDepthQ.z < Lim ? InW.z : 0.0f, InLnDepthQ.w < Lim ? InW.w : 0.0f);
+	const float S = Wl.x + Wl.y + Wl.z + Wl.w;
+	return S > 0.0f ? (Wl.x * InLnDepthQ.x + Wl.y * InLnDepthQ.y + Wl.z * InLnDepthQ.z + Wl.w * InLnDepthQ.w) / S : UNI_VOL_LN_DEPTH_NONE;
+}
+
+/** The four history texels around a previous-grid position (PixelDir convention) and their
+ *  bilinear weights; texels off the grid get weight 0 (their coordinates are clamped). */
+UNI_FN FUniTemporalTaps Uni_TemporalHistTaps(float2 InPrevPx, uint2 InSize)
+{
+	const float Fx = InPrevPx.x - 0.5f, Fy = InPrevPx.y - 0.5f;
+	const float X0 = floor(Fx), Y0 = floor(Fy);
+	const float Tx = Fx - X0, Ty = Fy - Y0;
+	const float Wx = (float)InSize.x, Hy = (float)InSize.y;
+	const float In0x = X0 >= 0.0f && X0 < Wx ? 1.0f : 0.0f, In1x = X0 + 1.0f >= 0.0f && X0 + 1.0f < Wx ? 1.0f : 0.0f;
+	const float In0y = Y0 >= 0.0f && Y0 < Hy ? 1.0f : 0.0f, In1y = Y0 + 1.0f >= 0.0f && Y0 + 1.0f < Hy ? 1.0f : 0.0f;
+	const uint Xa = (uint)clamp(X0, 0.0f, Wx - 1.0f), Xb = (uint)clamp(X0 + 1.0f, 0.0f, Wx - 1.0f);
+	const uint Ya = (uint)clamp(Y0, 0.0f, Hy - 1.0f), Yb = (uint)clamp(Y0 + 1.0f, 0.0f, Hy - 1.0f);
+	FUniTemporalTaps Tp;
+	Tp.Q0 = uint2(Xa, Ya);
+	Tp.Q1 = uint2(Xb, Ya);
+	Tp.Q2 = uint2(Xa, Yb);
+	Tp.Q3 = uint2(Xb, Yb);
+	Tp.W = float4((1.0f - Tx) * (1.0f - Ty) * In0x * In0y, Tx * (1.0f - Ty) * In1x * In0y, (1.0f - Tx) * Ty * In0x * In1y, Tx * Ty * In1x * In1y);
+	return Tp;
+}
+
+/** Catmull-Rom weights of the four taps at -1, 0, 1, 2 around a fraction InT in [0, 1): the
+ *  history is resampled with them (bilinear blurs a moving image a little more every frame it
+ *  is reprojected). They sum to 1; the outer two are negative. */
+UNI_FN float4 Uni_CatmullRomWeights(float InT)
+{
+	const float T = InT, T2 = InT * InT, T3 = T2 * InT;
+	return float4(-0.5f * T3 + T2 - 0.5f * T, 1.5f * T3 - 2.5f * T2 + 1.0f, -1.5f * T3 + 2.0f * T2 + 0.5f * T, 0.5f * T3 - 0.5f * T2);
+}
+
+/** History tap weights: bilinear x the same-surface weight against the scene distance each
+ *  texel was marched to. The history is usable when they keep at least half the bilinear mass. */
+UNI_FN float4 Uni_TemporalHistW(float4 InWb, float InLnTp, float4 InLnSceneH)
+{
+	return float4(InWb.x * Uni_TemporalDepthWeight(InLnTp, InLnSceneH.x), InWb.y * Uni_TemporalDepthWeight(InLnTp, InLnSceneH.y),
+		InWb.z * Uni_TemporalDepthWeight(InLnTp, InLnSceneH.z), InWb.w * Uni_TemporalDepthWeight(InLnTp, InLnSceneH.w));
 }
 
 // ------------------------------------------------------------------------------------------

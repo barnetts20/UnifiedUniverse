@@ -357,9 +357,11 @@ UNI_FN float UniField_Cluster(float3 InP, FUniFieldParams InPar)
  *  A = (disc scale length, disc scale height, disc weight, bulge effective radius)
  *  B = (bulge flattening q, bulge weight, arm count, tan(pitch))
  *  C = (arm amplitude, arm sharpness, arm phase, unused)
- *  D = (cut radius, dust sigma (dust carriers only), unused, unused)
+ *  D = (cut radius, dust sigma, dust lanes, dust bubbles)   the last three on dust carriers only (D-132, D-180)
  *  E = (disc warp amplitude, warp twist (rad), lopsidedness, flare)     D-178; zero = off
- *  F = (arm asymmetry 0..1, pitch tightening, shape seed (integer-valued float), unused)
+ *  F = (arm asymmetry 0..1, pitch tightening, shape seed (integer-valued float), palette seed (D-182; 0 = none))
+ *  G = (disc warp amount, bulge warp amount, warp frequency, detail frequency)  D-179; zero = off
+ *  H = (disc fBm modulation, arm knot modulation, frame twist share, texels per texture period)
  *  Zero outside the cut radius, so no child is ever placed outside its contributor's
  *  influence (T2 contributor coverage). Each layer early-outs when its weight is zero. */
 /** D-160: the galaxy field prefiltered over a footprint (field units; the volume passes the
@@ -389,16 +391,20 @@ UNI_FN float Uni_BulgeInCut(float InRe, float InCut)
 	return saturate(1.0f - exp(-Y) * Sum);
 }
 
+#define UNI_GALAXY_MAX_ARMS 4u   // D-181: arms beyond 4 are not drawn (every archetype rolls 0..4)
+
 /** D-178: per-arm shape of a galaxy with arm asymmetry or pitch tightening (UltraLargeScale's
  *  GalaxyDensityCore ideas, on our cos-wave arms). Each arm i of M has its own pitch factor,
  *  phase jitter, strength and end radius, from one hash of the galaxy's shape seed; its profile
  *  is the symmetric wave's own lobe, ((1 + cos(M d)) / 2)^s for |d| < pi / M (d: angle from the
- *  arm's centre line), so with no asymmetry the arms are the symmetric wave exactly. Arms merge
- *  by max (a smooth union: no seam where two arms meet). Winding: theta_c = -k (u + T u^2 / 2) /
+ *  arm's centre line), so with no asymmetry the arms are the symmetric wave exactly. Lobes add
+ *  (each ends smoothly at zero, so there is no seam; where jittered arms overlap they brighten),
+ *  which makes the azimuthal mean exact (Uni_GalaxyArmsAsymMean): a max under-counted it by up to
+ *  3% where lobes overlapped. Winding: theta_c = -k (u + T u^2 / 2) /
  *  tan(p) - phase + 2 pi i / M + jitter, u = -ln r (field units), T the tightening. */
-UNI_FN float Uni_GalaxyArmsAsym(float InTheta, float InR, FUniFieldParams InPar, uint InSeed)
+UNI_FN float Uni_GalaxyArmsAsym(float InTheta, float InR, FUniFieldParams InPar, uint4 InArmH)
 {
-	const float M = max(floor(InPar.B.z + 0.5f), 1.0f);
+	const float M = min(max(floor(InPar.B.z + 0.5f), 1.0f), (float)UNI_GALAXY_MAX_ARMS);
 	const float TanP = max(InPar.B.w, 1.0e-3f);
 	const float S = max(InPar.C.y, 0.1f);
 	const float Asym = saturate(InPar.F.x);
@@ -408,10 +414,10 @@ UNI_FN float Uni_GalaxyArmsAsym(float InTheta, float InR, FUniFieldParams InPar,
 	const float Lobe = 3.14159265f / M;
 	const float Cut = max(InPar.D.x, 1.0e-6f);
 	float Best = 0.0f;
-	for (uint I = 0u; I < 8u; ++I)
+	for (uint I = 0u; I < UNI_GALAXY_MAX_ARMS; ++I)
 	{
 		if (float(I) >= M) { break; }
-		const uint H = Uni_SeedMix(Uni_SeedMix(InSeed, UNI_CH_DISCMODE), 8u + I);
+		const uint H = I == 0u ? InArmH.x : (I == 1u ? InArmH.y : (I == 2u ? InArmH.z : InArmH.w));
 		const float H0 = float(H & 0xFFu) * (1.0f / 255.0f);
 		const float H1 = float((H >> 8u) & 0xFFu) * (1.0f / 255.0f);
 		const float H2 = float((H >> 16u) & 0xFFu) * (1.0f / 255.0f);
@@ -428,24 +434,24 @@ UNI_FN float Uni_GalaxyArmsAsym(float InTheta, float InR, FUniFieldParams InPar,
 		float Fade = 1.0f;
 		if (InR > REnd) { const float Tf = saturate((InR - REnd) / (0.2f * Cut)); Fade = 1.0f - Tf * Tf * (3.0f - 2.0f * Tf); }
 		const float W = pow(0.5f + 0.5f * cos(M * Ad), S) * Str * Fade;
-		Best = max(Best, W);
+		Best = Best + W;
 	}
 	return Best;
 }
 
 /** D-178: the azimuthal mean of Uni_GalaxyArmsAsym at radius InR, for the prefilter's blend:
- *  the symmetric wave's mean x the arms' mean strength and end fade there (exact while lobes do
- *  not overlap; the phase jitter makes them overlap a little, where max is below the sum). */
-UNI_FN float Uni_GalaxyArmsAsymMean(float InR, FUniFieldParams InPar, uint InSeed)
+ *  each lobe's mean over the circle is the symmetric wave's mean / M, so this is that mean x the
+ *  arms' mean strength and end fade there (exact: the lobes add). */
+UNI_FN float Uni_GalaxyArmsAsymMean(float InR, FUniFieldParams InPar, uint4 InArmH)
 {
-	const float M = max(floor(InPar.B.z + 0.5f), 1.0f);
+	const float M = min(max(floor(InPar.B.z + 0.5f), 1.0f), (float)UNI_GALAXY_MAX_ARMS);
 	const float Asym = saturate(InPar.F.x);
 	const float Cut = max(InPar.D.x, 1.0e-6f);
 	float Sum = 0.0f;
-	for (uint I = 0u; I < 8u; ++I)
+	for (uint I = 0u; I < UNI_GALAXY_MAX_ARMS; ++I)
 	{
 		if (float(I) >= M) { break; }
-		const uint H = Uni_SeedMix(Uni_SeedMix(InSeed, UNI_CH_DISCMODE), 8u + I);
+		const uint H = I == 0u ? InArmH.x : (I == 1u ? InArmH.y : (I == 2u ? InArmH.z : InArmH.w));
 		const float H2 = float((H >> 16u) & 0xFFu) * (1.0f / 255.0f);
 		const float H3 = float((H >> 24u) & 0xFFu) * (1.0f / 255.0f);
 		const float Str = max(1.0f + 0.6f * Asym * (2.0f * H2 - 1.0f), 0.0f);
@@ -457,18 +463,148 @@ UNI_FN float Uni_GalaxyArmsAsymMean(float InR, FUniFieldParams InPar, uint InSee
 	return Uni_GalaxyArmMean(InPar.C.y) * Sum / M;
 }
 
-UNI_FN float UniField_GalaxyFiltered(float3 InP, FUniFieldParams InPar, float InFoot)
+/** D-181: what a galaxy sample shares between its emission and its dust (the dust carrier's
+ *  parameters differ only in scale height, disc and bulge weight, arm phase, sigma, cloud terms
+ *  and knots: DustFrom), so the volume evaluates the warps, texture reads, angle and hashes once
+ *  per sample for both (UniField_GalaxyPair). Every value here depends only on parameters the two
+ *  share; each evaluation applies its own slab and terms (Uni_GalaxyFromShared), so a pair gives
+ *  exactly what two separate evaluations give. */
+struct FUniGalaxyShared
 {
+	float3 Pd;      // disc family's sample position (texture-warped)
+	float3 Pb;      // bulge's sample position
+	float4 Dt;      // galaxy_detail texel (valid when bDetail)
+	float Rcyl;     // cylindrical radius at Pd
+	float Theta;    // azimuth at Pd
+	uint4 ArmH;     // per-arm hashes (D-178)
+	float WarpZ;    // D-178 modes at Pd: the warp's vertical offset, lopsidedness and flare factors
+	float Lop;
+	float Flare;
+	uint bDetail;
+};
+
+/** The disc slab beyond which a galaxy's disc term is dropped (D-179): 12 flared scale heights,
+ *  the mode warp and 3 x the texture warp's RMS. */
+UNI_FN float Uni_GalaxyDiscSlab(FUniFieldParams InPar)
+{
+	return 12.0f * max(InPar.A.y, 1.0e-6f) * (1.0f + max(InPar.E.w, 0.0f)) + abs(InPar.E.x) + 3.0f * abs(InPar.G.x);
+}
+
+UNI_FN bool Uni_GalaxyTextured(FUniFieldParams InPar)
+{
+	return InPar.G.x != 0.0f || InPar.G.y != 0.0f || InPar.H.x != 0.0f || InPar.H.y != 0.0f || InPar.D.z != 0.0f || InPar.D.w != 0.0f;
+}
+
+UNI_FN bool Uni_GalaxyNeedsDetail(FUniFieldParams InPar)
+{
+	return InPar.H.x != 0.0f || InPar.H.y != 0.0f || InPar.D.z != 0.0f || InPar.D.w != 0.0f;
+}
+
+/** D-179 texture terms and the shared state. InSlab: the widest disc slab of the evaluations that
+ *  will use it; InTex / InDetail: whether any of them reads textures / the detail texture. The
+ *  warps blend out as the footprint reads mips 4 to 5 (2^3 texels a period: the curl field's mean
+ *  is ~0 there), so distant galaxies skip their warp reads; placement (footprint 0) always reads. */
+UNI_FN FUniGalaxyShared Uni_GalaxyShared(float3 InP, FUniFieldParams InPar, float InFoot, float InSlab, bool InTex, bool InDetail)
+{
+	FUniGalaxyShared S;
+	S.Pd = InP;
+	S.Pb = InP;
+	S.Dt = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	S.bDetail = 0u;
+	const float Cut = InPar.D.x;
+	const uint Seed = (uint)max(InPar.F.z, 0.0f);
+	if (InTex)
+	{
+		const uint Ho = Uni_SeedMix(Uni_SeedMix(Seed, UNI_CH_DISCMODE), 1u);
+		const float3 Off = float3(float(Ho & 0x3FFu), float((Ho >> 10u) & 0x3FFu), float((Ho >> 20u) & 0x3FFu)) * (1.0f / 1024.0f);
+		const float R0 = sqrt(InP.x * InP.x + InP.y * InP.y);
+		const float Rn0 = saturate(R0 / max(Cut, 1.0e-6f));
+		const float U0 = min(-log(max(R0, 1.0e-4f)), 6.0f);
+		const float Tw = (U0 + 0.5f * max(InPar.F.y, 0.0f) * U0 * U0) / max(InPar.B.w, 1.0e-3f) * Rn0 * InPar.H.z;
+		const float St = sin(Tw), Ct = cos(Tw);
+		const float3 Fr = float3(InP.x * Ct - InP.y * St, InP.x * St + InP.y * Ct, 2.0f * InP.z);
+		const float TexN = max(InPar.H.w, 1.0f);
+		const bool bInSlab = !(abs(InP.z) > InSlab);
+		if (InPar.G.x != 0.0f && bInSlab)
+		{
+			const float Mip = log2(max(InFoot * InPar.G.z * TexN, 1.0f));
+			const float Wf = saturate(5.0f - Mip);
+			if (Wf > 0.0f)
+			{
+				const float4 W = UNI_GAL_WARP_FINE(Fr * InPar.G.z + Off, Mip);
+				S.Pd = InP + float3(W.x, W.y, W.z) * (InPar.G.x * Wf);
+			}
+		}
+		// The bulge's warp fades out between 0.3 and 0.5 (its light is ~all inside): no read beyond.
+		const float R2 = dot(InP, InP);
+		if (InPar.G.y != 0.0f && InPar.B.y > 0.0f && R2 < 0.25f)
+		{
+			const float Mip = log2(max(InFoot * 0.5f * InPar.G.z * TexN, 1.0f));
+			const float Wf = saturate(5.0f - Mip);
+			if (Wf > 0.0f)
+			{
+				const float4 W = UNI_GAL_WARP_LARGE(InP * (0.5f * InPar.G.z) + float3(Off.z, Off.x, Off.y), Mip);
+				const float Fb = 1.0f - saturate((sqrt(R2) - 0.3f) * 5.0f);
+				S.Pb = InP + float3(W.x, W.y, W.z) * (InPar.G.y * Fb * Wf);
+			}
+		}
+		if (InDetail && bInSlab)
+		{
+			const float Mip = log2(max(InFoot * InPar.G.w * TexN, 1.0f));
+			S.Dt = UNI_GAL_DETAIL(Fr * InPar.G.w + float3(Off.y, Off.z, Off.x), Mip);
+			S.bDetail = 1u;
+		}
+	}
+	S.Rcyl = sqrt(S.Pd.x * S.Pd.x + S.Pd.y * S.Pd.y);
+	S.Theta = atan2(S.Pd.y, S.Pd.x);
+	const uint Hs = Uni_SeedMix(Seed, UNI_CH_DISCMODE);
+	S.ArmH = uint4(0u, 0u, 0u, 0u);
+	if ((InPar.F.x > 0.0f || InPar.F.y > 0.0f) && InPar.C.x > 0.0f && InPar.B.z > 0.0f)
+	{
+		S.ArmH = uint4(Uni_SeedMix(Hs, 8u), Uni_SeedMix(Hs, 9u), Uni_SeedMix(Hs, 10u), Uni_SeedMix(Hs, 11u));
+	}
+	S.WarpZ = 0.0f; S.Lop = 1.0f; S.Flare = 1.0f;
+	if (InPar.E.x != 0.0f || InPar.E.z != 0.0f || InPar.E.w > 0.0f)
+	{
+		const float Rn = saturate(S.Rcyl / max(Cut, 1.0e-6f));
+		const uint Hp = Uni_SeedMix(Hs, 0u);
+		const float PhW = 6.2831853f * float(Hp & 0xFFFFu) * (1.0f / 65536.0f);
+		const float PhL = 6.2831853f * float(Hp >> 16u) * (1.0f / 65536.0f);
+		if (InPar.E.x != 0.0f) { S.WarpZ = InPar.E.x * Rn * Rn * sin(S.Theta - PhW - InPar.E.y * Rn); }
+		if (InPar.E.z != 0.0f) { S.Lop = max(1.0f + InPar.E.z * Rn * cos(S.Theta - PhL), 0.0f); }
+		if (InPar.E.w > 0.0f) { S.Flare = 1.0f + InPar.E.w * Rn; }
+	}
+	return S;
+}
+
+/** D-160..D-181: the galaxy field at InP for parameters InPar from the shared state (see
+ *  UniField_GalaxyFiltered for what each term is). */
+UNI_FN float Uni_GalaxyFromSharedC(FUniGalaxyShared InS, float3 InP, FUniFieldParams InPar, float InFoot, UNI_OUT(float4) OutComp)
+{
+	OutComp = float4(0.0f, 0.0f, 0.0f, 0.0f);   // D-182: (bulge, disc, arms, knots), before the soft edge
 	const float Cut = InPar.D.x;
 	const float R2 = dot(InP, InP);
 	if (R2 >= Cut * Cut) { return 0.0f; }
-
-	const float Rcyl = sqrt(InP.x * InP.x + InP.y * InP.y);
-	float Z = abs(InP.z);
+	const bool bTex = Uni_GalaxyTextured(InPar);
+	// D-179: beyond the slab the disc term is below e^-12 of its peak and is dropped.
+	const bool bDiscOff = bTex && abs(InP.z) > Uni_GalaxyDiscSlab(InPar);
+	float DetailN = 0.0f, Knot = 0.0f, DustCloud = 1.0f;
+	if (bTex && !bDiscOff && InS.bDetail != 0u && Uni_GalaxyNeedsDetail(InPar))
+	{
+		const float4 Dt = InS.Dt;
+		DetailN = 2.0f * Dt.z - 1.0f;   // fBm
+		Knot = 2.0f * Dt.y - 1.0f;      // Perlin-Worley clumps
+		// D-180: dust only (D.z, D.w are zero for emission): ridged lanes and superbubble holes.
+		if (InPar.D.z != 0.0f) { DustCloud = max(1.0f + InPar.D.z * (2.0f * Dt.x - 1.0f), 0.0f); }
+		if (InPar.D.w != 0.0f) { DustCloud = DustCloud * max(1.0f - InPar.D.w * max(2.0f * Dt.w - 1.0f, 0.0f), 0.0f); }
+	}
+	const float3 Pd = InS.Pd;   // InP unless textured
+	float Rcyl = InS.Rcyl;
+	float Z = abs(Pd.z);
 	float Rho = 0.0f;
 
 	const float DiscW = InPar.A.z;
-	if (DiscW > 0.0f)
+	if (DiscW > 0.0f && !bDiscOff)
 	{
 		// D-178: disc-level modes (UltraLargeScale's m = 1 modes): a vertical warp of the outer
 		// disc, z - A rn^2 sin(theta - phase - twist rn), whose node line precesses with radius;
@@ -476,22 +612,11 @@ UNI_FN float UniField_GalaxyFiltered(float3 InP, FUniFieldParams InPar, float In
 		// scale height x (1 + f rn) with the face-on surface density kept. rn = r / cut. Phases
 		// from the galaxy's shape seed (F.z) on channel DISCMODE. All zero: the field as before,
 		// exactly. The bulge is not warped (it holds the inner disc rigid).
-		const uint Seed = (uint)max(InPar.F.z, 0.0f);
 		const bool bModes = InPar.E.x != 0.0f || InPar.E.z != 0.0f || InPar.E.w > 0.0f;
 		const bool bArmsAsym = InPar.F.x > 0.0f || InPar.F.y > 0.0f;
-		float Theta = 0.0f;
-		if (bModes || bArmsAsym) { Theta = atan2(InP.y, InP.x); }
-		float Lop = 1.0f, Flare = 1.0f;
-		if (bModes)
-		{
-			const float Rn = saturate(Rcyl / max(Cut, 1.0e-6f));
-			const uint Hp = Uni_SeedMix(Uni_SeedMix(Seed, UNI_CH_DISCMODE), 0u);
-			const float PhW = 6.2831853f * float(Hp & 0xFFFFu) * (1.0f / 65536.0f);
-			const float PhL = 6.2831853f * float(Hp >> 16u) * (1.0f / 65536.0f);
-			if (InPar.E.x != 0.0f) { Z = abs(InP.z - InPar.E.x * Rn * Rn * sin(Theta - PhW - InPar.E.y * Rn)); }
-			if (InPar.E.z != 0.0f) { Lop = max(1.0f + InPar.E.z * Rn * cos(Theta - PhL), 0.0f); }
-			if (InPar.E.w > 0.0f) { Flare = 1.0f + InPar.E.w * Rn; }
-		}
+		const float Theta = InS.Theta;
+		const float Lop = InS.Lop, Flare = InS.Flare;
+		if (InPar.E.x != 0.0f) { Z = abs(Pd.z - InS.WarpZ); }
 		float Disc;
 		const float H = max(InPar.A.y, 1.0e-6f) * Flare;
 		if (InFoot > 0.0f)
@@ -504,6 +629,8 @@ UNI_FN float UniField_GalaxyFiltered(float3 InP, FUniFieldParams InPar, float In
 			Disc = DiscW * exp(-Rcyl / max(InPar.A.x, 1.0e-5f)) * exp(-Z / H);
 		}
 		if (bModes) { Disc = Disc * (Lop / Flare); }
+		if (InPar.H.x != 0.0f) { Disc = Disc * max(1.0f + InPar.H.x * DetailN, 0.0f); }   // D-179
+		Disc = Disc * DustCloud;   // D-180 (dust carriers only; 1 otherwise)
 		const float ArmAmp = InPar.C.x;
 		if (ArmAmp > 0.0f && InPar.B.z > 0.0f)
 		{
@@ -526,25 +653,39 @@ UNI_FN float UniField_GalaxyFiltered(float3 InP, FUniFieldParams InPar, float In
 			{
 				if (bArmsAsym)
 				{
-					Wave = Uni_GalaxyArmsAsym(Theta, Rcyl, InPar, Seed);
+					Wave = Uni_GalaxyArmsAsym(Theta, Rcyl, InPar, InS.ArmH);
 				}
 				else
 				{
-					const float Th = atan2(InP.y, InP.x);
-					const float Phi = InPar.B.z * (Th - log(max(Rcyl, 1.0e-4f)) / max(InPar.B.w, 1.0e-3f) + InPar.C.z);
+					const float Phi = InPar.B.z * (Theta - log(max(Rcyl, 1.0e-4f)) / max(InPar.B.w, 1.0e-3f) + InPar.C.z);
 					Wave = pow(0.5f + 0.5f * cos(Phi), max(InPar.C.y, 0.1f));
 				}
 			}
 			if (Blend > 0.0f)
 			{
-				const float Mean = bArmsAsym ? Uni_GalaxyArmsAsymMean(Rcyl, InPar, Seed) : Uni_GalaxyArmMean(InPar.C.y);
+				const float Mean = bArmsAsym ? Uni_GalaxyArmsAsymMean(Rcyl, InPar, InS.ArmH) : Uni_GalaxyArmMean(InPar.C.y);
 				Wave = Wave + (Mean - Wave) * Blend;
 			}
+			float Wk = 1.0f;
+			if (InPar.H.y != 0.0f) { Wk = max(1.0f + InPar.H.y * Knot, 0.0f); Wave = Wave * Wk; }   // D-179: knots along the arms
+			// D-182: the arms' share split into arms (up to the knot-free wave) and knots (above it).
+			const float ArmLight = Disc * ArmAmp * (Wave / max(Wk, 1.0e-6f)) * (1.0f + InPar.C.y);
+			OutComp.z = ArmLight * min(Wk, 1.0f);
+			OutComp.w = ArmLight * max(Wk - 1.0f, 0.0f);
+			OutComp.y = Disc * (1.0f - ArmAmp);
 			Disc = Disc * ((1.0f - ArmAmp) + ArmAmp * Wave * (1.0f + InPar.C.y));
+		}
+		else
+		{
+			OutComp.y = Disc;
 		}
 		Rho += Disc;
 	}
-	Z = abs(InP.z);   // the bulge is never warped
+	// The bulge: never warped by the disc modes (it holds the inner disc rigid); D-179: displaced
+	// by warp_large when on.
+	const float3 Pb = InS.Pb;
+	Rcyl = sqrt(Pb.x * Pb.x + Pb.y * Pb.y);
+	Z = abs(Pb.z);
 
 	const float BulgeW = InPar.B.y;
 	if (BulgeW > 0.0f)
@@ -566,13 +707,197 @@ UNI_FN float UniField_GalaxyFiltered(float3 InP, FUniFieldParams InPar, float In
 		}
 		const float R3 = sqrt(Rcyl * Rcyl + (Z / Q) * (Z / Q));
 		// Sersic-like, n = 2: exp(-b ((r / re)^(1/2) - 1)), b = 3.67.
-		Rho += Amp * exp(-3.67f * (sqrt(R3 / Re) - 1.0f));
+		const float Bulge = Amp * exp(-3.67f * (sqrt(R3 / Re) - 1.0f));
+		OutComp.x = Bulge;
+		Rho += Bulge;
 	}
 
 	// Soft edge over the outer 5% of the cut, so the field (and so the placed count) has no
 	// hard shell at the influence radius.
 	const float R = sqrt(R2);
 	return Rho * saturate((Cut - R) / (0.05f * Cut));
+}
+
+
+UNI_FN float Uni_GalaxyFromShared(FUniGalaxyShared InS, float3 InP, FUniFieldParams InPar, float InFoot)
+{
+	float4 Comp = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	return Uni_GalaxyFromSharedC(InS, InP, InPar, InFoot, Comp);
+}
+
+UNI_FN float UniField_GalaxyFiltered(float3 InP, FUniFieldParams InPar, float InFoot)
+{
+	const float Cut = InPar.D.x;
+	if (dot(InP, InP) >= Cut * Cut) { return 0.0f; }
+	const bool bTex = Uni_GalaxyTextured(InPar);
+	const FUniGalaxyShared S = Uni_GalaxyShared(InP, InPar, InFoot, Uni_GalaxyDiscSlab(InPar), bTex, bTex && Uni_GalaxyNeedsDetail(InPar));
+	return Uni_GalaxyFromShared(S, InP, InPar, InFoot);
+}
+
+/** D-181: a galaxy's emission and its dust at one sample, with what they share evaluated once
+ *  (the volume march's dusty galaxy carriers). Exactly UniField_GalaxyFiltered of each. */
+UNI_FN void UniField_GalaxyPair(float3 InP, FUniFieldParams InPar, FUniFieldParams InDust, float InFoot, UNI_OUT(float) OutEmission, UNI_OUT(float) OutDust)
+{
+	OutEmission = 0.0f;
+	OutDust = 0.0f;
+	const float Cut = max(InPar.D.x, InDust.D.x);
+	if (dot(InP, InP) >= Cut * Cut) { return; }
+	const bool bTexA = Uni_GalaxyTextured(InPar), bTexB = Uni_GalaxyTextured(InDust);
+	const bool bDetail = (bTexA && Uni_GalaxyNeedsDetail(InPar)) || (bTexB && Uni_GalaxyNeedsDetail(InDust));
+	const float Slab = max(bTexA ? Uni_GalaxyDiscSlab(InPar) : 0.0f, bTexB ? Uni_GalaxyDiscSlab(InDust) : 0.0f);
+	// HLSL: no conditional operator on structs.
+	FUniGalaxyShared S;
+	if (bTexA) { S = Uni_GalaxyShared(InP, InPar, InFoot, Slab, bTexA || bTexB, bDetail); }
+	else { S = Uni_GalaxyShared(InP, InDust, InFoot, Slab, bTexA || bTexB, bDetail); }
+	OutEmission = Uni_GalaxyFromShared(S, InP, InPar, InFoot);
+	OutDust = Uni_GalaxyFromShared(S, InP, InDust, InFoot);
+}
+
+/** D-182: UniField_GalaxyPair with the emission's components (bulge, disc, arms, knots). */
+UNI_FN void UniField_GalaxyPairC(float3 InP, FUniFieldParams InPar, FUniFieldParams InDust, float InFoot, UNI_OUT(float) OutEmission, UNI_OUT(float) OutDust, UNI_OUT(float4) OutComp)
+{
+	OutEmission = 0.0f;
+	OutDust = 0.0f;
+	OutComp = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	const float Cut = max(InPar.D.x, InDust.D.x);
+	if (dot(InP, InP) >= Cut * Cut) { return; }
+	const bool bTexA = Uni_GalaxyTextured(InPar), bTexB = Uni_GalaxyTextured(InDust);
+	const bool bDetail = (bTexA && Uni_GalaxyNeedsDetail(InPar)) || (bTexB && Uni_GalaxyNeedsDetail(InDust));
+	const float Slab = max(bTexA ? Uni_GalaxyDiscSlab(InPar) : 0.0f, bTexB ? Uni_GalaxyDiscSlab(InDust) : 0.0f);
+	// HLSL: no conditional operator on structs.
+	FUniGalaxyShared S;
+	if (bTexA) { S = Uni_GalaxyShared(InP, InPar, InFoot, Slab, bTexA || bTexB, bDetail); }
+	else { S = Uni_GalaxyShared(InP, InDust, InFoot, Slab, bTexA || bTexB, bDetail); }
+	OutEmission = Uni_GalaxyFromSharedC(S, InP, InPar, InFoot, OutComp);
+	OutDust = Uni_GalaxyFromShared(S, InP, InDust, InFoot);
+}
+
+/** D-182: the galaxy field with its components. */
+UNI_FN float UniField_GalaxyFilteredC(float3 InP, FUniFieldParams InPar, float InFoot, UNI_OUT(float4) OutComp)
+{
+	OutComp = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	const float Cut = InPar.D.x;
+	if (dot(InP, InP) >= Cut * Cut) { return 0.0f; }
+	const bool bTex = Uni_GalaxyTextured(InPar);
+	const FUniGalaxyShared S = Uni_GalaxyShared(InP, InPar, InFoot, Uni_GalaxyDiscSlab(InPar), bTex, bTex && Uni_GalaxyNeedsDetail(InPar));
+	return Uni_GalaxyFromSharedC(S, InP, InPar, InFoot, OutComp);
+}
+
+// ==========================================================================================
+// D-182: galaxy colour palettes (owner: each galaxy its own palette, plausible but stylised;
+// its stars take it too). Four colours per galaxy, bulge / disc / arms / knots, rolled from the
+// palette seed (the galaxy's object seed on channel PALETTE, carried in its contributor's F.w)
+// within families: gold-amber bulges; teal-azure, warm-neutral or violet discs; blue-violet
+// arms (sometimes teal); pink-magenta knots (sometimes HII red-orange). Each colour is mixed
+// with white by UNI_PALETTE_STRENGTH and normalised to luminance 1 (D-135), so a tint changes
+// only chroma: every sprite's and the volume's light is unchanged.
+// ==========================================================================================
+#define UNI_PALETTE_STRENGTH 0.9f
+
+struct FUniGalaxyPalette
+{
+	float3 Bulge;
+	float3 Disc;
+	float3 Arm;
+	float3 Knot;
+};
+
+UNI_FN float Uni_PaletteLum(float3 InC) { return 0.2126f * InC.x + 0.7152f * InC.y + 0.0722f * InC.z; }   // = Uni_Luminance (UniPhotometry.ush)
+
+/** HSV (hue in turns) to linear RGB, then mixed with white by the palette strength and
+ *  normalised to luminance 1. */
+UNI_FN float3 Uni_PaletteColour(float InHue, float InSat)
+{
+	const float Hh = InHue - floor(InHue);
+	const float R = saturate(abs(Hh * 6.0f - 3.0f) - 1.0f);
+	const float G = saturate(2.0f - abs(Hh * 6.0f - 2.0f));
+	const float B = saturate(2.0f - abs(Hh * 6.0f - 4.0f));
+	const float S = saturate(InSat) * UNI_PALETTE_STRENGTH;
+	const float3 C = float3(1.0f - S + S * R, 1.0f - S + S * G, 1.0f - S + S * B);
+	return C * (1.0f / max(Uni_PaletteLum(C), 1.0e-4f));
+}
+
+/** The palette seed of a galaxy (never 0: 0 in F.w means no palette). Integer-valued, < 2^24,
+ *  so it travels exactly in a float. */
+UNI_FN uint Uni_PaletteSeed(uint InObjSeed)
+{
+	return (Uni_SeedMix(InObjSeed, UNI_CH_PALETTE) & 0xFFFFFFu) | 1u;
+}
+
+UNI_FN FUniGalaxyPalette Uni_GalaxyPalette(uint InPaletteSeed)
+{
+	const uint S = InPaletteSeed;
+	FUniGalaxyPalette P;
+	const float Vib = 0.9f + 0.4f * Uni_DrawUnit(S, UNI_CH_PALETTE, 0u);   // the galaxy's vibrance
+	// Bulge: gold to amber.
+	P.Bulge = Uni_PaletteColour((28.0f + 24.0f * Uni_DrawUnit(S, UNI_CH_PALETTE, 1u)) / 360.0f, (0.4f + 0.3f * Uni_DrawUnit(S, UNI_CH_PALETTE, 2u)) * Vib);
+	// Disc: teal-azure (half), warm-neutral (30%) or violet (20%).
+	const float Fd = Uni_DrawUnit(S, UNI_CH_PALETTE, 3u), Ud = Uni_DrawUnit(S, UNI_CH_PALETTE, 4u), Sd = Uni_DrawUnit(S, UNI_CH_PALETTE, 5u);
+	const float Hd = Fd < 0.5f ? 185.0f + 40.0f * Ud : (Fd < 0.8f ? 35.0f + 20.0f * Ud : 250.0f + 30.0f * Ud);
+	const float Sdd = Fd < 0.5f ? 0.3f + 0.3f * Sd : (Fd < 0.8f ? 0.2f + 0.2f * Sd : 0.3f + 0.25f * Sd);
+	P.Disc = Uni_PaletteColour(Hd / 360.0f, Sdd * Vib);
+	// Arms: blue to violet (80%) or teal (20%).
+	const float Fa = Uni_DrawUnit(S, UNI_CH_PALETTE, 6u), Ua = Uni_DrawUnit(S, UNI_CH_PALETTE, 7u);
+	const float Ha = Fa < 0.8f ? 195.0f + 80.0f * Ua : 160.0f + 25.0f * Ua;
+	P.Arm = Uni_PaletteColour(Ha / 360.0f, (0.55f + 0.3f * Uni_DrawUnit(S, UNI_CH_PALETTE, 8u)) * Vib);
+	// Knots: pink-magenta (70%) or HII red-orange (30%).
+	const float Fk = Uni_DrawUnit(S, UNI_CH_PALETTE, 9u), Uk = Uni_DrawUnit(S, UNI_CH_PALETTE, 10u);
+	const float Hk = Fk < 0.7f ? 305.0f + 40.0f * Uk : 360.0f + 20.0f * Uk;
+	P.Knot = Uni_PaletteColour(Hk / 360.0f, (0.7f + 0.25f * Uni_DrawUnit(S, UNI_CH_PALETTE, 11u)) * Vib);
+	return P;
+}
+
+/** The tint (luminance 1) at a sample with components InComp (bulge, disc, arms, knots),
+ *  blended by InFar toward the galaxy's whole-body tint (fixed shares 0.3 / 0.45 / 0.2 / 0.05),
+ *  which its sprite carries, so the hand-off from sprite to volume keeps the colour (D-129). */
+UNI_FN float3 Uni_GalaxyFarTint(FUniGalaxyPalette InP)
+{
+	const float3 C = InP.Bulge * 0.3f + InP.Disc * 0.45f + InP.Arm * 0.2f + InP.Knot * 0.05f;
+	return C * (1.0f / max(Uni_PaletteLum(C), 1.0e-4f));
+}
+
+/** Uni_GalaxyTint with the whole-body tint given (the volume reads it from the carrier's palette
+ *  block instead of recomputing it per sample). */
+UNI_FN float3 Uni_GalaxyTintFar(FUniGalaxyPalette InP, float4 InComp, float InFar, float3 InFarTint)
+{
+	const float Sum = InComp.x + InComp.y + InComp.z + InComp.w;
+	float3 Local = InFarTint;
+	if (Sum > 0.0f)
+	{
+		Local = (InP.Bulge * InComp.x + InP.Disc * InComp.y + InP.Arm * InComp.z + InP.Knot * InComp.w) * (1.0f / Sum);
+	}
+	const float F = saturate(InFar);
+	const float3 C = Local + (InFarTint - Local) * F;
+	return C * (1.0f / max(Uni_PaletteLum(C), 1.0e-4f));
+}
+
+UNI_FN float3 Uni_GalaxyTint(FUniGalaxyPalette InP, float4 InComp, float InFar)
+{
+	const float Sum = InComp.x + InComp.y + InComp.z + InComp.w;
+	float3 Local = Uni_GalaxyFarTint(InP);
+	if (Sum > 0.0f)
+	{
+		Local = (InP.Bulge * InComp.x + InP.Disc * InComp.y + InP.Arm * InComp.z + InP.Knot * InComp.w) * (1.0f / Sum);
+	}
+	const float3 Far = Uni_GalaxyFarTint(InP);
+	const float F = saturate(InFar);
+	const float3 C = Local + (Far - Local) * F;
+	return C * (1.0f / max(Uni_PaletteLum(C), 1.0e-4f));
+}
+
+/** A record colour (brightest channel 1, as Uni_TemperatureColour and Uni_PackColour take it)
+ *  tinted by InTint: the sprite normalises colours by luminance (D-135), so only the chroma counts. */
+UNI_FN float3 Uni_TintRecordColour(float3 InRgb, float3 InTint)
+{
+	const float3 C = InRgb * InTint;
+	return C * (1.0f / max(max(C.x, max(C.y, C.z)), 1.0e-12f));
+}
+
+/** A colour InRgb tinted by InTint, its luminance kept. */
+UNI_FN float3 Uni_TintKeepLuminance(float3 InRgb, float3 InTint)
+{
+	const float3 C = InRgb * InTint;
+	return C * (Uni_PaletteLum(InRgb) / max(Uni_PaletteLum(C), 1.0e-12f));
 }
 
 UNI_FN float UniField_Galaxy(float3 InP, FUniFieldParams InPar)
@@ -653,12 +978,32 @@ UNI_FN float Uni_FieldBoundBeyond(uint InFieldId, float InDist, FUniFieldParams 
  *  the broadened one and the arms need no resolving once blended away. */
 UNI_FN float Uni_GalaxyStepHintFiltered(float3 InP, float3 InD, FUniFieldParams InPar, float InFoot)
 {
-	const float H0 = max(InPar.A.y, 1.0e-6f);
-	const float H = InFoot > 0.0f ? sqrt(H0 * H0 + 0.25f * InFoot * InFoot) : H0;
-	const float Slab = 4.0f * H;
 	const float Rcyl = sqrt(InP.x * InP.x + InP.y * InP.y);
+	// D-178: the flare thickens the disc; D-181: the slab where steps must resolve the disc is
+	// centred on its mode-warped plane at this point (z_c = A rn^2 sin(...), the field's own
+	// formula), widened by how far z_c can move within one step (a step is at most 0.3 scale
+	// lengths: |grad z_c| <= |A| (3 + |twist|) / cut) and by the texture warp's reach (D-179).
+	float H0 = max(InPar.A.y, 1.0e-6f);
+	float Margin = 2.5f * abs(InPar.G.x);
+	float Zc = 0.0f;
+	if (InPar.E.x != 0.0f || InPar.E.w > 0.0f)
+	{
+		const float Cut = max(InPar.D.x, 1.0e-6f);
+		const float Rn = saturate(Rcyl / Cut);
+		if (InPar.E.w > 0.0f) { H0 = H0 * (1.0f + InPar.E.w * saturate((Rcyl + 0.3f * max(InPar.A.x, 1.0e-4f)) / Cut)); }
+		if (InPar.E.x != 0.0f)
+		{
+			const uint Hp = Uni_SeedMix(Uni_SeedMix((uint)max(InPar.F.z, 0.0f), UNI_CH_DISCMODE), 0u);
+			const float PhW = 6.2831853f * float(Hp & 0xFFFFu) * (1.0f / 65536.0f);
+			Zc = InPar.E.x * Rn * Rn * sin(atan2(InP.y, InP.x) - PhW - InPar.E.y * Rn);
+			Margin = Margin + abs(InPar.E.x) * (3.0f + abs(InPar.E.y)) / Cut * 0.3f * max(InPar.A.x, 1.0e-4f);
+		}
+	}
+	const float H = InFoot > 0.0f ? sqrt(H0 * H0 + 0.25f * InFoot * InFoot) : H0;
+	const float Slab = 4.0f * H + Margin;
 	const float Dz = max(abs(InD.z), 1.0e-3f);
-	const float Z = abs(InP.z);
+	const float Zr = InP.z - Zc;
+	const float Z = abs(Zr);
 	float S = 0.25f;
 	if (InPar.A.z > 0.0f)
 	{
@@ -671,13 +1016,20 @@ UNI_FN float Uni_GalaxyStepHintFiltered(float3 InP, float3 InD, FUniFieldParams 
 				const float TanP = max(InPar.B.w, 1.0e-3f);
 				// Inside half a scale length the phase winds without limit (log R): the pattern is
 				// averaged there, not resolved, or the step collapses on the axis.
-				const float Grad = InPar.B.z / max(Rcyl, 0.5f * max(InPar.A.x, 1.0e-4f)) * sqrt(1.0f + 1.0f / (TanP * TanP));
+				float Wind2 = 1.0f / (TanP * TanP);
+				if (InPar.F.x > 0.0f || InPar.F.y > 0.0f)
+				{
+					// D-178: the local winding rate of the steepest arm, as the field's prefilter takes it.
+					const float Kw = (1.0f + max(InPar.F.y, 0.0f) * (-log(max(Rcyl, 1.0e-4f)))) * (1.0f + 0.3f * saturate(InPar.F.x)) / TanP;
+					Wind2 = Kw * Kw;
+				}
+				const float Grad = InPar.B.z / max(Rcyl, 0.5f * max(InPar.A.x, 1.0e-4f)) * sqrt(1.0f + Wind2);
 				if (!(InFoot * Grad >= 4.0f)) { S = min(S, 0.25f / Grad); }   // fully blended (D-160): nothing to resolve
 			}
 		}
 		else
 		{
-			const bool bToward = (InP.z > 0.0f) == (InD.z < 0.0f);
+			const bool bToward = (Zr > 0.0f) == (InD.z < 0.0f);
 			if (bToward) { S = min(S, max((Z - Slab) / Dz, 0.25f * H / Dz)); }
 		}
 	}

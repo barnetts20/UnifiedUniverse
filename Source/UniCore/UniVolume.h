@@ -54,7 +54,8 @@ namespace UniCore
 		float TEnd;
 		float ResolveScale;
 		float StepRatio;   // D-164: 0 = the view's
-		float Pad[2];
+		u32 PaletteIndex;  // D-182: the galaxy's palette (a parameter block: A..D bulge, disc, arms, knots; E whole body), with UNI_CARRIER_PALETTE
+		float Pad;
 	};
 	static_assert(sizeof(FCarrierGPU) == 112, "FCarrierGPU must match FUniCarrier (UniVolume.ush)");
 	static_assert(sizeof(HV::FUniCarrier) == 112, "shim FUniCarrier layout");
@@ -285,6 +286,14 @@ namespace UniCore
 		D.V[5] = 0.0f;                                // bulge weight
 		D.V[10] = Emission.V[10] + P.DustArmPhase;    // arm phase
 		D.V[13] = P.DustTau / (2.0f * std::max(D.V[1], 1.0e-6f));
+		// D-180: a textured galaxy's dust is cloud-like: ridged lanes and superbubble holes from
+		// galaxy_detail (D.z, D.w: read only by the field's dust terms), no star-forming knots.
+		if (Emission.V[24] != 0.0f || Emission.V[28] != 0.0f || Emission.V[29] != 0.0f)
+		{
+			D.V[14] = P.DustLanes;
+			D.V[15] = P.DustBubbles;
+			D.V[29] = 0.0f;
+		}
 		return D;
 	}
 
@@ -506,7 +515,7 @@ namespace UniCore
 			}
 
 			// Local carriers: resident contributors, ranked by angular size, capped.
-			struct FCand { double Theta; FCarrierGPU G; FFieldParamsGPU Par; FFieldParamsGPU Dust; bool bDust; };
+			struct FCand { double Theta; FCarrierGPU G; FFieldParamsGPU Par; FFieldParamsGPU Dust; bool bDust; FFieldParamsGPU Palette; bool bPalette = false; };
 			std::vector<FCand> Cands;
 			if (bLocal)
 			{
@@ -576,6 +585,18 @@ namespace UniCore
 					const FVolumeProfile& Prof = D.Arch(C.ParentArchetypeId).Volume;
 					Cd.bDust = Prof.bDust && Prof.DustTau > 0.0f && C.Emitter->FieldId == HV::UNI_FIELD_GALAXY && !C.bEarly;   // D-172: early types are dust-poor
 					if (Cd.bDust) { Cd.Dust = DustFrom(C.Params, Prof).Pack(); G.Flags |= HV::UNI_CARRIER_DUST; }
+					// D-182: the palette's colours, computed once per carrier (not per sample).
+					Cd.bPalette = C.Emitter->FieldId == HV::UNI_FIELD_GALAXY && C.Params.V[23] > 0.0f;
+					if (Cd.bPalette)
+					{
+						const HV::FUniGalaxyPalette Pp = HV::Uni_GalaxyPalette(u32(C.Params.V[23]));
+						const HV::float3 Ft = HV::Uni_GalaxyFarTint(Pp);
+						const HV::float3 Cs[5] = { Pp.Bulge, Pp.Disc, Pp.Arm, Pp.Knot, Ft };
+						FFieldParams Pb;
+						for (int K = 0; K < 5; ++K) { Pb.V[4 * K] = Cs[K].x; Pb.V[4 * K + 1] = Cs[K].y; Pb.V[4 * K + 2] = Cs[K].z; }
+						Cd.Palette = Pb.Pack();
+						G.Flags |= HV::UNI_CARRIER_PALETTE;
+					}
 					// D-160: an emission-only carrier starts where its LUT does. Nearer than that every
 					// child is resolved (drawn as a sprite), so the unresolved emission is < 1e-6 of
 					// its peak, but the log-uniform steps from 1 pc there were ~190 per ray from inside
@@ -605,6 +626,7 @@ namespace UniCore
 				Cd.G.ParamIndex = u32(Out.Params.size());
 				Out.Params.push_back(Cd.Par);
 				if (Cd.bDust) { Cd.G.DustParamIndex = u32(Out.Params.size()); Out.Params.push_back(Cd.Dust); }
+				if (Cd.bPalette) { Cd.G.PaletteIndex = u32(Out.Params.size()); Out.Params.push_back(Cd.Palette); }
 				Out.Carriers.push_back(Cd.G);
 			}
 

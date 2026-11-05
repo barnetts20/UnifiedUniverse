@@ -50,6 +50,7 @@ Known gaps: galaxies are round blobs until the volume takes over (no inclination
 **Reroll:** A1 and A3 move every galaxy's stars (their field changes; positions, counts per cell); A4 and A5 none. One decision entry each.
 
 ### B. Galaxies at a few pixels (new; render-only)
+*Done 2026-11-04 (D-183, offline; UE-21): seeded disc normal on the GPU, q0 0.2 / 0.65, round below ~2 px (the owner question answered by construction), hand-off axis ratio within 0.04 of the field's own light on average.*
 **Goal.** A distant galaxy reads as a disc at its inclination, not a round dot, before the volume takes over.
 - The contributor's orientation is a pure function of the object's seed (RandomRotation on UNI_CH_ORIENT), so the project pass can compute it on the GPU from the record alone, and its axis ratio from the rolled disc/bulge weights (or a cheap proxy). The sprite becomes an oriented ellipse (axis ratio from inclination, position angle from the projected disc normal), with the same energy.
 - **Hand-off:** the ellipse must match the volume's integrated shape at the D-129 hand-off size, so the swap is invisible; checked offline the way D-129 was.

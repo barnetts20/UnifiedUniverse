@@ -99,6 +99,9 @@ static TAutoConsoleVariable<int32> CVarUniVolumePrefilter(TEXT("uu.VolumePrefilt
 static TAutoConsoleVariable<int32> CVarUniVolumeLutStart(TEXT("uu.VolumeLutStart"), 1, TEXT("D-160: emission-only carriers start marching where their unresolved light becomes significant, not at 1 pc. 0: from 1 pc."));
 // D-164: the cosmic web from a baked texture.
 static TAutoConsoleVariable<int32> CVarUniWebSource(TEXT("uu.WebSource"), 1, TEXT("D-164: the cosmic web's density. 1: a 3D texture with mips (uu.WebTexture) (placement and the volume read the same texels; much cheaper to march). 0: the procedural lattices (D-012). Applies at uu.Enable; switching rerolls the web's galaxies."));
+static TAutoConsoleVariable<int32> CVarUniSpriteEllipses(TEXT("uu.SpriteEllipses"), 1, TEXT("D-183: disc galaxies' sprites are ellipses at their disc's inclination (energy unchanged; round below a few pixels). 0: every sprite round. Render-only, live."));
+static TAutoConsoleVariable<int32> CVarUniGalaxyPalettes(TEXT("uu.GalaxyPalettes"), 1, TEXT("D-182: every galaxy its own colour palette (bulge, disc, arms, knots), which its stars and glow take (chroma only: brightness unchanged). 0: physical colours. Applies at uu.Enable; rerolls star and galaxy colours only."));
+static TAutoConsoleVariable<int32> CVarUniGalaxyTextures(TEXT("uu.GalaxyTextures"), 1, TEXT("D-179: galaxies read the noise project's galaxy textures (warp_fine, warp_large, galaxy_detail in Plugins/UnifiedUniverse/Data/Noise): texture warps of discs, arms and bulges, disc noise and star-forming knots. 0: off. Applies at uu.Enable; rerolls galaxies' stars."));
 static TAutoConsoleVariable<FString> CVarUniWebTexture(TEXT("uu.WebTexture"), TEXT("web_adhesion_density_mid"), TEXT("D-165: which web texture uu.WebSource 1 uses: a texture delivered by the noise project in Plugins/UnifiedUniverse/Data/Noise (web_adhesion_density_young / _mid / _old), or standin (the procedural web baked here). Applies at uu.Enable; rerolls the web."));
 static TAutoConsoleVariable<int32> CVarUniWebTexSize(TEXT("uu.WebTexSize"), 128, TEXT("D-164: stand-in web texture texels per period (power of two, 32..512). 128: 0.78 Mpc texels for the demo's 100 Mpc period."));
 static TAutoConsoleVariable<int32> CVarUniWebTexSupersample(TEXT("uu.WebTexSupersample"), 2, TEXT("D-164: samples per texel axis when baking the stand-in web texture (1..4)."));
@@ -165,6 +168,8 @@ void UUniSubsystem::EnableUniverse(const FString& Scene)
 	bCameraJumped = true;
 	UniCore::FUniverseDef Def = SceneName == TEXT("web") ? UniScenes::WebToGalaxy(ClusterTuning) : (SceneName == TEXT("flythrough") ? UniScenes::Flythrough(ClusterTuning) : UniScenes::GalaxyToStar());
 	SetupWebTexture(Def);   // D-164: before the model, which bakes the definition's parameters
+	SetupGalaxyTextures(Def);   // D-179: likewise
+	if (CVarUniGalaxyPalettes.GetValueOnGameThread() != 0) { UniScenes::UseGalaxyPalettes(Def); }   // D-182
 	Model = MakeUnique<UniCore::FUniverseModel>(MoveTemp(Def));
 	for (const std::string& Problem : Model->Validate())
 	{
@@ -200,6 +205,23 @@ void UUniSubsystem::EnableUniverse(const FString& Scene)
 	for (const UniCore::FArchetype& A : Model->Definition().Archetypes)
 	{
 		if (A.bSystems && A.Id < 32u) { SystemArchetypeMask |= 1u << A.Id; }
+	}
+	// D-183: disc galaxies (archetypes with a galaxy-field emitter) draw as inclined ellipses.
+	DiscArchetypeMask = 0;
+	for (const UniCore::FArchetype& A : Model->Definition().Archetypes)
+	{
+		for (const UniCore::FUniEmitter& E : A.Emitters)
+		{
+			if (E.FieldId == UniHlsl::UNI_FIELD_GALAXY && A.Id < 32u) { DiscArchetypeMask |= 1u << A.Id; }
+		}
+	}
+	FMemory::Memzero(FixedDiscSeeds, sizeof(FixedDiscSeeds));
+	{
+		int32 NFixed = 0;
+		for (const UniCore::FAnchor& An : Model->Definition().Anchors)
+		{
+			if (An.bFixedOrientation && NFixed < 4) { FixedDiscSeeds[NFixed++] = An.Seed; }
+		}
 	}
 	UniverseTime = 0.0;
 	CellKeysByFrame.Reset();
@@ -246,6 +268,52 @@ void UUniSubsystem::DisableUniverse()
 	Model.Reset();
 	UniCore::BindWebTexture(nullptr);   // D-164: after everything that samples it on the CPU
 	WebTexture.Reset();
+	for (int32 S = 0; S < 3; ++S) { UniCore::BindGalaxyTexture(S, nullptr); GalaxyTextures[S].Reset(); }   // D-179
+}
+
+void UUniSubsystem::SetupGalaxyTextures(UniCore::FUniverseDef& Def)
+{
+	// D-179: the galaxy textures, all three or none. Missing (or uu.GalaxyTextures 0), galaxies keep
+	// their untextured field (the terms stay off: the definition never asks for a texture it does not
+	// have), with an error naming the files when they were wanted.
+	for (int32 S = 0; S < 3; ++S) { UniCore::BindGalaxyTexture(S, nullptr); GalaxyTextures[S].Reset(); FUniRenderer::Get().SetGalaxyTexture_GameThread(S, 0u, {}); }
+	if (CVarUniGalaxyTextures.GetValueOnGameThread() == 0) { return; }
+	const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("UnifiedUniverse"));
+	const FString Dir = FPaths::ConvertRelativePathToFull((Plugin.IsValid() ? Plugin->GetBaseDir() : FPaths::ProjectPluginsDir() / TEXT("UnifiedUniverse")) / TEXT("Data") / TEXT("Noise"));
+	const double T0 = FPlatformTime::Seconds();
+	TUniquePtr<UniCore::FWebTexture> T[3];
+	for (int32 S = 0; S < 3; ++S)
+	{
+		T[S] = MakeUnique<UniCore::FWebTexture>();
+		std::string Err;
+		if (!UniCore::FWebTexture::LoadDelivered(TCHAR_TO_UTF8(*Dir), UniCore::GalaxyTextureName(S), *T[S], &Err))
+		{
+			UE_LOG(LogUnifiedUniverse, Error, TEXT("UnifiedUniverse: galaxy texture '%s' not loaded (%s). Galaxies use their untextured field: regenerate it with the noise project into %s, or set uu.GalaxyTextures 0."),
+				UTF8_TO_TCHAR(UniCore::GalaxyTextureName(S)), UTF8_TO_TCHAR(Err.c_str()), *Dir);
+			return;
+		}
+	}
+	if (T[0]->Size != T[1]->Size || T[1]->Size != T[2]->Size)
+	{
+		UE_LOG(LogUnifiedUniverse, Error, TEXT("UnifiedUniverse: galaxy textures differ in size (%u, %u, %u); they must match. Galaxies use their untextured field."), T[0]->Size, T[1]->Size, T[2]->Size);
+		return;
+	}
+	for (int32 S = 0; S < 3; ++S)
+	{
+		TArray<TArray<FUintVector2>> Mips;
+		for (uint32 M = 0; M < T[S]->NumMips(); ++M)
+		{
+			TArray<FUintVector2>& A = Mips.AddDefaulted_GetRef();
+			A.SetNumUninitialized(int32(T[S]->TexelCount(M)));
+			FMemory::Memcpy(A.GetData(), T[S]->Mips[M].data(), T[S]->Mips[M].size() * sizeof(uint16));   // RGBA16F halves, as the web texture
+		}
+		FUniRenderer::Get().SetGalaxyTexture_GameThread(S, T[S]->Size, MoveTemp(Mips));
+		GalaxyTextures[S] = MoveTemp(T[S]);
+		UniCore::BindGalaxyTexture(S, GalaxyTextures[S].Get());
+	}
+	const int32 N = UniScenes::UseGalaxyTextures(Def, GalaxyTextures[0]->Size);
+	UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: galaxy textures warp_fine, warp_large, galaxy_detail %u^3 loaded (%.2f s); %d galaxy emitters and anchors textured (D-179)"),
+		GalaxyTextures[0]->Size, FPlatformTime::Seconds() - T0, N);
 }
 
 void UUniSubsystem::SetupWebTexture(UniCore::FUniverseDef& Def)
@@ -580,7 +648,11 @@ void UUniSubsystem::Tick(float DeltaTime)
 	// excluded), added to the owner's sensitivity and applied everywhere sensitivity is.
 	{
 		const double Dt = FMath::Max(double(DeltaTime), 1.0e-4);
-		const double Speed = bCameraJumped ? 0.0 : UniCore::Length(UniCore::ToDouble(UniCore::Sub(C, PrevCamera.ToCore()))) / Dt;
+		const UniCore::FVec3d Step = UniCore::ToDouble(UniCore::Sub(C, PrevCamera.ToCore()));
+		const double Speed = bCameraJumped ? 0.0 : UniCore::Length(Step) / Dt;
+		// D-184: the volume's temporal reprojection needs the camera's move (not across a jump).
+		CameraStepCm = bCameraJumped ? FVector3d::ZeroVector : FVector3d(Step.X, Step.Y, Step.Z);
+		bCameraStepValid = !bCameraJumped;
 		Travel.MaxDeltaMag = FMath::Clamp(double(CVarUniTravelSensitivity.GetValueOnGameThread()), 0.0, 5.0);
 		Travel.StartCmPerS = FMath::Max(double(CVarUniTravelStart.GetValueOnGameThread()), 1.0);
 		Travel.FullCmPerS = FMath::Max(double(CVarUniTravelFull.GetValueOnGameThread()), Travel.StartCmPerS * 1.01);
@@ -745,6 +817,10 @@ void UUniSubsystem::PushFrame()
 		F.SystemArchetypeMask = SystemArchetypeMask;
 	}
 	F.CameraFraction = CameraFraction;
+	F.CameraStepCm = FVector3f(CameraStepCm);   // D-184
+	F.bCameraStepValid = bCameraStepValid;
+	F.DiscArchetypeMask = CVarUniSpriteEllipses.GetValueOnGameThread() != 0 ? DiscArchetypeMask : 0u;   // D-183 (render-only: live)
+	for (int32 K = 0; K < 4; ++K) { F.FixedDiscSeeds[K] = FixedDiscSeeds[K]; }
 	F.DeltaMag = EffectiveDeltaMag;   // D-154: owner sensitivity + travel boost
 	F.ExposureBias = ExposureBias;
 	F.bEnabled = true;
