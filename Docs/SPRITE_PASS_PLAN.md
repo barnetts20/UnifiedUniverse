@@ -57,6 +57,7 @@ Known gaps: galaxies are round blobs until the volume takes over (no inclination
 - **Owner question:** worth it at all distances, or only above N px?
 
 ### C. Galaxy impostors (B-011; render-only; after A)
+*Measured 2026-11-04 (D-184): with the textures in, a cluster core costs ~11% more (textured galaxies +21%); far galaxies already skip their warps (D-181). Not built. The march cost inside a galaxy went to temporal slicing instead (D-184).*
 **Goal.** Keep the volume affordable when galaxy samples become costly (A) and many galaxies are a few to tens of pixels (cluster interiors).
 - A small image per galaxy (e.g. 64² RGBA16F, view-dependent), rendered from its field by the same march, cached in an atlas, redrawn when the view direction to it changes by more than a few degrees or its size changes by 2×. Drawn as a sprite quad in place of marching it.
 - **Band:** between the sprite (below ~8 px) and the full march (above ~64 px?). Light conserved by construction (the impostor is the march's own output).
@@ -64,11 +65,13 @@ Known gaps: galaxies are round blobs until the volume takes over (no inclination
 - **Measure first:** with A's warp in, the march cost in a cluster core; build C only if it is over budget.
 
 ### D. Stars: glare, disc and bloom (B-003 stars; render-only)
+*2026-11-04: spikes tried (D-185) and withdrawn by the owner in favour of the engine's bloom and lens flares; halo chroma kept; sprite quads no longer cut bright halos (D-188).*
 **Goal.** Seamless from point to disc to promoted actor, and the glare handed to engine bloom once the star is an emissive actor.
 - Today a star's glare stays as a corona through promotion (D-158). Options: (1) keep it (simple, consistent); (2) hand the glare to engine bloom at promotion with matched flux (UE-7 territory: emissive calibration); (3) per-star promotion at the glare/physical crossover (~16–17 px for every star, B-003's numbers) instead of the fixed 0.02 rad.
 - **Art options to decide:** diffraction spikes (a camera artefact, very "space-art"), colour saturation of bright stars, limb darkening on resolved discs.
 
 ### E. Speed: warp streaks and Doppler (B-001; render-only)
+*Planned in detail 2026-11-04: Docs/WARP_PLAN.md (owner: navigable, stylised, camouflage pop-in; five questions).*
 **Goal.** Turn late-arriving objects at warp speed into streaks instead of pops, and make speed visible.
 - Detection, tails from a ring of recent camera positions, collapse over 0.1–0.3 s, as B-001 describes; the ready-frame per cell is already known to the streamer (D-173 even knows which cells were late).
 - Doppler and aberration: relativistic formula, or an artistic scale from speed relative to the level's crossing rate (at real v ≪ c nothing would show). Applying aberration to all sprites makes the starfield bunch ahead at speed (the classic look).
@@ -81,7 +84,8 @@ Known gaps: galaxies are round blobs until the volume takes over (no inclination
 ### G. The web in the sky (B-010; render-only)
 Options from D-170: (a) leave it physical (isotropic beyond ~100 Mpc); (b) a near-web glow (the web's density within N Mpc as a faint non-physical emission, own gain; uu.WebDebug's machinery in the beauty pass); (c) dim the uniform tail so the near structure carries contrast. A quick A/B in the engine decides it.
 
-### H. Sky lighting (design spec item, not started)
+### H. Sky lighting (design spec item)
+*Done 2026-11-04 (D-186, offline; UE-24): a worker-built cube from the volume scene on a movable sky light.*
 The design calls for capturing the backdrop into the sky light's cubemap so promoted bodies are lit by and reflect the galaxy around them. Small and independent; fits here.
 
 ## 4. Proposed order
@@ -100,7 +104,7 @@ Each step ends as now: offline checks (equivalence and continuity of light where
 1. ~~A: which UltraLargeScale features to keep; connecting it~~ (connected 2026-11-04; proposal in §3 A).
 2. ~~A: the warp textures~~ (delivered: warp_fine, warp_large, galaxy_detail, ism_shape, ism_erode, curl_2d).
 3. B: oriented galaxy sprites at all distances, or above a size?
-4. D: glare kept as a corona, or handed to bloom; diffraction spikes yes/no.
-5. E: streaks decorative or conserved; aberration and Doppler on all sprites or streaks only; onset speed.
-6. G: physical sky, near-web glow, or dimmed tail.
+4. ~~D: diffraction spikes~~ (owner, 2026-11-04: tried, then bloom and lens flares instead; D-185 amended). Glare kept as a corona for now.
+5. E: see Docs/WARP_PLAN.md §5 (owner asked for a plan).
+6. G: physical sky, near-web glow, or dimmed tail (owner: not sure yet; an engine A/B would decide it).
 7. ~~Art direction~~ (owner, 2026-11-04): realistic, pulled towards stylised/fantasy: more vibrant colours and more colour variation than real life, physics-based dust lanes and luminance, no two galaxies alike. Art references still welcome: a few images of the look you want (sky from inside a galaxy, a galaxy at a few degrees, warp travel) would anchor every one of these choices.

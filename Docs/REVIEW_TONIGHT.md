@@ -565,3 +565,73 @@ A reviewer read the uncompiled engine code against UE 5.3–5.6 without seeing i
   4. `uu.SpriteEllipses 0` (live) for an A/B.
 - **Tuning:** thickness q0 (0.2 discs, 0.65 early types) in `Uni_ProjectObject`; the round-below threshold (0.7 px minor sigma) in `Uni_SpriteEllipseQ`.
 - **Failure looks like:** all galaxies round (mask empty: check the log for archetypes, or the CVar), ellipses rotating as the camera turns (basis mismatch between the project pass and the sprite vertex shader), galaxies dimmer or brighter with the switch, or the Milky Way's sprite (seen from far outside) not lining up with its band.
+
+## 18. Volume march cost: temporal slicing (D-184, UE-22)
+*Owner's option for the 63 ms march. Verified offline: T2.vol.temporal. Plan step C (impostors) measured and not needed: textured galaxies add ~11% in a cluster core.*
+
+- **What changes:** each frame marches a quarter of the glow's pixels (one of every 2 × 2) and fills the rest from the previous frame, reprojected through the camera's turn and move. Expect the march at about a quarter of its cost, plus a small reconstruct pass.
+- **Content:** none.
+- **Test steps:**
+  1. Build (`UniVolume.ush`, `UniVolume.usf`, `UniShaders.h/.cpp`, `UniRenderer.h/.cpp`, `UniSubsystem.h/.cpp`). Watch the shader compile: a new pass (`ReconstructCS`) and new march outputs.
+  2. ProfileGPU inside the Milky Way: `Uni.Volume.March …, 1/4 sliced` against your 63 ms, and `Uni.Volume.Reconstruct`.
+  3. Turn and fly inside the galaxy, then past galaxies at intergalactic speed: the glow should look the same as with `uu.VolumeTemporal 0` (live A/B).
+  4. Near a promoted body (a planet against the glow): its edge stays clean.
+- **Failure looks like:** a 2 × 2 checker or crawling pattern in the glow (reprojection off: compare turning only, moving only), smearing behind moving galaxies (depth wrong), the glow black or frozen (history not kept: check the event list shows the reconstruct pass), or no saving (the march not marked sliced: debug views and uu.VolumeTemporal 0 march everything).
+
+## 19. Stars: halo colour, no square cuts (D-185 amended, D-188, UE-23)
+*Owner: spikes out (bloom and lens flares instead); bright sprites were cut into squares. Verified offline: T1.sprite.reach.*
+
+- **What changes:**
+  - Spikes are gone.
+  - A sprite's quad now reaches until its light is below black (`uu.Sprite.Floor`, 2e-4 scene colour), 3 to 8 sigmas, with a soft edge, so a bright star's halo is never cut into a square.
+  - Halos stay more saturated than the core (`uu.Sprite.HaloChroma`).
+- **Content:** none.
+- **Test steps:**
+  1. Build (`UniProject.ush`, `UniSprite.usf`, `UniShaders.h`, `UniRenderer.cpp`).
+  2. Fly up to a bright star as in your screenshot: no square edge.
+  3. Far away, raise sensitivity: no square edges on the brightest stars.
+  4. Bloom and lens flares in your post-process volume now carry the glare. For spikes, use Convolution Bloom with a spiked kernel. `uu.Sprite.Saturation 0` gives all of a star's light to bloom (no drawn halo).
+- **Failure looks like:**
+  - a square edge still: lower `uu.Sprite.Floor` (e.g. 5e-5) and tell me;
+  - a visible cost: the brightest stars' quads are bigger.
+
+## 20. Sky light from the backdrop (D-186, UE-24)
+*Design spec item (plan step H). Verified offline: T2.sky.cube.*
+
+- **What changes:** a movable sky light, lit by the glow around the camera: the galaxy's band, the web. It is refreshed on a worker thread about once a second and blended over a second.
+- **Content:** none.
+- **Test steps:**
+  1. Build (`UniSky.h`, `UniSubsystem.h/.cpp`).
+  2. `uu.GotoSystem planet` and look at the giant's night side: it should be faintly lit from the Milky Way's band, brightest towards the galactic centre. Raise `uu.SkyLightIntensity` if it is too dim against the light rig.
+  3. Fly: the lighting follows without pops.
+  4. `uu.SkyLight 0` removes it.
+- **Failure looks like:** no light at all (a log error from CreateTransient, or the sky light not spawned), the lit side facing away from the band (the cube rotated: tell me which way), a hitch every second (the job should be off the game thread).
+
+## 21. Warp travel plan (E)
+*Plan only: Docs/WARP_PLAN.md (in the project as claude/WARP_PLAN.md). Five owner questions at its end.*
+
+## 22. Warp streaks and arrival (D-187, UE-25)
+*WARP_PLAN E1 and E2, built with the plan's recommended defaults. Verified offline: T1.warp.streaks (still still_warp_streaks).*
+
+- **What changes:**
+  - At speed (the travel curve: from 100 kpc/s, full at 10 Mpc/s), stars and small galaxies streak back along their motion over the last frame, towards the vanishing point when flying forward.
+  - Turning does not streak.
+  - Streaks keep each star's light.
+  - At warp, objects in cells that arrive late fade in over 8 frames, streaking in from ahead, instead of popping.
+- **Content:** none.
+- **Test steps:**
+  1. Build:
+     - shaders: `UniProject.ush`, `UniProject.usf`, `UniSprite.usf`;
+     - engine: `UniShaders.h`, `UniRenderer.h/.cpp`, `UniSubsystem.h/.cpp`;
+     - core: `UniStreamer.h`, `UniSystem.h`, `UniGpuTypes.h`.
+  2. `uu.Enable flythrough` and accelerate to intergalactic speed: streaks grow over about half a second, and shrink when you slow down.
+  3. Turn without moving: no streaks.
+  4. Watch the edges at speed: late objects should slide in, not pop.
+  5. A/B with `uu.Warp 0`. Tune with `uu.Warp.StreakFrames` (1), `uu.Warp.StreakMax` (64 px), `uu.Warp.Arrival` (8 frames) and `uu.Warp.ArrivalStretch` (6).
+- **Failure looks like:**
+  - streaks pointing the wrong way (away from the travel direction's vanishing point);
+  - streaks while only turning;
+  - stars dimming at speed (light should be kept);
+  - objects blinking at rest (arrival should be off at rest);
+  - planets fading in and out (their cells are always settled).
+

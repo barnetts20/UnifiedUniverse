@@ -26,6 +26,11 @@ float4 InvDeviceZToWorldZTransform; // FSceneView::InvDeviceZToWorldZTransform
 float4 DepthUVScaleBias;            // output pixel -> scene-depth UV (TSR upscaling changes resolution)
 float3 SceneColourScale;            // exposure-calibrated radiance -> scene colour units (lesson #36)
 float PixelsPerRadian;              // output pixels per radian at the view centre
+float HaloChroma;                   // D-185: halo chroma x the star's (luminance kept)
+float SpriteFloor;                  // D-188: scene colour below which a sprite's quad may end
+float4 WarpA;                       // D-187: (warp 0..1, streak exposure frames, longest streak px, arrival stretch)
+float3 CamStep;                     // D-187: camera move over the last frame (cm, now minus then)
+float WarpPad;
 
 Texture2D SceneDepthTexture;
 SamplerState SceneDepthSampler;
@@ -52,6 +57,9 @@ struct FSpriteVSOut
 	nointerpolation float CoreWeight : TEXCOORD9; // D-158: 0 for a promoted star (its actor draws the disc)
 	nointerpolation float EllipseAngle : TEXCOORD10; // D-183: the core ellipse's minor axis in the quad basis
 	nointerpolation float EllipseQ : TEXCOORD11;     // D-183: its effective axis ratio (1: round)
+	nointerpolation float3 HaloRadiance : TEXCOORD12; // D-185: the halo's colour (chroma scaled, luminance kept)
+	nointerpolation float ReachPx : TEXCOORD13;       // D-188: the quad's half size, pixels (the edge window's)
+	nointerpolation float3 Streak : TEXCOORD14;       // D-187: tail direction (quad basis) and length px (0: none)
 };
 
 void MainVS(uint VertexId : SV_VertexID, uint InstanceId : SV_InstanceID, out FSpriteVSOut Out)
@@ -69,21 +77,45 @@ void MainVS(uint VertexId : SV_VertexID, uint InstanceId : SV_InstanceID, out FS
 	const float3 Side = normalize(cross(Dir, ViewUp + ViewRight * 1.0e-3));
 	const float3 Up = cross(Side, Dir);
 	// D-156: the quad covers the footprint (the halo's sigma when the sprite has one; most
-	// sprites have none and stay a few pixels across).
+	// sprites have none and stay a few pixels across). D-188: out to where the core and the halo
+	// fall below SpriteFloor (at least SpriteExtent sigmas, at most UNI_SPRITE_REACH_MAX): a
+	// fixed 3 sigmas cut a bright star's halo into a square.
 	const float Foot = Uni_SpriteFootprint(S);
-	const float HalfSize = Foot * R * SpriteExtent;
-	const float3 P = S.RenderPos + (Side * C.x + Up * C.y) * HalfSize;
+	const float FootPxV = max(Foot * PixelsPerRadian, 0.5f);
+	const float SigmaPxV = max(S.AngularRadius * PixelsPerRadian, 0.5f);
+	const float HaloPxV = S.HaloRatio > 0.0f ? max(S.HaloRadius * PixelsPerRadian, 0.5f) : 0.0f;
+	const float LumV = Uni_Luminance(S.Radiance * SceneColourScale);
+	const float ReachPx = max(Uni_SpriteReachPx(LumV, SigmaPxV, Uni_SpriteDiscFrac(S, PixelsPerRadian), HaloPxV, S.HaloRatio, Uni_SpriteCoreWeight(S), SpriteFloor, SpriteExtent),
+		SpriteExtent * FootPxV);
+	// D-187: at warp a point source streaks back along its motion over the last frame (the
+	// camera's move only); the quad becomes the box from the sprite to its tail's end.
+	float3 Streak = float3(0.0f, 0.0f, 0.0f);
+	if (WarpA.x > 0.0f && Uni_SpriteDiscFrac(S, PixelsPerRadian) <= 0.0f && Uni_SpriteEllipseQ(S, SigmaPxV) >= 1.0f)
+	{
+		Streak = Uni_SpriteStreak(Dir, S.TrueDistance, CamStep, Side, Up, PixelsPerRadian, WarpA, (float)(S.Flags >> UNI_SPRITE_ARRIVAL_SHIFT) / 255.0f);
+	}
+	float2 O = C * ReachPx;   // pixels in the quad's basis
+	if (Streak.z > 0.0f)
+	{
+		const float2 Ax = Streak.xy;
+		const float2 Bx = float2(-Ax.y, Ax.x);
+		O = Ax * lerp(-ReachPx, Streak.z + ReachPx, C.x * 0.5f + 0.5f) + Bx * (C.y * ReachPx);
+	}
+	const float3 P = S.RenderPos + (Side * O.x + Up * O.y) * (R / PixelsPerRadian);
 	Out.Position = mul(float4(P, 1.0f), TranslatedWorldToClip);
-	Out.Corner = C * SpriteExtent;
+	Out.Corner = O / FootPxV;
+	Out.ReachPx = ReachPx;
+	Out.Streak = Streak;
 	Out.Radiance = S.Radiance * SceneColourScale;
 	Out.TrueDistance = S.TrueDistance;
 	Out.CosToForward = max(dot(Dir, ViewForward), 1.0e-3);
-	Out.SigmaPx = max(S.AngularRadius * PixelsPerRadian, 0.5f);
+	Out.SigmaPx = SigmaPxV;
 	Out.DiscFrac = Uni_SpriteDiscFrac(S, PixelsPerRadian);
-	Out.FootPx = max(Foot * PixelsPerRadian, 0.5f);
-	Out.HaloPx = S.HaloRatio > 0.0f ? max(S.HaloRadius * PixelsPerRadian, 0.5f) : 0.0f;
+	Out.FootPx = FootPxV;
+	Out.HaloPx = HaloPxV;
 	Out.HaloRatio = S.HaloRatio;
 	Out.CoreWeight = Uni_SpriteCoreWeight(S);
+	Out.HaloRadiance = Uni_SpriteChroma(S.Radiance, HaloChroma) * SceneColourScale;
 	Out.EllipseAngle = S.EllipseAngle;
 	Out.EllipseQ = Uni_SpriteEllipseQ(S, Out.SigmaPx);
 }
@@ -109,7 +141,27 @@ void MainPS(in FSpriteVSOut In, out float4 OutColor : SV_Target0)
 	// PIXEL so the energy summed over the covered pixels is Radiance x (1 + HaloRatio) whatever
 	// the sprite's size.
 	// D-183: Corner is in the quad's (Side, Up) basis, the basis of the ellipse's angle.
-	const float W = Uni_SpriteProfileEllipse(In.Corner.x * In.FootPx, In.Corner.y * In.FootPx, In.SigmaPx, In.DiscFrac, In.HaloPx, In.HaloRatio, In.CoreWeight, In.EllipseAngle, In.EllipseQ);
+	// D-185: the core in the star's colour, the halo in the chroma-scaled one. D-188: a soft edge
+	// over the quad's last tenth.
+	const float Xp = In.Corner.x * In.FootPx, Yp = In.Corner.y * In.FootPx;
+	const float Rp = sqrt(Xp * Xp + Yp * Yp);
+	float Wall, Wglare, Edge;
+	if (In.Streak.z > 0.0f)
+	{
+		// D-187: core and halo smeared along the tail; the soft edge by distance to the tail.
+		const float U = Xp * In.Streak.x + Yp * In.Streak.y;
+		const float Uc = clamp(U, 0.0f, In.Streak.z);
+		const float Dx = Xp - In.Streak.x * Uc, Dy = Yp - In.Streak.y * Uc;
+		Edge = Uni_SpriteEdgeWindow(sqrt(Dx * Dx + Dy * Dy), In.ReachPx);
+		Wall = Uni_SpriteProfileStreak(Xp, Yp, In.SigmaPx, In.HaloPx, In.HaloRatio, In.CoreWeight, In.Streak.x, In.Streak.y, In.Streak.z) * Edge;
+		Wglare = Uni_SpriteProfileStreak(Xp, Yp, In.SigmaPx, In.HaloPx, In.HaloRatio, 0.0f, In.Streak.x, In.Streak.y, In.Streak.z) * Edge;
+	}
+	else
+	{
+		Edge = Uni_SpriteEdgeWindow(Rp, In.ReachPx);
+		Wall = Uni_SpriteProfileEllipse(Xp, Yp, In.SigmaPx, In.DiscFrac, In.HaloPx, In.HaloRatio, In.CoreWeight, In.EllipseAngle, In.EllipseQ) * Edge;
+		Wglare = In.HaloRatio > 0.0f ? Uni_SpriteProfileHalo(Rp, In.SigmaPx, In.DiscFrac, In.HaloPx, In.HaloRatio, 0.0f) * Edge : 0.0f;
+	}
 	float T = 1.0f;
 	if (bVolume != 0u)
 	{
@@ -124,5 +176,5 @@ void MainPS(in FSpriteVSOut In, out float4 OutColor : SV_Target0)
 			T = Lo + (Hi - Lo) * (X - (float)I);
 		}
 	}
-	OutColor = float4(In.Radiance * (W * T), 0.0f);
+	OutColor = float4((In.Radiance * max(Wall - Wglare, 0.0f) + In.HaloRadiance * Wglare) * T, 0.0f);
 }

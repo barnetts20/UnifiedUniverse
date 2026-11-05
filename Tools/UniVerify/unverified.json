@@ -82,5 +82,21 @@
   {
     "id": "UE-21",
     "what": "Inclined galaxy sprites in the engine (D-183): galaxies a few to tens of pixels across read as ellipses at their discs' inclinations (edge-on needles, face-on discs) with no change in brightness; the ellipse lines up with the volume's glow at the hand-off (no rotation or squash jump); one- or two-pixel galaxies stay round; uu.SpriteEllipses 0 for an A/B; shader compile of the new sprite interpolants and the project pass's FixedDiscSeeds (REVIEW_TONIGHT \u00a717)."
+  },
+  {
+    "id": "UE-22",
+    "what": "Temporal slicing of the volume march in the engine (D-184): ProfileGPU shows Uni.Volume.March with ', 1/4 sliced' at about a quarter of its D-181 cost inside a galaxy, plus a cheap Uni.Volume.Reconstruct; no visible 2 x 2 pattern, smearing or lag in the glow while turning and flying (inside a galaxy, past galaxies at intergalactic speed); edges of promoted bodies against the glow stay clean; uu.VolumeTemporal 0 for an A/B; shader compile of the reconstruct pass (REVIEW_TONIGHT \u00a718)."
+  },
+  {
+    "id": "UE-23",
+    "what": "Star halos in the engine (D-185 amended, D-188): no square cut around bright stars up close or far away (the quad now reaches until the light falls below uu.Sprite.Floor, with a soft edge); halos more saturated than the core (uu.Sprite.HaloChroma 1 for an A/B); the engine's bloom and lens flares pick up bright stars (spikes withdrawn: Convolution Bloom with a spiked kernel if wanted; uu.Sprite.Saturation 0 hands all of a star's light to them); shader compile of the sprite pass (REVIEW_TONIGHT \u00a719)."
+  },
+  {
+    "id": "UE-24",
+    "what": "Sky light from the backdrop in the engine (D-186): a transient movable sky light appears after uu.Enable; promoted bodies are lit from the galaxy's band on their dark side and reflect it, brightest towards the galactic centre; the light follows travel without popping (1 s blends); no game-thread hitch (the cube is built on a worker); uu.SkyLight 0 removes it; the cube's orientation matches the sky (REVIEW_TONIGHT \u00a720)."
+  },
+  {
+    "id": "UE-25",
+    "what": "Warp streaks and arrival in the engine (D-187): at intergalactic speed stars and small galaxies streak back towards the vanishing point (none while turning in place, none at rest), with no change in overall brightness; objects in late cells stream in from ahead over ~8 frames instead of popping; uu.Warp 0 for an A/B; uu.Warp.StreakFrames, StreakMax, Arrival, ArrivalStretch for tuning; shader compile of the project and sprite passes (REVIEW_TONIGHT \u00a722)."
   }
 ]

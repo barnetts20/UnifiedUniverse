@@ -32,7 +32,7 @@ namespace UniCore
 		uint32_t Level;
 		uint32_t PoolStart;
 		uint32_t PoolCount;
-		uint32_t Flags;       // bit 0: level suspended (velocity LOD), bits 8..15: level fade 0..255
+		uint32_t Flags;       // bit 0: level suspended (velocity LOD), bits 8..15: level fade 0..255, bits 16..23: frames since first Ready (D-187)
 	};
 	static_assert(sizeof(FCellGPU) == 64, "FCellGPU must match FUniCellGPU (UniProject.usf)");
 

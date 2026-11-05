@@ -1113,3 +1113,108 @@ Rationale: T2.galaxy.sprites, 160 galaxies of the web scene, each looked at head
 Known limits: per-galaxy thickness is not carried (worst edge-on mismatch at the hand-off ~0.1 in axis ratio); a per-galaxy q0 from the rolled parameters would need the emitter ranges on the GPU. Bulge-dominated galaxies read slightly too thin edge-on.
 Reroll impact: None (render-only; no record, seed or placement change).
 Status: Provisional (UE-21)
+
+D-184 — Temporal slicing of the volume march (owner's option; SPRITE_PASS_PLAN step C measured)
+Question: Owner, in the engine after D-179: the GPU march is the frame's cost inside a galaxy (63 ms) and offered temporal slicing like the engine's cloud renderer, upsampling, adaptive steps or less noise. D-181 cut the per-sample cost; temporal slicing is the larger lever. Plan step C (impostors) was to be built only if the cluster-core march was over budget with the galaxy textures in.
+Measured first (reference, 242 × 159, anchored rich cluster): from inside the core textured galaxies cost 154 ms against 127 ms untextured (+21%; the whole frame +11%), from 2 Mpc no change. Far galaxies already skip the warps (D-181), so impostors (C) are not needed; not built.
+Decision (render-only):
+- **Slicing.** Each frame marches one pixel of every 2 × 2 block of the march grid; the phase cycles through the four in a Bayer order (`Uni_TemporalOffset`), so every pixel is fresh every fourth frame. The march dispatches a quarter of the threads.
+- **Reconstruction** (new compute pass `Uni.Volume.Reconstruct`, `UNI_VOL_PASS 3`; rules in the shared core, `Uni_Temporal*` in UniVolume.ush): a pixel not marched this frame takes the previous frame's output reprojected through the camera's rotation and its move (`FUniFrameData::CameraStepCm`, from the subsystem's exact camera delta), at the depth its light comes from (new `FUniVolumeResult::LnDepth`: the march's luminance-weighted ln t, from the fresh neighbours). The history is resampled by Catmull-Rom where all 16 texels are on the grid and on this pixel's scene surface (bilinear otherwise: bilinear alone blurs a moving image a little more every frame it is reprojected), accepted while its texels lie on the same scene surface (promoted bodies) and its luminance is within a factor of 4 of the fresh neighbours'. Otherwise the fresh neighbours, bilinear and depth-aware like the composite.
+- **History.** The frame's reconstructed volume, slices and depth are kept (extracted render targets) with the view. It is dropped on a jump (teleport, goto, uu.Enable), a new march size, or a non-consecutive frame; that frame marches every pixel.
+- `uu.VolumeTemporal` (1), live; the debug views always march every pixel.
+- The CPU reference runs the same (`FTemporalVolume`, UniVolumeRef.h); the per-pixel march is factored out of RenderVolume (`MarchPixel`, unchanged results).
+Rationale: T2.vol.temporal, 16-frame paths against a full march of every frame (the first four not compared):
+- inside the Milky Way at rest: identical (p95 0.0%);
+- turning 1° a frame (~1.8 px): light 0.03%, per-pixel p95 0.5%;
+- flying 3 pc a frame and turning: light 0.09%, p95 0.6%;
+- from 60 kpc drifting 0.4 kpc a frame (~24 Mpc/s at 60 fps), 320 × 200: light 0.23%, p95 1.3%; drifting and turning 0.3° a frame: 0.39%, p95 2.8%, worst 8 × 8 block 2.0%;
+- 25% of the pixels marched; on the reference 3.5–4× less time for the volume.
+- Bilinear history instead of Catmull-Rom: p95 ~10% on the far galaxy turning; at 160 × 100 (arms a pixel or two wide) the reprojection's resampling dominates (7% mean error, 1% at 320 × 200).
+- T3.vol.march, conservation, handoff and cube unchanged.
+Known: up to three frames of latency in the glow of a pixel (light that changes while the camera is still, such as the travel-sensitivity ramp, refreshes over four frames, a faint 2 × 2 pattern while it changes); scene-surface edges (promoted bodies) are handled by the same-surface test but not checked offline (no surfaces in the volume checks).
+Reroll impact: None (render only).
+Status: Provisional (UE-22: ProfileGPU Uni.Volume.March and Uni.Volume.Reconstruct, look while flying and turning)
+
+D-185 — Diffraction spikes and halo colour on bright stars (SPRITE_PASS_PLAN §3 D; owner: better star sprites, spikes yes)
+Question: Owner: better star sprite work, with diffraction spikes. The D-156/D-158 sprite is a pinpoint core plus a capped round halo above saturation.
+Decision (render-only, sprite style):
+- **Spikes** (`Uni_SpriteSpikes`, UniProject.ush, shared by the sprite pixel shader and the reference splat): on every sprite with a halo (point sources above saturation, D-158), so they appear and grow with it and never shrink on the way in. Lines through the centre at Angle + k π / lines in the quad's (Side, Up) basis (about screen-aligned). Along each, (1 − |u| / length)³; across, a Gaussian of 0.7 px. Their light is Gain × the halo's, exact over the pixels (the profile ends at its length, which the quad covers). Length = 10 halo sigmas, at most 48 px.
+- **Halo chroma** (`Uni_SpriteChroma`): the halo and spikes take the star's colour with its chroma × 1.4, luminance kept. The core stays the star's colour (it reads white once it saturates). This is the art direction's "more vibrant" for bright stars.
+- **Defaults and switches:** 4 spikes (a cross), gain 0.5. `uu.Sprite.Spikes` (0 off; 6 or 8 more arms), `.SpikeGain`, `.SpikeLength`, `.SpikeMax`, `.SpikeAngle` (degrees), `.SpikeWidth`, `.HaloChroma` (1: the star's colour); live, render thread.
+- The glare (halo) is kept through promotion as before (D-158): a promoted star keeps its halo and spikes around the actor. Handing it to the engine's bloom stays possible later (physical mode, uu.Sprite.Saturation 0, draws neither).
+- The reference camera's style is off by default (stills and render checks unchanged bit for bit).
+Rationale: T1.sprite.spikes:
+- 400 random styles (2–8 spikes, lengths 2–48 px, widths 0.5–1.5 px, any angle and sub-pixel centre): spike light within 1.28% of gain × halo light;
+- a line, not a disc (on-spike against off-spike far above 50);
+- length and light never shrink as the halo grows;
+- chroma keeps luminance (2e-7), makes colours more vivid, identity at 1;
+- the splat deposits radiance × (core + halo × (1 + gain)) within 1e-7;
+- style off draws every sprite as before, bit for bit.
+- T1.sprite.style, arrival and profile, T2.parallax.promotion and T3.frames unchanged. Still: still_star_spikes (4, 6, and 4 at 45°; warm, white and blue stars).
+Reroll impact: None (render only).
+Status: Provisional (UE-23; tuning is art direction)
+
+D-186 — Sky light from the backdrop (design spec item; SPRITE_PASS_PLAN §3 H)
+Question: The design calls for promoted bodies lit by, and reflecting, the galaxy around them. Our backdrop draws after the scene, so the engine's sky capture never sees it.
+Decision:
+- **Cube** (`UniCore::BuildSkyCube`, UniSky.h): 16 texels a face, each the mean of 2 × 2 rays marched through a copy of the frame's volume scene (local and background carriers, to the horizon, the texel's footprint as the prefilter). Direct3D / Unreal face order and orientation (`SkyTexelDir`). Radiance × one screen pixel's solid angle, so a texel holds what a screen pixel of that sky shows.
+- Sprites are not in it (a few percent of a galaxy's light). The nearest star lights through the light rig (D-147).
+- **Engine** (`UUniSubsystem::StartSkyJob` / `UpdateSkyLight`):
+  - a worker job every `uu.SkyLightInterval` (1 s), started only when the last one is done;
+  - the result is uploaded as a transient float cubemap (`UTextureCube::CreateTransient`);
+  - it is blended in over `uu.SkyLightBlend` (1 s) on a movable sky light with a specified cubemap (SetCubemapBlend, then SetCubemap), lower hemisphere not black;
+  - `uu.SkyLight` (1), `uu.SkyLightSize` (16), `uu.SkyLightIntensity` (1);
+  - disabling waits for the worker (it reads the CPU textures).
+Rationale: T2.sky.cube:
+- Direct3D's face selection of 20,000 directions comes back through SkyTexelDir (3.5e-16);
+- the texels tile the sphere (4π to 1e-10);
+- inside the Milky Way the brightest 5% of texels lie along the disc (mean |z| 0.097) and the brightest is towards the centre (cos 0.981);
+- 16 and 48 texels a face hold the same light (1.026; one ray per texel was 1.08);
+- the 16-texel cube takes 0.4 s on one reference thread, untextured. Textured, expect ~1–2 s on a worker; it refreshes at most once a second.
+Known: the sky light is only as bright as the glow on screen, so next to the 10-lux light rig (uncalibrated, D-147) it may need uu.SkyLightIntensity. A level's own sky light adds to it. If the engine samples the cube rotated or mirrored, the face table is the place to fix (the check pins Direct3D's convention).
+Reroll impact: None.
+Status: Provisional (UE-24)
+
+D-185 (amended, owner 2026-11-04) — Spikes withdrawn. Owner, after seeing them: star glare should come from the scene's post-processing (bloom and lens flares) instead of drawn spikes. The spike profile, its style and its console variables are removed (uu.Sprite.Spikes … SpikeWidth gone); the halo chroma stays (uu.Sprite.HaloChroma). The sprites are drawn after motion blur and before bloom and tonemapping (D-006, D-124), so they already feed the engine's bloom and lens flares. A bloom kernel with spikes (Convolution Bloom) gives engine-side spikes if wanted. uu.Sprite.Saturation 0 (physical mode, D-156) hands all of a star's light to them (no drawn halo).
+
+D-188 — Sprite quads reach until their light falls below a floor (owner: bright sprites "bleed to the edge and clip")
+Question: Owner's screenshot: a bright star near promotion, its halo cut into a square. The sprite quad was a fixed 3 sigmas of its footprint, where a Gaussian is still 1.1% of its peak. For a halo hundreds of times over the display's black, that is a visible edge.
+Decision (render-only):
+- **Reach** (`Uni_SpriteReachPx`, UniProject.ush): the quad reaches until the core and the halo each fall below half of `uu.Sprite.Floor` (2e-4 in pre-exposed scene colour, below one 8-bit step after tonemapping), so together they stay under it. It is never under SpriteExtent (3) sigmas and at most 8 sigmas (`UNI_SPRITE_REACH_MAX`); a resolved disc reaches past its soft edge. It is computed in the sprite vertex shader from the sprite's luminance.
+- **Soft edge** (`Uni_SpriteEdgeWindow`): the profile fades to zero over the quad's last tenth, so a profile cut at the 8-sigma cap still shows no square.
+- The reference splat already sized its kernel by brightness (unchanged).
+Rationale: T1.sprite.reach, 2,000 sprites with cores 0.5–6.5 px, halos up to 5×, luminance 1e-3 to 1e8:
+- 0 above the floor at their reach (worst exactly the floor), 0 under 3 sigmas;
+- the light beyond the soft edge and outside the quad is at most 1.6% (the fixed 3-sigma quad lost 1.1%; most sprites now reach much farther);
+- halo chroma: luminance kept to 2.4e-7.
+- T1.sprite.style and profile, T3.frames and T2.galaxy.sprites unchanged.
+Cost: the brightest stars' quads grow, about 2.3× the radius for a very bright one, so ~5× the area for a handful of sprites; faint ones are unchanged at 3 sigmas.
+Reroll impact: None (render only).
+Status: Provisional (UE-23)
+
+D-187 — Warp streaks and arrival as motion (WARP_PLAN E1, E2; render-only)
+Question: Owner: speed should read as speed while staying navigable, and the effects should hide pop-in. WARP_PLAN proposed streaks (E1) and arrival as motion (E2) first, both in the sprite pass. Its five owner questions mostly concern E3/E4; E1/E2 are built with the plan's recommended defaults (the travel curve; light-conserving streaks).
+Decision:
+- **Warp amount.** The travel-sensitivity curve (D-154) normalised to 0..1: 0 below 100 kpc/s, 1 at 10 Mpc/s, smoothstep in log speed, rising 2/s and falling 1/s. Jumps don't count. `uu.Warp` (1) scales it, 0 is physical. `FUniFrameData::WarpAmount`.
+- **Streaks (E1)** (`Uni_SpriteStreak`, `Uni_SpriteProfileStreak`, UniProject.ush):
+  - A point source's core and halo are smeared evenly along its motion over the last frame. The object is static, so its previous direction is normalize(Dir + CamStep / distance), the camera's move only. Turning does not streak, so steering stays readable.
+  - Flying forward, tails point back to the vanishing point.
+  - Length: the motion × `uu.Warp.StreakFrames` (1) × the warp amount, at most `uu.Warp.StreakMax` (64 px).
+  - The profile is a Gaussian convolved with the segment (erf, Abramowitz–Stegun 7.1.26, the same on CPU and GPU). It sums to the sprite's light at any length, so the streak keeps the star's light.
+  - The quad becomes the box from the sprite to its tail's end; D-188's reach and soft edge apply around the segment.
+  - Bodies (resolved discs) and inclined galaxy ellipses don't streak.
+- **Arrival (E2):**
+  - The streamer records the frame a cell first became Ready (a regeneration keeps it). The cell table carries its age in Flags bits 16..23; planets' dynamic cells are always settled.
+  - At warp, the project pass fades a new cell's objects in over `uu.Warp.Arrival` (8) frames: level fade × lerp(1, arrival, warp). It stores the arrival in the sprite's Flags bits 24..31.
+  - The sprite pass stretches an arriving sprite's tail by 1 + `uu.Warp.ArrivalStretch` (6) × (1 − arrival). An object that arrives late streams in from ahead and settles, instead of popping.
+  - At rest nothing changes: arrival is off, and the age bits are ignored.
+Rationale: T1.warp.streaks:
+- erf within 4.1e-7;
+- over 300 random streaks (sigma 0.6–4 px, 0–64 px long, any angle and sub-pixel centre): light within 0.03%, centroid at half the length along the tail (0.01 of the bar), on its axis, continuous at the short-tail switch (1.4e-4);
+- 474 forward tails all point to the view centre; sideways moves streak along the move; none at rest or without warp; none over the cap; arriving tails exactly 7× as long;
+- arrival 0 → 1 over its frames;
+- 59,194 cell-frames: every cell's age is 0 on its first Ready frame and one more each frame after.
+- Still: still_warp_streaks (warp 0, 0.5, 1). Fixed while building it: |Dir × distance|² overflows a float past ~1e19 cm, so the direction is divided through first.
+Known: the streak follows the last frame's move, so a sudden stop shortens it at once (the warp amount itself falls over a second). Galaxy sprites large enough to be ellipses don't streak.
+Reroll impact: None (render only; the cell age is bookkeeping).
+Status: Provisional (UE-25; the remaining WARP_PLAN questions decide E3/E4)

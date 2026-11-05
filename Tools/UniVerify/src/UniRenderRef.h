@@ -42,6 +42,7 @@ namespace UniRender
 		u32 SystemArchetypeMask = 1u << 1;   // the demo's star archetype (UniDemoScenes kStar) has systems (D-150)
 		u32 DiscArchetypeMask = 0u;          // D-183: archetypes drawn as inclined ellipses (0: every sprite round, as before)
 		u32 FixedDiscSeeds[4] = { 0u, 0u, 0u, 0u };   // D-183: fixed-orientation anchors (disc normal world z)
+		float HaloChroma = 1.0f;   // D-185: halo chroma; 1 here by default (sprites as before)
 
 		void LookAlong(FV3 F, FV3 WorldUp = { 0, 0, 1 })
 		{
@@ -144,6 +145,8 @@ namespace UniRender
 			const double HPeak = Lum * HaloRatio / (6.283185307179586 * HaloSigma * HaloSigma);
 			Reach = std::max(Reach, HaloSigma * std::sqrt(2.0 * std::log(std::max(HPeak / 1.0e-3, 2.0))));
 		}
+		// D-185: the halo's chroma.
+		const bool bGlareColour = HaloRatio > 0.0 && Cam.HaloChroma != 1.0f;
 		const int Rad = int(std::min(160.0, std::ceil(std::max({ 3.0 * Sigma, 3.0 * HaloSigma, Reach, double(DiscFrac) * Sigma + 2.0 }))));
 		const float CoreW = H::Uni_SpriteCoreWeight(S);   // D-158: 0 for a promoted star's glare
 		// D-183: a disc galaxy's core is an ellipse in the quad's (Side, Up) basis, built from the
@@ -160,12 +163,19 @@ namespace UniRender
 			Sx[0] = Dot(Cam.Right, Side); Sx[1] = -Dot(Cam.Up, Side);   // a pixel step's component along Side: (x right, y down)
 			Uy[0] = Dot(Cam.Right, Up); Uy[1] = -Dot(Cam.Up, Up);
 		}
-		auto Profile = [&](double Ex, double Ey)
+		auto Base = [&](double Ex, double Ey)
 		{
 			if (!(Q < 1.0f)) { return double(H::Uni_SpriteProfileHalo(float(std::sqrt(Ex * Ex + Ey * Ey)), float(Sigma), DiscFrac, float(HaloSigma), float(HaloRatio), CoreW)); }   // round: as before D-183, bit for bit
 			const double U = Ex * Sx[0] + Ey * Sx[1], V = Ex * Uy[0] + Ey * Uy[1];
 			return double(H::Uni_SpriteProfileEllipse(float(U), float(V), float(Sigma), DiscFrac, float(HaloSigma), float(HaloRatio), CoreW, S.EllipseAngle, Q));
 		};
+		// The halo alone (core weight 0): drawn in the chroma-scaled colour.
+		auto Glare = [&](double Ex, double Ey)
+		{
+			return double(H::Uni_SpriteProfileHalo(float(std::sqrt(Ex * Ex + Ey * Ey)), float(Sigma), DiscFrac, float(HaloSigma), float(HaloRatio), 0.0f));
+		};
+		auto Profile = [&](double Ex, double Ey) { return Base(Ex, Ey); };
+		const H::float3 HaloRad = bGlareColour ? H::Uni_SpriteChroma(S.Radiance, Cam.HaloChroma) : S.Radiance;
 		const int Cx = int(std::floor(Px)), Cy = int(std::floor(Py));
 		// Scene-depth test at the sprite centre pixel, as the pixel shader does per pixel.
 		bool bAnyKept = false;
@@ -181,8 +191,17 @@ namespace UniRender
 			if (X < 0 || Y < 0 || X >= Img.W || Y >= Img.H) { continue; }
 			if (!H::Uni_SceneDepthKeep(S.TrueDistance, float(std::min(Img.SceneDist[size_t(Y) * Img.W + X], 3.0e38)))) { continue; }
 			const double Ex = (X + 0.5) - Px, Ey = (Y + 0.5) - Py;
-			const double Wt = Profile(Ex, Ey) / Norm * (double(CoreW) + HaloRatio);
-			Img.Add(X, Y, float(S.Radiance.x * Wt), float(S.Radiance.y * Wt), float(S.Radiance.z * Wt));
+			if (!bGlareColour)
+			{
+				const double Wt = Profile(Ex, Ey) / Norm * (double(CoreW) + HaloRatio);
+				Img.Add(X, Y, float(S.Radiance.x * Wt), float(S.Radiance.y * Wt), float(S.Radiance.z * Wt));
+			}
+			else
+			{
+				const double K = (double(CoreW) + HaloRatio) / Norm;
+				const double Wa = Profile(Ex, Ey) * K, Wg = Glare(Ex, Ey) * K, Wc = std::max(Wa - Wg, 0.0);
+				Img.Add(X, Y, float(S.Radiance.x * Wc + HaloRad.x * Wg), float(S.Radiance.y * Wc + HaloRad.y * Wg), float(S.Radiance.z * Wc + HaloRad.z * Wg));
+			}
 			bAnyKept = true;
 		}
 		return bAnyKept;

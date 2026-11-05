@@ -44,6 +44,7 @@ struct FUniFrameData
 	// temporal reprojection; not valid across a jump (teleport, goto, uu.Enable).
 	FVector3f CameraStepCm = FVector3f::ZeroVector;
 	bool bCameraStepValid = false;
+	float WarpAmount = 0.0f;   // D-187: 0 at rest, 1 at full warp (the travel curve), drives streaks and arrival
 
 	// Star systems (D-142, D-143). Planet records for the reserved pool tail
 	// (UniGpuLayout::DynamicPoolBase..), rewritten every frame, and the archetype mask the

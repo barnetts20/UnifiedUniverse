@@ -45,6 +45,11 @@
 //   uu.GotoSystem [planet]              jump into the nearest star system with a gas giant
 //                                       (planet: to 30 radii from the giant, to watch it promote)
 //   uu.LightRig <0|1>                   the directional light from the active star (M3 placeholder)
+//   uu.SkyLight <0|1>                   a sky light lit by the backdrop (D-186; uu.SkyLightSize, Interval,
+//                                       Blend, Intensity)
+//   uu.VolumeTemporal <0|1>             temporal slicing of the glow's march (D-184)
+//   uu.Sprite.HaloChroma / Floor        halo colour on bright stars (D-185); how far a sprite's quad
+//                                       reaches before its light is cut (D-188)
 //   uu.Disable
 
 #include "CoreMinimal.h"
@@ -61,7 +66,12 @@
 #include "UniTravel.h"
 #include "UniProfile.h"
 #include "UniWebTexture.h"
+#include "UniSky.h"
+#include "Async/Future.h"
 #include "UniSubsystem.generated.h"
+
+class UTextureCube;
+class ASkyLight;
 
 /** D-157: game-thread phases of the universe's frame (plain C++, not reflected). */
 namespace UniPerf
@@ -207,6 +217,7 @@ private:
 
 	// Travel sensitivity (D-154): the owner's sensitivity plus a speed-driven boost
 	UniCore::FTravelSensitivity Travel;
+	UniCore::FTravelSensitivity Warp;   // D-187: the same curve, 0..1, for the warp effects
 	float EffectiveDeltaMag = 0.0f;
 	FUniCoord PrevCamera;
 	bool bCameraJumped = true;
@@ -255,6 +266,23 @@ private:
 	void UpdateParallax(const FVector& ViewLoc);
 	void UpdateLightRig();
 	void ClearPromotion();
+
+	// D-186: the sky light from the backdrop. A small cube marched on a worker thread from a copy
+	// of the frame's volume scene every uu.SkyLightInterval seconds, uploaded as a transient
+	// cubemap and blended in over uu.SkyLightBlend seconds on a movable sky light.
+	TWeakObjectPtr<ASkyLight> SkyLightActor;
+	UPROPERTY(Transient)
+	TObjectPtr<UTextureCube> SkyCubePrev;
+	UPROPERTY(Transient)
+	TObjectPtr<UTextureCube> SkyCubeCur;
+	TFuture<UniCore::FSkyCube> SkyJob;
+	bool bSkyJob = false;
+	bool bSkyBlending = false;
+	double SkyLastStart = -1.0e9;
+	double SkyBlendStart = 0.0;
+	void StartSkyJob(const UniCore::FVolumeScene& Sc);
+	void UpdateSkyLight();
+	void ClearSkyLight();
 
 	FUniCoord Camera;
 	FUniCoord LocalAnchor;

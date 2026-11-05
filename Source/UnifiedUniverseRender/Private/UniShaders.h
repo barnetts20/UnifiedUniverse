@@ -164,6 +164,8 @@ public:
 		SHADER_PARAMETER(uint32, MaxPromote)
 		SHADER_PARAMETER(uint32, MaxActivate)
 		SHADER_PARAMETER(uint32, SystemArchetypeMask)
+		SHADER_PARAMETER(float, WarpAmount)        // D-187
+		SHADER_PARAMETER(float, ArrivalFrames)
 		SHADER_PARAMETER(uint32, DiscArchetypeMask)   // D-183
 		SHADER_PARAMETER(FUintVector4, FixedDiscSeeds)   // D-183
 		SHADER_PARAMETER(FVector3f, ViewForward)
@@ -370,6 +372,11 @@ BEGIN_SHADER_PARAMETER_STRUCT(FUniSpriteParameters, )
 	SHADER_PARAMETER(FVector4f, DepthUVScaleBias)
 	SHADER_PARAMETER(FVector3f, SceneColourScale)
 	SHADER_PARAMETER(float, PixelsPerRadian)
+	SHADER_PARAMETER(float, HaloChroma)   // D-185
+	SHADER_PARAMETER(float, SpriteFloor)  // D-188
+	SHADER_PARAMETER(FVector4f, WarpA)    // D-187: warp, streak exposure frames, longest streak px, arrival stretch
+	SHADER_PARAMETER(FVector3f, CamStep)  // D-187: camera move over the last frame, cm
+	SHADER_PARAMETER(float, WarpPad)
 	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneDepthTexture)
 	SHADER_PARAMETER_SAMPLER(SamplerState, SceneDepthSampler)
 	SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float>, VolumeSlices)

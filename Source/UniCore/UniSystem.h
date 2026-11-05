@@ -304,7 +304,7 @@ namespace UniCore
 					G.Level = u32(UNI_PLANET_CELL_LEVEL);
 					G.PoolStart = PoolBase + u32(OutRecords.size());
 					G.PoolCount = 1u;
-					G.Flags = 255u << 8;   // fully faded in: planets fade by magnitude, like everything else
+					G.Flags = (255u << 8) | (255u << 16);   // fully faded in (planets fade by magnitude, like everything else) and settled (D-187: no arrival)
 					OutRecords.push_back(PlanetRecord(A, P, Pc, K, Camera, TimeS));
 					if (Promoted && Promoted->count(P.Seed)) { OutRecords.back().A[3] |= (UniHlsl::UNI_OBJ_FLAG_PROMOTED << 16); }
 					OutCells.push_back(G);

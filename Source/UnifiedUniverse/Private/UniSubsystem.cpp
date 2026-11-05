@@ -20,6 +20,9 @@
 #include "GameFramework/Pawn.h"
 #include "Engine/DirectionalLight.h"
 #include "Components/DirectionalLightComponent.h"
+#include "Engine/SkyLight.h"
+#include "Components/SkyLightComponent.h"
+#include "Engine/TextureCube.h"
 #include "InputCoreTypes.h"
 #include "UniScaleLadder.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h"
@@ -99,6 +102,7 @@ static TAutoConsoleVariable<int32> CVarUniVolumePrefilter(TEXT("uu.VolumePrefilt
 static TAutoConsoleVariable<int32> CVarUniVolumeLutStart(TEXT("uu.VolumeLutStart"), 1, TEXT("D-160: emission-only carriers start marching where their unresolved light becomes significant, not at 1 pc. 0: from 1 pc."));
 // D-164: the cosmic web from a baked texture.
 static TAutoConsoleVariable<int32> CVarUniWebSource(TEXT("uu.WebSource"), 1, TEXT("D-164: the cosmic web's density. 1: a 3D texture with mips (uu.WebTexture) (placement and the volume read the same texels; much cheaper to march). 0: the procedural lattices (D-012). Applies at uu.Enable; switching rerolls the web's galaxies."));
+static TAutoConsoleVariable<float> CVarUniWarp(TEXT("uu.Warp"), 1.0f, TEXT("D-187: warp effects (streaks, arrival), 0..1 x the warp amount from speed (the travel-sensitivity curve). 0: physical."));
 static TAutoConsoleVariable<int32> CVarUniSpriteEllipses(TEXT("uu.SpriteEllipses"), 1, TEXT("D-183: disc galaxies' sprites are ellipses at their disc's inclination (energy unchanged; round below a few pixels). 0: every sprite round. Render-only, live."));
 static TAutoConsoleVariable<int32> CVarUniGalaxyPalettes(TEXT("uu.GalaxyPalettes"), 1, TEXT("D-182: every galaxy its own colour palette (bulge, disc, arms, knots), which its stars and glow take (chroma only: brightness unchanged). 0: physical colours. Applies at uu.Enable; rerolls star and galaxy colours only."));
 static TAutoConsoleVariable<int32> CVarUniGalaxyTextures(TEXT("uu.GalaxyTextures"), 1, TEXT("D-179: galaxies read the noise project's galaxy textures (warp_fine, warp_large, galaxy_detail in Plugins/UnifiedUniverse/Data/Noise): texture warps of discs, arms and bulges, disc noise and star-forming knots. 0: off. Applies at uu.Enable; rerolls galaxies' stars."));
@@ -260,6 +264,7 @@ void UUniSubsystem::DisableUniverse()
 	FUniRenderer::Get().SetFrame_GameThread(MoveTemp(Off));
 	VolumeBuilder.Reset();
 	ClearPromotion();
+	ClearSkyLight();   // D-186: waits for its worker (it reads the CPU textures unbound below)
 	Systems.Reset();
 	CellKeysByFrame.Reset();
 	Streamer.Reset();
@@ -658,6 +663,13 @@ void UUniSubsystem::Tick(float DeltaTime)
 		Travel.FullCmPerS = FMath::Max(double(CVarUniTravelFull.GetValueOnGameThread()), Travel.StartCmPerS * 1.01);
 		Travel.Update(Speed, Dt);
 		EffectiveDeltaMag = FMath::Clamp(DeltaMag + float(Travel.Current), -5.0f, 5.0f);
+		// D-187: the warp amount, the same curve normalised to 0..1 (render-only effects).
+		Warp.MaxDeltaMag = 1.0;
+		Warp.StartCmPerS = Travel.StartCmPerS;
+		Warp.FullCmPerS = Travel.FullCmPerS;
+		Warp.RiseMagPerS = 2.0;
+		Warp.FallMagPerS = 1.0;
+		Warp.Update(Speed, Dt);
 		PrevCamera = Camera;
 		bCameraJumped = false;
 	}
@@ -680,7 +692,7 @@ void UUniSubsystem::Tick(float DeltaTime)
 	// that just moved (same frame, same camera: no lag against the backdrop at any speed).
 	{ TRACE_CPUPROFILER_EVENT_SCOPE(Uni_Promotion); FPerfTimer T(PerfMs[PerfPromotion]); UpdatePromotion(); }
 	{ TRACE_CPUPROFILER_EVENT_SCOPE(Uni_Parallax); FPerfTimer T(PerfMs[PerfParallax]); UpdateParallax(ViewLoc); }
-	{ TRACE_CPUPROFILER_EVENT_SCOPE(Uni_LightRig); FPerfTimer T(PerfMs[PerfLightRig]); UpdateLightRig(); }
+	{ TRACE_CPUPROFILER_EVENT_SCOPE(Uni_LightRig); FPerfTimer T(PerfMs[PerfLightRig]); UpdateLightRig(); UpdateSkyLight(); }
 	{ TRACE_CPUPROFILER_EVENT_SCOPE(Uni_PushFrame); FPerfTimer T(PerfMs[PerfPushFrame]); PushFrame(); }
 	}
 	RecordPerf();
@@ -818,6 +830,7 @@ void UUniSubsystem::PushFrame()
 	}
 	F.CameraFraction = CameraFraction;
 	F.CameraStepCm = FVector3f(CameraStepCm);   // D-184
+	F.WarpAmount = float(Warp.Current) * FMath::Clamp(CVarUniWarp.GetValueOnGameThread(), 0.0f, 1.0f);   // D-187
 	F.bCameraStepValid = bCameraStepValid;
 	F.DiscArchetypeMask = CVarUniSpriteEllipses.GetValueOnGameThread() != 0 ? DiscArchetypeMask : 0u;   // D-183 (render-only: live)
 	for (int32 K = 0; K < 4; ++K) { F.FixedDiscSeeds[K] = FixedDiscSeeds[K]; }
@@ -853,6 +866,7 @@ void UUniSubsystem::PushFrame()
 		F.VolumeView = Sc.View;
 		F.BackgroundStartCm = float(Settings.BackgroundStartCm);
 		F.bVolume = true;
+		StartSkyJob(Sc);   // D-186
 
 		// Re-march the background map (D-136) when the camera has moved a quarter texel's
 		// parallax at the background's start, or its LUT has changed by more than 1%.
@@ -1056,6 +1070,119 @@ void UUniSubsystem::UpdateLightRig()
 		C->SetLightColor(FLinearColor(Near->Sys.StarRgb[0], Near->Sys.StarRgb[1], Near->Sys.StarRgb[2]));
 		C->SetIntensity(CVarUniLightRigLux.GetValueOnGameThread());
 	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// D-186: sky light from the backdrop
+// ---------------------------------------------------------------------------------------------
+
+static TAutoConsoleVariable<int32> CVarUniSkyLight(TEXT("uu.SkyLight"), 1, TEXT("D-186: a movable sky light lit by the backdrop (the galaxy's glow and the web around the camera), refreshed on a worker thread. 0: none."));
+static TAutoConsoleVariable<int32> CVarUniSkyLightSize(TEXT("uu.SkyLightSize"), 16, TEXT("D-186: sky light cube texels per face (each the mean of 2 x 2 rays)."));
+static TAutoConsoleVariable<float> CVarUniSkyLightInterval(TEXT("uu.SkyLightInterval"), 1.0f, TEXT("D-186: seconds between sky light refreshes (a refresh starts only when the last one has finished)."));
+static TAutoConsoleVariable<float> CVarUniSkyLightBlend(TEXT("uu.SkyLightBlend"), 1.0f, TEXT("D-186: seconds over which a new sky light cube blends in."));
+static TAutoConsoleVariable<float> CVarUniSkyLightIntensity(TEXT("uu.SkyLightIntensity"), 1.0f, TEXT("D-186: sky light intensity; 1: the cube holds what a screen pixel of that sky shows."));
+
+void UUniSubsystem::StartSkyJob(const UniCore::FVolumeScene& Sc)
+{
+	if (CVarUniSkyLight.GetValueOnGameThread() == 0 || bSkyJob) { return; }
+	const double Now = FPlatformTime::Seconds();
+	if (Now - SkyLastStart < double(FMath::Max(CVarUniSkyLightInterval.GetValueOnGameThread(), 0.05f))) { return; }
+	SkyLastStart = Now;
+	const int32 N = FMath::Clamp(CVarUniSkyLightSize.GetValueOnGameThread(), 4, 64);
+	// A texel holds radiance x one screen pixel's solid angle: what the screen shows of that sky.
+	const double ThetaPx = double(FUniRenderer::Get().Stats.ThetaPixelLastFrame.load());
+	const double Scale = ThetaPx * ThetaPx;
+	TSharedPtr<UniCore::FVolumeScene, ESPMode::ThreadSafe> Copy = MakeShared<UniCore::FVolumeScene, ESPMode::ThreadSafe>(Sc);
+	SkyJob = Async(EAsyncExecution::ThreadPool, [Copy, N, Scale]() { return UniCore::BuildSkyCube(*Copy, N, Scale); });
+	bSkyJob = true;
+}
+
+void UUniSubsystem::UpdateSkyLight()
+{
+	UWorld* World = GetWorld();
+	if (CVarUniSkyLight.GetValueOnGameThread() == 0 || !World)
+	{
+		ClearSkyLight();
+		return;
+	}
+	const double Now = FPlatformTime::Seconds();
+	if (bSkyJob && SkyJob.IsReady())
+	{
+		const UniCore::FSkyCube Cube = SkyJob.Get();
+		SkyJob = TFuture<UniCore::FSkyCube>();
+		bSkyJob = false;
+		const int32 N = Cube.N;
+		UTextureCube* Tex = N > 0 ? UTextureCube::CreateTransient(N, N, PF_FloatRGBA) : nullptr;
+		FTexturePlatformData* PD = Tex ? Tex->GetPlatformData() : nullptr;
+		if (PD && PD->Mips.Num() > 0)
+		{
+			Tex->SRGB = false;
+			FTexture2DMipMap& Mip = PD->Mips[0];
+			const int64 Bytes = int64(6) * N * N * int64(sizeof(FFloat16Color));
+			Mip.BulkData.Lock(LOCK_READ_WRITE);
+			FFloat16Color* Dst = reinterpret_cast<FFloat16Color*>(Mip.BulkData.Realloc(Bytes));
+			for (int64 I = 0; I < int64(6) * N * N; ++I)
+			{
+				const UniHlsl::float3 B = Cube.Texels[size_t(I)];
+				Dst[I] = FFloat16Color(FLinearColor(FMath::Clamp(B.x, 0.0f, 60000.0f), FMath::Clamp(B.y, 0.0f, 60000.0f), FMath::Clamp(B.z, 0.0f, 60000.0f), 1.0f));
+			}
+			Mip.BulkData.Unlock();
+			Tex->UpdateResource();
+			SkyCubePrev = SkyCubeCur ? SkyCubeCur.Get() : Tex;
+			SkyCubeCur = Tex;
+			SkyBlendStart = Now;
+			bSkyBlending = true;
+		}
+	}
+	if (!SkyCubeCur) { return; }
+	ASkyLight* L = SkyLightActor.Get();
+	USkyLightComponent* C = L ? L->GetLightComponent() : nullptr;
+	if (!L)
+	{
+		FActorSpawnParameters Params;
+		Params.ObjectFlags |= RF_Transient;
+		L = World->SpawnActorDeferred<ASkyLight>(ASkyLight::StaticClass(), FTransform::Identity, nullptr, nullptr, ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
+		if (!L) { return; }
+		C = L->GetLightComponent();
+		if (C)
+		{
+			C->SetMobility(EComponentMobility::Movable);
+			C->SourceType = ESkyLightSourceType::SLS_SpecifiedCubemap;
+			C->bLowerHemisphereIsBlack = false;   // the sky is all around
+		}
+		L->FinishSpawning(FTransform::Identity);
+		SkyLightActor = L;
+		bSkyBlending = true;
+	}
+	if (!C) { return; }
+	C->SetIntensity(FMath::Max(CVarUniSkyLightIntensity.GetValueOnGameThread(), 0.0f));
+	if (bSkyBlending)
+	{
+		const float Blend = FMath::Max(CVarUniSkyLightBlend.GetValueOnGameThread(), 0.0f);
+		const float A = Blend > 0.0f ? float(FMath::Clamp((Now - SkyBlendStart) / double(Blend), 0.0, 1.0)) : 1.0f;
+		if (A < 1.0f && SkyCubePrev && SkyCubePrev != SkyCubeCur)
+		{
+			C->SetCubemapBlend(SkyCubePrev, SkyCubeCur, A);
+		}
+		else
+		{
+			C->SetCubemapBlend(SkyCubeCur, SkyCubeCur, 1.0f);   // clear any blend
+			C->SetCubemap(SkyCubeCur);
+			bSkyBlending = false;
+		}
+	}
+}
+
+void UUniSubsystem::ClearSkyLight()
+{
+	if (bSkyJob) { SkyJob.Wait(); SkyJob = TFuture<UniCore::FSkyCube>(); bSkyJob = false; }
+	const UWorld* World = GetWorld();
+	if (ASkyLight* L = SkyLightActor.Get(); L && World && !World->bIsTearingDown) { L->Destroy(); }
+	SkyLightActor.Reset();
+	SkyCubePrev = nullptr;
+	SkyCubeCur = nullptr;
+	bSkyBlending = false;
+	SkyLastStart = -1.0e9;
 }
 
 void UUniSubsystem::LogClusters() const

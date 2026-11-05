@@ -39,6 +39,14 @@ static const float UNI_SPRITE_CORE_SAT = 16.0f;       // intensity (exposure uni
 static const float UNI_SPRITE_HALO_GAIN = 0.25f;      // halo energy per doubling over saturation (x saturation)
 static const float UNI_SPRITE_HALO_GROWTH_PX = 0.5f;  // halo sigma growth per doubling over saturation, px
 static const float UNI_SPRITE_HALO_MAX_PX = 4.0f;     // halo sigma cap, px
+// D-185: halo colour (render-only sprite style; uu.Sprite.HaloChroma). D-188: the sprite quad's
+// reach (uu.Sprite.Floor).
+static const float UNI_SPRITE_HALO_CHROMA = 1.4f;     // halo chroma x the star's (luminance kept)
+static const float UNI_SPRITE_FLOOR = 2.0e-4f;        // scene colour (pre-exposed): a sprite's quad reaches until its profile falls below this
+static const float UNI_SPRITE_REACH_MAX = 8.0f;       // the farthest reach, in Gaussian sigmas
+// D-187: warp streaks and arrival (WARP_PLAN E1, E2; render-only; uu.Warp*).
+static const uint UNI_SPRITE_ARRIVAL_SHIFT = 24u;     // FUniSprite::Flags bits 24..31: arrival 0..255 (255 settled)
+static const uint UNI_CELL_AGE_SHIFT = 16u;           // FUniCellGPU::Flags bits 16..23: frames since the cell first became Ready (255: settled)
 
 
 /** D-150: the distance at which an object's sprite must be back at its true perceived size.
@@ -387,6 +395,119 @@ UNI_FN float Uni_SpriteProfileEllipse(float InX, float InY, float InSigmaPx, flo
 	if (!(InQ < 1.0f)) { return Uni_SpriteProfileHalo(R, InSigmaPx, InDiscFrac, InHaloSigmaPx, InHaloRatio, InCoreWeight); }
 	float W = InCoreWeight > 0.0f ? InCoreWeight * Uni_SpriteProfile(Uni_SpriteEllipseR(InX, InY, InAngle, InQ), InSigmaPx, InDiscFrac) / InQ : 0.0f;
 	return W + Uni_SpriteProfileHalo(R, InSigmaPx, InDiscFrac, InHaloSigmaPx, InHaloRatio, 0.0f);
+}
+
+/** D-185: a colour with its chroma scaled about its luminance, luminance kept (the halo: more
+ *  vibrant than the core, which reads white once it saturates). */
+UNI_FN float3 Uni_SpriteChroma(float3 InC, float InK)
+{
+	const float Y = Uni_Luminance(InC);
+	if (!(Y > 0.0f)) { return InC; }
+	const float3 C = max(float3(Y, Y, Y) + (InC - float3(Y, Y, Y)) * InK, float3(0.0f, 0.0f, 0.0f));
+	const float Yc = Uni_Luminance(C);
+	return Yc > 0.0f ? C * (Y / Yc) : InC;
+}
+
+/** D-188: how many sigmas a Gaussian of peak InPeak (per pixel) needs before it falls below
+ *  InFloor: at least InMinSigmas (the quad's old fixed 3), at most UNI_SPRITE_REACH_MAX. */
+UNI_FN float Uni_GaussReachSigmas(float InPeak, float InFloor, float InMinSigmas)
+{
+	const float K = sqrt(2.0f * log(max(InPeak / max(InFloor, 1.0e-30f), 1.0f)));
+	return clamp(K, InMinSigmas, max(UNI_SPRITE_REACH_MAX, InMinSigmas));
+}
+
+/** D-188: the radius (pixels) a sprite's quad must cover so that nothing it draws is cut: the
+ *  core and the halo each out to where they fall below InFloor (InLum: the sprite's luminance in
+ *  the units of InFloor), a resolved disc (D-148) past its soft edge. Before, the quad was a fixed
+ *  3 sigmas, and a very bright halo was still well above black there: a square cut. */
+UNI_FN float Uni_SpriteReachPx(float InLum, float InSigmaPx, float InDiscFrac, float InHaloPx, float InHaloRatio, float InCoreWeight, float InFloor, float InMinSigmas)
+{
+	// Each part to half the floor, so core and halo together stay under it.
+	const float Fl = (InHaloRatio > 0.0f && InHaloPx > 0.0f) ? 0.5f * InFloor : InFloor;
+	const float CorePeak = InCoreWeight * InLum / (6.2831853f * InSigmaPx * InSigmaPx);
+	float R = InSigmaPx * Uni_GaussReachSigmas(CorePeak, Fl, InMinSigmas);
+	if (InDiscFrac > 0.0f) { R = max(R, InDiscFrac * InSigmaPx + 1.5f); }
+	if (InHaloRatio > 0.0f && InHaloPx > 0.0f)
+	{
+		const float HaloPeak = InHaloRatio * InLum / (6.2831853f * InHaloPx * InHaloPx);
+		R = max(R, InHaloPx * Uni_GaussReachSigmas(HaloPeak, Fl, InMinSigmas));
+	}
+	return R;
+}
+
+/** D-188: a soft edge over the quad's last tenth, so a profile cut at the reach cap still never
+ *  shows a hard square (below the cap the profile is already under the floor there). */
+UNI_FN float Uni_SpriteEdgeWindow(float InRPx, float InReachPx)
+{
+	return 1.0f - smoothstep(0.9f * InReachPx, InReachPx, InRPx);
+}
+
+/** D-187: erf, Abramowitz and Stegun 7.1.26 (|error| < 1.5e-7), the same on CPU and GPU. */
+UNI_FN float Uni_Erf(float InX)
+{
+	const float X = abs(InX);
+	const float T = 1.0f / (1.0f + 0.3275911f * X);
+	const float P = T * (0.254829592f + T * (-0.284496736f + T * (1.421413741f + T * (-1.453152027f + T * 1.061405429f))));
+	const float E = 1.0f - P * exp(-X * X);
+	return InX < 0.0f ? -E : E;
+}
+
+/** D-187: a normalised Gaussian of sigma InSigma smeared evenly along a segment from the
+ *  centre to InL pixels along (InAx, InAy) (a unit vector in the quad's basis): the light a
+ *  point leaves on the sensor while it moves through one frame's exposure. It sums to 1 over
+ *  the pixels at any length; InL -> 0 is the plain Gaussian. */
+UNI_FN float Uni_SpriteStreakGauss(float InX, float InY, float InSigma, float InAx, float InAy, float InL)
+{
+	const float S = max(InSigma, 1.0e-3f);
+	const float U = InX * InAx + InY * InAy;     // along the tail
+	const float V = -InX * InAy + InY * InAx;    // across
+	const float Across = exp(-0.5f * V * V / (S * S)) / (2.5066283f * S);
+	if (InL < 0.05f * S)
+	{
+		// Below this the difference of erfs cancels in float: the Gaussian at the tail's
+		// midpoint (exact to second order in InL / InSigma, ~1e-4 here).
+		const float Um = U - 0.5f * InL;
+		return Across * exp(-0.5f * Um * Um / (S * S)) / (2.5066283f * S);
+	}
+	const float K = 0.70710678f / S;
+	return Across * 0.5f * (Uni_Erf(U * K) - Uni_Erf((U - InL) * K)) / InL;
+}
+
+/** D-187: the core and halo of a point-source sprite as a streak (Uni_SpriteProfileHalo
+ *  smeared over the tail; sums to CoreWeight + HaloRatio). */
+UNI_FN float Uni_SpriteProfileStreak(float InX, float InY, float InSigmaPx, float InHaloSigmaPx, float InHaloRatio, float InCoreWeight, float InAx, float InAy, float InL)
+{
+	float W = InCoreWeight > 0.0f ? InCoreWeight * Uni_SpriteStreakGauss(InX, InY, InSigmaPx, InAx, InAy, InL) : 0.0f;
+	if (InHaloRatio > 0.0f && InHaloSigmaPx > 0.0f) { W += InHaloRatio * Uni_SpriteStreakGauss(InX, InY, InHaloSigmaPx, InAx, InAy, InL); }
+	return W;
+}
+
+/** D-187: a sprite's settled share from its cell's age: 0 on the frame its cell first became
+ *  Ready, 1 after InFrames frames. */
+UNI_FN float Uni_SpriteArrival(uint InAgeFrames, float InFrames)
+{
+	return InFrames > 0.0f ? saturate((float)InAgeFrames / InFrames) : 1.0f;
+}
+
+/** D-187: a sprite's streak over the last frame, from the camera's move alone (turning does not
+ *  streak, so the view stays readable while steering): the object is static, so a frame ago it
+ *  was along normalize(Dir x TrueDistance + CamStep). Returns the tail's direction in the quad's
+ *  (Side, Up) basis and its length in pixels (z; 0: no streak). InWarp: (warp amount 0..1,
+ *  exposure in frames, longest streak px, arrival stretch); an arriving sprite (InArrival < 1)
+ *  streams in with its tail stretched by 1 + stretch x (1 - arrival). */
+UNI_FN float3 Uni_SpriteStreak(float3 InDir, float InTrueDistance, float3 InCamStep, float3 InSide, float3 InUp, float InPixelsPerRadian, float4 InWarp, float InArrival)
+{
+	if (!(InWarp.x > 0.0f) || !(InWarp.y > 0.0f)) { return float3(0.0f, 0.0f, 0.0f); }
+	// Divided through by the distance first: |Dir x distance|^2 overflows a float past ~1e19 cm.
+	const float3 Prev = normalize(InDir + InCamStep * (1.0f / max(InTrueDistance, 1.0f)));
+	const float3 T = Prev - InDir;
+	const float Tx = dot(T, InSide), Ty = dot(T, InUp);
+	const float Len = sqrt(Tx * Tx + Ty * Ty);
+	if (!(Len > 0.0f)) { return float3(0.0f, 0.0f, 0.0f); }
+	const float Stretch = 1.0f + InWarp.w * (1.0f - saturate(InArrival));
+	const float L = min(Len * InPixelsPerRadian * InWarp.y * InWarp.x * Stretch, max(InWarp.z, 0.0f));
+	if (L < 0.25f) { return float3(0.0f, 0.0f, 0.0f); }
+	return float3(Tx / Len, Ty / Len, L);
 }
 
 #endif // UNI_PROJECT_USH

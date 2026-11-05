@@ -41,6 +41,8 @@ uint MaxSprites;
 uint MaxPromote;
 uint MaxActivate;
 uint SystemArchetypeMask;                        // bit per archetype id < 32 whose objects have systems
+float WarpAmount;                                // D-187: warp 0..1 (0: at rest, every sprite as before)
+float ArrivalFrames;                             // D-187: frames over which a new cell's objects arrive at warp
 uint DiscArchetypeMask;                          // D-183: bit per archetype id < 32 whose objects are disc galaxies (inclined elliptical sprites)
 uint4 FixedDiscSeeds;                            // D-183: seeds of fixed-orientation anchors (disc normal world z)
 
@@ -88,12 +90,17 @@ void MainCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
 	V.DiscArchetypeMask = DiscArchetypeMask;
 	V.FixedDiscSeeds = FixedDiscSeeds;
 
-	const float LevelFade = (float)((Cell.Flags >> 8u) & 255u) / 255.0f;
+	// D-187: at warp a new cell's objects arrive over ArrivalFrames (faded in, streaking in from
+	// ahead: the sprite pass stretches their tails by their arrival); at rest nothing changes.
+	const float Arrival = Uni_SpriteArrival((Cell.Flags >> UNI_CELL_AGE_SHIFT) & 255u, ArrivalFrames);
+	const float LevelFade = (float)((Cell.Flags >> 8u) & 255u) / 255.0f * lerp(1.0f, Arrival, saturate(WarpAmount));
+	const uint ArrivalBits = (uint)(Arrival * 255.0f + 0.5f) << UNI_SPRITE_ARRIVAL_SHIFT;
 	for (uint I = GroupIndex; I < Cell.PoolCount; I += 64)
 	{
 		const FUniObject O = InPool[Cell.PoolStart + I];
-		const FUniSprite S = Uni_ProjectObject(Cell.DeltaX, Cell.DeltaY, Cell.DeltaZ, Cell.Level, LevelFade, O, V,
+		FUniSprite S = Uni_ProjectObject(Cell.DeltaX, Cell.DeltaY, Cell.DeltaZ, Cell.Level, LevelFade, O, V,
 			(Uni_ObjectFlags(O) & UNI_OBJ_FLAG_PROMOTED) != 0u);
+		S.Flags = S.Flags | ArrivalBits;
 		// System activation: by true distance, before any culling (a system behind the camera
 		// still activates). Dynamic planet records carry an archetype id >= 32 and never match.
 		if (SystemArchetypeMask != 0u && (Uni_ObjectFlags(O) & UNI_OBJ_FLAG_DELTA_HIDDEN) == 0u && Uni_SystemActivates(Uni_ObjectArchetype(O), SystemArchetypeMask, Uni_ObjectAbsMag(O), S.TrueDistance))

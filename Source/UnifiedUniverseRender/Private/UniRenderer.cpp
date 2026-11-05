@@ -27,6 +27,12 @@ static TAutoConsoleVariable<float> CVarUniSpriteCorePx(TEXT("uu.Sprite.CorePx"),
 static TAutoConsoleVariable<float> CVarUniSpriteSaturation(TEXT("uu.Sprite.Saturation"), UniHlsl::UNI_SPRITE_CORE_SAT, TEXT("Intensity (exposure units: 1 = a star at the exposure magnitude) where a sprite's core stops brightening. 0: physical (all light in the core, no halo; the engine's bloom does the glare)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<float> CVarUniSpriteHaloGain(TEXT("uu.Sprite.HaloGain"), UniHlsl::UNI_SPRITE_HALO_GAIN, TEXT("Halo light per doubling of brightness over saturation, in units of the saturation level (0: no halo)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<float> CVarUniSpriteHaloGrowth(TEXT("uu.Sprite.HaloGrowth"), UniHlsl::UNI_SPRITE_HALO_GROWTH_PX, TEXT("Halo size growth per doubling of brightness over saturation (pixels of Gaussian sigma)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniSpriteHaloChroma(TEXT("uu.Sprite.HaloChroma"), UniHlsl::UNI_SPRITE_HALO_CHROMA, TEXT("D-185: halo colour saturation x the star's (luminance kept; 1: the star's colour)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniSpriteFloor(TEXT("uu.Sprite.Floor"), UniHlsl::UNI_SPRITE_FLOOR, TEXT("D-188: scene colour (pre-exposed) below which a sprite's quad may end: it reaches until its core and halo fall below this (3 to 8 sigmas)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniWarpStreakFrames(TEXT("uu.Warp.StreakFrames"), 1.0f, TEXT("D-187: warp streak length in frames of motion (the camera's move only), at full warp."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniWarpStreakMax(TEXT("uu.Warp.StreakMax"), 64.0f, TEXT("D-187: longest warp streak, pixels."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniWarpArrival(TEXT("uu.Warp.Arrival"), 8.0f, TEXT("D-187: at warp, frames over which a new cell's objects fade in, streaking in from ahead (0: off)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniWarpArrivalStretch(TEXT("uu.Warp.ArrivalStretch"), 6.0f, TEXT("D-187: an arriving object's streak is 1 + this x (1 - arrival) times longer."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<float> CVarUniSpriteHaloMax(TEXT("uu.Sprite.HaloMax"), UniHlsl::UNI_SPRITE_HALO_MAX_PX, TEXT("Largest halo of an unresolved sprite (Gaussian sigma, pixels)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniVolumeTemporal(TEXT("uu.VolumeTemporal"), 1, TEXT("D-184: temporal slicing of the volume march: each frame marches one pixel of every 2 x 2 block and reprojects the rest from the previous frame (about a quarter of the march's cost). 0: march every pixel every frame. Off in the debug views."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniVolumeDivisor(TEXT("uu.VolumeDivisor"), 2, TEXT("Volume march resolution divisor (1 = full, 2 = half, 4 = quarter)."), ECVF_RenderThreadSafe);
@@ -775,6 +781,8 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 		P->MaxPromote = UniGpuLayout::MaxPromote;
 		P->MaxActivate = UniGpuLayout::MaxActivate;
 		P->SystemArchetypeMask = F.SystemArchetypeMask;
+		P->WarpAmount = FMath::Clamp(F.WarpAmount, 0.0f, 1.0f);   // D-187
+		P->ArrivalFrames = FMath::Max(CVarUniWarpArrival.GetValueOnRenderThread(), 0.0f);
 		P->DiscArchetypeMask = F.DiscArchetypeMask;   // D-183
 		P->FixedDiscSeeds = FUintVector4(F.FixedDiscSeeds[0], F.FixedDiscSeeds[1], F.FixedDiscSeeds[2], F.FixedDiscSeeds[3]);
 		P->ViewForward = Forward; P->ViewRight = Right; P->ViewUp = Up;
@@ -905,6 +913,12 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 		P->Sprite.DepthUVScaleBias = FVector4f(Scale.X, Scale.Y, Bias.X, Bias.Y);
 		P->Sprite.SceneColourScale = FVector3f(F.SceneColourScale * PreExposure);   // scene colour is pre-exposed here
 		P->Sprite.PixelsPerRadian = PixelsPerRadian;
+		P->Sprite.HaloChroma = FMath::Clamp(CVarUniSpriteHaloChroma.GetValueOnRenderThread(), 0.0f, 4.0f);   // D-185
+		P->Sprite.SpriteFloor = FMath::Max(CVarUniSpriteFloor.GetValueOnRenderThread(), 1.0e-8f);           // D-188
+		P->Sprite.WarpA = FVector4f(F.bCameraStepValid ? FMath::Clamp(F.WarpAmount, 0.0f, 1.0f) : 0.0f, FMath::Max(CVarUniWarpStreakFrames.GetValueOnRenderThread(), 0.0f),
+			FMath::Clamp(CVarUniWarpStreakMax.GetValueOnRenderThread(), 0.0f, 512.0f), FMath::Max(CVarUniWarpArrivalStretch.GetValueOnRenderThread(), 0.0f));   // D-187
+		P->Sprite.CamStep = F.bCameraStepValid ? F.CameraStepCm : FVector3f::ZeroVector;
+		P->Sprite.WarpPad = 0.0f;
 		P->Sprite.SceneDepthTexture = SceneDepth;
 		P->Sprite.SceneDepthSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
 		P->Sprite.VolumeSlices = VolumeSlices;

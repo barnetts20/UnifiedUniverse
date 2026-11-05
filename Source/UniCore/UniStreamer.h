@@ -193,6 +193,7 @@ namespace UniCore
 			u32 DeferredFrames = 0;                  // D-173: of those, frames it was left waiting while not needed
 			bool bGrowthChecked = false;             // D-138: checked against the level's current gathered set
 			u64 SubmittedAt = 0;                     // D-139: frame its probe was submitted
+			u64 FirstReadyAt = 0;                    // D-187: frame it first became Ready (0: never; a regeneration keeps it)
 		};
 
 		FUniStreamer(const FRefGenerator& InGen, IGenBackend& InBackend) : Gen(InGen), Backend(InBackend), Pool(InBackend.PoolCapacity())
@@ -522,7 +523,10 @@ namespace UniCore
 					G.Level = u32(C.Key.Level);
 					G.PoolStart = C.PoolStart;
 					G.PoolCount = C.PoolCount;
-					G.Flags = (Lv.Lod.bSuspended ? 1u : 0u) | (Fade << 8);
+					// D-187: bits 16..23, frames since the cell first became Ready (255: settled): the
+					// sprite pass fades a late cell's objects in as warp streaks (render only).
+					const u32 Age = u32(std::min<u64>(C.FirstReadyAt > 0u && FrameNo >= C.FirstReadyAt ? FrameNo - C.FirstReadyAt : 255u, 255u));
+					G.Flags = (Lv.Lod.bSuspended ? 1u : 0u) | (Fade << 8) | (Age << 16);
 					Out.push_back(G);
 					if (OutKeys) { OutKeys->push_back(C.Key); }
 				}
@@ -1099,6 +1103,7 @@ namespace UniCore
 				if (C->Tasks.empty() && !bHasAnchor)
 				{
 					C->Batch.reset(); C->PoolCount = 0; C->State = ECellState::Ready; C->bGrowthChecked = false;
+					if (C->FirstReadyAt == 0u) { C->FirstReadyAt = FrameNo; }   // D-187
 					MaxLatency = std::max<size_t>(MaxLatency, C->Frames - std::min(C->Frames, C->DeferredFrames));   // D-173: deferral is not latency
 					continue;
 				}
@@ -1248,6 +1253,7 @@ namespace UniCore
 					C->State = ECellState::Ready;
 					C->bGrowthChecked = false;
 					C->Batch.reset();
+					if (C->FirstReadyAt == 0u) { C->FirstReadyAt = FrameNo; }   // D-187: a regeneration keeps the first
 					MaxLatency = std::max<size_t>(MaxLatency, C->Frames - std::min(C->Frames, C->DeferredFrames));   // D-173: deferral is not latency
 					// D-139: fast attack, slow decay, clamped so one stall cannot widen every window.
 					const double Obs = std::min(double(FrameNo - C->SubmittedAt), 16.0);

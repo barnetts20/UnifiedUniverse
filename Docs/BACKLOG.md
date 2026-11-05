@@ -136,7 +136,8 @@ After D-168 the game thread's remaining spikes at speed are cells entering at on
 ## B-010: How visible should the web be in the sky? (owner, art direction; D-170 follow-up)
 Physically, the integrated light of unresolved galaxies is isotropic to a few percent: D-170 marched the web to 3.2 Gpc and the image did not change. The structure that does show is the near ~100 Mpc over a uniform pedestal (the tail). Options: (a) leave it physical; (b) a near-web glow: the web's density within N Mpc added as a faint, non-physical emission with its own gain (render only, like uu.WebDebug but in the beauty pass); (c) dim the pedestal (scale the tail) so the near structure carries the contrast. (b) is the owner's "low-grade field contribution to the background".
 
-## B-011: Galaxy impostors in cluster interiors (D-172 follow-up)
+## B-011: Galaxy impostors in cluster interiors (D-172 follow-up) — MEASURED, NOT NEEDED (2026-11-04, D-184)
+Measured with the warp textures in: a cluster core costs ~11% more (textured galaxies +21%), because far galaxies skip their warps (D-181). Parked; reopen if engine numbers in a rich core say otherwise.
 Inside a rich core the volume marches up to 12 galaxies per ray and 128 per frame (D-161 caps), ~36 steps per ray of which 31 are the cluster's own glow. Cheap now; when warp textures go into the galaxy density each galaxy sample costs more. Then: galaxies under N pixels drawn from a cached impostor (a small view-dependent image per galaxy, re-rendered when the view direction changes by a few degrees) instead of marched. Measure with the warp textures first.
 
 ## B-012: Port the mature spiral galaxy density generator from UltraLargeScale (owner, 2026-11-03) — INVESTIGATED (2026-11-04; plan in SPRITE_PASS_PLAN §3 A)
