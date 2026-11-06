@@ -42,6 +42,8 @@ uint MaxPromote;
 uint MaxActivate;
 uint SystemArchetypeMask;                        // bit per archetype id < 32 whose objects have systems
 float WarpAmount;                                // D-187: warp 0..1 (0: at rest, every sprite as before)
+float4 WarpVelBeta;                              // D-190: warp optics: the camera's motion (unit), effective speed (0: none)
+float4 WarpDopplerKQ;                            // D-190: Doppler colour strength, beaming exponent
 float ArrivalFrames;                             // D-187: frames over which a new cell's objects arrive at warp
 uint DiscArchetypeMask;                          // D-183: bit per archetype id < 32 whose objects are disc galaxies (inclined elliptical sprites)
 uint4 FixedDiscSeeds;                            // D-183: seeds of fixed-orientation anchors (disc normal world z)
@@ -89,6 +91,12 @@ void MainCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
 	V.SystemArchetypeMask = SystemArchetypeMask;
 	V.DiscArchetypeMask = DiscArchetypeMask;
 	V.FixedDiscSeeds = FixedDiscSeeds;
+	V.WarpVel = WarpVelBeta.xyz;
+	V.WarpBeta = WarpVelBeta.w;
+	V.WarpDoppler = WarpDopplerKQ.x;
+	V.WarpBeaming = WarpDopplerKQ.y;
+	V.WarpPad0 = 0.0f;
+	V.WarpPad1 = 0.0f;
 
 	// D-187: at warp a new cell's objects arrive over ArrivalFrames (faded in, streaking in from
 	// ahead: the sprite pass stretches their tails by their arrival); at rest nothing changes.

@@ -58,6 +58,7 @@ static const uint UNI_CH_MORPH = 0x645635E5u;       // ChannelId("MORPH")       
 static const uint UNI_CH_MEMBER = 0x66BFD5C3u;      // ChannelId("MEMBER")      authored bright members of catalogue clusters (D-177)
 static const uint UNI_CH_PALETTE = 0x129A5140u;     // ChannelId("PALETTE")     a galaxy's colour palette from its object seed (D-182)
 static const uint UNI_CH_DISCMODE = 0x519B432Fu;    // ChannelId("DISCMODE")    galaxy disc modes and per-arm asymmetry from the shape seed (D-178)
+static const uint UNI_CH_MOTE = 0xF6008302u;        // ChannelId("MOTE")        warp ambience motes per lattice cell (D-192; render-only decoration)
 
 // ------------------------------------------------------------------------------------------
 // ProcSeed port

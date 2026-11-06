@@ -635,3 +635,71 @@ A reviewer read the uncompiled engine code against UE 5.3–5.6 without seeing i
   - objects blinking at rest (arrival should be off at rest);
   - planets fading in and out (their cells are always settled).
 
+## 23. The web in the sky (D-189, UE-26)
+*SPRITE_PASS_PLAN G (owner: not sure), built as a switch, physical by default. Verified offline: T3.webtex.skyweb (stills still_skyweb_physical, _glow, _dimtail).*
+
+- **What changes:** nothing by default. `uu.SkyWeb 1` lifts the near web (within 50 Mpc) where it is overdense; `uu.SkyWeb 2` dims the uniform far background so the near structure carries the contrast; `3` does both.
+- **Content:** none.
+- **Test steps:**
+  1. Build: shaders `UniVolume.ush`, `UniVolume.usf`; core `UniVolume.h`; engine `UniSubsystem.h/.cpp`.
+  2. `uu.Enable flythrough` and stop in a void. Cycle `uu.SkyWeb 0..3`.
+  3. Tune with `uu.SkyWeb.Glow` (2), `uu.SkyWeb.Depth` (50 Mpc) and `uu.SkyWeb.Tail` (0.1).
+  4. Tell me which mode you want as the default.
+- **Failure looks like:**
+  - no change between modes (the background map is not re-marched);
+  - blocky glow (texel-scale steps);
+  - a seam between the near march and the background.
+
+## 24. Warp optics: aberration and Doppler colour (D-190, UE-27)
+*WARP_PLAN E3 with the recommended defaults (effective speed 0.5 at full warp, colour only). Verified offline: T1.warp.optics (still still_warp_optics).*
+
+- **What changes:** at speed the sky crowds ahead (the forward cone about 1.7× tighter at full warp), bluer ahead and redder behind, then settles back over a second after stopping. What is straight ahead stays straight ahead.
+- **Content:** none.
+- **Test steps:**
+  1. Build:
+     - shaders: `UniPhotometry.ush`, `UniProject.ush`, `UniVolume.ush`, `UniProject.usf`, `UniSprite.usf`, `UniVolume.usf`;
+     - engine: `UniShaders.h`, `UniRenderer.h/.cpp`.
+  2. Accelerate to intergalactic speed while looking ahead, then look sideways and back.
+  3. A/B with `uu.Warp.Aberration 0` and `uu.Warp.Doppler 0`. `uu.Warp.Beaming 1` adds mild brightening ahead.
+- **Failure looks like:**
+  - sprites and the volume / background disagreeing (stars sliding off their galaxy's glow at speed);
+  - the volume smearing while flying (temporal reprojection under the optics);
+  - the view centre drifting;
+  - colour flicker.
+
+## 25. Brightest cluster galaxies and intracluster light (D-191, UE-28)
+*SPRITE_PASS_PLAN F. Verified offline: T2.webtex.bcg; members, nodes, groups and cluster tests unchanged.*
+
+- **What changes:** rich catalogue clusters (brighter than M −25) have a giant elliptical at their centre (their brightest galaxy) and a faint diffuse glow over the cluster (12% of its light). The members are fewer, so the total is the same.
+- **Content:** the members of rich catalogue clusters reroll (counts × 0.82 or a little less, plus the BCG). Everything else is unchanged.
+- **Test steps:**
+  1. Build:
+     - core: `UniArchetype.h`, `UniDemoScenes.h`, `UniGenRef.h`, `UniVolume.h`;
+     - shaders: `UniVolume.ush`.
+  2. `uu.Enable flythrough` and go to the heaviest cluster (the cluster goto). The BCG sits at the centre, clearly the brightest, and the core has a soft glow.
+  3. Fly through the cluster: the glow should be smooth, with no step where it starts.
+- **Failure looks like:**
+  - no BCG, or two;
+  - a BCG off-centre;
+  - the cluster dimmer or brighter overall than before;
+  - a glow that pops in at some distance;
+  - a visible cost inside the cluster (the glow adds one LUT read per sample there).
+
+## 26. Warp motes in empty space (D-192, UE-29)
+*WARP_PLAN E4 (motes on; the peripheral glow is not built, B-014). Verified offline: T1.warp.motes (still still_warp_motes).*
+
+- **What changes:** at speed, faint motes fixed in space stream past and streak, so a void reads as fast. Their spacing follows your speed (the nearest pass in about half a second). At rest there are none.
+- **Content:** none.
+- **Test steps:**
+  1. Build:
+     - core: `UniMotes.h` (new), `UniSeed.ush`, `UniProject.ush`;
+     - shader: `UniSprite.usf`;
+     - engine: `UniShaders.h`, `UniRenderer.h/.cpp`, `UniSubsystem.h/.cpp`.
+  2. Fly through a void at 1–30 Mpc/s: motes should stream past smoothly while you accelerate and turn.
+  3. Tune with `uu.Warp.Motes` (0..1), `uu.Warp.MoteFrames` (30) and `uu.Warp.MoteMag` (1.5: fainter > 0).
+- **Failure looks like:**
+  - motes popping or jumping (especially while accelerating);
+  - motes moving with the camera instead of passing it;
+  - any motes at rest;
+  - motes in front of nearby bodies (they are depth-tested like the stars).
+

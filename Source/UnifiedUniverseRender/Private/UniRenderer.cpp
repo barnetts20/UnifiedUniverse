@@ -33,6 +33,24 @@ static TAutoConsoleVariable<float> CVarUniWarpStreakFrames(TEXT("uu.Warp.StreakF
 static TAutoConsoleVariable<float> CVarUniWarpStreakMax(TEXT("uu.Warp.StreakMax"), 64.0f, TEXT("D-187: longest warp streak, pixels."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<float> CVarUniWarpArrival(TEXT("uu.Warp.Arrival"), 8.0f, TEXT("D-187: at warp, frames over which a new cell's objects fade in, streaking in from ahead (0: off)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<float> CVarUniWarpArrivalStretch(TEXT("uu.Warp.ArrivalStretch"), 6.0f, TEXT("D-187: an arriving object's streak is 1 + this x (1 - arrival) times longer."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniWarpAberration(TEXT("uu.Warp.Aberration"), 0.5f, TEXT("D-190: warp optics' effective speed (v/c) at full warp: the sky crowds towards the motion (0.5: the forward cone ~1.7x tighter). 0: none."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniWarpDoppler(TEXT("uu.Warp.Doppler"), 1.0f, TEXT("D-190: Doppler colour strength at warp: blue ahead, red behind (luminance kept). 0: none."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniWarpBeaming(TEXT("uu.Warp.Beaming"), 0.0f, TEXT("D-190: Doppler beaming exponent at warp (brighter ahead, dimmer behind). 0: light kept."), ECVF_RenderThreadSafe);
+
+/** D-190: the warp optics for a frame: the camera's motion (unit) and the effective speed. */
+static FVector4f WarpVelBetaOf(const FUniFrameData& F)
+{
+	const float L = F.CameraStepCm.Size();
+	const float Beta = FMath::Clamp(F.WarpAmount, 0.0f, 1.0f) * FMath::Clamp(CVarUniWarpAberration.GetValueOnRenderThread(), 0.0f, 0.9f);
+	if (!F.bCameraStepValid || !(L > 0.0f) || !(Beta > 0.0f)) { return FVector4f(0.0f, 0.0f, 0.0f, 0.0f); }
+	const FVector3f V = F.CameraStepCm / L;
+	return FVector4f(V.X, V.Y, V.Z, Beta);
+}
+static FVector4f WarpDopplerKQOf()
+{
+	return FVector4f(FMath::Clamp(CVarUniWarpDoppler.GetValueOnRenderThread(), 0.0f, 4.0f), FMath::Clamp(CVarUniWarpBeaming.GetValueOnRenderThread(), -4.0f, 4.0f), 0.0f, 0.0f);
+}
+
 static TAutoConsoleVariable<float> CVarUniSpriteHaloMax(TEXT("uu.Sprite.HaloMax"), UniHlsl::UNI_SPRITE_HALO_MAX_PX, TEXT("Largest halo of an unresolved sprite (Gaussian sigma, pixels)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniVolumeTemporal(TEXT("uu.VolumeTemporal"), 1, TEXT("D-184: temporal slicing of the volume march: each frame marches one pixel of every 2 x 2 block and reprojects the rest from the previous frame (about a quarter of the march's cost). 0: march every pixel every frame. Off in the debug views."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniVolumeDivisor(TEXT("uu.VolumeDivisor"), 2, TEXT("Volume march resolution divisor (1 = full, 2 = half, 4 = quarter)."), ECVF_RenderThreadSafe);
@@ -421,6 +439,8 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		C.TanHalfFovX = TanX;
 		C.TanHalfFovY = TanY;
 		C.Pad0 = 0.0f;
+		C.WarpVelBeta = WarpVelBetaOf(F);   // D-190
+		C.WarpDopplerKQ = WarpDopplerKQOf();
 	};
 	auto FillCommon = [&](FUniVolumeCommonParameters& C, const TArray<UniCore::FCarrierGPU>& Carriers, const UniCore::FVolumeViewGPU& V)
 	{
@@ -611,6 +631,7 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		P->PrevRight = TemporalPrevRight; P->PrevTanY = TemporalPrevTanY;
 		P->PrevUp = TemporalPrevUp; P->TemporalPhase = Phase;
 		P->CamStep = F.CameraStepCm; P->bHistory = 1u;
+		P->PrevWarpVelBeta = TemporalPrevWarp;   // D-190
 		P->FreshVolume = MarchVol; P->FreshSlices = MarchSlices; P->FreshDepth = MarchDepth;
 		P->HistVolume = GraphBuilder.RegisterExternalTexture(TemporalVolume, TEXT("UniVolumeHistory"));
 		P->HistSlices = GraphBuilder.RegisterExternalTexture(TemporalSlices, TEXT("UniVolumeHistorySlices"));
@@ -634,6 +655,7 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		TemporalPrevTanX = TanX;
 		TemporalPrevTanY = TanY;
 		TemporalLastFrame = F.FrameNumber;
+		TemporalPrevWarp = WarpVelBetaOf(F);   // D-190
 		TemporalPhase = Phase;
 		bTemporalHave = true;
 	}
@@ -782,6 +804,8 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 		P->MaxActivate = UniGpuLayout::MaxActivate;
 		P->SystemArchetypeMask = F.SystemArchetypeMask;
 		P->WarpAmount = FMath::Clamp(F.WarpAmount, 0.0f, 1.0f);   // D-187
+		P->WarpVelBeta = WarpVelBetaOf(F);   // D-190
+		P->WarpDopplerKQ = WarpDopplerKQOf();
 		P->ArrivalFrames = FMath::Max(CVarUniWarpArrival.GetValueOnRenderThread(), 0.0f);
 		P->DiscArchetypeMask = F.DiscArchetypeMask;   // D-183
 		P->FixedDiscSeeds = FUintVector4(F.FixedDiscSeeds[0], F.FixedDiscSeeds[1], F.FixedDiscSeeds[2], F.FixedDiscSeeds[3]);
@@ -919,6 +943,14 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 			FMath::Clamp(CVarUniWarpStreakMax.GetValueOnRenderThread(), 0.0f, 512.0f), FMath::Max(CVarUniWarpArrivalStretch.GetValueOnRenderThread(), 0.0f));   // D-187
 		P->Sprite.CamStep = F.bCameraStepValid ? F.CameraStepCm : FVector3f::ZeroVector;
 		P->Sprite.WarpPad = 0.0f;
+		P->Sprite.WarpVelBeta = WarpVelBetaOf(F);   // D-190
+		P->Sprite.MoteMode = 0u;                    // D-192: the motes are a second draw (below)
+		P->Sprite.MoteCell0 = F.MoteCell[0];
+		P->Sprite.MoteCell1 = F.MoteCell[1];
+		P->Sprite.MoteFrac0 = F.MoteFrac[0];
+		P->Sprite.MoteFrac1 = F.MoteFrac[1];
+		P->Sprite.MoteScale = FVector4f(F.MoteScale.X, F.MoteScale.Y, F.MoteScale.Z, FMath::Max(CVarUniSpriteCorePx.GetValueOnRenderThread(), 0.25f) / FMath::Max(PixelsPerRadian, 1.0f));
+		P->Sprite.MoteDopplerKQ = WarpDopplerKQOf();
 		P->Sprite.SceneDepthTexture = SceneDepth;
 		P->Sprite.SceneDepthSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
 		P->Sprite.VolumeSlices = VolumeSlices;
@@ -951,6 +983,32 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 				SetShaderParameters(RHICmdList, PS, PS.GetPixelShader(), P->Sprite);
 				RHICmdList.DrawPrimitiveIndirect(P->DrawArgs->GetIndirectRHICallBuffer(), 0);
 			});
+		// D-192: the warp motes, the same shaders over UNI_MOTE_COUNT procedural instances, only
+		// while a lattice slot has weight (at warp, uu.Warp.Motes on).
+		if (F.bCameraStepValid && (F.MoteFrac[0].W > 0.0f || F.MoteFrac[1].W > 0.0f))
+		{
+			FUniSpritePassParameters* Pm = GraphBuilder.AllocParameters<FUniSpritePassParameters>();
+			*Pm = *P;
+			Pm->Sprite.MoteMode = 1u;
+			GraphBuilder.AddPass(RDG_EVENT_NAME("Uni.WarpMotes"), Pm, ERDGPassFlags::Raster,
+				[Pm, VS, PS, OutRect](FRHICommandList& RHICmdList)
+				{
+					RHICmdList.SetViewport(float(OutRect.Min.X), float(OutRect.Min.Y), 0.0f, float(OutRect.Max.X), float(OutRect.Max.Y), 1.0f);
+					FGraphicsPipelineStateInitializer Pso;
+					RHICmdList.ApplyCachedRenderTargets(Pso);
+					Pso.BlendState = TStaticBlendState<CW_RGB, BO_Add, BF_One, BF_One>::GetRHI();
+					Pso.RasterizerState = TStaticRasterizerState<FM_Solid, CM_None>::GetRHI();
+					Pso.DepthStencilState = TStaticDepthStencilState<false, CF_Always>::GetRHI();
+					Pso.BoundShaderState.VertexDeclarationRHI = GEmptyVertexDeclaration.VertexDeclarationRHI;
+					Pso.BoundShaderState.VertexShaderRHI = VS.GetVertexShader();
+					Pso.BoundShaderState.PixelShaderRHI = PS.GetPixelShader();
+					Pso.PrimitiveType = PT_TriangleList;
+					SetGraphicsPipelineState(RHICmdList, Pso, 0);
+					SetShaderParameters(RHICmdList, VS, VS.GetVertexShader(), Pm->Sprite);
+					SetShaderParameters(RHICmdList, PS, PS.GetPixelShader(), Pm->Sprite);
+					RHICmdList.DrawPrimitive(0, 2, UniHlsl::UNI_MOTE_COUNT);
+				});
+		}
 	}
 	Stats.CellsLastFrame = uint32(F.Cells.Num());
 }

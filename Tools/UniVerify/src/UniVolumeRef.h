@@ -215,6 +215,7 @@ namespace UniRender
 			TV.Phase = Phase;
 			TV.CamStep = H::float3(float(CamStepCm.X), float(CamStepCm.Y), float(CamStepCm.Z));
 			TV.bHistory = (bHave && bStepValid && bTemporal) ? 1u : 0u;
+			TV.PrevVel = H::float3(0, 0, 0); TV.PrevBeta = 0.0f;   // D-190: no warp optics here
 			// Without usable history (first frame, a jump, a new size) every pixel is marched, as the
 			// renderer does.
 			const bool bSlice = bTemporal && TV.bHistory != 0u;

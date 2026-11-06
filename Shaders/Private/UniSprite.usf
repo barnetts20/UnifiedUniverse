@@ -31,6 +31,14 @@ float SpriteFloor;                  // D-188: scene colour below which a sprite'
 float4 WarpA;                       // D-187: (warp 0..1, streak exposure frames, longest streak px, arrival stretch)
 float3 CamStep;                     // D-187: camera move over the last frame (cm, now minus then)
 float WarpPad;
+float4 WarpVelBeta;                 // D-190: the warp optics (motion, effective speed; 0: none)
+uint MoteMode;                      // D-192: 1: this draw is the warp motes (UNI_MOTE_COUNT instances)
+uint4 MoteCell0;                    // D-192: per lattice slot, the camera's cell (w: level) ..
+uint4 MoteCell1;
+float4 MoteFrac0;                   // .. and its fraction in it (w: the slot's weight)
+float4 MoteFrac1;
+float4 MoteScale;                   // cell cm (slot 0, slot 1), flux (exposure units), core angular radius
+float4 MoteDopplerKQ;               // the project pass's Doppler strength and beaming
 
 Texture2D SceneDepthTexture;
 SamplerState SceneDepthSampler;
@@ -65,8 +73,18 @@ struct FSpriteVSOut
 void MainVS(uint VertexId : SV_VertexID, uint InstanceId : SV_InstanceID, out FSpriteVSOut Out)
 {
 	Out = (FSpriteVSOut)0;
-	if (InstanceId >= MaxSprites) { Out.Position = float4(0, 0, -1, 1); return; }   // past the cap: degenerate
-	const FUniSprite S = InSprites[InstanceId];
+	FUniSprite S;
+	if (MoteMode != 0u)
+	{
+		// D-192: a warp mote, built here (decoration: no buffer, nothing generated).
+		S = Uni_MoteSprite(InstanceId, MoteCell0, MoteFrac0, MoteCell1, MoteFrac1, MoteScale, ViewForward, WarpVelBeta, MoteDopplerKQ.xy);
+		if ((S.Flags & UNI_SPRITE_VISIBLE) == 0u) { Out.Position = float4(0, 0, -1, 1); return; }
+	}
+	else
+	{
+		if (InstanceId >= MaxSprites) { Out.Position = float4(0, 0, -1, 1); return; }   // past the cap: degenerate
+		S = InSprites[InstanceId];
+	}
 	// Two triangles: (-1,-1) (1,-1) (1,1) / (-1,-1) (1,1) (-1,1).
 	const float2 Corners[6] = { float2(-1, -1), float2(1, -1), float2(1, 1), float2(-1, -1), float2(1, 1), float2(-1, 1) };
 	const float2 C = Corners[VertexId % 6];
@@ -92,7 +110,7 @@ void MainVS(uint VertexId : SV_VertexID, uint InstanceId : SV_InstanceID, out FS
 	float3 Streak = float3(0.0f, 0.0f, 0.0f);
 	if (WarpA.x > 0.0f && Uni_SpriteDiscFrac(S, PixelsPerRadian) <= 0.0f && Uni_SpriteEllipseQ(S, SigmaPxV) >= 1.0f)
 	{
-		Streak = Uni_SpriteStreak(Dir, S.TrueDistance, CamStep, Side, Up, PixelsPerRadian, WarpA, (float)(S.Flags >> UNI_SPRITE_ARRIVAL_SHIFT) / 255.0f);
+		Streak = Uni_SpriteStreak(Dir, S.TrueDistance, CamStep, Side, Up, PixelsPerRadian, WarpA, (float)(S.Flags >> UNI_SPRITE_ARRIVAL_SHIFT) / 255.0f, WarpVelBeta);
 	}
 	float2 O = C * ReachPx;   // pixels in the quad's basis
 	if (Streak.z > 0.0f)

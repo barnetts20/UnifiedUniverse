@@ -139,4 +139,47 @@ UNI_FN float Uni_SpriteIntensity(float InApparentMag, float InExposureMag, float
 	return pow(10.0f, -0.4f * (InApparentMag - InExposureMag)) * Uni_MagFade(InApparentMag, InLimitingMag);
 }
 
+// ------------------------------------------------------------------------------------------
+// D-190: warp optics (WARP_PLAN E3; render-only). A stylised relativistic view: an effective
+// speed InBeta (BetaMax x the warp amount, never the real one) along the camera's motion InVel
+// (unit). Shared by the sprite projection, the volume march and composite, and the temporal
+// reprojection, so everything shifts together. InBeta 0 is the identity everywhere.
+// ------------------------------------------------------------------------------------------
+
+/** The apparent direction of a source at true direction InDir (unit): aberration crowds the sky
+ *  towards the motion, cos t' = (cos t + b) / (1 + b cos t); the motion's direction is fixed. A
+ *  negative InBeta is the inverse (apparent -> true). */
+UNI_FN float3 Uni_Aberrate(float3 InDir, float3 InVel, float InBeta)
+{
+	if (InBeta == 0.0f) { return InDir; }
+	const float C = clamp(dot(InDir, InVel), -1.0f, 1.0f);
+	const float3 Perp = InDir - InVel * C;
+	const float Pl = sqrt(max(dot(Perp, Perp), 0.0f));
+	const float Cp = (C + InBeta) / (1.0f + InBeta * C);
+	if (!(Pl > 1.0e-7f)) { return InDir; }   // along the motion (or against it): unchanged
+	const float Sp = sqrt(max(1.0f - Cp * Cp, 0.0f));
+	return InVel * Cp + Perp * (Sp / Pl);
+}
+
+/** The Doppler factor of a source at true direction InDir: g (1 + b cos t), above 1 ahead. */
+UNI_FN float Uni_DopplerFactor(float3 InDir, float3 InVel, float InBeta)
+{
+	if (InBeta == 0.0f) { return 1.0f; }
+	const float G = 1.0f / sqrt(max(1.0f - InBeta * InBeta, 1.0e-6f));
+	return G * (1.0f + InBeta * dot(InDir, InVel));
+}
+
+/** A colour shifted by Doppler factor InD: blue up and red down by InD^InK ahead (the reverse
+ *  behind), luminance kept; then x InD^InQ (beaming; InQ 0 keeps the light). InD 1: unchanged. */
+UNI_FN float3 Uni_DopplerTint(float3 InC, float InD, float InK, float InQ)
+{
+	if (InD == 1.0f) { return InC; }
+	const float D = clamp(InD, 0.25f, 4.0f);
+	const float Y = Uni_Luminance(InC);
+	float3 C = InC * float3(pow(D, -InK), 1.0f, pow(D, InK));
+	const float Yc = Uni_Luminance(C);
+	C = Yc > 0.0f ? C * (Y / Yc) : InC;
+	return InQ != 0.0f ? C * pow(D, InQ) : C;
+}
+
 #endif // UNI_PHOTOMETRY_USH

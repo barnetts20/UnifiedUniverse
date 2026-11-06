@@ -67,6 +67,7 @@
 #include "UniProfile.h"
 #include "UniWebTexture.h"
 #include "UniSky.h"
+#include "UniMotes.h"
 #include "Async/Future.h"
 #include "UniSubsystem.generated.h"
 
@@ -214,10 +215,12 @@ private:
 	uint32 BackgroundVersion = 0;
 	UniCore::FCoord BackgroundAnchor;
 	TArray<FVector4f> BackgroundLutLast;
+	FVector3f SkyWebLast = FVector3f::ZeroVector;   // D-189: the sky-web settings the background map was marched with
 
 	// Travel sensitivity (D-154): the owner's sensitivity plus a speed-driven boost
 	UniCore::FTravelSensitivity Travel;
 	UniCore::FTravelSensitivity Warp;   // D-187: the same curve, 0..1, for the warp effects
+	UniCore::FMoteScale MoteScale;      // D-192: the warp motes' lattice scale (follows the speed)
 	float EffectiveDeltaMag = 0.0f;
 	FUniCoord PrevCamera;
 	bool bCameraJumped = true;

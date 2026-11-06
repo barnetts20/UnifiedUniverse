@@ -49,6 +49,16 @@ float3 ViewRight;
 float TanHalfFovY;
 float3 ViewUp;
 float Pad0;
+float4 WarpVelBeta;      // D-190: the camera's motion (unit) and the warp optics' effective speed (0: none)
+float4 WarpDopplerKQ;    // D-190: Doppler colour strength, beaming exponent
+
+/** D-190: the true direction behind an apparent one (a pixel's), and its Doppler colour shift. */
+float3 TrueDir(float3 InApparent) { return Uni_Aberrate(InApparent, WarpVelBeta.xyz, -WarpVelBeta.w); }
+float3 DopplerOf(float3 InRadiance, float3 InTrueDir)
+{
+	if (WarpVelBeta.w == 0.0f) { return InRadiance; }
+	return Uni_DopplerTint(InRadiance, Uni_DopplerFactor(InTrueDir, WarpVelBeta.xyz, WarpVelBeta.w), WarpDopplerKQ.x, WarpDopplerKQ.y);
+}
 
 /** Unit view direction through a pixel of a W x H grid covering the view (same as the CPU
  *  reference's PixelDir). */
@@ -114,9 +124,10 @@ void MarchCS(uint3 DispatchId : SV_DispatchThreadID)
 	const FUniVolumeView V = InVolumeView[0];
 	const float2 Size = float2((float)MarchSize.x, (float)MarchSize.y);
 	const float2 Px = float2((float)Id.x + 0.5f, (float)Id.y + 0.5f);
-	const float3 Dir = PixelDir(Px, Size);
-	const float TScene = SceneDistanceAtUV(Px * MarchToDepthUV.xy + MarchToDepthUV.zw, dot(Dir, ViewForward));
+	const float3 ApDir = PixelDir(Px, Size);
+	const float TScene = SceneDistanceAtUV(Px * MarchToDepthUV.xy + MarchToDepthUV.zw, dot(ApDir, ViewForward));
 	const float LnScene = log(max(TScene, 1.0f));
+	const float3 Dir = TrueDir(ApDir);   // D-190: the ray's true direction (identity at rest)
 	if (DebugMode == 5u)
 	{
 		// D-169: one ray per pixel, the web only; no dust, so the slices are clear.
@@ -151,7 +162,7 @@ void MarchCS(uint3 DispatchId : SV_DispatchThreadID)
 		for (uint I = 0u; I < SS; ++I)
 		{
 			const float2 Sub = float2((float)Id.x + ((float)I + 0.5f) / (float)SS, (float)Id.y + ((float)J + 0.5f) / (float)SS);
-			const FUniVolumeResult R = Uni_VolumeMarch(SS == 1u ? Dir : PixelDir(Sub, Size), TScene, InCarriers, InParams, InLut, V);
+			const FUniVolumeResult R = Uni_VolumeMarch(SS == 1u ? Dir : TrueDir(PixelDir(Sub, Size)), TScene, InCarriers, InParams, InLut, V);
 			B += R.Radiance;
 			T += R.Transmittance;
 			StepSum += R.Steps;
@@ -163,7 +174,7 @@ void MarchCS(uint3 DispatchId : SV_DispatchThreadID)
 		}
 	}
 	const float Inv = 1.0f / (float)(SS * SS);
-	float4 Out = float4(B * Inv, Uni_Luminance(T * Inv));
+	float4 Out = float4(DopplerOf(B * Inv, Dir), Uni_Luminance(T * Inv));   // D-190
 	if (DebugMode == 1u)
 	{
 		Out = float4(AnyTruncated != 0u ? float3(1.0f, 0.0f, 1.0f) : DebugHeat((float)StepSum * Inv / (float)max(V.MaxSteps, 1u)), 0.0f);
@@ -217,6 +228,7 @@ float3 PrevUp;
 uint TemporalPhase;
 float3 CamStep;             // camera now minus then, cm
 uint bHistory;
+float4 PrevWarpVelBeta;     // D-190: the previous frame's warp optics
 Texture2D<float4> FreshVolume;
 Texture2DArray<float> FreshSlices;
 Texture2D<float2> FreshDepth;
@@ -246,10 +258,12 @@ void ReconstructCS(uint3 Id : SV_DispatchThreadID)
 	TV.PrevRight = PrevRight; TV.PrevTanY = PrevTanY;
 	TV.PrevUp = PrevUp; TV.Phase = TemporalPhase;
 	TV.CamStep = CamStep; TV.bHistory = bHistory;
+	TV.PrevVel = PrevWarpVelBeta.xyz; TV.PrevBeta = PrevWarpVelBeta.w;
 	const float2 Size = float2((float)MarchSize.x, (float)MarchSize.y);
 	const float2 Pc = float2((float)Px.x + 0.5f, (float)Px.y + 0.5f);
-	const float3 Dir = PixelDir(Pc, Size);
-	const float LnTp = log(max(SceneDistanceAtUV(Pc * MarchToDepthUV.xy + MarchToDepthUV.zw, dot(Dir, ViewForward)), 1.0f));
+	const float3 ApDir = PixelDir(Pc, Size);
+	const float LnTp = log(max(SceneDistanceAtUV(Pc * MarchToDepthUV.xy + MarchToDepthUV.zw, dot(ApDir, ViewForward)), 1.0f));
+	const float3 Dir = TrueDir(ApDir);   // D-190
 
 	// The fresh neighbours.
 	const FUniTemporalTaps Tp = Uni_TemporalTaps(Px, TemporalPhase, MarchSize);
@@ -398,12 +412,13 @@ void CompositePS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Targe
 	if (bBackground != 0u && DPix > BackgroundStartCm)
 	{
 		float X, Y;
-		const uint Face = Uni_CubeDirToFace(Dir, (float)CubeSize, X, Y);
+		const float3 BgDir = TrueDir(Dir);   // D-190
+		const uint Face = Uni_CubeDirToFace(BgDir, (float)CubeSize, X, Y);
 		const float3 Uvw = float3(X / (float)CubeSize, Y / (float)CubeSize, (float)Face);
 		const float3 BgCur = CubeTexture.SampleLevel(LinearClampSampler, Uvw, 0).rgb;
 		const float3 BgPrev = CubePrevTexture.SampleLevel(LinearClampSampler, Uvw, 0).rgb;
 		const float3 Bg = lerp(BgPrev, BgCur, BackgroundBlend);   // D-159: cross-fade between whole, consistent maps
-		B += Vol.a * Bg;
+		B += Vol.a * DopplerOf(Bg, BgDir);
 	}
 	// Solid angle of this pixel: cos^3 / f^2 (pinhole). Radiance x solid angle = the pixel's
 	// energy in the sprites' exposure units (D-128), so sprites + volume conserve light.

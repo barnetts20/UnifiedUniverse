@@ -70,6 +70,13 @@ namespace UniScenes
 		 *  each group's count goes with its node's mass. */
 		bool bGroups = true;
 		double GroupDwarfs = 20.0;
+		/** D-191: rich catalogue clusters (M < BcgMaxMag) carry a brightest cluster galaxy
+		 *  (BcgShare of their light at M -26.5, rising as L^-0.5 toward poorer ones: observed
+		 *  ~5-10% in the richest clusters) and intracluster light (IclShare; observed ~10-20%),
+		 *  taken from their members' budget. 0: none. */
+		double BcgShare = 0.06;
+		double IclShare = 0.12;
+		double BcgMaxMag = -25.0;
 	};
 
 	/** The galaxy number density over the galaxy luminosity function (the D-012 placeholder). */
@@ -565,6 +572,9 @@ namespace UniScenes
 					Cat.MemberArchetypeId = kGalaxy;
 					Cat.MemberMinLevel = BrightMemberMinLevel();
 					Cat.BrightRatio = PBright < 1.0 ? PBright / (1.0 - PBright) : 0.0;
+					Cat.BcgShare = std::clamp(T.BcgShare, 0.0, 0.5);   // D-191
+					Cat.IclShare = std::clamp(T.IclShare, 0.0, 0.5);
+					Cat.BcgMaxMag = float(T.BcgMaxMag);
 				}
 			}
 			D.Catalogues.push_back(Cat);

@@ -1218,3 +1218,89 @@ Rationale: T1.warp.streaks:
 Known: the streak follows the last frame's move, so a sudden stop shortens it at once (the warp amount itself falls over a second). Galaxy sprites large enough to be ellipses don't streak.
 Reroll impact: None (render only; the cell age is bookkeeping).
 Status: Provisional (UE-25; the remaining WARP_PLAN questions decide E3/E4)
+
+D-189 — The web in the sky: a near-web glow and a dimmed tail, as a switch (SPRITE_PASS_PLAN G, B-010; render-only)
+Question: Physically the unresolved galaxies' light is isotropic to a few percent past ~100 Mpc (D-170), so the web barely shows in the sky. B-010 offered (a) physical, (b) a near-web glow, (c) a dimmed tail. Owner: "not sure", so an engine A/B decides.
+Decision:
+- `uu.SkyWeb`: 0 physical (the default), 1 near-web glow, 2 dimmed tail, 3 both. Live; the background map is re-marched when the settings change.
+- **Glow (1):** on the periodic web carrier only, within `uu.SkyWeb.Depth` (50 Mpc, fading over its second half), the sampled density is lifted by `uu.SkyWeb.Glow` (2) × its overdensity (rho / mean − 1, never below 0). Where the web is denser it is brighter; voids are unchanged.
+- **Dimmed tail (2):** the analytic tail past the march (the uniform pedestal) is kept at `uu.SkyWeb.Tail` (0.1) of its light, so the marched near structure carries the contrast.
+- FVolumeViewGPU grew from 48 to 64 bytes: TailDim, WebGlowGain, WebGlowDepthCm and a pad. FVolumeSettings carries the three values.
+Rationale: T3.webtex.skyweb, over the delivered web from the void camera:
+- the dimmed tail is exactly the marched light + 0.1 × the tail;
+- sky contrast (the radiance's spread over its mean, per solid angle) is 0.010 physical, 0.236 with the glow and 0.084 with the dimmed tail;
+- stills: still_skyweb_physical, _glow and _dimtail.
+Known: both modes are non-physical (the light budget no longer holds for the background) by design; that is why physical is the default. The glow is per pixel, so it costs nothing extra; the tail dim costs nothing.
+Reroll impact: None (render only).
+Status: Provisional (UE-26: the owner's A/B)
+
+D-190 — Warp optics: stylised aberration and Doppler colour (WARP_PLAN E3; render-only)
+Question: WARP_PLAN E3 and owner questions 2 and 3 (aberration cap; Doppler colour only or beaming too). Unanswered, so the plan's recommended defaults are built behind switches.
+Decision:
+- **Speed.** Effective speed beta = `uu.Warp.Aberration` (0.5, at most 0.9) × the warp amount (D-187). The motion is the camera's move over the last frame. Nothing applies across a jump or at rest.
+- **Aberration** (`Uni_Aberrate`, UniPhotometry.ush): the relativistic angle remap; at −beta it is its own inverse. The direction of motion is a fixed point, so what is ahead stays ahead and steering keeps working. At 0.5 the forward cone is sqrt(3) ≈ 1.73× tighter. It is applied consistently:
+  - sprites: the project pass places every object at its aberrated direction;
+  - volume and background: each pixel's ray is un-aberrated to its true direction (the march, sub-rays and reconstruct pass, the background cube lookup);
+  - temporal reprojection (D-184): through the previous frame's optics;
+  - streaks (D-187): un-aberrate, step by the camera's move, re-aberrate.
+- **Doppler colour** (`Uni_DopplerFactor` = gamma (1 + beta cos theta), `Uni_DopplerTint`): blue ahead, red behind, as a colour-temperature scale of `uu.Warp.Doppler` (1), luminance kept, on sprites, the volume and the background.
+- **Beaming:** brightness × D^`uu.Warp.Beaming`, default 0 (colour only).
+Rationale: T1.warp.optics:
+- the remap matches the formula (2.8e-7) and its inverse (9.3e-6); nothing moves away from the motion; the motion's direction is fixed; the cone is ×1.7321 at 0.5;
+- Doppler 1.7321 ahead and 0.5774 behind; the tint keeps luminance (6e-8), blue ahead and red behind;
+- streaks are unchanged without the optics and point to the vanishing point with them; the reprojection puts every pixel back on itself at rest (3.8e-4 px);
+- still: still_warp_optics (beta 0, 0.25, 0.5).
+Known: the aberration crowds the sky ahead at speed, so targets near the edge of the view move inward while warping. That is the intended look; `uu.Warp.Aberration 0` removes it.
+Reroll impact: None (render only).
+Status: Provisional (UE-27)
+
+D-191 — Brightest cluster galaxies and intracluster light (SPRITE_PASS_PLAN F, B-006 rest; content + render)
+Question: B-006's remaining realism. Rich clusters have a giant elliptical at their centre and a diffuse intracluster glow (about 10–20% of their light). The light budget has to hold.
+Decision:
+- **Which clusters.** Rich catalogue clusters: node-list entries brighter than `BcgMaxMag` (−25); the delivered web's 113 node clusters run from M −26.5 to −24.5. Procedural clusters have no authored members (D-177), so they have neither.
+- **BCG share** (`FCatalogue::BcgShareAt`): 6% of the cluster's light at M −26.5, with its light going as the cluster's^0.5 (observed: a poorer cluster's BCG takes a larger share), at most 30%. At M −25 it is 12%.
+  - With a flat 6% the BCG of a cluster near the cut came out fainter than a drawn member (−22.00 against −22.39). With the scaling both rich clusters' BCGs are the brightest, with gaps of at least 0.33 mag.
+- **BCG** (UniGenRef CopyMembers): authored with the copy's bright members (D-177):
+  - at the cluster's centre, with rank 63 (index kFirstMemberIndex + 64 × entry + 63), so drawn members stop at 63;
+  - seed: the copy's member seed mixed with 0xBC6;
+  - an early type with the early types' colour shift (D-172);
+  - radius: the radius model's × `BcgRadiusScale` (1.5), an extended envelope;
+  - at its own magnitude's member level, which the member index now includes. Its magnitude is tested as the record stores it, a half float, on both sides.
+- **Members.** A rich cluster's contributor count is × (1 − BCG share − `IclShare`), so both its bright and its emitter-placed members shrink. Members + ICL + BCG = the cluster's light exactly.
+- **ICL** (UniVolume.h, UniVolume.ush): on the cluster's own carrier, not a second one, so it costs no carrier slot or field sample.
+  - A flag, `UNI_CARRIER_ICL`; the carrier's unused PaletteIndex holds a total-light LUT block (every child's light, none resolved as sprites, built once per scene and child); its pad holds IclRatio = IclShare / keep.
+  - The march adds LUT_total × IclRatio on the same density.
+  - Such a carrier marches from the local start (1 pc), not the members' significance start, because the glow is there at any distance.
+- Tuning: `FClusterTuning::BcgShare` (0.06), `IclShare` (0.12) and `BcgMaxMag` (−25).
+Rationale: T2.webtex.bcg, from the heaviest cluster's copy, over the 3 clusters within 30 Mpc (2 rich):
+- counts × keep for rich clusters only; light off by 0 at worst;
+- exactly one BCG per rich cluster and none elsewhere, at the centre (offset 0), at its share's magnitude (0.0001 off), early, the brightest (smallest gap 0.33 mag);
+- the ICL carrier's ratio and start are right; its block is never below the members' unresolved light, and equals it with no sprites drawn.
+- T2.webtex.members (the BCG among the bright members: 57 for 52.5 expected, 0.6 sigma), nodes, groups, catalogue_lookup and travel, and the cluster group all pass unchanged.
+Known:
+- The ICL follows the members' distribution (the cluster's beta model and clumps); real ICL is a little more concentrated, around the BCG.
+- Only catalogue clusters have BCGs (as with D-177's bright members).
+- The test's sample is small (2 rich clusters near the camera).
+Reroll impact: the members of rich catalogue clusters: bright and emitter-placed counts × 0.82 (more at the cut), plus one BCG each. Field galaxies, groups, poorer clusters, the web and stars elsewhere are unchanged.
+Status: Provisional (UE-28)
+
+D-192 — Warp ambience motes (WARP_PLAN E4; render-only decoration)
+Question: WARP_PLAN E4 and owner question 5. In a void the sky barely moves even at 30 Mpc/s, so nothing says "fast". Unanswered; built as a switch (on), without the peripheral glow.
+Decision:
+- **Motes** (`Uni_MoteSprite`, UniProject.ush; `UniMotes.h`):
+  - points fixed in the world, 16 hashed into every cell of a cubic lattice;
+  - two lattice levels at once, with cell 2^n cm. Their scale follows the speed: log2 of the cell tracks |camera step| × `uu.Warp.MoteFrames` (30), smoothed over 0.3 s, held while still and reset on a jump. Level n weighs 1 − |x − n|, and level n always lives in slot n & 1, so slots change hands only at zero weight;
+  - per level, the 4 × 4 × 4 cells around the camera's cell (shifted by its half cell). A mote fades out from 0.75 to 1.5 cells away, so the block's edge never shows, and fades in near the camera (from 0.35 to 0.1 cells). That makes about 20 in a 90 degree view.
+- **Brightness:** `uu.Warp.MoteMag` (1.5 magnitudes below the exposure magnitude), spread over two magnitudes by a hash, × the warp amount × `uu.Warp.Motes` (1). At rest there are none.
+- **Drawn** as a second draw of the sprite shaders (`MoteMode` 1): UNI_MOTE_COUNT = 2,048 procedural instances, no buffer. The streaks (E1), aberration and Doppler (E3), depth test and dust transmittance are the stars'.
+- Seed channel MOTE (0xF6008302) is new.
+- **Not built:** WARP_PLAN's peripheral glow (vignette) for pop-in at the view's edges. E2's arrival already covers late cells (BACKLOG B-014).
+Rationale: T1.warp.motes, over a scripted flight (1 Mpc/s, then 3 s accelerating to 30 Mpc/s, 300 frames, full warp):
+- 64,197 mote-frames found again the next frame in the same place (1e-5 of a cell); 3,431 faded out;
+- nothing appears or vanishes in view above 1.9% of the brightest mote's light;
+- the scale is 0.09 octaves off once settled; 20.4 motes in view on average; median streak 13 px at 30 Mpc/s; none behind the camera, none at rest;
+- still: still_warp_motes.
+- While building, the first fades were too steep (1–1.5 cells out, 0.03–0.15 near): a mote passing the camera vanished from 7.5% in two frames.
+Known: motes are pure decoration. They are not in any light budget and not in the sky light, and they read as dust rather than stars.
+Reroll impact: None (render only; a new seed channel).
+Status: Provisional (UE-29)

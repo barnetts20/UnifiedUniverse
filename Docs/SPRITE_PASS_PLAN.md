@@ -1,6 +1,6 @@
 # Sprite and appearance pass: plan for review
 
-*Draft, 2026-11-03. Status: for the owner's review; nothing here is built. It gathers the backlog items deferred to the "sprite work" milestone (B-001, B-003, B-006 rest, B-010, B-011, B-012), and proposes an order and the decisions needed before any code.*
+*Draft, 2026-11-03. **Status 2026-11-05: every step built and verified offline (A, B, D, E, F, G, H; C measured and not needed); the owner's engine passes are UE-19..UE-29.** Original status: for the owner's review; nothing here is built. It gathers the backlog items deferred to the "sprite work" milestone (B-001, B-003, B-006 rest, B-010, B-011, B-012), and proposes an order and the decisions needed before any code.*
 
 ## 1. What the milestone is
 
@@ -71,17 +71,19 @@ Known gaps: galaxies are round blobs until the volume takes over (no inclination
 - **Art options to decide:** diffraction spikes (a camera artefact, very "space-art"), colour saturation of bright stars, limb darkening on resolved discs.
 
 ### E. Speed: warp streaks and Doppler (B-001; render-only)
-*Planned in detail 2026-11-04: Docs/WARP_PLAN.md (owner: navigable, stylised, camouflage pop-in; five questions).*
+*Planned in detail 2026-11-04: Docs/WARP_PLAN.md (owner: navigable, stylised, camouflage pop-in; five questions). Done 2026-11-05 with the plan's recommended defaults: E1 streaks and E2 arrival (D-187, UE-25), E3 aberration and Doppler colour (D-190, UE-27), E4 motes (D-192, UE-29; no peripheral glow, B-014).*
 **Goal.** Turn late-arriving objects at warp speed into streaks instead of pops, and make speed visible.
 - Detection, tails from a ring of recent camera positions, collapse over 0.1–0.3 s, as B-001 describes; the ready-frame per cell is already known to the streamer (D-173 even knows which cells were late).
 - Doppler and aberration: relativistic formula, or an artistic scale from speed relative to the level's crossing rate (at real v ≪ c nothing would show). Applying aberration to all sprites makes the starfield bunch ahead at speed (the classic look).
 - **Owner questions:** decorative streaks (extra light) or conserved (borrowed from the volume's glow for those cells)? Aberration on everything or streaks only? At what speed should it start?
 
 ### F. Clusters: brightest cluster galaxy and intracluster light (B-006 rest; content + render)
+*Done 2026-11-05 (D-191, offline; UE-28): rich catalogue clusters (M < −25) carry a BCG (6% of the light at M −26.5, rising as L^−0.5, so it stays the brightest) and ICL (12%) on their own carrier; members × the rest.*
 - **BCG:** a giant elliptical at the centre of rich clusters, as an anchor-like first member (catalogue clusters know their centre exactly). Content (one new object per rich cluster; members' budget reduced by its light).
 - **Intracluster light:** 10–20% of a rich cluster's light in a diffuse halo: an extra emission term on the cluster's own volume carrier, taken from the members' budget so the total is conserved. Render + budget.
 
 ### G. The web in the sky (B-010; render-only)
+*Done 2026-11-05 as a switch (D-189, offline; UE-26): `uu.SkyWeb` 0 physical (default), 1 near-web glow, 2 dimmed tail, 3 both. The owner's engine A/B picks the default.*
 Options from D-170: (a) leave it physical (isotropic beyond ~100 Mpc); (b) a near-web glow (the web's density within N Mpc as a faint non-physical emission, own gain; uu.WebDebug's machinery in the beauty pass); (c) dim the uniform tail so the near structure carries contrast. A quick A/B in the engine decides it.
 
 ### H. Sky lighting (design spec item)
@@ -105,6 +107,6 @@ Each step ends as now: offline checks (equivalence and continuity of light where
 2. ~~A: the warp textures~~ (delivered: warp_fine, warp_large, galaxy_detail, ism_shape, ism_erode, curl_2d).
 3. B: oriented galaxy sprites at all distances, or above a size?
 4. ~~D: diffraction spikes~~ (owner, 2026-11-04: tried, then bloom and lens flares instead; D-185 amended). Glare kept as a corona for now.
-5. E: see Docs/WARP_PLAN.md §5 (owner asked for a plan).
-6. G: physical sky, near-web glow, or dimmed tail (owner: not sure yet; an engine A/B would decide it).
+5. E: see Docs/WARP_PLAN.md §5 (owner asked for a plan). Built with the recommended defaults (2026-11-05); each is a switch.
+6. G: physical sky, near-web glow, or dimmed tail (owner: not sure yet). Built as `uu.SkyWeb` 0..3 (D-189); the engine A/B decides the default.
 7. ~~Art direction~~ (owner, 2026-11-04): realistic, pulled towards stylised/fantasy: more vibrant colours and more colour variation than real life, physics-based dust lanes and luminance, no two galaxies alike. Art references still welcome: a few images of the look you want (sky from inside a galaxy, a galaxy at a few degrees, warp travel) would anchor every one of these choices.

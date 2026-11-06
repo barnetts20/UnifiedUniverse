@@ -1,6 +1,6 @@
 # Warp travel: speed effects that stay navigable and hide pop-in (SPRITE_PASS_PLAN §3 E)
 
-*Draft, 2026-11-04, for the owner's review. E1 and E2 built 2026-11-05 (D-187) with the recommended defaults; E3 and E4 wait for the questions in section 5. Owner's brief: speed should read as speed while the view stays navigable; relativistic shifts only as far as they help; the effects should hide streaming artefacts such as pop-in.*
+*Draft, 2026-11-04, for the owner's review. **Built 2026-11-05 with the recommended defaults, each behind a switch:** E1 and E2 (D-187), E3 (D-190), E4 motes (D-192; the peripheral glow is not built, BACKLOG B-014). The questions in section 5 can still change any of them. Owner's brief: speed should read as speed while the view stays navigable; relativistic shifts only as far as they help; the effects should hide streaming artefacts such as pop-in.*
 
 ## 1. What it has to do
 
@@ -65,6 +65,8 @@ An alternative is to key each effect to the speed relative to the level the came
 Each effect gets its own CVar, with `uu.Warp` for all of them (0 = physical) and `uu.Warp.<Effect>` for each. Each step ends as the others do: offline checks, stills, a REVIEW_TONIGHT section, then the owner's engine pass.
 
 ## 5. Owner questions
+
+*Unanswered at build time; the defaults taken: 1 the travel curve only; 2 BetaMax 0.5 (`uu.Warp.Aberration`); 3 colour only (`uu.Warp.Beaming` 0); 4 light-conserving; 5 motes yes (`uu.Warp.Motes`), no peripheral glow.*
 
 1. Speed curve: the travel-sensitivity curve (100 kpc/s → 10 Mpc/s) for everything, or also a per-level curve for in-galaxy speeds?
 2. Aberration cap: BetaMax 0.5 (forward cone ~1.7× tighter at full warp), stronger, or none?

@@ -255,6 +255,33 @@ namespace UniCore
 		u32 MemberArchetypeId = 0;
 		int MemberMinLevel = 0;
 		double BrightRatio = 0.0;
+		/** D-191: rich entries (AbsMag < BcgMaxMag) take a brightest cluster galaxy (a giant early
+		 *  type at their centre, authored with the bright members) and intracluster light
+		 *  (IclShare: a diffuse glow on their volume carrier); their members' counts shrink by
+		 *  1 - BCG share - IclShare, so the total is unchanged. The BCG's share is BcgShare at
+		 *  BcgPivotMag and its light goes as the cluster's^BcgSlope (observed ~0.5: a poorer
+		 *  cluster's BCG takes more of its light, so it stays the brightest member), at most
+		 *  BcgShareMax. 0: none. */
+		double BcgShare = 0.0;
+		double IclShare = 0.0;
+		float BcgMaxMag = -25.0f;
+		float BcgPivotMag = -26.5f;
+		double BcgSlope = 0.5;
+		double BcgShareMax = 0.3;
+		double BcgRadiusScale = 1.5;   // the BCG's radius x the radius model's (an extended cD envelope)
+
+		/** D-191: the BCG's share of a rich entry's light at magnitude M (0: not rich). */
+		double BcgShareAt(float M) const
+		{
+			if (!(BcgShare > 0.0) || !(M < BcgMaxMag)) { return 0.0; }
+			return std::min(BcgShare * std::pow(10.0, 0.4 * (1.0 - BcgSlope) * (double(M) - double(BcgPivotMag))), BcgShareMax);
+		}
+		/** D-191: the members' share of a rich entry's light (1: not rich). */
+		double MemberKeepAt(float M) const
+		{
+			if (!(M < BcgMaxMag) || !(BcgShare > 0.0 || IclShare > 0.0)) { return 1.0; }
+			return std::max(1.0 - BcgShareAt(M) - IclShare, 1.0e-3);
+		}
 	};
 
 	struct FSuppressor

@@ -110,6 +110,7 @@ namespace UniCore
 		FFieldParams Params;
 		bool bEarly = false;                  // D-172: the parent is an early type (its emitter's early shape; no dust)
 		double NTotal = 0.0;
+		double IclRatio = 0.0;                // D-191: intracluster light / its members' light (0: none)
 		mutable double IntegralAll = -1.0;   // field-space integral over the unit ball / period (lazy, cached)
 	};
 
@@ -232,6 +233,14 @@ namespace UniCore
 				for (const FSlice& Sl : Model.SlicesOf(Cat.MemberArchetypeId).Slices)
 				{
 					if (Sl.Level >= Cat.MemberMinLevel && Cat.PeriodBits - Sl.Level >= 2 && Cat.PeriodBits - Sl.Level <= 21) { Levels.insert(Sl.Level); }
+				}
+				// D-191: a rich entry's BCG sits at its own magnitude's level.
+				// (The entry's magnitude as its record stores it, a half float: the copy tests that.)
+				const float EntryM = H::Uni_F16ToF32(H::Uni_F32ToF16(Cat.Entries[R.Entry].AbsMag));
+				if (Cat.BcgShareAt(EntryM) > 0.0)
+				{
+					const int Lb = Model.LevelOf(Cat.MemberArchetypeId, double(BcgMag(Cat, EntryM)));
+					if (Cat.PeriodBits - Lb >= 2 && Cat.PeriodBits - Lb <= 21) { Levels.insert(Lb); }
 				}
 				for (const int L : Levels)
 				{
@@ -736,6 +745,20 @@ namespace UniCore
 			return FromHlsl(H::Uni_MakeObject(H::uint3(Off[0], Off[1], Off[2]), Cat.ArchetypeId, Flags, Seed, RL2, M, SB, Rgb));
 		}
 
+		/** D-191: the catalogue a rich (BCG / ICL) entry of archetype Arch at magnitude M belongs
+		 *  to, or null. */
+		const FCatalogue* RichCatalogueOf(u32 Arch, float M) const
+		{
+			for (const FCatalogue& Cat : Model.Definition().Catalogues)
+			{
+				if (Cat.ArchetypeId == Arch && Cat.bBrightMembers && (Cat.BcgShare > 0.0 || Cat.IclShare > 0.0) && M < Cat.BcgMaxMag) { return &Cat; }
+			}
+			return nullptr;
+		}
+
+		/** D-191: a rich entry's BCG magnitude (its share of the entry's light). */
+		static float BcgMag(const FCatalogue& Cat, float EntryMag) { return EntryMag - 2.5f * float(std::log10(std::max(Cat.BcgShareAt(EntryMag), 1.0e-6))); }
+
 		/** D-177: the authored bright members of catalogue entries in cell K (a member level).
 		 *  For each entry whose copy lies in K's tile cell or a neighbour's: the copy's own object
 		 *  and contributor (exactly as the streamer makes them: shape, orientation, influence),
@@ -968,7 +991,9 @@ namespace UniCore
 				const H::FUniFieldParams Fp = C.Params.ToHlsl();
 				const u32 ObjSeed = Host.Objects[0].B[0];
 				const u32 Ms = H::Uni_SeedMix(ObjSeed, H::UNI_CH_MEMBER);
-				const u32 Count = std::min(H::Uni_PoissonCount(float(C.NTotal * Cat.BrightRatio), Ms), 64u);
+				// D-191: a rich entry's BCG takes rank 63, so its drawn members stop at 63.
+				const bool bBcg = Host.Objects[0].A[3] != 0u && Cat.BcgShareAt(H::Uni_ObjectAbsMag(UniCore::ToHlsl(Host.Objects[0]))) > 0.0;
+				const u32 Count = std::min(H::Uni_PoissonCount(float(C.NTotal * Cat.BrightRatio), Ms), bBcg ? 63u : 64u);
 				const FSliceTable& St = Model.SlicesOf(Cat.MemberArchetypeId);
 				double PBright = 0.0;
 				for (const FSlice& Sl : St.Slices) { if (Sl.Level >= Cat.MemberMinLevel) { PBright += Sl.P; } }
@@ -1010,6 +1035,29 @@ namespace UniCore
 					if (MA.bPalette) { Rgb = H::Uni_TintRecordColour(Rgb, H::Uni_GalaxyFarTint(H::Uni_GalaxyPalette(H::Uni_PaletteSeed(S)))); }   // D-182
 					const bool bExt = MA.Visibility == EUniVisibility::Extended;
 					const u32 Flags = H::UNI_OBJ_FLAG_ANCHOR | (bExt ? H::UNI_OBJ_FLAG_EXTENDED : 0u) | (MA.Emitters.empty() ? 0u : H::UNI_OBJ_FLAG_HAS_CONTRIBUTOR) | (bEarly ? H::UNI_OBJ_FLAG_EARLY : 0u);
+					const float SB = bExt ? SurfaceBrightness(M, RL2) : 0.0f;
+					Mr.Obj = FromHlsl(H::Uni_MakeObject(H::uint3(0u, 0u, 0u), Cat.MemberArchetypeId, Flags, S, RL2, M, SB, Rgb));
+					Out->Members.push_back(Mr);
+				}
+				if (bBcg)
+				{
+					// D-191: the brightest cluster galaxy, a giant early type at the cluster's centre:
+					// its share of the cluster's light, the radius model's radius x BcgRadiusScale
+					// (an extended envelope), an early type's colour; keyed by the copy's seed.
+					const u32 S = H::Uni_SeedMix(Ms, 0xBC6u);
+					const float M = BcgMag(Cat, H::Uni_ObjectAbsMag(UniCore::ToHlsl(Host.Objects[0])));
+					FMemberRec Mr;
+					Mr.Pos = C.Centre;
+					Mr.Level = Model.LevelOf(Cat.MemberArchetypeId, double(M));
+					Mr.Cell = CellOf(Mr.Pos, Mr.Level);
+					Mr.Index = kFirstMemberIndex + R.Entry * 64u + 63u;
+					H::float4 Cm(MA.ColourModel[0], MA.ColourModel[1], MA.ColourModel[2], MA.ColourModel[3]);
+					Cm.x = Cm.x + Fp.C.w;   // the early types' colour shift (D-172)
+					const float RL2 = H::Uni_DrawRadiusLog2(S, M, Rm) + float(std::log2(std::max(Cat.BcgRadiusScale, 0.1)));
+					H::float3 Rgb = H::Uni_DrawColour(S, M, Cm);
+					if (MA.bPalette) { Rgb = H::Uni_TintRecordColour(Rgb, H::Uni_GalaxyFarTint(H::Uni_GalaxyPalette(H::Uni_PaletteSeed(S)))); }
+					const bool bExt = MA.Visibility == EUniVisibility::Extended;
+					const u32 Flags = H::UNI_OBJ_FLAG_ANCHOR | (bExt ? H::UNI_OBJ_FLAG_EXTENDED : 0u) | (MA.Emitters.empty() ? 0u : H::UNI_OBJ_FLAG_HAS_CONTRIBUTOR) | H::UNI_OBJ_FLAG_EARLY;
 					const float SB = bExt ? SurfaceBrightness(M, RL2) : 0.0f;
 					Mr.Obj = FromHlsl(H::Uni_MakeObject(H::uint3(0u, 0u, 0u), Cat.MemberArchetypeId, Flags, S, RL2, M, SB, Rgb));
 					Out->Members.push_back(Mr);
@@ -1089,6 +1137,17 @@ namespace UniCore
 					// D-182: a galaxy's palette seed, from its object seed (as its record's colour takes it).
 					if (A.bPalette && Em.FieldId == H::UNI_FIELD_GALAXY) { Ct.Params.V[23] = float(H::Uni_PaletteSeed(O.B[0])); }
 					Ct.NTotal = std::isfinite(Em.NTotalRefMag) ? Em.NTotal * std::pow(10.0, -0.4 * (double(M) - Em.NTotalRefMag)) : Em.NTotal;
+					// D-191: a rich catalogue cluster's light is shared with its BCG and ICL.
+					if (bAnchor && E == 0 && C.Indices[I] >= kFirstCatalogueIndex && C.Indices[I] < kFirstMemberIndex)
+					{
+						const FCatalogue* Cat = RichCatalogueOf(Arch, M);
+						if (Cat)
+						{
+							const double Keep = Cat->MemberKeepAt(M);
+							Ct.NTotal *= Keep;
+							Ct.IclRatio = Cat->IclShare / Keep;
+						}
+					}
 					if (Em.bRandomOrientation && !(Anc && Anc->bFixedOrientation)) { RandomRotation(O.B[0], Ct.Rot); }
 					Out.push_back(Ct);
 				}

@@ -102,7 +102,14 @@ static TAutoConsoleVariable<int32> CVarUniVolumePrefilter(TEXT("uu.VolumePrefilt
 static TAutoConsoleVariable<int32> CVarUniVolumeLutStart(TEXT("uu.VolumeLutStart"), 1, TEXT("D-160: emission-only carriers start marching where their unresolved light becomes significant, not at 1 pc. 0: from 1 pc."));
 // D-164: the cosmic web from a baked texture.
 static TAutoConsoleVariable<int32> CVarUniWebSource(TEXT("uu.WebSource"), 1, TEXT("D-164: the cosmic web's density. 1: a 3D texture with mips (uu.WebTexture) (placement and the volume read the same texels; much cheaper to march). 0: the procedural lattices (D-012). Applies at uu.Enable; switching rerolls the web's galaxies."));
+static TAutoConsoleVariable<int32> CVarUniSkyWeb(TEXT("uu.SkyWeb"), 0, TEXT("D-189: the web in the sky (art choice, render-only): 0 physical; 1 near-web glow (the near web's light lifted where it is overdense); 2 dimmed tail (the uniform far background dimmed, so the near web carries contrast); 3 both. Live."));
+static TAutoConsoleVariable<float> CVarUniSkyWebGlow(TEXT("uu.SkyWeb.Glow"), 2.0f, TEXT("D-189: near-web glow gain (x overdensity)."));
+static TAutoConsoleVariable<float> CVarUniSkyWebDepth(TEXT("uu.SkyWeb.Depth"), 50.0f, TEXT("D-189: near-web glow depth, Mpc (it fades over the second half)."));
+static TAutoConsoleVariable<float> CVarUniSkyWebTail(TEXT("uu.SkyWeb.Tail"), 0.1f, TEXT("D-189: the far background's share kept in mode 2 (1: physical)."));
 static TAutoConsoleVariable<float> CVarUniWarp(TEXT("uu.Warp"), 1.0f, TEXT("D-187: warp effects (streaks, arrival), 0..1 x the warp amount from speed (the travel-sensitivity curve). 0: physical."));
+static TAutoConsoleVariable<float> CVarUniWarpMotes(TEXT("uu.Warp.Motes"), 1.0f, TEXT("D-192: warp ambience, 0..1 (x the warp amount): decorative motes fixed in space around the camera, streaking past at speed so a void still reads as fast. 0: none. Live."));
+static TAutoConsoleVariable<float> CVarUniWarpMoteFrames(TEXT("uu.Warp.MoteFrames"), 30.0f, TEXT("D-192: the motes' lattice cell, in frames of the camera's motion (the nearest motes pass in about this many frames)."));
+static TAutoConsoleVariable<float> CVarUniWarpMoteMag(TEXT("uu.Warp.MoteMag"), 1.5f, TEXT("D-192: the brightest motes' magnitude relative to the exposure magnitude (fainter > 0); they spread over two magnitudes below it."));
 static TAutoConsoleVariable<int32> CVarUniSpriteEllipses(TEXT("uu.SpriteEllipses"), 1, TEXT("D-183: disc galaxies' sprites are ellipses at their disc's inclination (energy unchanged; round below a few pixels). 0: every sprite round. Render-only, live."));
 static TAutoConsoleVariable<int32> CVarUniGalaxyPalettes(TEXT("uu.GalaxyPalettes"), 1, TEXT("D-182: every galaxy its own colour palette (bulge, disc, arms, knots), which its stars and glow take (chroma only: brightness unchanged). 0: physical colours. Applies at uu.Enable; rerolls star and galaxy colours only."));
 static TAutoConsoleVariable<int32> CVarUniGalaxyTextures(TEXT("uu.GalaxyTextures"), 1, TEXT("D-179: galaxies read the noise project's galaxy textures (warp_fine, warp_large, galaxy_detail in Plugins/UnifiedUniverse/Data/Noise): texture warps of discs, arms and bulges, disc noise and star-forming knots. 0: off. Applies at uu.Enable; rerolls galaxies' stars."));
@@ -670,6 +677,9 @@ void UUniSubsystem::Tick(float DeltaTime)
 		Warp.RiseMagPerS = 2.0;
 		Warp.FallMagPerS = 1.0;
 		Warp.Update(Speed, Dt);
+		// D-192: the motes' lattice follows the speed (held while still, reset on a jump).
+		if (bCameraJumped) { MoteScale.Reset(); }
+		MoteScale.Update(UniCore::Length(Step) * (bCameraJumped ? 0.0 : 1.0), FMath::Max(double(CVarUniWarpMoteFrames.GetValueOnGameThread()), 1.0), Dt);
 		PrevCamera = Camera;
 		bCameraJumped = false;
 	}
@@ -832,6 +842,18 @@ void UUniSubsystem::PushFrame()
 	F.CameraStepCm = FVector3f(CameraStepCm);   // D-184
 	F.WarpAmount = float(Warp.Current) * FMath::Clamp(CVarUniWarp.GetValueOnGameThread(), 0.0f, 1.0f);   // D-187
 	F.bCameraStepValid = bCameraStepValid;
+	{
+		// D-192: the warp motes' lattice around the camera.
+		const UniCore::FMoteLattice Ml = UniCore::MoteLattice(Camera.ToCore(), UniCore::FVec3f{ CameraFraction.X, CameraFraction.Y, CameraFraction.Z }, MoteScale.Log2Cm,
+			F.WarpAmount * FMath::Clamp(CVarUniWarpMotes.GetValueOnGameThread(), 0.0f, 1.0f));
+		for (int32 K = 0; K < 2; ++K)
+		{
+			const UniCore::FMoteSlot& Sl = Ml.Slot[K];
+			F.MoteCell[K] = FUintVector4(Sl.Cell[0], Sl.Cell[1], Sl.Cell[2], Sl.Level);
+			F.MoteFrac[K] = FVector4f(Sl.Frac[0], Sl.Frac[1], Sl.Frac[2], Sl.Weight);
+		}
+		F.MoteScale = FVector4f(float(Ml.Slot[0].CellCm), float(Ml.Slot[1].CellCm), FMath::Pow(10.0f, -0.4f * CVarUniWarpMoteMag.GetValueOnGameThread()), 0.0f);
+	}
 	F.DiscArchetypeMask = CVarUniSpriteEllipses.GetValueOnGameThread() != 0 ? DiscArchetypeMask : 0u;   // D-183 (render-only: live)
 	for (int32 K = 0; K < 4; ++K) { F.FixedDiscSeeds[K] = FixedDiscSeeds[K]; }
 	F.DeltaMag = EffectiveDeltaMag;   // D-154: owner sensitivity + travel boost
@@ -855,6 +877,13 @@ void UUniSubsystem::PushFrame()
 		Settings.MaxSubsamples = UniCore::u32(FMath::Clamp(CVarUniVolumeMaxSubsamples.GetValueOnGameThread(), 1, 8));
 		Settings.bPrefilter = CVarUniVolumePrefilter.GetValueOnGameThread() != 0;
 		Settings.bLutStart = CVarUniVolumeLutStart.GetValueOnGameThread() != 0;
+		{
+			// D-189: the web in the sky.
+			const int32 SkyMode = CVarUniSkyWeb.GetValueOnGameThread();
+			Settings.WebGlowGain = (SkyMode & 1) ? FMath::Max(CVarUniSkyWebGlow.GetValueOnGameThread(), 0.0f) : 0.0f;
+			Settings.WebGlowDepthCm = float(double(FMath::Max(CVarUniSkyWebDepth.GetValueOnGameThread(), 0.1f)) * 3.0856775814913673e24);
+			Settings.TailDim = (SkyMode & 2) ? 1.0f - FMath::Clamp(CVarUniSkyWebTail.GetValueOnGameThread(), 0.0f, 1.0f) : 0.0f;
+		}
 		const UniCore::FVolumeScene Sc = VolumeBuilder->Build(*Streamer, Cam, UniCore::FVec3f{ CameraFraction.X, CameraFraction.Y, CameraFraction.Z }, V, Settings);
 		for (const UniCore::FCarrierGPU& C : Sc.Carriers)
 		{
@@ -886,6 +915,9 @@ void UUniSubsystem::PushFrame()
 				}
 			}
 		}
+		// D-189: a sky-web change re-marches the background map too.
+		const FVector3f SkyKey(Settings.TailDim, Settings.WebGlowGain, Settings.WebGlowDepthCm);
+		if (SkyKey != SkyWebLast) { bDirty = true; SkyWebLast = SkyKey; }
 		if (bDirty) { ++BackgroundVersion; BackgroundAnchor = Cam; BackgroundLutLast = F.VolumeLut; }
 		F.BackgroundVersion = BackgroundVersion;
 	}

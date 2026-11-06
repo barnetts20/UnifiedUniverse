@@ -90,6 +90,12 @@ struct FUniView
 	float HaloMaxPx;          // halo sigma cap for an unresolved source, pixels
 	uint DiscArchetypeMask;   // D-183: archetypes (id < 32) whose objects are disc galaxies: their sprites are inclined ellipses
 	uint4 FixedDiscSeeds;     // D-183: object seeds of anchors with a fixed (identity) orientation: disc normal world z (0: unused)
+	float3 WarpVel;           // D-190: the camera's motion (unit; any when WarpBeta is 0)
+	float WarpBeta;           // D-190: the effective speed of the warp optics (0: none)
+	float WarpDoppler;        // D-190: Doppler colour strength (Uni_DopplerTint's InK)
+	float WarpBeaming;        // D-190: beaming exponent (0: light kept)
+	float WarpPad0;
+	float WarpPad1;
 };
 
 struct FUniSprite
@@ -230,7 +236,10 @@ UNI_FN FUniSprite Uni_ProjectObject(uint4 InCellDeltaX, uint4 InCellDeltaY, uint
 	const uint3 Off = uint3(InObj.A.x, InObj.A.y, InObj.A.z);
 	const float3 Rel = Uni_ObjectRelative(InCellDeltaX, InCellDeltaY, InCellDeltaZ, Off, InLevel, InView.CameraFraction);
 	const float R = max(Uni_SafeLength(Rel), 1.0e-3f);
-	const float3 Dir = Rel * (1.0f / R);
+	// D-190: at warp the source is seen at its aberrated direction, in its Doppler-shifted colour.
+	const float3 TrueDir = Rel * (1.0f / R);
+	const float Dop = Uni_DopplerFactor(TrueDir, InView.WarpVel, InView.WarpBeta);
+	const float3 Dir = Uni_Aberrate(TrueDir, InView.WarpVel, InView.WarpBeta);
 	S.TrueDistance = R;
 
 	const float Radius = exp2(Uni_ObjectRadiusLog2(InObj));
@@ -315,6 +324,7 @@ UNI_FN FUniSprite Uni_ProjectObject(uint4 InCellDeltaX, uint4 InCellDeltaY, uint
 	const float3 Col = Uni_UnpackColour(InObj.B.w);
 	S.Radiance = Col * (CoreE / max(Uni_Luminance(Col), 1.0e-3f));   // the core's light; luminance = core energy (D-135)
 	S.Flags = S.Flags | UNI_SPRITE_VISIBLE | (bExtended ? UNI_SPRITE_EXTENDED : 0u) | (bBody ? UNI_SPRITE_BODY : 0u) | (bPromoted ? UNI_SPRITE_HALO_ONLY : 0u);
+	if (InView.WarpBeta != 0.0f) { S.Radiance = Uni_DopplerTint(S.Radiance, Dop, InView.WarpDoppler, InView.WarpBeaming); }   // D-190
 	// D-183: a disc galaxy reads as an ellipse at its inclination: the disc normal is its
 	// contributor's (the object seed's random rotation, UniGenRef RandomRotation), the axis ratio
 	// sqrt(cos^2 i + q0^2 sin^2 i) (q0 0.2 for a disc, 0.65 for an early type: the rolled fields'
@@ -494,12 +504,24 @@ UNI_FN float Uni_SpriteArrival(uint InAgeFrames, float InFrames)
  *  was along normalize(Dir x TrueDistance + CamStep). Returns the tail's direction in the quad's
  *  (Side, Up) basis and its length in pixels (z; 0: no streak). InWarp: (warp amount 0..1,
  *  exposure in frames, longest streak px, arrival stretch); an arriving sprite (InArrival < 1)
- *  streams in with its tail stretched by 1 + stretch x (1 - arrival). */
-UNI_FN float3 Uni_SpriteStreak(float3 InDir, float InTrueDistance, float3 InCamStep, float3 InSide, float3 InUp, float InPixelsPerRadian, float4 InWarp, float InArrival)
+ *  streams in with its tail stretched by 1 + stretch x (1 - arrival). InAberr: the warp optics
+ *  (D-190: motion xyz, effective speed w; w 0 none). */
+UNI_FN float3 Uni_SpriteStreak(float3 InDir, float InTrueDistance, float3 InCamStep, float3 InSide, float3 InUp, float InPixelsPerRadian, float4 InWarp, float InArrival, float4 InAberr)
 {
 	if (!(InWarp.x > 0.0f) || !(InWarp.y > 0.0f)) { return float3(0.0f, 0.0f, 0.0f); }
 	// Divided through by the distance first: |Dir x distance|^2 overflows a float past ~1e19 cm.
-	const float3 Prev = normalize(InDir + InCamStep * (1.0f / max(InTrueDistance, 1.0f)));
+	// D-190: with the warp optics on, InDir is apparent: the motion is the true one, re-aberrated.
+	float3 Prev;
+	if (InAberr.w != 0.0f)
+	{
+		const float3 Vel = float3(InAberr.x, InAberr.y, InAberr.z);
+		const float3 True = Uni_Aberrate(InDir, Vel, -InAberr.w);
+		Prev = Uni_Aberrate(normalize(True + InCamStep * (1.0f / max(InTrueDistance, 1.0f))), Vel, InAberr.w);
+	}
+	else
+	{
+		Prev = normalize(InDir + InCamStep * (1.0f / max(InTrueDistance, 1.0f)));
+	}
 	const float3 T = Prev - InDir;
 	const float Tx = dot(T, InSide), Ty = dot(T, InUp);
 	const float Len = sqrt(Tx * Tx + Ty * Ty);
@@ -508,6 +530,69 @@ UNI_FN float3 Uni_SpriteStreak(float3 InDir, float InTrueDistance, float3 InCamS
 	const float L = min(Len * InPixelsPerRadian * InWarp.y * InWarp.x * Stretch, max(InWarp.z, 0.0f));
 	if (L < 0.25f) { return float3(0.0f, 0.0f, 0.0f); }
 	return float3(Tx / Len, Ty / Len, L);
+}
+
+/** D-192: warp ambience. Motes are decoration in empty space (nothing generated, render-only):
+ *  points fixed in the world, UNI_MOTE_PER_CELL hashed into every cell of a cubic lattice, on two
+ *  lattice levels whose scale follows the speed, so the nearest stream past within a second and
+ *  streak like the stars (E1). Each level is 4 x 4 x 4 cells around the camera's (UNI_MOTE_COUNT
+ *  sprites in all; about 20 in a 90 degree view); a mote fades out from 0.75 to 1.5 cells away, so
+ *  the 4-cell block (shifted by the camera's half-cell) never shows its edge, and fades in near
+ *  the camera from 0.35 to 0.1 cells (no one-frame flashes). The engine
+ *  (UniMotes.h) gives per level: the camera's cell (low 32 bits per axis; w the level) and its
+ *  fraction in it (w the level's weight: the warp amount x the scale's cross-fade), and the cell
+ *  size (cm). InScale: (cell cm level 0, level 1, mote flux in exposure units, core angular
+ *  radius). Doppler and aberration as the project pass's (InDopplerKQ: strength, beaming). */
+static const uint UNI_MOTE_PER_CELL = 16u;
+static const uint UNI_MOTE_COUNT = 2u * 64u * UNI_MOTE_PER_CELL;
+
+UNI_FN FUniSprite Uni_MoteSprite(uint InIndex, uint4 InCell0, float4 InFrac0, uint4 InCell1, float4 InFrac1, float4 InScale, float3 InForward, float4 InVelBeta, float2 InDopplerKQ)
+{
+	FUniSprite S;
+	S.RenderPos = float3(0.0f, 0.0f, 0.0f);
+	S.AngularRadius = 0.0f;
+	S.Radiance = float3(0.0f, 0.0f, 0.0f);
+	S.TrueDistance = 0.0f;
+	S.NdcX = 0.0f;
+	S.NdcY = 0.0f;
+	S.Flags = 0u;
+	S.PhysAngularRadius = 0.0f;
+	S.HaloRadius = 0.0f;
+	S.HaloRatio = 0.0f;
+	S.EllipseAngle = 0.0f;
+	S.EllipseAxis = 0.0f;
+	if (InIndex >= UNI_MOTE_COUNT) { return S; }
+	const bool bSlot1 = InIndex >= (UNI_MOTE_COUNT / 2u);
+	const uint4 Cell = bSlot1 ? InCell1 : InCell0;
+	const float4 Fr = bSlot1 ? InFrac1 : InFrac0;
+	const float CellCm = bSlot1 ? InScale.y : InScale.x;
+	if (!(Fr.w > 0.0f) || !(CellCm > 0.0f)) { return S; }
+	const uint J = (InIndex / UNI_MOTE_PER_CELL) & 63u;   // the cell in the 4 x 4 x 4 block
+	const uint Km = InIndex % UNI_MOTE_PER_CELL;          // the mote in the cell
+	// Cells -2..1 or -1..2 on each axis, whichever centres the camera (its half of its cell).
+	const int Dx = (int)(J & 3u) + (Fr.x < 0.5f ? -2 : -1);
+	const int Dy = (int)((J >> 2u) & 3u) + (Fr.y < 0.5f ? -2 : -1);
+	const int Dz = (int)(J >> 4u) + (Fr.z < 0.5f ? -2 : -1);
+	const uint Seed = Uni_SeedMix(Uni_SeedMix(Uni_SeedMix(Uni_SeedMix(Uni_SeedMix(UNI_CH_MOTE, Cell.w), Cell.x + (uint)Dx), Cell.y + (uint)Dy), Cell.z + (uint)Dz), Km);
+	const float3 Hp = float3(Uni_DrawUnit(Seed, UNI_CH_MOTE, 1u), Uni_DrawUnit(Seed, UNI_CH_MOTE, 2u), Uni_DrawUnit(Seed, UNI_CH_MOTE, 3u));
+	const float3 Cells = float3((float)Dx + Hp.x - Fr.x, (float)Dy + Hp.y - Fr.y, (float)Dz + Hp.z - Fr.z);
+	const float Rc = Uni_SafeLength(Cells);
+	const float Fade = Fr.w * (1.0f - smoothstep(0.75f, 1.5f, Rc)) * smoothstep(0.1f, 0.35f, Rc);
+	if (!(Fade > 0.0f)) { return S; }
+	const float3 TrueDir = Cells * (1.0f / Rc);
+	const float3 Vel = float3(InVelBeta.x, InVelBeta.y, InVelBeta.z);
+	const float3 Dir = Uni_Aberrate(TrueDir, Vel, InVelBeta.w);
+	if (!(dot(Dir, InForward) > 0.0f)) { return S; }
+	const float R = Rc * CellCm;
+	const float I = InScale.z * Fade * pow(10.0f, -0.8f * Uni_DrawUnit(Seed, UNI_CH_MOTE, 4u));   // two magnitudes of spread
+	S.TrueDistance = R;
+	S.RenderPos = Dir * Uni_Compress(R);
+	S.AngularRadius = InScale.w;
+	S.PhysAngularRadius = 0.0f;
+	S.Radiance = float3(I, I, I);
+	if (InVelBeta.w != 0.0f) { S.Radiance = Uni_DopplerTint(S.Radiance, Uni_DopplerFactor(TrueDir, Vel, InVelBeta.w), InDopplerKQ.x, InDopplerKQ.y); }
+	S.Flags = UNI_SPRITE_VISIBLE;
+	return S;
 }
 
 #endif // UNI_PROJECT_USH

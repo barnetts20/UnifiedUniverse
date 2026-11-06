@@ -1323,6 +1323,151 @@ UNI_TEST(webtex, members)
 				Near, Got, Want, Z, Outside, Worst, Members, BrightBad, Cut, FaintMembers, FaintBad, CoreFrac, CoreN, OuterFrac, OuterN, CellsCmp, CellsDiff, Ks, KsMax));
 }
 
+UNI_TEST(webtex, bcg)
+{
+	// D-191: rich catalogue clusters (M < BcgMaxMag) carry a brightest cluster galaxy (a giant
+	// early type at their centre, authored with their bright members; its share of the light 6% at
+	// M -26.5, rising as L^-0.5 toward poorer clusters) and intracluster light (IclShare: a second
+	// LUT block on their own volume carrier, never resolved); their members' counts shrink so the
+	// total is unchanged. From the heaviest cluster's copy nearest the void camera, over the
+	// clusters within 30 Mpc: every contributor's count scaled by 1 - BCG share - IclShare when
+	// rich and untouched when not, with members + ICL + BCG = the cluster's light; exactly one BCG
+	// per rich cluster and none elsewhere, at the centre, at its share's magnitude, early, the
+	// cluster's brightest galaxy; and in the volume scene every rich cluster's carrier has its ICL
+	// block (total light at least the unresolved light at every distance, equal with no sprites
+	// drawn) and marches from the local start.
+	std::string Err;
+	const FWebTexture& T = Delivered(&Err);
+	std::vector<FWebNode> Nodes;
+	if (!T.IsValid() || !LoadWebNodes(kDeliveredDir, kDeliveredName, Nodes, &Err)) { Uni::Check(2, "T2.webtex.bcg", "D-191 brightest cluster galaxies and intracluster light").Pass(false, "not loaded: " + Err); return; }
+	FBindScope Bind(T);
+	const UniScenes::FClusterTuning Tun;
+	FUniverseDef Def = UniScenes::WebToGalaxy(Tun);
+	const H::float4 Mean = T.Mean();
+	UniScenes::UseDeliveredWeb(Def, Tun, T.Size, Mean.z / (double(Mean.x) + Mean.y + Mean.z + Mean.w), &Nodes);
+	const FCatalogue& Cat = Def.Catalogues.at(0);
+	FUniverseModel M(Def);
+	FRefGenerator G(M);
+	FRefPipeline P(G);
+	P.bVelocityLod = false;
+	const double Tile = std::ldexp(1.0, Cat.PeriodBits);
+	FCoord Cam = UniScenes::VoidCamera();
+	{
+		double Pv[3];
+		for (int Ax = 0; Ax < 3; ++Ax) { Pv[Ax] = U128ToDouble(MaskLow(Cam.Axis(Ax), Cat.PeriodBits)) / Tile; }
+		auto Wrap = [](double X) { return X - std::round(X); };
+		FVec3f Fr{};
+		AddDisplacement(Cam, Fr, FVec3d{ Wrap(Cat.Entries[0].Pos[0] - Pv[0]) * Tile, Wrap(Cat.Entries[0].Pos[1] - Pv[1]) * Tile, Wrap(Cat.Entries[0].Pos[2] - Pv[2]) * Tile });
+	}
+	P.Update(Cam, FVec3f{});
+	auto EntryMag = [&](u32 E) { return H::Uni_F16ToF32(H::Uni_F32ToF16(Cat.Entries[E].AbsMag)); };
+	// Authored members by entry: the BCG (rank 63) and the brightest of the rest.
+	struct FBcg { FCoord Pos; float M; bool bEarly; };
+	std::map<u32, std::vector<FBcg>> Bcgs;
+	std::map<u32, float> BrightestOther;
+	for (const auto& KV : P.CacheRef())
+	{
+		for (size_t I = 0; I < KV.second.Objects.size(); ++I)
+		{
+			const FObjectGPU& O = KV.second.Objects[I];
+			const u32 Ix = KV.second.Indices[I];
+			if ((O.A[3] & 0xFFFFu) != UniScenes::kGalaxy || Ix < kFirstMemberIndex) { continue; }
+			const u32 Entry = (Ix - kFirstMemberIndex) / 64u;
+			const float Mg = H::Uni_ObjectAbsMag(UniCore::ToHlsl(O));
+			if ((Ix - kFirstMemberIndex) % 64u == 63u)
+			{
+				const u32 Off[3] = { O.A[0], O.A[1], O.A[2] };
+				Bcgs[Entry].push_back(FBcg{ ObjectCoord(KV.first, Off), Mg, ((O.A[3] >> 16) & H::UNI_OBJ_FLAG_EARLY) != 0u });
+			}
+			else
+			{
+				auto It = BrightestOther.find(Entry);
+				if (It == BrightestOther.end() || Mg < It->second) { BrightestOther[Entry] = Mg; }
+			}
+		}
+	}
+	// Contributors within 30 Mpc.
+	size_t Near = 0, Rich = 0, CountBad = 0, OneBcg = 0, BcgBad = 0, Brightest = 0, StrayBcg = 0;
+	double WorstLight = 0.0, WorstOff = 0.0, WorstMag = 0.0;
+	std::set<u32> NearEntries;
+	double Gap = 99.0;   // the smallest magnitude gap from a BCG to its cluster's next brightest
+	std::vector<float> IclRatios;
+	for (const auto& KV : P.Contributors())
+	{
+		const FContributor& C = KV.second;
+		if (C.ParentArchetypeId != UniScenes::kCluster || C.Parent.Index < kFirstCatalogueIndex || C.Parent.Index >= kFirstMemberIndex || C.EmitterIndex != 0) { continue; }
+		if (Length(ToDouble(Sub(C.Centre, Cam))) > 30.0 * Units::Mpc) { continue; }
+		const u32 Entry = (C.Parent.Index - kFirstCatalogueIndex) % u32(Cat.Entries.size());
+		const float Mc = EntryMag(Entry);
+		const bool bRich = Mc < Cat.BcgMaxMag;
+		const double Share = Cat.BcgShareAt(Mc), Keep = 1.0 - Share - Cat.IclShare;
+		++Near;
+		NearEntries.insert(Entry);
+		const FUniEmitter& Em = *C.Emitter;
+		const double Full = std::isfinite(Em.NTotalRefMag) ? Em.NTotal * std::pow(10.0, -0.4 * (double(Mc) - Em.NTotalRefMag)) : Em.NTotal;
+		const double Ratio = C.NTotal / Full;
+		// Members' + ICL light over the cluster's, plus the BCG's share: 1.
+		const double Light = Ratio * (1.0 + C.IclRatio) + Share;
+		WorstLight = std::max(WorstLight, std::abs(Light - 1.0));
+		CountBad += (std::abs(Ratio - (bRich ? Keep : 1.0)) > 1e-9 || (bRich ? std::abs(C.IclRatio - Cat.IclShare / Keep) > 1e-12 : C.IclRatio != 0.0)) ? 1 : 0;
+		if (bRich) { IclRatios.push_back(float(C.IclRatio)); }
+		if (!bRich) { StrayBcg += Bcgs.count(Entry) ? Bcgs[Entry].size() : 0; continue; }
+		++Rich;
+		const auto It = Bcgs.find(Entry);
+		if (It == Bcgs.end() || It->second.size() != 1) { continue; }
+		++OneBcg;
+		const FBcg& B = It->second[0];
+		const double Off = Length(ToDouble(Sub(B.Pos, C.Centre)));
+		const double WantM = double(Mc) - 2.5 * std::log10(Share);
+		WorstOff = std::max(WorstOff, Off / C.InfluenceCm);
+		WorstMag = std::max(WorstMag, std::abs(double(B.M) - WantM));
+		BcgBad += (!B.bEarly || Off > 1e-6 * C.InfluenceCm || std::abs(double(B.M) - WantM) > 0.02) ? 1 : 0;
+		const auto Ot = BrightestOther.find(Entry);
+		Brightest += (Ot == BrightestOther.end() || B.M < Ot->second) ? 1 : 0;
+		if (Ot != BrightestOther.end()) { Gap = std::min(Gap, double(Ot->second) - double(B.M)); }
+	}
+	// BCGs of entries with no contributor near (copies farther away) are counted only if poor.
+	for (const auto& KV : Bcgs) { if (!NearEntries.count(KV.first) && !(EntryMag(KV.first) < Cat.BcgMaxMag)) { StrayBcg += KV.second.size(); } }
+	// The volume scene: rich clusters' carriers carry the ICL block.
+	FVolumeBuilder VB(M, G);
+	FCamera Cm; Cm.Coord = Cam; Cm.Width = 320; Cm.Height = 180; Cm.LookAlong({ 1, 0.3, 0.1 });
+	const FVolumeSettings Vs;
+	size_t Icl = 0, Plain = 0, IclBad = 0, LutBelow = 0, LutUnequal = 0;
+	double WorstEq = 0.0;
+	const u32 Ls = H::UNI_VOL_LUT_SIZE;
+	for (int Pass = 0; Pass < 2; ++Pass)
+	{
+		VB.ForceLevelFade = Pass == 0 ? -1.0f : 0.0f;   // pass 1: no sprites, every child unresolved
+		const FVolumeScene Sc = VB.Build(P, Cam, FVec3f{}, Cm.View(), Vs);
+		for (const FCarrierGPU& Ca : Sc.Carriers)
+		{
+			if (Ca.FieldId != H::UNI_FIELD_CLUSTER) { continue; }
+			if (!(Ca.Flags & H::UNI_CARRIER_ICL)) { Plain += Pass == 0 ? 1 : 0; continue; }
+			Icl += Pass == 0 ? 1 : 0;
+			const bool bKnown = std::any_of(IclRatios.begin(), IclRatios.end(), [&](float R) { return std::abs(R - Ca.IclRatio) <= 1e-6f * R; });
+			IclBad += (!bKnown || Ca.TStart != float(Vs.LocalStartCm) || Ca.PaletteIndex == Ca.LutIndex) ? 1 : 0;
+			for (u32 I = 0; I < Ls; ++I)
+			{
+				const H::float4 E = Sc.Lut[size_t(Ca.LutIndex) * Ls + I], Tt = Sc.Lut[size_t(Ca.PaletteIndex) * Ls + I];
+				const double Le = double(E.x) + E.y + E.z, Lt = double(Tt.x) + Tt.y + Tt.z;
+				if (Pass == 0) { LutBelow += Lt < Le * (1.0 - 1e-6) ? 1 : 0; }
+				else
+				{
+					const double D = std::abs(Lt - Le) / std::max(Lt, 1e-300);
+					WorstEq = std::max(WorstEq, D);
+					LutUnequal += D > 1e-6 ? 1 : 0;
+				}
+			}
+		}
+	}
+	Uni::Check(2, "T2.webtex.bcg", "D-191 brightest cluster galaxies and intracluster light (from the heaviest cluster, clusters within 30 Mpc): counts x (1 - BCG share - IclShare) for rich clusters only, members + ICL + BCG = the cluster's light (1e-9); exactly one BCG per rich cluster and none for poorer ones, at the centre, at M - 2.5 log10 share (0.02), early, its cluster's brightest; rich carriers carry the ICL block (a rich cluster's ratio IclShare / keep, from the local start), its light at least the members' unresolved light at every distance and equal with no sprites drawn")
+		.Metric("clusters_near", double(Near)).Metric("rich", double(Rich)).Metric("one_bcg", double(OneBcg)).Metric("bcg_brightest", double(Brightest)).Metric("bcg_gap", Gap).Metric("worst_light", WorstLight).Metric("worst_bcg_mag", WorstMag).Metric("icl_carriers", double(Icl)).Metric("plain_cluster_carriers", double(Plain)).Metric("icl_lut_eq", WorstEq)
+		.Pass(Near >= 3 && Rich >= 1 && CountBad == 0 && WorstLight < 1e-9 && OneBcg == Rich && BcgBad == 0 && StrayBcg == 0 && Brightest == Rich
+			&& Icl >= 1 && IclBad == 0 && LutBelow == 0 && LutUnequal == 0,
+			Uni::Fmt("%zu clusters within 30 Mpc, %zu rich: %zu counts wrong, light off by %.1e at worst; %zu rich with exactly one BCG (%zu wrong: worst offset %.1e of the influence, magnitude %.4f off), %zu the brightest (smallest gap %.2f mag), %zu stray; volume: %zu ICL carriers (%zu wrong), %zu plain cluster carriers, ICL block below the members' at %zu entries, %zu unequal with no sprites (worst %.1e)",
+				Near, Rich, CountBad, WorstLight, OneBcg, BcgBad, WorstOff, WorstMag, Brightest, Gap, StrayBcg, Icl, IclBad, Plain, LutBelow, LutUnequal, WorstEq));
+}
+
 UNI_TEST(webtex, catalogue_lookup)
 {
 	// D-174 follow-up (owner's engine log: game-thread spikes of 50-450 ms at speed in Submit and
@@ -1418,4 +1563,82 @@ UNI_TEST(webtex, catalogue_lookup)
 		.Metric("cells", double(Cells)).Metric("objects", double(Hits)).Metric("mismatch", double(Mismatch)).Metric("us_per_cell", UsPerCell).Metric("us_per_cell_walk", 1000.0 * MsWalk / double(std::max<size_t>(Cells, 1)))
 		.Pass(Cells > 0 && Hits > 0 && Mismatch == 0 && MsWalk > 10.0 * MsIndex,
 			Uni::Fmt("%zu cells, %zu catalogue objects, %zu cells differ from the walk; %.2f us per cell (the walk: %.1f us)", Cells, Hits, Mismatch, UsPerCell, 1000.0 * MsWalk / double(std::max<size_t>(Cells, 1))));
+}
+
+UNI_TEST(webtex, skyweb)
+{
+	// D-189 (plan step G; owner: not sure, an A/B in the engine decides): the web in the sky. From
+	// intergalactic space, the background (marched part + tail) of the adhesion web in the three
+	// modes: physical; near-web glow (the near web's light lifted where it is overdense); dimmed
+	// tail (the uniform far background x 0.1). The dimmed tail is exactly the marched part plus
+	// 0.1 x the tail; both art modes raise the sky's contrast; stills of the three.
+	std::string Err;
+	const FWebTexture& T = Delivered(&Err);
+	if (!T.IsValid()) { Uni::Check(3, "T3.webtex.skyweb", "D-189 the web in the sky").Pass(false, "texture not loaded: " + Err); return; }
+	FBindScope Bind(T);
+	const UniScenes::FClusterTuning Tun;
+	FUniverseDef Def = UniScenes::WebToGalaxy(Tun);
+	const H::float4 Mean = T.Mean();
+	UniScenes::UseDeliveredWeb(Def, Tun, T.Size, Mean.z / (double(Mean.x) + Mean.y + Mean.z + Mean.w));
+	FUniverseModel M(Def);
+	FRefGenerator G(M);
+	FVolumeBuilder VB(M, G);
+	FRefPipeline P(G);
+	P.bVelocityLod = false;
+	const FCoord Cam = UniScenes::VoidCamera();
+	P.Update(Cam, FVec3f{});
+	FCamera Cm; Cm.Coord = Cam; Cm.Width = 240; Cm.Height = 135; Cm.LookAlong({ 1, 0.3, 0.1 });
+	auto Render = [&](float Glow, float TailDim, bool bTail, double& OutLum) -> FImage
+	{
+		FVolumeSettings S;
+		S.WebGlowGain = Glow;
+		S.TailDim = TailDim;
+		FVolumeScene Bg = VB.Build(P, Cam, FVec3f{}, Cm.View(), S).Subset(true);
+		if (!bTail) { for (FCarrierGPU& C : Bg.Carriers) { C.Flags &= ~H::UNI_CARRIER_TAIL; } }
+		FImage Im(Cm.Width, Cm.Height);
+		const FVolumeStats St = RenderVolume(Bg, Cm, Im, nullptr, 2);
+		OutLum = Lum3(St.Flux);
+		return Im;
+	};
+	auto Contrast = [&](const FImage& Im)
+	{
+		// std / mean of 8 x 8 block radiance (pixel energy over its solid angle: the pinhole's
+		// cos^3 falloff is not structure)
+		std::vector<double> B;
+		for (int By = 0; By + 8 <= Im.H; By += 8) for (int Bx = 0; Bx + 8 <= Im.W; Bx += 8)
+		{
+			double S = 0;
+			for (int Y = By; Y < By + 8; ++Y) for (int X = Bx; X < Bx + 8; ++X)
+			{
+				const float* Px = &Im.Rgb[(size_t(Y) * Im.W + X) * 3];
+				S += (0.2126 * Px[0] + 0.7152 * Px[1] + 0.0722 * Px[2]) / PixelSolidAngle(Cm, Im.W, Im.H, X + 0.5, Y + 0.5);
+			}
+			B.push_back(S);
+		}
+		double Mn = 0, V = 0;
+		for (double X : B) { Mn += X / B.size(); }
+		for (double X : B) { V += (X - Mn) * (X - Mn) / B.size(); }
+		return std::sqrt(V) / std::max(Mn, 1e-300);
+	};
+	double L0, LNoTail, LGlow, LDim;
+	FImage Phys = Render(0.0f, 0.0f, true, L0);
+	FImage NoTail = Render(0.0f, 0.0f, false, LNoTail);
+	FImage Glow = Render(2.0f, 0.0f, true, LGlow);
+	FImage Dim = Render(0.0f, 0.9f, true, LDim);
+	// The dimmed tail, pixel by pixel: marched part + 0.3 x (physical - marched part).
+	double WorstDim = 0.0;
+	for (size_t I = 0; I < Phys.Rgb.size(); ++I)
+	{
+		const double Want = NoTail.Rgb[I] + 0.1 * (Phys.Rgb[I] - NoTail.Rgb[I]);
+		WorstDim = std::max(WorstDim, std::abs(Dim.Rgb[I] - Want) / std::max(std::abs(Want), 1e-30));
+	}
+	const double C0 = Contrast(Phys), CGlow = Contrast(Glow), CDim = Contrast(Dim);
+	// Stills, each at its own display gain.
+	CameraGainStill(Phys); WriteFrame(Phys, "still_skyweb_physical", { "D-189 the web in the sky: physical (uu.SkyWeb 0)", Uni::Fmt("contrast %.3f", C0) });
+	CameraGainStill(Glow); WriteFrame(Glow, "still_skyweb_glow", { "D-189: near-web glow (uu.SkyWeb 1: x (1 + 2 x overdensity) within 50 Mpc)", Uni::Fmt("contrast %.3f, light %.2fx", CGlow, LGlow / L0) });
+	CameraGainStill(Dim); WriteFrame(Dim, "still_skyweb_dimtail", { "D-189: dimmed tail (uu.SkyWeb 2: the far background x 0.1)", Uni::Fmt("contrast %.3f, light %.2fx", CDim, LDim / L0) });
+	Uni::Check(3, "T3.webtex.skyweb", "D-189 the web in the sky: the dimmed tail is the marched part + 0.1 x the tail (1e-4); the near-web glow adds light and both art modes raise the sky's 8 x 8 block radiance contrast over the physical sky (1.2x); stills of the three")
+		.Metric("worst_dim", WorstDim).Metric("contrast_physical", C0).Metric("contrast_glow", CGlow).Metric("contrast_dim", CDim).Metric("glow_light", LGlow / L0).Metric("dim_light", LDim / L0)
+		.Pass(WorstDim < 1e-4 && LGlow > L0 && CGlow > 1.2 * C0 && CDim > 1.2 * C0,
+			Uni::Fmt("dimmed tail within %.1e of marched + 0.1 x tail; contrast physical %.3f, glow %.3f (light %.2fx), dimmed tail %.3f (light %.2fx)", WorstDim, C0, CGlow, LGlow / L0, CDim, LDim / L0));
 }

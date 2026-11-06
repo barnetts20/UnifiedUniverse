@@ -43,6 +43,7 @@ static const uint UNI_CARRIER_DUST = 2u;            // has an absorbing field
 static const uint UNI_CARRIER_TAIL = 4u;            // add the analytic tail past TEnd (background)
 static const uint UNI_CARRIER_PREFILTER = 8u;       // D-160: sample the field prefiltered over the pixel footprint (galaxies)
 static const uint UNI_CARRIER_PALETTE = 16u;        // D-182: a galaxy with a palette (PaletteIndex)
+static const uint UNI_CARRIER_ICL = 32u;            // D-191: a rich cluster's intracluster light (a second LUT block, PaletteIndex, x IclRatio)
 
 /** One marched volume. 112 bytes (UniCore::FCarrierGPU, static_assert). */
 struct FUniCarrier
@@ -65,8 +66,8 @@ struct FUniCarrier
 	float TEnd;             // cm (local carriers: the chord bounds it; periodic: march extent)
 	float ResolveScale;     // field units: smallest feature to resolve (supersampling)
 	float StepRatio;        // D-164: this carrier's log step ratio (0: the view's); a step takes the smallest of the active carriers'
-	uint PaletteIndex;      // D-182: its palette's parameter block (A..D bulge, disc, arms, knots; E whole body), with UNI_CARRIER_PALETTE
-	float Pad2;
+	uint PaletteIndex;      // D-182: its palette's parameter block (A..D bulge, disc, arms, knots; E whole body), with UNI_CARRIER_PALETTE; D-191: a cluster's total-light LUT block, with UNI_CARRIER_ICL
+	float IclRatio;         // D-191: intracluster light / members' light, with UNI_CARRIER_ICL
 };
 
 struct FUniVolumeView
@@ -81,6 +82,11 @@ struct FUniVolumeView
 	uint MaxSubsamples;     // D-157: cap on rays per pixel axis (Uni_CarrierSubsamples; 0 = 8)
 	float3 DustSigmaRgb;    // reddening: sigma per channel relative to sigma
 	float Pad1;
+	// D-189: the web in the sky (uu.SkyWeb; render-only art choices, all 0 = physical).
+	float TailDim;          // the background's analytic tail x (1 - TailDim): the near web carries more contrast
+	float WebGlowGain;      // near-web glow: the web's emission x (1 + gain x overdensity) ...
+	float WebGlowDepthCm;   // ... out to this distance (fading over its second half)
+	float SkyPad;
 };
 
 struct FUniVolumeResult
@@ -314,6 +320,14 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 			{
 				Rho = J == ClusterSlot ? UniField_ClusterC(P, Par, Cc0, Cc1, Cc2, Cc3) : Uni_FieldSampleFoot(Ca.FieldId, P, Par, FootS);
 				Rho = Rho + (Ca.MeanDensity - Rho) * Blend;
+				// D-189: the near-web glow (non-physical, an art choice): the periodic web's light
+				// lifted where it is overdense, so its structure shows in the sky.
+				if (InView.WebGlowGain > 0.0f && Ca.FieldId == UNI_FIELD_WEB && (Ca.Flags & UNI_CARRIER_PERIODIC) != 0u && Tm < InView.WebGlowDepthCm)
+				{
+					const float Over = max(Rho / max(Ca.MeanDensity, 1.0e-30f) - 1.0f, 0.0f);
+					const float Fade = 1.0f - smoothstep(0.5f * InView.WebGlowDepthCm, InView.WebGlowDepthCm, Tm);
+					Rho = Rho * (1.0f + InView.WebGlowGain * Over * Fade);
+				}
 			}
 			else
 			{
@@ -322,6 +336,8 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 			if (Rho > 0.0f)
 			{
 				float3 L = Uni_VolumeLut(InLut, Ca.LutIndex, Tm);
+				// D-191: intracluster light, on the same density (a rich cluster's diffuse glow).
+				if ((Ca.Flags & UNI_CARRIER_ICL) != 0u) { L = L + Uni_VolumeLut(InLut, Ca.PaletteIndex, Tm) * Ca.IclRatio; }
 				if (bPalette)
 				{
 					// Toward the whole-body tint (the sprite's) as the footprint passes the disc scale length.
@@ -387,7 +403,7 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 		const FUniCarrier Ca = InCarriers[Act[Q]];
 		if ((Ca.Flags & UNI_CARRIER_TAIL) == 0u || A1[Q] < Ca.TEnd || InTScene <= Ca.TEnd) { continue; }
 		const float3 Tail = Uni_VolumeLut(InLut, Ca.LutIndex + 1u, Ca.TEnd);
-		B = B + Tr * (Tail * ((Ca.Amplitude * Ca.Weight * Ca.MeanDensity) * Ca.InvRadius));
+		B = B + Tr * (Tail * ((Ca.Amplitude * Ca.Weight * Ca.MeanDensity) * Ca.InvRadius * (1.0f - InView.TailDim)));   // D-189: TailDim 0 = physical
 	}
 	Res.Radiance = B;
 	Res.Transmittance = Tr;
@@ -418,6 +434,8 @@ struct FUniTemporalView
 	uint Phase;              // this frame's fresh pixel of each 2 x 2 block (0..3)
 	float3 CamStep;          // camera position now minus then, cm
 	uint bHistory;           // 0: no usable history (first frame, a jump, a new size): fresh neighbours only
+	float3 PrevVel;          // D-190: the previous frame's warp optics (its grid is in its apparent directions)
+	float PrevBeta;
 };
 
 /** The fresh pixel of each 2 x 2 block at a phase: (0,0), (1,1), (1,0), (0,1). */
@@ -485,8 +503,17 @@ UNI_FN float Uni_TemporalDepthWeight(float InLnTp, float InLnTq)
  *  was behind the previous view. */
 UNI_FN bool Uni_TemporalPrevPixel(float3 InDir, float InLnDepth, FUniTemporalView InTV, float2 InSize, UNI_OUT(float2) OutPx)
 {
+	// InDir is the TRUE direction (D-190: the caller undoes this frame's aberration).
 	float3 D = InDir;
-	if (InLnDepth < UNI_VOL_LN_DEPTH_NONE - 1.0f)
+	if (InTV.PrevBeta != 0.0f)
+	{
+		// D-190: the previous grid is in that frame's apparent directions: the point seen from
+		// where the camera was (scaled down first: its length overflows a float squared), then
+		// aberrated as that frame was.
+		if (InLnDepth < UNI_VOL_LN_DEPTH_NONE - 1.0f) { D = normalize(InDir + InTV.CamStep * exp(-InLnDepth)); }
+		D = Uni_Aberrate(D, InTV.PrevVel, InTV.PrevBeta);
+	}
+	else if (InLnDepth < UNI_VOL_LN_DEPTH_NONE - 1.0f)
 	{
 		// The light's point relative to the camera now, seen from where the camera was.
 		D = InDir * exp(InLnDepth) + InTV.CamStep;

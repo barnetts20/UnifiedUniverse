@@ -2,7 +2,7 @@
 
 *Ideas and deferred work not yet scheduled. Each item says where it would land and what it depends on. Decisions still go to `DECISIONS.md` once taken.*
 
-## B-001: Warp streaks from late-loading stars (owner idea, 2026-11-01)
+## B-001: Warp streaks from late-loading stars (owner idea, 2026-11-01) — DONE (D-187 streaks and arrival as motion; D-190 optics; D-192 motes)
 
 **Milestone:** sprite work (better stand-ins for star and galaxy sprites). Render-only (lesson #12): no content change, no reroll.
 
@@ -117,7 +117,7 @@ Glare grows only with log flux, so every star crosses over at about the same on-
 
 The coarsest star levels (the brightest stars) have cells comparable to a galaxy's influence sphere, so the same probe miss can under-place them. Turning `bSampleBox` on for the galaxy emitter would fix it, but rerolls stars. Measure first (a T2 member census per galaxy, like T2.cluster.members), and decide before content.
 
-## B-006: Cluster realism — PARTLY DONE (D-172: morphology-density; intracluster light and a brightest cluster galaxy remain)
+## B-006: Cluster realism — DONE (D-172: morphology-density; D-191: brightest cluster galaxies and intracluster light for rich catalogue clusters)
 
 Elliptical and lenticular galaxies dominate cluster cores (the morphology-density relation). Members currently roll the same spiral parameters as field galaxies.
 - A galaxy archetype variant, or parameter ranges conditioned on the parent, would add it.
@@ -133,7 +133,7 @@ The analytic tail past the march (0.5 periods) is ~99% of the background's light
 ## B-009: Spread cell submissions over frames (D-168 follow-up) — DONE (D-173: modest; remaining bursts are urgent work)
 After D-168 the game thread's remaining spikes at speed are cells entering at once: a coarse window shift or a travel-sensitivity resize brings 500–1,000 cells in one frame, and task building (Submit) plus eviction (Window) cost 20–40 ms on the reference for them. A per-frame budget on cells submitted (nearest the camera first, never one inside the visible radius left waiting) would spread them; T2.stream.responsive bounds what the delay may cost.
 
-## B-010: How visible should the web be in the sky? (owner, art direction; D-170 follow-up)
+## B-010: How visible should the web be in the sky? (owner, art direction; D-170 follow-up) — BUILT AS A SWITCH (D-189: uu.SkyWeb; the owner's A/B picks the default)
 Physically, the integrated light of unresolved galaxies is isotropic to a few percent: D-170 marched the web to 3.2 Gpc and the image did not change. The structure that does show is the near ~100 Mpc over a uniform pedestal (the tail). Options: (a) leave it physical; (b) a near-web glow: the web's density within N Mpc added as a faint, non-physical emission with its own gain (render only, like uu.WebDebug but in the beauty pass); (c) dim the pedestal (scale the tail) so the near structure carries the contrast. (b) is the owner's "low-grade field contribution to the background".
 
 ## B-011: Galaxy impostors in cluster interiors (D-172 follow-up) — MEASURED, NOT NEEDED (2026-11-04, D-184)
@@ -145,3 +145,6 @@ Our galaxy field is the basic one (exponential disc, n = 2 bulge, log-spiral arm
 
 ## B-013: Members for procedural clusters, and member generation on the GPU (D-177 follow-up)
 D-177 authors bright members only for catalogue clusters (node list), on the CPU, cached per copy (~15 µs per copy cold on the reference). Scenes without a node list keep the old emitter split (all members from the emitter, cluster reach ~330 Mpc). If a scene ever needs many procedural clusters, the same split could run from the cluster emitter's own placement (members of generated clusters drawn on the GPU in the place pass). Worth it only if such a scene matters.
+
+## B-014: Peripheral glow at warp (WARP_PLAN E4 rest; D-192 follow-up)
+WARP_PLAN E4 also proposed a slight brightening at the edges of the view at speed, to hide what pops in there (windows lead forward, so peripheral cells are the late ones). Not built: E2's arrival (D-187) already fades late cells in, and a vignette is a matter of taste. Render-only, a few lines in the composite; build it if the owner sees pop-in at the edges at speed.

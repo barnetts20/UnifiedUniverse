@@ -45,6 +45,12 @@ struct FUniFrameData
 	FVector3f CameraStepCm = FVector3f::ZeroVector;
 	bool bCameraStepValid = false;
 	float WarpAmount = 0.0f;   // D-187: 0 at rest, 1 at full warp (the travel curve), drives streaks and arrival
+	// D-192: warp ambience motes (UniCore::MoteLattice): per lattice slot the camera's cell (w: the
+	// level) and its fraction in it (w: the slot's weight, 0: none); cell sizes (cm) and the
+	// motes' flux (exposure units) in MoteScale (x, y, z).
+	FUintVector4 MoteCell[2] = { FUintVector4(0, 0, 0, 0), FUintVector4(0, 0, 0, 0) };
+	FVector4f MoteFrac[2] = { FVector4f(0.0f, 0.0f, 0.0f, 0.0f), FVector4f(0.0f, 0.0f, 0.0f, 0.0f) };
+	FVector4f MoteScale = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
 
 	// Star systems (D-142, D-143). Planet records for the reserved pool tail
 	// (UniGpuLayout::DynamicPoolBase..), rewritten every frame, and the archetype mask the
@@ -197,6 +203,7 @@ private:
 	FVector3f TemporalPrevForward = FVector3f::ZeroVector, TemporalPrevRight = FVector3f::ZeroVector, TemporalPrevUp = FVector3f::ZeroVector;
 	float TemporalPrevTanX = 1.0f, TemporalPrevTanY = 1.0f;
 	uint64 TemporalLastFrame = 0;
+	FVector4f TemporalPrevWarp = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);   // D-190: the history's warp optics
 	uint32 TemporalPhase = 0;
 	bool bTemporalHave = false;
 	int32 BgPrev = 0, BgCur = 1, BgBack = 2;

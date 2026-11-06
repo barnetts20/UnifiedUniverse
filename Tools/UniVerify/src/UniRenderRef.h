@@ -71,6 +71,7 @@ namespace UniRender
 			V.SystemArchetypeMask = SystemArchetypeMask;
 			V.DiscArchetypeMask = DiscArchetypeMask;
 			V.FixedDiscSeeds = H::uint4(FixedDiscSeeds[0], FixedDiscSeeds[1], FixedDiscSeeds[2], FixedDiscSeeds[3]);
+			V.WarpVel = H::float3(0, 0, 0); V.WarpBeta = 0.0f; V.WarpDoppler = 0.0f; V.WarpBeaming = 0.0f; V.WarpPad0 = 0.0f; V.WarpPad1 = 0.0f;   // D-190: no warp optics
 			return H::Uni_SpriteDefaults(V);   // D-156 sprite style
 		}
 	};

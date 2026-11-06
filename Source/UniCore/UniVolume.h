@@ -54,8 +54,8 @@ namespace UniCore
 		float TEnd;
 		float ResolveScale;
 		float StepRatio;   // D-164: 0 = the view's
-		u32 PaletteIndex;  // D-182: the galaxy's palette (a parameter block: A..D bulge, disc, arms, knots; E whole body), with UNI_CARRIER_PALETTE
-		float Pad;
+		u32 PaletteIndex;  // D-182: the galaxy's palette (a parameter block: A..D bulge, disc, arms, knots; E whole body), with UNI_CARRIER_PALETTE; D-191: a cluster's total-light LUT block, with UNI_CARRIER_ICL
+		float IclRatio;    // D-191: intracluster light / members' light, with UNI_CARRIER_ICL
 	};
 	static_assert(sizeof(FCarrierGPU) == 112, "FCarrierGPU must match FUniCarrier (UniVolume.ush)");
 	static_assert(sizeof(HV::FUniCarrier) == 112, "shim FUniCarrier layout");
@@ -73,9 +73,13 @@ namespace UniCore
 		u32 MaxSubsamples;   // D-157
 		float DustSigmaRgb[3];
 		float Pad1;
+		float TailDim;          // D-189 (0: physical)
+		float WebGlowGain;
+		float WebGlowDepthCm;
+		float SkyPad;
 	};
-	static_assert(sizeof(FVolumeViewGPU) == 48, "FVolumeViewGPU must match FUniVolumeView (UniVolume.ush)");
-	static_assert(sizeof(HV::FUniVolumeView) == 48, "shim FUniVolumeView layout");
+	static_assert(sizeof(FVolumeViewGPU) == 64, "FVolumeViewGPU must match FUniVolumeView (UniVolume.ush)");
+	static_assert(sizeof(HV::FUniVolumeView) == 64, "shim FUniVolumeView layout");
 
 	inline HV::FUniCarrier ToHlsl(const FCarrierGPU& C) { HV::FUniCarrier H; std::memcpy(static_cast<void*>(&H), &C, sizeof(H)); return H; }
 	inline HV::FUniVolumeView ToHlsl(const FVolumeViewGPU& V) { HV::FUniVolumeView H; std::memcpy(static_cast<void*>(&H), &V, sizeof(H)); return H; }
@@ -317,6 +321,9 @@ namespace UniCore
 		double SliceLoCm = 3.0856775814913673e18;         // transmittance slices: 1 pc ..
 		double SliceHiCm = 3.0856775814913673e23;         // .. 100 kpc
 		float DustSigmaRgb[3] = { 0.8f, 1.0f, 1.3f };
+		float TailDim = 0.0f;                             // D-189: the web in the sky (uu.SkyWeb): 0 physical
+		float WebGlowGain = 0.0f;
+		float WebGlowDepthCm = 1.5428387907456837e26f;    // 50 Mpc
 		float TexturedWebStepRatio = 0.2f;                // D-164: log step ratio of a textured web carrier (T3.webtex.background: same light as 0.08, 30% fewer steps)
 	};
 
@@ -514,6 +521,31 @@ namespace UniCore
 				}
 			}
 
+			// D-191: total-light LUT blocks (no child drawn as a sprite) for intracluster light,
+			// built the first time a carrier needs one (once per scene and child), cached like the
+			// emission blocks.
+			std::map<u32, u32> TotalBlock;
+			auto TotalBlockOf = [&](u32 Child) -> u32
+			{
+				const auto It = TotalBlock.find(Child);
+				if (It != TotalBlock.end()) { return It->second; }
+				FLutFrame Ft = F;
+				Ft.LevelFade = nullptr;   // F_L = 0: every child's light
+				const std::vector<double> Key = { std::round(double(Ft.ExposureMag) * 1000.0) / 1000.0 };
+				FLutCache& Cache = TotalLutCache[Child];
+				if (Cache.Key != Key)
+				{
+					Cache.Key = Key;
+					Cache.Lut.clear();
+					BuildEmissionLut(Tables.at(Child), Ft, Cache.Lut, LutScale(Tables.at(Child)));
+					++LutRebuilds;
+				}
+				const u32 B = u32(Out.Lut.size() / HV::UNI_VOL_LUT_SIZE);
+				Out.Lut.insert(Out.Lut.end(), Cache.Lut.begin(), Cache.Lut.end());
+				TotalBlock[Child] = B;
+				return B;
+			};
+
 			// Local carriers: resident contributors, ranked by angular size, capped.
 			struct FCand { double Theta; FCarrierGPU G; FFieldParamsGPU Par; FFieldParamsGPU Dust; bool bDust; FFieldParamsGPU Palette; bool bPalette = false; };
 			std::vector<FCand> Cands;
@@ -603,6 +635,18 @@ namespace UniCore
 					// a cluster. Dust absorbs at any distance, so dusty carriers keep the 1 pc start.
 					if (!Cd.bDust && S.bLutStart) { G.TStart = float(std::max(S.LocalStartCm, SigStart[C.Emitter->ChildArchetypeId])); }
 					if (S.bPrefilter && C.Emitter->FieldId == HV::UNI_FIELD_GALAXY) { G.Flags |= HV::UNI_CARRIER_PREFILTER; }
+					// D-191: a rich cluster's intracluster light rides on its own carrier: the same
+					// field sample, a second LUT block (every child's light: never resolved as
+					// sprites) at IclRatio x its members' amplitude. It is there at any distance, so
+					// the carrier marches from the local start (the members' significance start
+					// would skip it from inside the cluster).
+					if (C.IclRatio > 0.0 && C.Emitter->FieldId == HV::UNI_FIELD_CLUSTER)
+					{
+						G.Flags |= HV::UNI_CARRIER_ICL;
+						G.PaletteIndex = TotalBlockOf(C.Emitter->ChildArchetypeId);
+						G.IclRatio = float(C.IclRatio);
+						if (!Cd.bDust) { G.TStart = float(S.LocalStartCm); }
+					}
 					Cands.push_back(Cd);
 				}
 			}
@@ -640,6 +684,11 @@ namespace UniCore
 			V.SliceLnTLo = float(std::log(S.SliceLoCm));
 			V.SliceLnTHi = float(std::log(S.SliceHiCm));
 			for (int K = 0; K < 3; ++K) { V.DustSigmaRgb[K] = S.DustSigmaRgb[K]; }
+			V.Pad1 = 0.0f;
+			V.TailDim = S.TailDim;
+			V.WebGlowGain = S.WebGlowGain;
+			V.WebGlowDepthCm = S.WebGlowDepthCm;
+			V.SkyPad = 0.0f;
 			return Out;
 		}
 
@@ -652,5 +701,6 @@ namespace UniCore
 		const FRefGenerator& Gen;
 		std::map<u32, FUnresolvedTable> Tables;
 		mutable std::map<u32, FLutCache> LutCache;
+		mutable std::map<u32, FLutCache> TotalLutCache;   // D-191
 	};
 }

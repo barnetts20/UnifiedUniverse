@@ -98,5 +98,21 @@
   {
     "id": "UE-25",
     "what": "Warp streaks and arrival in the engine (D-187): at intergalactic speed stars and small galaxies streak back towards the vanishing point (none while turning in place, none at rest), with no change in overall brightness; objects in late cells stream in from ahead over ~8 frames instead of popping; uu.Warp 0 for an A/B; uu.Warp.StreakFrames, StreakMax, Arrival, ArrivalStretch for tuning; shader compile of the project and sprite passes (REVIEW_TONIGHT \u00a722)."
+  },
+  {
+    "id": "UE-26",
+    "what": "The web in the sky in the engine (D-189): uu.SkyWeb 0 physical (default), 1 near-web glow, 2 dimmed tail, 3 both; the background re-marches on a change; no seam or blockiness; uu.SkyWeb.Glow, Depth, Tail for tuning; the owner picks the default (REVIEW_TONIGHT \u00a723)."
+  },
+  {
+    "id": "UE-27",
+    "what": "Warp optics in the engine (D-190): at speed the sky crowds ahead (forward cone ~1.7x tighter at full warp), blue ahead and red behind, the view centre fixed; sprites, volume and background agree (no stars sliding off their glow); temporal reprojection clean while flying; uu.Warp.Aberration, Doppler, Beaming; shader compile of the volume, project and sprite passes (REVIEW_TONIGHT \u00a724)."
+  },
+  {
+    "id": "UE-28",
+    "what": "Brightest cluster galaxies and intracluster light in the engine (D-191): one giant early-type galaxy at the centre of each rich catalogue cluster, its brightest; a smooth diffuse glow over the cluster with no pop-in; the cluster's overall brightness unchanged; the cost inside a rich core (REVIEW_TONIGHT \u00a725)."
+  },
+  {
+    "id": "UE-29",
+    "what": "Warp motes in the engine (D-192): faint motes fixed in space stream past and streak at speed in a void, none at rest, no pops while accelerating; uu.Warp.Motes, MoteFrames, MoteMag; the second sprite draw (Uni.WarpMotes) compiles and costs little (REVIEW_TONIGHT \u00a726)."
   }
 ]

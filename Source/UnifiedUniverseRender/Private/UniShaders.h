@@ -165,6 +165,8 @@ public:
 		SHADER_PARAMETER(uint32, MaxActivate)
 		SHADER_PARAMETER(uint32, SystemArchetypeMask)
 		SHADER_PARAMETER(float, WarpAmount)        // D-187
+		SHADER_PARAMETER(FVector4f, WarpVelBeta)   // D-190
+		SHADER_PARAMETER(FVector4f, WarpDopplerKQ)
 		SHADER_PARAMETER(float, ArrivalFrames)
 		SHADER_PARAMETER(uint32, DiscArchetypeMask)   // D-183
 		SHADER_PARAMETER(FUintVector4, FixedDiscSeeds)   // D-183
@@ -201,6 +203,8 @@ BEGIN_SHADER_PARAMETER_STRUCT(FUniVolumeCommonParameters, )
 	SHADER_PARAMETER(float, TanHalfFovY)
 	SHADER_PARAMETER(FVector3f, ViewUp)
 	SHADER_PARAMETER(float, Pad0)
+	SHADER_PARAMETER(FVector4f, WarpVelBeta)     // D-190
+	SHADER_PARAMETER(FVector4f, WarpDopplerKQ)
 	SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniWebTexture)   // D-164
 	SHADER_PARAMETER_SAMPLER(SamplerState, UniWebSampler)
 	SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalWarpFine)    // D-179
@@ -264,6 +268,7 @@ public:
 		SHADER_PARAMETER(uint32, TemporalPhase)
 		SHADER_PARAMETER(FVector3f, CamStep)
 		SHADER_PARAMETER(uint32, bHistory)
+		SHADER_PARAMETER(FVector4f, PrevWarpVelBeta)   // D-190
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float4>, FreshVolume)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float>, FreshSlices)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float2>, FreshDepth)
@@ -377,6 +382,14 @@ BEGIN_SHADER_PARAMETER_STRUCT(FUniSpriteParameters, )
 	SHADER_PARAMETER(FVector4f, WarpA)    // D-187: warp, streak exposure frames, longest streak px, arrival stretch
 	SHADER_PARAMETER(FVector3f, CamStep)  // D-187: camera move over the last frame, cm
 	SHADER_PARAMETER(float, WarpPad)
+	SHADER_PARAMETER(FVector4f, WarpVelBeta)   // D-190
+	SHADER_PARAMETER(uint32, MoteMode)         // D-192: 1: this draw is the warp motes (Uni_MoteSprite), not the sprite buffer
+	SHADER_PARAMETER(FUintVector4, MoteCell0)
+	SHADER_PARAMETER(FUintVector4, MoteCell1)
+	SHADER_PARAMETER(FVector4f, MoteFrac0)
+	SHADER_PARAMETER(FVector4f, MoteFrac1)
+	SHADER_PARAMETER(FVector4f, MoteScale)     // cell cm (two levels), flux, core angular radius
+	SHADER_PARAMETER(FVector4f, MoteDopplerKQ)
 	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneDepthTexture)
 	SHADER_PARAMETER_SAMPLER(SamplerState, SceneDepthSampler)
 	SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float>, VolumeSlices)
