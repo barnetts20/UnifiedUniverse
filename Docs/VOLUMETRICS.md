@@ -213,8 +213,8 @@ The march's cost is rays x steps per ray x cost per step. These are the console 
 | `uu.CellGlow` | 1 | a cell still loading (or fading in) is drawn as glow from the field; its sprites fade in once it is Ready (section 13). 0: a hole until it loads (before D-203) | D-203 |
 | `uu.VolumeGalaxyConst` | 1 | the march reads each galaxy's per-object hashes from blocks the builder writes once a frame (the same image). 0: hashed at every step (A/B for ProfileGPU) | D-210 |
 | `uu.GalaxyMap` | 1 | the galaxy the camera is in is marched from its baked 2D map (arms and modes; warp, vertical profile, bulge and detail per sample; D-212). 0: its field at every step | D-212 |
-| `uu.GalaxyMap.Size` | 2048 | the map's texels a side (power of two): 2048 ~43 MB, 1024 ~11 MB | D-212 |
-| `uu.GalaxyMap.Budget` | 1048576 | texels of the map the GPU bakes a frame (2048^2 in 4 frames) | D-212 |
+| `uu.GalaxyMap.Size` | 1024 | the map's texels a side (power of two): 1024 ~11 MB (one frame to bake), 2048 ~43 MB (no visible difference in the engine) | D-212 |
+| `uu.GalaxyMap.Budget` | 1048576 | texels of the map the GPU bakes a frame (1024^2 in one frame, 2048^2 in 4) | D-212 |
 | `uu.GalaxyCache` | 0 | the D-211 clipmap, used only where no map is published (superseded by uu.GalaxyMap) | D-211, D-212 |
 | `uu.GalaxyCache.Size` | 128 | voxels a cache level side (64..256); 128 ~120 MB, 96 ~50 MB (a little softer far away) | D-211 |
 | `uu.GalaxyCache.Budget` | 1048576 | voxels baked a frame at most; levels that cannot follow keep their last window (coarser levels cover) | D-211 |
