@@ -923,6 +923,135 @@ UNI_TEST(webtex, travel)
 				Cells, Objects, Differ, NotYet, (unsigned long long)Out[0].MaxCells, (unsigned long long)Out[1].MaxCells, (unsigned long long)Out[1].Deferred, Out[0].MeanMs, Out[0].WorstMs, Out[0].MeasureWorst, Out[0].PeakAwake, Out[1].MeanMs, Out[1].WorstMs, Out[1].MeasureWorst, Out[1].PeakAwake, Out[1].PeakAll, Gain));
 }
 
+namespace
+{
+	/** D-203: the streamer's frame as the GPU sees it (its cell table, fades as uploaded, and the
+	 *  pool's records, with identities for the carrier handoffs), for RenderFrameWithVolume. */
+	struct FStreamFrame
+	{
+		const FUniStreamer& S;
+		const FCpuGenBackend& Pool;
+		template <typename Fn> void ForEachResident(Fn&& F) const
+		{
+			std::vector<FCellKey> Keys;
+			std::vector<u32> Gens;
+			const std::vector<FCellGPU> Cells = S.CellTable(&Keys, &Gens);
+			for (size_t I = 0; I < Cells.size(); ++I)
+			{
+				const float Fade = float((Cells[I].Flags >> 8u) & 255u) / 255.0f;
+				for (u32 K = 0; K < Cells[I].PoolCount; ++K)
+				{
+					FObjectId Id;
+					const u64 Hash = S.IdentityAt(Keys[I], Gens[I], K, Id) ? HashObject(Id) : 0u;
+					F(Keys[I], Pool.PoolData()[Cells[I].PoolStart + K], Fade, Hash);
+				}
+			}
+		}
+	};
+}
+
+UNI_TEST(webtex, cell_glow)
+{
+	// D-203 (owner: intergalactic speed still heavy; do not stretch windows, let a fade in the
+	// march cover what has not loaded). The owner's scene (adhesion web with its node list,
+	// galaxies, clusters, stars), at rest in intergalactic space, then accelerating to 30 Mpc/s
+	// and cruising, through the streamer with GPU-like latency, two ways:
+	//   D-202  windows stretch ahead at speed (D-162), D-173's per-level spreading, travel
+	//          sensitivity +0.5 at speed (D-201), no cell glow;
+	//   D-203  windows keep their rest size, at most 96 cells built a frame, cell glow.
+	// Per frame: the streamer's bookkeeping, the generation it asks for (the CPU backend's time:
+	// the GPU's work in the engine) and the cells submitted. At two frames of the cruise: the
+	// light over the whole sphere (sprites as the cell table fades them, plus the volume) against
+	// a settled reference pipeline at the same camera, over the reference's sprite light (the
+	// background web's analytic tail is most of the sky and never changes with loading).
+	std::string Err;
+	const FWebTexture& T = Delivered(&Err);
+	std::vector<FWebNode> Nodes;
+	if (!T.IsValid() || !LoadWebNodes(kDeliveredDir, kDeliveredName, Nodes, &Err)) { Uni::Check(2, "T2.webtex.cell_glow", "D-203 cell glow at intergalactic speed").Pass(false, "not loaded: " + Err); return; }
+	FBindScope Bind(T);
+	const UniScenes::FClusterTuning Tun;
+	FUniverseDef Def = UniScenes::Flythrough(Tun);
+	const H::float4 Mean = T.Mean();
+	UniScenes::UseDeliveredWeb(Def, Tun, T.Size, Mean.z / (double(Mean.x) + Mean.y + Mean.z + Mean.w), &Nodes);
+	FUniverseModel M(Def);
+	FRefGenerator G(M);
+	FVolumeBuilder VB(M, G);
+	struct FRun { double MeanMs = 0, WorstMs = 0, MeanGen = 0, WorstGen = 0, MeanTotal = 0, WorstTotal = 0; u64 MaxCells = 0, MaxTasks = 0, Tasks = 0; std::vector<double> ErrOn, ErrOff; size_t MaxWindow = 0; };
+	FRun Runs[2];
+	const int Size = 24;
+	const int Frames = 96;
+	const int Samples[2] = { 64, 96 };
+	for (int K = 0; K < 2; ++K)
+	{
+		const bool bNew = K == 1;
+		FCpuGenBackend Cpu(G, 8388608u);
+		FLagBackend Be(Cpu, 3);
+		FUniStreamer S(G, Be);
+		S.bAsyncIntegrals = false;
+		if (bNew) { S.bCellFade = true; S.WindowLeadMax = 0; S.BuildBudget = 96; }
+		FCoord C = UniScenes::VoidCamera();
+		FVec3f F{};
+		S.Update(C); ++Be.Frame;
+		for (int I = 0; I < 400 && !S.AllReady(); ++I) { S.Update(C); ++Be.Frame; }
+		for (int I = 0; I < 10; ++I) { S.Update(C); ++Be.Frame; }
+		FTravelSensitivity Travel;
+		Travel.MaxDeltaMag = 0.5;   // D-201
+		double Speed = 100.0 * Units::Kpc;
+		for (int Fr = 1; Fr <= Frames; ++Fr)
+		{
+			Speed = std::min(Speed * 1.15, 30.0 * Units::Mpc);
+			const double Step = Speed / 60.0;
+			S.DeltaMag = bNew ? 0.0f : float(Travel.Update(Speed, 1.0 / 60.0));
+			AddDisplacement(C, F, FVec3d{ Step, 0.37 * Step, 0.11 * Step });
+			Be.GenMs = 0.0;
+			S.Update(C); ++Be.Frame;
+			const double Ms = std::max(S.Profile.Ms[int(EStreamPhase::Update)] - Be.GenMs, 0.0);
+			FRun& R = Runs[K];
+			R.MeanMs += Ms / Frames; R.WorstMs = std::max(R.WorstMs, Ms);
+			R.MeanGen += Be.GenMs / Frames; R.WorstGen = std::max(R.WorstGen, Be.GenMs);
+			R.MeanTotal += (Ms + Be.GenMs) / Frames; R.WorstTotal = std::max(R.WorstTotal, Ms + Be.GenMs);
+			R.MaxCells = std::max<u64>(R.MaxCells, S.Profile.CellsSubmitted);
+			R.MaxTasks = std::max<u64>(R.MaxTasks, S.Profile.TasksSubmitted);
+			R.Tasks += S.Profile.TasksSubmitted;
+			for (const FUniStreamer::FLevelState& L : S.LevelStates()) { R.MaxWindow = std::max(R.MaxWindow, L.Cells); }
+			if (Fr != Samples[0] && Fr != Samples[1]) { continue; }
+			FCamera Cm; Cm.Coord = C; Cm.Width = Size; Cm.Height = Size;
+			const H::FUniView V = Cm.View();
+			const FStreamFrame Sf{ S, Cpu };
+			FVolumeSettings On; On.bCellGlow = true;
+			FVolumeSettings Off;
+			FRefPipeline P(G);
+			P.bVelocityLod = false;
+			for (int I = 0; I < 12; ++I) { P.Update(C, FVec3f{}); }
+			double SpRef = 0.0;
+			const double LRef = SphereLight(P, VB.Build(P, C, FVec3f{}, V, Off), C, Size, &SpRef);
+			const double Spr = std::max(SpRef * LRef, 1.0e-300);
+			const double LOff = SphereLight(Sf, VB.Build(S, C, FVec3f{}, V, Off), C, Size);
+			R.ErrOff.push_back((LOff - LRef) / Spr);
+			if (bNew) { const double LOn = SphereLight(Sf, VB.Build(S, C, FVec3f{}, V, On), C, Size); R.ErrOn.push_back((LOn - LRef) / Spr); }
+		}
+	}
+	const FRun& A = Runs[0];
+	const FRun& B = Runs[1];
+	double WorstOn = 0.0, WorstOffNew = 0.0, WorstOffOld = 0.0;
+	for (double E : B.ErrOn) { WorstOn = std::max(WorstOn, std::fabs(E)); }
+	for (double E : B.ErrOff) { WorstOffNew = std::max(WorstOffNew, std::fabs(E)); }
+	for (double E : A.ErrOff) { WorstOffOld = std::max(WorstOffOld, std::fabs(E)); }
+	std::string Light;
+	for (size_t I = 0; I < B.ErrOn.size() && I < B.ErrOff.size() && I < A.ErrOff.size(); ++I)
+	{
+		Light += Uni::Fmt("%sframe %d: %+.1f%% (no glow %+.1f%%; D-202 %+.1f%%)", Light.empty() ? "" : "; ", Samples[I], 100.0 * B.ErrOn[I], 100.0 * B.ErrOff[I], 100.0 * A.ErrOff[I]);
+	}
+	Uni::Check(2, "T2.webtex.cell_glow", "D-203 at intergalactic speed (owner's scene, to 30 Mpc/s, 3-frame phases): with rest-size windows, 96 cells a frame and cell glow, the light over the sphere stays within 10% of the settled reference's sprite light and no further than without the glow (levels too fast to load are suspended into the glow already, D-128); at most 96 cells built a frame; less generation and bookkeeping than D-202 (stretched windows, travel sensitivity +0.5) on average")
+		.Metric("err_on", WorstOn).Metric("err_off_new", WorstOffNew).Metric("err_off_old", WorstOffOld)
+		.Metric("mean_ms_old", A.MeanMs).Metric("mean_ms_new", B.MeanMs).Metric("gen_ms_old", A.MeanGen).Metric("gen_ms_new", B.MeanGen)
+		.Metric("worst_total_old", A.WorstTotal).Metric("worst_total_new", B.WorstTotal).Metric("max_cells_old", double(A.MaxCells)).Metric("max_cells_new", double(B.MaxCells))
+		.Metric("tasks_old", double(A.Tasks)).Metric("tasks_new", double(B.Tasks)).Metric("max_window_old", double(A.MaxWindow)).Metric("max_window_new", double(B.MaxWindow))
+		.Pass(WorstOn < 0.10 && WorstOn <= WorstOffNew + 0.005 && B.MaxCells <= 96u && B.MeanTotal < A.MeanTotal,
+			Uni::Fmt("light against the settled reference's sprite light: %s. Per frame, D-202 -> D-203: bookkeeping %.2f -> %.2f ms mean; generation %.2f -> %.2f ms mean (worst frame, both: %.1f -> %.1f ms); cells submitted at most %llu -> %llu, tasks %llu -> %llu over the flight; largest window %zu -> %zu cells",
+				Light.c_str(), A.MeanMs, B.MeanMs, A.MeanGen, B.MeanGen, A.WorstTotal, B.WorstTotal, (unsigned long long)A.MaxCells, (unsigned long long)B.MaxCells, (unsigned long long)A.Tasks, (unsigned long long)B.Tasks, A.MaxWindow, B.MaxWindow));
+}
+
 UNI_TEST(webtex, debug)
 {
 	// D-169: uu.WebDebug, the textured web in false colour (Uni_WebDebugMarch, the core the march
@@ -1641,4 +1770,111 @@ UNI_TEST(webtex, skyweb)
 		.Metric("worst_dim", WorstDim).Metric("contrast_physical", C0).Metric("contrast_glow", CGlow).Metric("contrast_dim", CDim).Metric("glow_light", LGlow / L0).Metric("dim_light", LDim / L0)
 		.Pass(WorstDim < 1e-4 && LGlow > L0 && CGlow > 1.2 * C0 && CDim > 1.2 * C0,
 			Uni::Fmt("dimmed tail within %.1e of marched + 0.1 x tail; contrast physical %.3f, glow %.3f (light %.2fx), dimmed tail %.3f (light %.2fx)", WorstDim, C0, CGlow, LGlow / L0, CDim, LDim / L0));
+}
+
+UNI_TEST(webtex, travel_hint)
+{
+	// D-202 (owner: intergalactic speed still heavy). From intergalactic space the glow is the
+	// background web alone (the engine's textured scene at the void camera: 73 steps per pixel,
+	// all of them the two periodic web carriers; no local carrier on any ray), and while
+	// travelling fast it is marched per pixel (D-196). Its step hints x 2 at full travel speed
+	// (uu.VolumeWebTravelHint): the background map (6 x 96^2) at 2 against 1, marched part.
+	// Measured: x 3 gives 23 steps a texel but a 6.1% median texel and correlation 0.973.
+	const FWebTexture& T = StandIn();
+	FBindScope Bind(T);
+	const FCoord Cam = UniScenes::VoidCamera();
+	FCamera Cm; Cm.Coord = Cam; Cm.Width = 480; Cm.Height = 270; Cm.LookAlong({ 1, 0.3, 0.1 });
+	FUniverseDef Def = UniScenes::WebToGalaxy();
+	EnableWebTexture(Def, T.Key);
+	FUniverseModel M(Def);
+	FRefGenerator G(M);
+	FVolumeBuilder VB(M, G);
+	FRefPipeline P(G);
+	P.Update(Cam, FVec3f{});
+	FBackgroundCube Cubes[2];
+	for (int K = 0; K < 2; ++K)
+	{
+		FVolumeSettings S; S.WebHintScale = K == 0 ? 1.0f : 2.0f;
+		FVolumeScene Bg = VB.Build(P, Cam, FVec3f{}, Cm.View(), S).Subset(true);
+		for (FCarrierGPU& C : Bg.Carriers) { C.Flags &= ~H::UNI_CARRIER_TAIL; }
+		Cubes[K] = RenderBackgroundCube(Bg, 96);
+	}
+	const auto& A = Cubes[0].Tex; const auto& B = Cubes[1].Tex;
+	double Sa = 0, Sb = 0, Saa = 0, Sbb = 0, Sab = 0;
+	std::vector<double> Errs;
+	for (size_t I = 0; I < A.size(); ++I)
+	{
+		const double La = 0.2126 * A[I].x + 0.7152 * A[I].y + 0.0722 * A[I].z, Lb = 0.2126 * B[I].x + 0.7152 * B[I].y + 0.0722 * B[I].z;
+		Sa += La; Sb += Lb; Saa += La * La; Sbb += Lb * Lb; Sab += La * Lb;
+		if (La > 0.0) { Errs.push_back(std::fabs(Lb - La) / La); }
+	}
+	std::sort(Errs.begin(), Errs.end());
+	const double N = double(A.size());
+	const double Corr = (Sab / N - Sa / N * Sb / N) / std::sqrt(std::max((Saa / N - Sa * Sa / (N * N)) * (Sbb / N - Sb * Sb / (N * N)), 1e-300));
+	const double Total = Sb / Sa - 1.0;
+	const double Median = Errs.empty() ? 0.0 : Errs[Errs.size() / 2];
+	const double P95 = Errs.empty() ? 0.0 : Errs[size_t(0.95 * double(Errs.size() - 1))];
+	const double StepsA = double(Cubes[0].Steps) / N, StepsB = double(Cubes[1].Steps) / N;
+	Uni::Check(2, "T2.webtex.travel_hint", "D-202 the background web's hints x 2 at full travel speed: the map's marched light within 0.5% of hints x 1, texel correlation >= 0.99, median texel within 2.5%, and at least 25% fewer steps")
+		.Metric("light", Total).Metric("corr", Corr).Metric("median", Median).Metric("p95", P95).Metric("steps_x1", StepsA).Metric("steps_x2", StepsB)
+		.Pass(std::fabs(Total) < 0.005 && Corr >= 0.99 && Median < 0.025 && StepsB < 0.75 * StepsA && Cubes[1].Truncated == 0,
+			Uni::Fmt("cube 6 x 96^2: light %+.2f%%, texel correlation %.4f, median texel %.2f%%, p95 %.2f%%; %.1f -> %.1f steps per texel (%.0f%% fewer)",
+				100.0 * Total, Corr, 100.0 * Median, 100.0 * P95, StepsA, StepsB, 100.0 * (1.0 - StepsB / std::max(StepsA, 1e-9))));
+}
+
+UNI_TEST(webtex, shared_texel)
+{
+	// D-206 (B-019). In the owner's scene the background is two periodic textured web carriers
+	// (field galaxies on walls, filaments and void matter; group dwarfs on the node matter): the
+	// same texture in the same frame, so every step read the same texel twice. The march now reads
+	// it once for both (UniField_WebTexCh). The background map (6 x 64^2) from the void camera with
+	// and without the shared read: bit for bit the same light, steps and truncation.
+	std::string Err;
+	const FWebTexture& T = Delivered(&Err);
+	std::vector<FWebNode> Nodes;
+	if (!T.IsValid() || !LoadWebNodes(kDeliveredDir, kDeliveredName, Nodes, &Err)) { Uni::Check(2, "T2.webtex.shared_texel", "D-206 one web texel read for both background carriers").Pass(false, "not loaded: " + Err); return; }
+	FBindScope Bind(T);
+	const UniScenes::FClusterTuning Tun;
+	FUniverseDef Def = UniScenes::Flythrough(Tun);
+	const H::float4 Mean = T.Mean();
+	UniScenes::UseDeliveredWeb(Def, Tun, T.Size, Mean.z / (double(Mean.x) + Mean.y + Mean.z + Mean.w), &Nodes);
+	FUniverseModel M(Def);
+	FRefGenerator G(M);
+	FVolumeBuilder VB(M, G);
+	FRefPipeline P(G);
+	const FCoord Cam = UniScenes::VoidCamera();
+	P.Update(Cam, FVec3f{});
+	FCamera Cm; Cm.Coord = Cam; Cm.Width = 320; Cm.Height = 180;
+	FVolumeScene Bg = VB.Build(P, Cam, FVec3f{}, Cm.View(), FVolumeSettings{}).Subset(true);
+	size_t WebTex = 0, Pairs = 0;
+	for (size_t I = 0; I < Bg.Carriers.size(); ++I)
+	{
+		const FCarrierGPU& C = Bg.Carriers[I];
+		const H::FUniFieldParams& Pa = reinterpret_cast<const H::FUniFieldParams&>(Bg.Params[C.ParamIndex]);
+		if (!H::Uni_CarrierWebTex(reinterpret_cast<const H::FUniCarrier&>(C), Pa)) { continue; }
+		++WebTex;
+		for (size_t J = 0; J < I; ++J)
+		{
+			if (H::Uni_CarrierSameWebTexel(reinterpret_cast<const H::FUniCarrier&>(C), Pa, reinterpret_cast<const H::FUniCarrier&>(Bg.Carriers[J]), reinterpret_cast<const H::FUniFieldParams&>(Bg.Params[Bg.Carriers[J].ParamIndex]))) { ++Pairs; break; }
+		}
+	}
+	using Clock = std::chrono::steady_clock;
+	FVolumeScene Off = Bg;
+	Off.View.MarchFlags |= 1u;
+	const auto T0 = Clock::now();
+	const FBackgroundCube A = RenderBackgroundCube(Off, 64);
+	const auto T1 = Clock::now();
+	const FBackgroundCube B = RenderBackgroundCube(Bg, 64);
+	const auto T2 = Clock::now();
+	size_t Differ = 0;
+	for (size_t I = 0; I < A.Tex.size(); ++I)
+	{
+		if (std::memcmp(&A.Tex[I], &B.Tex[I], sizeof(H::float3)) != 0) { ++Differ; }
+	}
+	const double Ma = std::chrono::duration<double, std::milli>(T1 - T0).count(), Mb = std::chrono::duration<double, std::milli>(T2 - T1).count();
+	Uni::Check(2, "T2.webtex.shared_texel", "D-206 the owner's scene from the void camera: the background's two textured web carriers read the same texel; marching them with one read is bit for bit the march with two (every texel of a 6 x 64^2 map, steps, truncation)")
+		.Metric("web_carriers", double(WebTex)).Metric("pairs", double(Pairs)).Metric("differ", double(Differ)).Metric("ms_two", Ma).Metric("ms_one", Mb)
+		.Pass(Pairs >= 1 && Differ == 0 && A.Steps == B.Steps && A.Truncated == B.Truncated,
+			Uni::Fmt("%zu textured web carriers, %zu reading an earlier one's texel; %zu of %zu texels differ, steps %llu / %llu; reference march %.0f -> %.0f ms (the CPU's trilinear emulation: %.0f%% less)",
+				WebTex, Pairs, Differ, A.Tex.size(), (unsigned long long)A.Steps, (unsigned long long)B.Steps, Ma, Mb, 100.0 * (1.0 - Mb / std::max(Ma, 1e-9))));
 }

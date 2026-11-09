@@ -1,0 +1,133 @@
+// UniQuery.usf
+// D-193: the runtime API's GPU lookups. Every rule is in Core/UniQuery.ush, shared with the
+// offline checks (T2.query.*); this file only walks the buffers.
+//
+// Pick (UUniSubsystem::Pick), over the frame's sprites, after the project pass:
+//   PickScoreCS    the best Uni_PickScore (as uint bits: positive floats order as uints)
+//   PickSelectCS   the lowest sprite index with that score (as the max of ~index: no initial
+//                  value but 0 is needed)
+//   PickResolveCS  that sprite's source (cell index, slot, from the project pass) and its record
+// Query (QueryResident, FindNearest), over the cell table and pool, one group of 64 per cell
+// like the project pass:
+//   QueryCS        Mode 0: every match within the radius; 1: the smallest match distance;
+//                  2: every match at that distance (FindNearest runs 1 then 2)
+// Results are read back through rings (UniRenderer.cpp); nothing ever waits on them.
+
+#include "/Engine/Public/Platform.ush"
+#include "UniWebTexture.ush"   // before any core (D-164); nothing here samples it
+#include "Core/UniQuery.ush"
+
+struct FUniCellGPU   // GPU-MIRROR: UniCore::FCellGPU (64 bytes)
+{
+	uint4 DeltaX;
+	uint4 DeltaY;
+	uint4 DeltaZ;
+	uint Level;
+	uint PoolStart;
+	uint PoolCount;
+	uint Flags;
+};
+
+StructuredBuffer<FUniCellGPU> InCells;
+StructuredBuffer<FUniObject> InPool;
+
+// ---------------------------------------------------------------------------------------------
+// Pick
+
+StructuredBuffer<FUniSprite> InSprites;
+StructuredBuffer<uint2> InSpriteSource;   // (cell index, slot) per sprite, from the project pass
+Buffer<uint> InDrawArgs;                  // the sprite draw's args: [1] = sprites written
+RWStructuredBuffer<uint> OutPickBest;     // [0] best score bits, [1] ~(its lowest sprite index); both cleared to 0 (0: none)
+RWStructuredBuffer<uint> OutPickResult;   // 16: found, sprite, cell index, slot, score bits, 0, 0, 0, record (8)
+uint MaxSprites;
+float2 CursorNdc;
+float2 HalfViewPx;
+float PixelsPerRadian;
+float PickMinPx;
+
+uint PickSpriteCount() { return min(InDrawArgs[1], MaxSprites); }
+
+[numthreads(64, 1, 1)]
+void PickScoreCS(uint3 DispatchId : SV_DispatchThreadID)
+{
+	if (DispatchId.x >= PickSpriteCount()) { return; }
+	const float Score = Uni_PickScore(InSprites[DispatchId.x], CursorNdc, HalfViewPx, PixelsPerRadian, PickMinPx);
+	if (Score > 0.0f) { InterlockedMax(OutPickBest[0], asuint(Score)); }
+}
+
+[numthreads(64, 1, 1)]
+void PickSelectCS(uint3 DispatchId : SV_DispatchThreadID)
+{
+	if (DispatchId.x >= PickSpriteCount()) { return; }
+	const uint Best = OutPickBest[0];
+	if (Best == 0u) { return; }
+	const float Score = Uni_PickScore(InSprites[DispatchId.x], CursorNdc, HalfViewPx, PixelsPerRadian, PickMinPx);
+	if (Score > 0.0f && asuint(Score) == Best) { InterlockedMax(OutPickBest[1], ~DispatchId.x); }
+}
+
+[numthreads(1, 1, 1)]
+void PickResolveCS()
+{
+	const uint Best = OutPickBest[0];
+	const uint NotIndex = OutPickBest[1];
+	for (uint I = 0; I < 16u; ++I) { OutPickResult[I] = 0u; }
+	if (Best == 0u || NotIndex == 0u) { return; }
+	const uint Index = ~NotIndex;
+	const uint2 Src = InSpriteSource[Index];
+	const FUniCellGPU Cell = InCells[Src.x];
+	const FUniObject O = InPool[Cell.PoolStart + Src.y];
+	OutPickResult[0] = 1u;
+	OutPickResult[1] = Index;
+	OutPickResult[2] = Src.x;
+	OutPickResult[3] = Src.y;
+	OutPickResult[4] = Best;
+	OutPickResult[8] = O.A.x; OutPickResult[9] = O.A.y; OutPickResult[10] = O.A.z; OutPickResult[11] = O.A.w;
+	OutPickResult[12] = O.B.x; OutPickResult[13] = O.B.y; OutPickResult[14] = O.B.z; OutPickResult[15] = O.B.w;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Query
+
+RWStructuredBuffer<uint> OutQueryMin;        // [0] smallest match distance bits (mode 1; cleared to ~0)
+StructuredBuffer<uint> InQueryMin;           // the same, read by mode 2
+RWStructuredBuffer<uint4> OutQueryHits;      // (cell index, slot, distance bits, 0)
+RWStructuredBuffer<FUniObject> OutQueryRecords;
+RWStructuredBuffer<uint> OutQueryCount;      // [0] matches found (may exceed QueryMaxResults: only that many are written)
+uint NumCells;
+uint DispatchGroupsX;
+uint QueryMode;
+uint4 QueryDeltaX;                           // centre - camera, exact (two's complement 128-bit per axis)
+uint4 QueryDeltaY;
+uint4 QueryDeltaZ;
+float QueryRadius;
+uint QueryArchMask;
+float QueryMaxAbsMag;
+uint QueryMaxResults;
+
+[numthreads(64, 1, 1)]
+void QueryCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint CellIndex = GroupId.y * DispatchGroupsX + GroupId.x;
+	if (CellIndex >= NumCells) { return; }
+	const FUniCellGPU Cell = InCells[CellIndex];
+	const float Reach = QueryMode == UNI_QUERY_MODE_SPHERE ? QueryRadius : -1.0f;
+	if (!Uni_QueryCellMayHit(Cell.DeltaX, Cell.DeltaY, Cell.DeltaZ, QueryDeltaX, QueryDeltaY, QueryDeltaZ, Cell.Level, Reach)) { return; }
+	const uint MinBits = QueryMode == 2u ? InQueryMin[0] : 0u;
+	for (uint I = GroupIndex; I < Cell.PoolCount; I += 64)
+	{
+		const FUniObject O = InPool[Cell.PoolStart + I];
+		if (!Uni_QueryMatch(O, QueryArchMask, QueryMaxAbsMag)) { continue; }
+		const float D = Uni_SafeLength(Uni_QueryRelative(Cell.DeltaX, Cell.DeltaY, Cell.DeltaZ, QueryDeltaX, QueryDeltaY, QueryDeltaZ, O, Cell.Level));
+		const uint Bits = asuint(D);
+		if (QueryMode == 1u) { InterlockedMin(OutQueryMin[0], Bits); continue; }
+		const bool bHit = QueryMode == 2u ? Bits <= MinBits : D <= QueryRadius;
+		if (!bHit) { continue; }
+		uint Slot;
+		InterlockedAdd(OutQueryCount[0], 1u, Slot);
+		if (Slot < QueryMaxResults)
+		{
+			OutQueryHits[Slot] = uint4(CellIndex, I, Bits, 0u);
+			OutQueryRecords[Slot] = O;
+		}
+	}
+}

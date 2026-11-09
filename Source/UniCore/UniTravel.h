@@ -45,4 +45,21 @@ namespace UniCore
 			return Current;
 		}
 	};
+
+	/** D-199 (B-018): the warp optics' motion for a frame: the camera's step (cm) as a unit vector
+	 *  and the effective speed, 0 when there is no motion or no optics. In double: the step's
+	 *  length squared overflows a float past 1.8e19 cm (6 pc a frame), and UE's float Size() gave
+	 *  inf there, so the motion came out zero with the optics on: every direction shrank by
+	 *  sqrt(1 - b^2), and every sprite off the view's centre took a capped 64 px streak (its light
+	 *  spread 64x): at intergalactic speed nearly everything vanished. */
+	inline void WarpMotion(double InStepX, double InStepY, double InStepZ, double InBeta, float OutVelBeta[4])
+	{
+		OutVelBeta[0] = OutVelBeta[1] = OutVelBeta[2] = OutVelBeta[3] = 0.0f;
+		const double L = std::sqrt(InStepX * InStepX + InStepY * InStepY + InStepZ * InStepZ);
+		if (!(L > 0.0) || !std::isfinite(L) || !(InBeta > 0.0)) { return; }
+		OutVelBeta[0] = float(InStepX / L);
+		OutVelBeta[1] = float(InStepY / L);
+		OutVelBeta[2] = float(InStepZ / L);
+		OutVelBeta[3] = float(std::min(InBeta, 0.9));
+	}
 }

@@ -11,6 +11,11 @@
 //                   PoolCapacity accepted are written; the rest of the range is blanked
 //                   (lesson #27). OutAccepted[task] = filled count.
 //   UNI_GEN_PASS 2  SCATTER: authored records (anchors) written at CPU-chosen pool indices.
+//   UNI_GEN_PASS 3  ALLOC (D-207, one-trip batches): one thread walks the batch's cells in order
+//                   and gives every task its pool range inside the arena the CPU reserved,
+//                   exactly as FuseAllocate (UniStreamer.h). PLACE then reads the ranges from
+//                   InAlloc (UseAlloc 1) instead of the task, so probe, allocation and place run
+//                   back to back and only the counts are read back.
 //
 // Dispatch is wrapped into 2D (lesson #23): task = GroupId.y * DispatchGroupsX + GroupId.x.
 // Padding groups (TaskIndex >= NumTasks) do NOT return early: every thread of every group
@@ -82,6 +87,8 @@ StructuredBuffer<FUniSlice> InSlices;
 StructuredBuffer<float> InLut;
 RWStructuredBuffer<FUniObject> OutPool;
 RWStructuredBuffer<uint> OutAccepted;
+StructuredBuffer<uint4> InAlloc;   // D-207: (pool base, capacity, index base, fits) per task, with UseAlloc
+uint UseAlloc;
 
 groupshared uint GsScan[UNI_GEN_THREADS];
 groupshared uint GsBase;
@@ -92,7 +99,15 @@ void MainCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
 	const uint TaskIndex = GroupId.y * DispatchGroupsX + GroupId.x;
 	const bool bValid = TaskIndex < NumTasks;   // group-uniform
 	const uint TaskRead = min(TaskIndex, NumTasks - 1);
-	const FUniGenTask T = InTasks[TaskRead];
+	FUniGenTask T = InTasks[TaskRead];
+	if (UseAlloc != 0u)
+	{
+		// D-207: the range ALLOC gave this task on the GPU (a one-trip batch).
+		const uint4 Al = InAlloc[TaskRead];
+		T.PoolBase = Al.x;
+		T.PoolCapacity = Al.y;
+		T.IndexBase = Al.z;
+	}
 	const FUniTaskCount C = InCounts[TaskRead];
 	const FUniSlice S = InSlices[T.SliceIndex];
 	const uint Capacity = bValid ? T.PoolCapacity : 0u;
@@ -149,6 +164,53 @@ void MainCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
 		OutPool[T.PoolBase + I] = Uni_BlankObject();
 	}
 	if (bValid && GroupIndex == 0) { OutAccepted[TaskIndex] = Filled; }
+}
+
+#elif UNI_GEN_PASS == 3
+
+StructuredBuffer<FUniTaskCount> InCounts;
+RWStructuredBuffer<uint4> OutAlloc;
+uint ArenaBase;
+uint ArenaCap;
+uint MaxPerCell;
+
+/** D-207: FuseAllocate (UniStreamer.h), line for line. Cells are runs of tasks with the same
+ *  ordinal (BoxLo.w), in order. A task's capacity is its count truncated so its cell holds at
+ *  most MaxPerCell; its index base the running sum before it in the cell. A cell whose total fits
+ *  in the arena's remaining room is packed at the cursor; otherwise its tasks get capacity 0 and
+ *  the next cells still try. One thread: a batch is at most a few thousand tasks. */
+[numthreads(1, 1, 1)]
+void AllocCS()
+{
+	uint Cursor = 0u;
+	uint I = 0u;
+	[loop]
+	while (I < NumTasks)
+	{
+		const uint Cell = InTasks[I].BoxLo.w;
+		uint J = I;
+		uint Index = 0u;
+		[loop]
+		for (; J < NumTasks; ++J)
+		{
+			if (InTasks[J].BoxLo.w != Cell) { break; }
+			const uint Room = Index < MaxPerCell ? MaxPerCell - Index : 0u;
+			Index += min(InCounts[J].Count, Room);
+		}
+		const bool bFits = Index <= ArenaCap - Cursor;
+		uint Idx = 0u;
+		[loop]
+		for (uint K = I; K < J; ++K)
+		{
+			const uint Room = Idx < MaxPerCell ? MaxPerCell - Idx : 0u;
+			const uint Cap = min(InCounts[K].Count, Room);
+			if (bFits) { OutAlloc[K] = uint4(ArenaBase + Cursor + Idx, Cap, Idx, 1u); }
+			else { OutAlloc[K] = uint4(ArenaBase, 0u, Idx, 0u); }
+			Idx += Cap;
+		}
+		if (bFits) { Cursor += Index; }
+		I = J;
+	}
 }
 
 #else // UNI_GEN_PASS == 2: scatter authored records (anchors) into the pool

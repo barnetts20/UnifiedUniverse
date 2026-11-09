@@ -4,7 +4,10 @@
 // Core/UniProject.ush, shared with the CPU reference renderer (Tier 3).
 //
 // Outputs: compacted sprites + an indirect draw argument block {6, instances, 0, 0}, and
-// promotion candidates (cell index, object index in cell) for the CPU readback.
+// promotion candidates (cell index, object index in cell) for the CPU readback. D-193: on a
+// frame with a pick request, each sprite's (cell index, slot) beside it (UniQuery.usf).
+// D-196: an object with a volume carrier draws only the share its carrier did not take this
+// frame (InHandoffs, from the volume builder); one with no carrier keeps its whole sprite.
 //
 // The view is passed as raw floats and rebuilt here (lesson #2: no derived struct mirrored as a
 // constant buffer). The cell table carries exact 128-bit deltas (D-104).
@@ -34,6 +37,7 @@ RWBuffer<uint> OutPromoteCount;
 RWStructuredBuffer<uint2> OutActivate;          // D-142: (cell index, object index) of stars inside their system radius
 RWStructuredBuffer<FUniObject> OutActivateRecord; // and their records, for the CPU (star records otherwise never leave the GPU)
 RWBuffer<uint> OutActivateCount;
+RWStructuredBuffer<uint2> OutSpriteSource;      // D-193: (cell index, slot) of each sprite, for a pick (written when WriteSpriteSource)
 
 uint NumCells;
 uint DispatchGroupsX;
@@ -47,6 +51,25 @@ float4 WarpDopplerKQ;                            // D-190: Doppler colour streng
 float ArrivalFrames;                             // D-187: frames over which a new cell's objects arrive at warp
 uint DiscArchetypeMask;                          // D-183: bit per archetype id < 32 whose objects are disc galaxies (inclined elliptical sprites)
 uint4 FixedDiscSeeds;                            // D-183: seeds of fixed-orientation anchors (disc normal world z)
+uint WriteSpriteSource;                          // D-193: 1 on a frame with a pick request
+StructuredBuffer<uint4> InHandoffs;              // D-196: (cell index, slot, carrier share bits, 0), sorted by (cell index, slot)
+uint NumHandoffs;
+
+/** D-196: the share of an object's light its volume carrier takes this frame (0: none). */
+float CarrierShareOf(uint InCellIndex, uint InSlot)
+{
+	uint Lo = 0u, Hi = NumHandoffs;
+	UNI_LOOP
+	while (Lo < Hi)
+	{
+		const uint Mid = (Lo + Hi) >> 1u;
+		const uint4 E = InHandoffs[Mid];
+		if (E.x == InCellIndex && E.y == InSlot) { return asfloat(E.z); }
+		if (E.x < InCellIndex || (E.x == InCellIndex && E.y < InSlot)) { Lo = Mid + 1u; }
+		else { Hi = Mid; }
+	}
+	return 0.0f;
+}
 
 float3 ViewForward;
 float TanHalfFovX;
@@ -98,16 +121,24 @@ void MainCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
 	V.WarpPad0 = 0.0f;
 	V.WarpPad1 = 0.0f;
 
-	// D-187: at warp a new cell's objects arrive over ArrivalFrames (faded in, streaking in from
-	// ahead: the sprite pass stretches their tails by their arrival); at rest nothing changes.
+	// D-187: at warp a new cell's objects streak in from ahead (the sprite pass stretches their
+	// tails by their arrival). D-203: their fade-in is the cell's own (bits 8..15: the level's fade
+	// x the cell's, whose undrawn share the volume draws as glow), at any speed, so it is no
+	// longer applied again here.
 	const float Arrival = Uni_SpriteArrival((Cell.Flags >> UNI_CELL_AGE_SHIFT) & 255u, ArrivalFrames);
-	const float LevelFade = (float)((Cell.Flags >> 8u) & 255u) / 255.0f * lerp(1.0f, Arrival, saturate(WarpAmount));
+	const float LevelFade = (float)((Cell.Flags >> 8u) & 255u) / 255.0f;
 	const uint ArrivalBits = (uint)(Arrival * 255.0f + 0.5f) << UNI_SPRITE_ARRIVAL_SHIFT;
+	// D-204: the cell's origin relative to the camera once per thread (hi + lo floats for a cell a
+	// cell width away or more), so each object costs float adds, not 128-bit integer math.
+	// D-205: threads with no object in this cell skip it (most cells hold fewer than 64).
+	FUniCellRel CellRel = (FUniCellRel)0;
+	if (GroupIndex < Cell.PoolCount) { CellRel = Uni_CellRel(Cell.DeltaX, Cell.DeltaY, Cell.DeltaZ, Cell.Level); }
 	for (uint I = GroupIndex; I < Cell.PoolCount; I += 64)
 	{
 		const FUniObject O = InPool[Cell.PoolStart + I];
-		FUniSprite S = Uni_ProjectObject(Cell.DeltaX, Cell.DeltaY, Cell.DeltaZ, Cell.Level, LevelFade, O, V,
-			(Uni_ObjectFlags(O) & UNI_OBJ_FLAG_PROMOTED) != 0u);
+		const float Share = Uni_ObjectIsCarrierParent(O) ? CarrierShareOf(CellIndex, I) : 0.0f;   // D-196
+		FUniSprite S = Uni_ProjectObjectC(CellRel, LevelFade, O, V,
+			(Uni_ObjectFlags(O) & UNI_OBJ_FLAG_PROMOTED) != 0u, Share);
 		S.Flags = S.Flags | ArrivalBits;
 		// System activation: by true distance, before any culling (a system behind the camera
 		// still activates). Dynamic planet records carry an archetype id >= 32 and never match.
@@ -127,7 +158,11 @@ void MainCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
 		{
 			uint Slot;
 			InterlockedAdd(OutDrawArgs[1], 1u, Slot);
-			if (Slot < MaxSprites) { OutSprites[Slot] = S; }
+			if (Slot < MaxSprites)
+			{
+				OutSprites[Slot] = S;
+				if (WriteSpriteSource != 0u) { OutSpriteSource[Slot] = uint2(CellIndex, I); }
+			}
 		}
 	}
 }

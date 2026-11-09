@@ -11,6 +11,7 @@
 
 #include <atomic>
 #include <thread>
+#include <unordered_map>
 
 namespace UniRender
 {
@@ -117,14 +118,14 @@ namespace UniRender
 				const FV3 Ds = PixelDir(Cam, Wd, Ht, X + (I + 0.5) / SS, Y + (J + 0.5) / SS);
 				const H::FUniVolumeResult Rs = H::Uni_VolumeMarch(H::float3(float(Ds.X), float(Ds.Y), float(Ds.Z)), TScene, Cb, Pb, Lb, V);
 				Acc += Rs.Radiance; AccT += Rs.Transmittance; Steps += Rs.Steps; Tr += Rs.Truncated; Act = std::max(Act, Rs.Active);
-				Dw += Rs.DepthWeight; Dwl += Rs.DepthWeight * Rs.LnDepth;
+				Dw += Rs.DepthWeight; if (Rs.LnDepth < H::UNI_VOL_LN_DEPTH_NONE - 1.0f) { Dwl += Rs.DepthWeight * H::Uni_LightInvDepth(Rs.LnDepth); }   // D-194: harmonic
 				for (u32 K = 0; K < H::UNI_VOL_SLICES; ++K) { AccS[K] = (I == 0 && J == 0) ? Rs.SliceT[K] : AccS[K] + Rs.SliceT[K]; }
 			}
 			const float Inv = 1.0f / float(SS * SS);
 			R.Radiance = Acc * Inv; R.Transmittance = AccT * Inv; R.Steps = Steps; R.Truncated = Tr ? 1u : 0u; R.Active = Act; R.Pad = 0u;
 			for (u32 K = 0; K < H::UNI_VOL_SLICES; ++K) { R.SliceT[K] = AccS[K] * Inv; }
 			R.DepthWeight = Dw * Inv;
-			R.LnDepth = Dw > 0.0f ? Dwl / Dw : H::UNI_VOL_LN_DEPTH_NONE;
+			R.LnDepth = Dw > 0.0f && Dwl > 0.0f ? H::Uni_LightLnDepthFromInv(Dwl / Dw) : H::UNI_VOL_LN_DEPTH_NONE;
 			bOutSuper = true;
 		}
 		return R;
@@ -199,6 +200,14 @@ namespace UniRender
 		FCamera Prev;
 		u32 Frame = 0;
 		size_t Marched = 0, FromHistory = 0, FromFresh = 0, Steps = 0;
+		// D-194: the history clamped into the fresh neighbours' range (tight from ClampTightPx of
+		// motion), not used beyond MaxMotionPx. bClamp false: the D-184 luminance band.
+		bool bClamp = true;
+		float ClampTightPx = 2.0f;
+		float MaxMotionPx = 8.0f;
+		size_t TooFast = 0;
+		// D-208: the slicing's block (2: D-184's 2 x 2); set before each Step to vary it.
+		u32 Interleave = 2;
 
 		static float Lum(const H::float4& V) { return H::Uni_Luminance(H::float3(V.x, V.y, V.z)); }
 
@@ -206,7 +215,7 @@ namespace UniRender
 		{
 			if (Cam.Width != W || Cam.Height != Ht) { W = Cam.Width; Ht = Cam.Height; bHave = false; }
 			const size_t N = size_t(W) * Ht;
-			const u32 Phase = Frame & 3u;
+			const u32 Phase = H::Uni_TemporalPack(Frame, Interleave);   // D-208 (2: Frame & 3, as before)
 			H::FUniTemporalView TV;
 			TV.PrevForward = H::float3(float(Prev.Forward.X), float(Prev.Forward.Y), float(Prev.Forward.Z));
 			TV.PrevRight = H::float3(float(Prev.Right.X), float(Prev.Right.Y), float(Prev.Right.Z));
@@ -271,10 +280,17 @@ namespace UniRender
 					const float Sw = Ws.x + Ws.y + Ws.z + Ws.w;
 					H::float4 Sp(0, 0, 0, 0);
 					float Lo = 3.0e38f, Hi = 0.0f;
+					H::float4 Lo4(3.0e38f, 3.0e38f, 3.0e38f, 3.0e38f), Hi4(0, 0, 0, 0);
 					for (int K = 0; K < 4; ++K)
 					{
 						Sp = Sp + FVol[Q[K]] * (Wsa[K] / Sw);
-						if (Wba[K] > 0.0f) { Lo = std::min(Lo, Lum(FVol[Q[K]])); Hi = std::max(Hi, Lum(FVol[Q[K]])); }
+						if (Wba[K] > 0.0f)
+						{
+							Lo = std::min(Lo, Lum(FVol[Q[K]])); Hi = std::max(Hi, Lum(FVol[Q[K]]));
+							const H::float4& Fv = FVol[Q[K]];
+							Lo4 = H::float4(std::min(Lo4.x, Fv.x), std::min(Lo4.y, Fv.y), std::min(Lo4.z, Fv.z), std::min(Lo4.w, Fv.w));
+							Hi4 = H::float4(std::max(Hi4.x, Fv.x), std::max(Hi4.y, Fv.y), std::max(Hi4.z, Fv.z), std::max(Hi4.w, Fv.w));
+						}
 					}
 					const float LnD = H::Uni_TemporalLightLnDepth(Ws, H::float4(FDep[Q[0]].x, FDep[Q[1]].x, FDep[Q[2]].x, FDep[Q[3]].x));
 					bool bHist = false;
@@ -319,7 +335,14 @@ namespace UniRender
 									}
 									if (bSame) { Hv = H::float4(std::max(Cr.x, 0.0f), std::max(Cr.y, 0.0f), std::max(Cr.z, 0.0f), std::min(std::max(Cr.w, 0.0f), 1.0f)); }
 								}
-								bHist = H::Uni_TemporalAccept(Lum(Hv), Lo, Hi);
+								if (bClamp)
+								{
+									// D-194: clamp into the fresh range (tight once moving); too fast: not used.
+									const float Mo = H::Uni_TemporalMotionPx(Pp, Px);
+									if (Mo <= MaxMotionPx) { Hv = H::Uni_TemporalClamp(Hv, Lo4, Hi4, H::Uni_TemporalClampK(Mo, ClampTightPx)); bHist = true; }
+									else { ++TooFast; }
+								}
+								else { bHist = H::Uni_TemporalAccept(Lum(Hv), Lo, Hi); }
 							}
 						}
 					}
@@ -352,18 +375,29 @@ namespace UniRender
 	};
 
 	/** RenderFrame with the volume: promoted bodies, then the volume (it needs their distance),
-	 *  then sprites attenuated by the slice transmittance at their true distance. */
-	inline FFrameStats RenderFrameWithVolume(const FRefPipeline& P, const FVolumeScene& Sc, const FCamera& Cam, FImage& Img, FVolumeStats* VolOut = nullptr, bool bVolume = true)
+	 *  then sprites attenuated by the slice transmittance at their true distance. D-196: a
+	 *  carrier's parent sprite draws 1 - the share the scene's handoffs give it (0 when it has no
+	 *  carrier), as the engine's project pass does; bCurveHandoff: the handoff curve instead (the
+	 *  behaviour before D-196, for comparisons).
+	 *  D-203: P is anything with ForEachResident(Fn(key, object, fade, identity hash)): the
+	 *  reference pipeline, or a view of the runtime streamer's cell table and pool. */
+	template <typename TSource>
+	inline FFrameStats RenderFrameWithVolume(const TSource& P, const FVolumeScene& Sc, const FCamera& Cam, FImage& Img, FVolumeStats* VolOut = nullptr, bool bVolume = true, bool bCurveHandoff = false)
 	{
 		FFrameStats St;
 		const H::FUniView V = Cam.View();
 		std::vector<H::FUniSprite> Sprites;
-		P.ForEachResident([&](const FCellKey& K, const FObjectGPU& O, float Fade, u64)
+		std::unordered_map<u64, float> Share;
+		if (bVolume) { for (const FCarrierHandoff& Hd : Sc.Handoffs) { Share[HashObject(Hd.Parent)] = Hd.Hand; } }
+		P.ForEachResident([&](const FCellKey& K, const FObjectGPU& O, float Fade, u64 Hash)
 		{
 			++St.Resident;
 			H::uint4 D[3];
 			CellDelta(K, Cam.Coord, D);
-			const H::FUniSprite S = H::Uni_ProjectObject(D[0], D[1], D[2], u32(K.Level), Fade, UniCore::ToHlsl(O), V, false);
+			const H::FUniObject Ho = UniCore::ToHlsl(O);
+			float Sh = -1.0f;
+			if (!bCurveHandoff) { const auto It = Share.find(Hash); Sh = It != Share.end() ? It->second : 0.0f; }
+			const H::FUniSprite S = H::Uni_ProjectObjectH(D[0], D[1], D[2], u32(K.Level), Fade, Ho, V, false, Sh);
 			if (S.Flags & H::UNI_SPRITE_PROMOTE_CANDIDATE)
 			{
 				if (!((O.A[3] >> 16) & H::UNI_OBJ_FLAG_EXTENDED))
@@ -399,5 +433,25 @@ namespace UniRender
 		}
 		if (VolOut) { *VolOut = Vs; }
 		return St;
+	}
+
+	/** D-196/D-197: the light over the whole sphere (six 90-degree faces of Size^2), sprites +
+	 *  volume, as luminance; OutSprites: the sprites' share of it. */
+	template <typename TSource>
+	inline double SphereLight(const TSource& P, const FVolumeScene& Sc, const FCoord& Cam, int Size, double* OutSprites = nullptr)
+	{
+		const FV3 Looks[6] = { { 1, 0, 0 }, { -1, 0, 0 }, { 0, 1, 0 }, { 0, -1, 0 }, { 0.001, 0, 1 }, { 0.001, 0, -1 } };
+		double L = 0.0, Sp = 0.0;
+		for (const FV3& Lk : Looks)
+		{
+			FCamera Cm; Cm.Coord = Cam; Cm.Width = Size; Cm.Height = Size; Cm.DeltaMag = 0.0; Cm.LookAlong(Lk);
+			FImage Img(Cm.Width, Cm.Height);
+			FVolumeStats Vs;
+			RenderFrameWithVolume(P, Sc, Cm, Img, &Vs);
+			L += 0.2126 * (Vs.Flux[0] + Vs.SpriteFlux[0]) + 0.7152 * (Vs.Flux[1] + Vs.SpriteFlux[1]) + 0.0722 * (Vs.Flux[2] + Vs.SpriteFlux[2]);
+			Sp += 0.2126 * Vs.SpriteFlux[0] + 0.7152 * Vs.SpriteFlux[1] + 0.0722 * Vs.SpriteFlux[2];
+		}
+		if (OutSprites) { *OutSprites = L > 0.0 ? Sp / L : 0.0; }
+		return L;
 	}
 }

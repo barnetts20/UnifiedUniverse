@@ -20,6 +20,7 @@
 #include "RenderGraphResources.h"
 #include "RendererInterface.h"   // IPooledRenderTarget
 #include "UniStreamer.h"
+#include "UniQuery.h"   // D-193
 #include "UniVolume.h"
 
 #include <atomic>
@@ -45,12 +46,49 @@ struct FUniFrameData
 	FVector3f CameraStepCm = FVector3f::ZeroVector;
 	bool bCameraStepValid = false;
 	float WarpAmount = 0.0f;   // D-187: 0 at rest, 1 at full warp (the travel curve), drives streaks and arrival
+	float SpeedAmount = 0.0f;  // D-198: the travel curve itself (not x uu.Warp): the volume march's budget falls with it
+	float VolumeBudgetScale = 1.0f;   // D-200: the auto budget's scale of the march pixel budget (1: off)
+	float VolumeNearCm = 0.0f;        // D-208: the nearest marched structure's distance (FVolumeScene::NearCm; 0: unknown)
+	// D-211: the galaxy cache (UniGalaxyCache.h). This frame's boxes to bake (two uint4 each:
+	// (level, lo.xyz as int bits), (size.xyz, 0)), queued on the render thread in order; the
+	// layout, and an epoch that changes when the game thread resets the cache.
+	TArray<FUintVector4> GalCacheBoxes;
+	uint32 GalCacheN = 0;               // 0: no cache
+	uint32 GalCacheLevels = 0;
+	uint32 GalCacheEpoch = 0;
+	float GalCacheV0 = 0.0f;
+	float GalCacheZCap = 0.0f;
+	float GalCacheScale = 1.0f;
+	float GalCacheFootScale = 1.0f;
+	// D-212: the galaxy map's bake request (the camera's own galaxy): an epoch that changes per
+	// galaxy or size (0: no map), its size, the light's and dust's parameters, and the texels the
+	// GPU may bake a frame. The renderer bakes it over frames and reports the epoch when done.
+	uint32 GalMapEpoch = 0;
+	uint32 GalMapSize = 0;
+	uint32 GalMapBudget = 0;
+	uint32 bGalMapDust = 0;
+	UniCore::FFieldParamsGPU GalMapParams[2] = {};
 	// D-192: warp ambience motes (UniCore::MoteLattice): per lattice slot the camera's cell (w: the
 	// level) and its fraction in it (w: the slot's weight, 0: none); cell sizes (cm) and the
 	// motes' flux (exposure units) in MoteScale (x, y, z).
 	FUintVector4 MoteCell[2] = { FUintVector4(0, 0, 0, 0), FUintVector4(0, 0, 0, 0) };
 	FVector4f MoteFrac[2] = { FVector4f(0.0f, 0.0f, 0.0f, 0.0f), FVector4f(0.0f, 0.0f, 0.0f, 0.0f) };
 	FVector4f MoteScale = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+
+	// D-193: at most one pick and one resident query per frame (the subsystem queues the rest).
+	// The pick scores this frame's sprites under a cursor; the query walks this frame's cell
+	// table. Results come back a few frames later (DrainPicks / DrainQueries), named by
+	// (cell index in this frame's table, slot).
+	int32 PickRequestId = 0;                            // 0: none
+	FVector2f PickCursorNdc = FVector2f::ZeroVector;    // [-1, 1] across the view, y up
+	float PickMinPx = 4.0f;
+	int32 QueryRequestId = 0;                           // 0: none
+	uint32 QueryMode = 0u;                              // UniHlsl::UNI_QUERY_MODE_SPHERE or _NEAREST
+	FUintVector4 QueryDelta[3] = { FUintVector4(0, 0, 0, 0), FUintVector4(0, 0, 0, 0), FUintVector4(0, 0, 0, 0) };   // centre - camera, exact
+	float QueryRadiusCm = 0.0f;
+	uint32 QueryArchMask = 0u;                          // 0: every archetype
+	float QueryMaxAbsMag = 99.0f;
+	uint32 QueryMaxResults = 256u;                      // at most UniGpuLayout::MaxQueryResults
 
 	// Star systems (D-142, D-143). Planet records for the reserved pool tail
 	// (UniGpuLayout::DynamicPoolBase..), rewritten every frame, and the archetype mask the
@@ -72,6 +110,10 @@ struct FUniFrameData
 	UniCore::FVolumeViewGPU VolumeView{};
 	float BackgroundStartCm = 3.0856775e23f;
 	uint32 BackgroundVersion = 0;
+	/** D-196: each local carrier's parent object as (cell index in Cells, slot, share bits, 0),
+	 *  sorted by (cell index, slot): its sprite draws 1 - share. Objects not listed keep their
+	 *  whole sprite (empty with the volume off). */
+	TArray<FUintVector4> CarrierHandoffs;
 };
 
 /** A star the project pass found inside its system radius (D-142), as read back. CellIndex
@@ -84,6 +126,28 @@ struct FUniActivation
 	UniCore::FObjectGPU Record{};
 };
 
+/** D-193: a pick as read back. CellIndex indexes the cell table of frame FrameNumber. */
+struct FUniPickReadback
+{
+	uint64 FrameNumber = 0;
+	int32 RequestId = 0;
+	bool bFound = false;
+	uint32 CellIndex = 0;
+	uint32 Slot = 0;
+	float Score = 0.0f;
+	UniCore::FObjectGPU Record{};
+};
+
+/** D-193: a resident query as read back: Total matches (Hits holds at most the request's
+ *  maximum, unordered), each named by (cell index in frame FrameNumber's table, slot). */
+struct FUniQueryReadback
+{
+	uint64 FrameNumber = 0;
+	int32 RequestId = 0;
+	uint32 Total = 0;
+	TArray<UniCore::FQueryHit> Hits;
+};
+
 struct FUniRenderStats
 {
 	std::atomic<uint32> SpritesLastFrame{ 0 };
@@ -93,6 +157,23 @@ struct FUniRenderStats
 	std::atomic<uint32> GenBatchesFailed{ 0 };
 	std::atomic<uint32> VolumeCarriersLastFrame{ 0 };
 	std::atomic<uint32> BackgroundFacesMarched{ 0 };
+	std::atomic<uint32> BackgroundPerPixelFrames{ 0 };   // D-196: frames the background was marched per pixel
+	std::atomic<uint32> VolumeMarchWidth{ 0 };           // D-196: the last frame's march size and rays
+	std::atomic<uint32> VolumeMarchHeight{ 0 };
+	std::atomic<uint32> VolumeMarchRays{ 0 };
+	std::atomic<uint32> VolumeMarchFlags{ 0 };           // D-196: 1 per-pixel background, 2 sliced; D-209: bits 8..15 the slicing's N
+	/** D-209: volume frames by slicing since the last uu.Perf (the game thread swaps them to 0):
+	 *  [2..4] sliced N x N; not sliced: [5] temporal off or a debug view, [6] no history, [7] march
+	 *  size changed, [8] camera jump, [9] the same frame rendered again, [10] frames skipped. */
+	static constexpr int32 NumSliceCounts = 11;
+	std::atomic<uint32> VolumeSliceCounts[NumSliceCounts] = {};
+	/** D-211: the render thread lost cache work (its queue overflowed, or the textures were
+	 *  recreated): the game thread resets the cache (exchange to false). */
+	std::atomic<bool> bGalCacheLost{ false };
+	std::atomic<uint32> GalCacheVoxelsBaked{ 0 };    // voxels baked on the GPU (total)
+	std::atomic<uint32> GalCacheBytes{ 0 };          // the cache textures' size
+	std::atomic<uint32> GalMapReadyEpoch{ 0 };       // D-212: the galaxy map baked for this request
+	std::atomic<uint32> GalMapBakeFrames{ 0 };       // frames the last bake took
 	std::atomic<uint32> ActivationsLastReadback{ 0 };
 	/** The last rendered view's angular pixel size (rad): the game thread builds the next
 	 *  frame's carriers with it (one frame late, harmless: it only sets handoff weights). */
@@ -118,9 +199,15 @@ public:
 	/** Game thread: system activations read back since the last call (D-142). */
 	void DrainActivations_GameThread(TArray<FUniActivation>& Out);
 
+	/** Game thread (D-193): picks and resident queries read back since the last call. */
+	void DrainPicks_GameThread(TArray<FUniPickReadback>& Out);
+	void DrainQueries_GameThread(TArray<FUniQueryReadback>& Out);
+
 	/** First pool slot of the planet records (D-143); the generation pool ends below it. */
 	static uint32 DynamicPoolBase();
 	static uint32 DynamicPoolSlots();
+	/** D-193: the most hits one resident query reads back. */
+	static uint32 MaxQueryResults();
 
 	/** Game thread. Slice table and LUTs, once per universe definition. */
 	void SetTables_GameThread(TArray<UniCore::FSliceGPU> Slices, TArray<float> Lut);
@@ -140,9 +227,11 @@ public:
 	 *  every mip, packed as SetWebTexture's. Size 0 clears it (the NaN dummy is bound). */
 	void SetGalaxyTexture_GameThread(int32 Slot, uint32 Size, TArray<TArray<FUintVector2>> Mips);
 
+
 	/** Render thread (D-179): galaxy texture Slot registered into a graph (uploaded on first use
 	 *  after SetGalaxyTexture), or the NaN dummy. */
 	FRDGTextureRef RegisterGalaxyTexture_RenderThread(FRDGBuilder& GraphBuilder, int32 Slot);
+	FRDGTextureRef RegisterGalaxyMap_RenderThread(FRDGBuilder& GraphBuilder);   // D-212: bakes a chunk while one is due; a 1x1 zero dummy without one
 
 	/** Render thread: draws the backdrop additively into Output (a render-targetable copy of
 	 *  scene colour, made by the view extension). Called from the view extension. */
@@ -183,6 +272,12 @@ private:
 	TArray<TArray<FUintVector2>> GalMipsRT[GalaxyTextureSlots];
 	uint32 GalSizeRT[GalaxyTextureSlots] = { 0, 0, 0 };
 	bool bGalDirty[GalaxyTextureSlots] = { false, false, false };
+	// D-212: the galaxy map (render thread): the request being baked, rows done, whether complete.
+	TRefCountPtr<IPooledRenderTarget> GalMapTexture, GalMapDummy;
+	uint32 GalMapEpochRT = 0, GalMapSizeRT = 0, GalMapBudgetRT = 0, GalMapRowsDone = 0;
+	bool bGalMapDustRT = false, bGalMapComplete = false;
+	TArray<UniCore::FFieldParamsGPU> GalMapParamsRT;
+	void QueueGalaxyMap_RenderThread(const FUniFrameData& F);
 	TRefCountPtr<IPooledRenderTarget> GalTexture[GalaxyTextureSlots];
 
 	/** The 1^3 NaN dummy any unbound field texture reads (fail closed). */
@@ -204,7 +299,9 @@ private:
 	float TemporalPrevTanX = 1.0f, TemporalPrevTanY = 1.0f;
 	uint64 TemporalLastFrame = 0;
 	FVector4f TemporalPrevWarp = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);   // D-190: the history's warp optics
-	uint32 TemporalPhase = 0;
+	uint32 TemporalPhase = 0;          // the packed phase (D-208: step | N << 8)
+	uint32 TemporalStep = 0;           // D-208: counts sliced frames
+	uint32 TemporalInterleave = 2;     // D-208: the last frame's N (for uu.perf)
 	bool bTemporalHave = false;
 	int32 BgPrev = 0, BgCur = 1, BgBack = 2;
 	bool bBgHaveCur = false;
@@ -215,6 +312,16 @@ private:
 	int32 BgBlendFrames = 0;
 	uint32 BgLastVersion = ~0u;   // D-166: frames since the background last changed
 	int32 BgStillFrames = 0;
+	int32 BgDirtyInterval = 1 << 30;   // D-196: frames between the background's last two changes
+	bool bBgPerPixel = false;          // D-196: marching the background per pixel (hysteresis)
+	// D-211: the galaxy cache's textures and its queue of boxes not yet baked (render thread).
+	TRefCountPtr<IPooledRenderTarget> GalCacheA, GalCacheB;
+	FIntVector GalCacheSize = FIntVector::ZeroValue;
+	TArray<FUintVector4> GalCachePending;
+	uint64 GalCachePendingVoxels = 0;
+	uint32 GalCacheEpoch = ~0u;
+	bool bGalCacheReady = false;       // the textures hold every box queued since the last reset
+	void QueueGalaxyCache_RenderThread(const FUniFrameData& F);
 	TArray<UniCore::FCarrierGPU> BgSnapCarriers;
 	TArray<UniCore::FFieldParamsGPU> BgSnapParams;
 	TArray<FVector4f> BgSnapLut;
@@ -233,6 +340,19 @@ private:
 	int32 ActivateRingNext = 0;
 	FCriticalSection ActivationLock;
 	TArray<FUniActivation> ActivationsReady;
+
+	// D-193: picks and resident queries, one of each per frame, read back through rings.
+	struct FPickReadback;
+	struct FQueryReadback;
+	TArray<TSharedPtr<FPickReadback>> PickRing;
+	TArray<TSharedPtr<FQueryReadback>> QueryRing;
+	uint64 LastPickFrame = 0;    // render thread: a frame's request runs once (the first view that draws it)
+	uint64 LastQueryFrame = 0;
+	FCriticalSection ApiLock;
+	TArray<FUniPickReadback> PicksReady;
+	TArray<FUniQueryReadback> QueriesReady;
+	void CollectApiReadbacks_RenderThread();
+	void AddQuery_RenderThread(FRDGBuilder& GraphBuilder, const FUniFrameData& F, ERHIFeatureLevel::Type FeatureLevel, FRDGBufferRef CellBuf, FRDGBufferRef PoolBuf);
 };
 
 /** GPU generation backend for UniCore::FUniStreamer. Game thread only. */
@@ -247,6 +367,11 @@ public:
 	virtual void SubmitPlace(std::shared_ptr<UniCore::FGenBatch> Batch) override;
 	virtual bool PollPlace(const UniCore::FGenBatch& Batch) override;
 	virtual UniCore::u32 PoolCapacity() const override;
+	/** D-207 (B-020): one-trip batches: probe, allocation (UniGen.usf pass 3) and place in one
+	 *  graph; the counts and accepted counts are read back. */
+	virtual bool SupportsFused() const override { return true; }
+	virtual void SubmitFused(std::shared_ptr<UniCore::FGenBatch> Batch) override;
+	virtual bool PollFused(const UniCore::FGenBatch& Batch) override;
 
 private:
 	struct FRequest;

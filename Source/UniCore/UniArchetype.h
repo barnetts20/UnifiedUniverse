@@ -154,6 +154,12 @@ namespace UniCore
 
 		/** Expected children per parent. The field gives only the shape (lesson #8). */
 		double NTotal = 0.0;
+		/** D-197: the share of the children that are generated (and drawn): counts are NTotal x
+		 *  SpriteKeep, while the light stays NTotal's. The rest is glow: the parent's volume
+		 *  carrier draws (1 - SpriteKeep) of every child's light whether or not it would be
+		 *  resolved (Uni LUT: Lbar - Keep F_L G). The kept children are the first of the old
+		 *  draw (Poisson inversion on the same uniform), so they keep their identities. */
+		double SpriteKeep = 1.0;
 		/** If finite: N = NTotal * 10^(-0.4 (M_parent - NTotalRefMag)), so brighter parents
 		 *  hold proportionally more children (D-111). */
 		double NTotalRefMag = NAN;

@@ -37,6 +37,15 @@ static const float UNI_VOL_LN_T_HI = 71.383884f;    // ln(1e31 cm): above, last 
 static const uint UNI_VOL_MAX_ACTIVE = 12u;         // carriers marched by one ray (D-161: 8 -> 12; past it, the least significant are faded out, not cut)
 static const uint UNI_VOL_SLICES = 8u;              // transmittance slices
 static const float UNI_VOL_LN_DEPTH_NONE = 87.0f;   // D-184: ln t of a ray with no light (beyond any distance: reprojects by direction)
+// D-194: the light's depth is the luminance-weighted HARMONIC mean distance (the mean of 1/t:
+// the mean parallax, which is what the reprojection needs). A pixel that mixes near light with
+// a far background no longer reprojects as if all of it were far. 1/t is carried scaled by
+// e^UNI_VOL_LN_DEPTH_REF (t ~ 36 Mpc) so it never underflows a float.
+static const float UNI_VOL_LN_DEPTH_REF = 60.0f;
+UNI_FN float Uni_LightInvDepth(float InLnDepth) { return exp(UNI_VOL_LN_DEPTH_REF - InLnDepth); }
+UNI_FN float Uni_LightLnDepthFromInv(float InInvMean) { return UNI_VOL_LN_DEPTH_REF - log(InInvMean); }
+
+static const uint UNI_VOL_GLOW_LEVELS = 32u;        // D-203: a carrier's children span at most this many levels for cell glow
 
 static const uint UNI_CARRIER_PERIODIC = 1u;        // root field: p = frac(...), unbounded chord
 static const uint UNI_CARRIER_DUST = 2u;            // has an absorbing field
@@ -81,12 +90,29 @@ struct FUniVolumeView
 	float SliceLnTHi;
 	uint MaxSubsamples;     // D-157: cap on rays per pixel axis (Uni_CarrierSubsamples; 0 = 8)
 	float3 DustSigmaRgb;    // reddening: sigma per channel relative to sigma
-	float Pad1;
+	float WebHintScale;     // D-202: the step hints of periodic (background) carriers x this (0: 1)
 	// D-189: the web in the sky (uu.SkyWeb; render-only art choices, all 0 = physical).
 	float TailDim;          // the background's analytic tail x (1 - TailDim): the near web carries more contrast
 	float WebGlowGain;      // near-web glow: the web's emission x (1 + gain x overdensity) ...
 	float WebGlowDepthCm;   // ... out to this distance (fading over its second half)
-	float SkyPad;
+	float HintScale;        // D-195: the step hints of carriers around the camera x this (0: 1)
+	// D-203: cell glow. Levels (bits 0..127) with cells still loading or fading in; their grids
+	// sit in the LUT buffer from GlowBase (Uni_CellGlowFade), one entry per set bit, in order.
+	uint4 GlowMask;
+	uint GlowBase;          // float4 index of the first grid header in the LUT buffer
+	uint GlowLevels;        // set bits in GlowMask (0: no cell glow)
+	uint MarchFlags;        // D-206: bit 0: no shared web texel reads (checks only)
+	uint GalaxyConstBase;   // D-210: params index of the galaxy constant blocks (one per parameter block, Uni_GalaxyConstPack); 0: hash inline
+	// D-211: the galaxy cache (a camera-centred clipmap of the camera's own galaxy, Uni_GalCacheSample).
+	uint CacheBase;         // float4 index of its header in the LUT buffer
+	uint CacheCarrier;      // the cached carrier's index + 1 (0: no cache)
+	uint CacheN;            // voxels a level side
+	uint CacheLevels;       // levels
+	// D-212: the galaxy map (Uni_GalaxyMapEval): the camera's own galaxy from its baked 2D map.
+	uint MapCarrier;        // the mapped carrier's index + 1 (0: none)
+	uint MapSize;           // texels a side of its mip 0
+	uint MapPad0;
+	uint MapPad1;
 };
 
 struct FUniVolumeResult
@@ -98,7 +124,7 @@ struct FUniVolumeResult
 	uint Active;            // carriers intersected
 	uint Pad;
 	float3 SliceT[UNI_VOL_SLICES];
-	float LnDepth;          // D-184: ln t of the light, weighted by each step's luminance reaching the camera (UNI_VOL_LN_DEPTH_NONE: no light)
+	float LnDepth;          // D-184: ln t of the light, weighted by each step's luminance reaching the camera (D-194: ln of the harmonic mean; UNI_VOL_LN_DEPTH_NONE: no light)
 	float DepthWeight;      // D-184: that luminance (the weight's sum)
 };
 
@@ -111,6 +137,110 @@ UNI_FN float3 Uni_VolumeLut(StructuredBuffer<float4> InLut, uint InBlock, float 
 	const float4 A = InLut[InBlock * UNI_VOL_LUT_SIZE + I0];
 	const float4 B = InLut[InBlock * UNI_VOL_LUT_SIZE + I0 + 1u];
 	return float3(A.x + (B.x - A.x) * F, A.y + (B.y - A.y) * F, A.z + (B.z - A.z) * F);
+}
+
+// ------------------------------------------------------------------------------------------
+// D-203: cell glow. A cell still loading (or fading in) draws only part of its sprites; its
+// children's light it does not draw is added here, from the same field and the same tables:
+// per carrier block, after its emission and tail blocks, one block per child level q (from the
+// block's first level) of the light drawn as sprites at that level, D_q(t) = sum over the
+// level's slices of P keep F_L G (UniVolume.h). The march adds (1 - cell fade) D_q(t) for the
+// cell of level q holding the sample, so sprites + glow stay the population's light whatever
+// has loaded. The first emission entry's w holds the block's levels: first + 256 x count.
+// ------------------------------------------------------------------------------------------
+
+/** One level's cell fade at a camera-relative point (cm): its grid's header pair (corner and
+ *  cell width; sides and the first fade's float index), then the fade. Outside the window: 1
+ *  (nothing there is drawn as a sprite at that level, so nothing to add). */
+UNI_FN float Uni_CellGlowFade(StructuredBuffer<float4> InLut, uint InGlowBase, uint InEntry, float3 InX)
+{
+	const float4 H0 = InLut[InGlowBase + 2u * InEntry];
+	const float4 H1 = InLut[InGlowBase + 2u * InEntry + 1u];
+	const float Inv = 1.0f / H0.w;
+	const float3 U = float3((InX.x - H0.x) * Inv, (InX.y - H0.y) * Inv, (InX.z - H0.z) * Inv);
+	if (U.x < 0.0f || U.y < 0.0f || U.z < 0.0f || U.x >= H1.x || U.y >= H1.y || U.z >= H1.z) { return 1.0f; }
+	const uint I = (uint)U.x + (uint)H1.x * ((uint)U.y + (uint)H1.y * (uint)U.z);
+	const uint F = (uint)H1.w + I;
+	const float4 Q = InLut[F >> 2u];
+	const uint C = F & 3u;
+	return C == 0u ? Q.x : (C == 1u ? Q.y : (C == 2u ? Q.z : Q.w));
+}
+
+UNI_FN uint Uni_GlowMaskWord(uint4 InM, uint InI)
+{
+	return InI == 0u ? InM.x : (InI == 1u ? InM.y : (InI == 2u ? InM.z : (InI == 3u ? InM.w : 0u)));
+}
+
+/** A carrier's loading levels: bit q of OutMask for level first + q (from its block's code), and
+ *  the grid entry of its first level (the set bits of GlowMask below it) | its first level << 8. */
+UNI_FN void Uni_CellGlowCarrier(FUniVolumeView InView, float InCode, UNI_OUT(uint) OutMask, UNI_OUT(uint) OutEntry0)
+{
+	OutMask = 0u;
+	OutEntry0 = 0u;
+	const uint Code = (uint)max(InCode, 0.0f);
+	const uint Lo = Code & 255u;
+	const uint Count = min(Code >> 8u, UNI_VOL_GLOW_LEVELS);
+	if (Count == 0u || Lo >= 128u) { return; }
+	const uint W = Lo >> 5u, Sh = Lo & 31u;
+	uint Bits = Uni_GlowMaskWord(InView.GlowMask, W) >> Sh;
+	if (Sh != 0u) { Bits = Bits | (Uni_GlowMaskWord(InView.GlowMask, W + 1u) << (32u - Sh)); }
+	if (Count < 32u) { Bits = Bits & ((1u << Count) - 1u); }
+	uint E = 0u;
+	for (uint I = 0u; I < W; ++I) { E = E + countbits(Uni_GlowMaskWord(InView.GlowMask, I)); }
+	if (Sh != 0u) { E = E + countbits(Uni_GlowMaskWord(InView.GlowMask, W) & ((1u << Sh) - 1u)); }
+	OutMask = Bits;
+	OutEntry0 = E | (Lo << 8u);
+}
+
+/** The light a carrier's loading cells do not draw at InX (camera-relative, cm), distance InT:
+ *  sum over its loading levels of (1 - cell fade) D_q(t). Per unit density, like the LUT. */
+UNI_FN float3 Uni_CellGlow(StructuredBuffer<float4> InLut, uint InGlowBase, uint InMask, uint InEntry0, uint InDrawnBlock, float3 InX, float InT)
+{
+	float3 Add = float3(0.0f, 0.0f, 0.0f);
+	const uint E0 = InEntry0 & 255u;
+	const uint Lo = InEntry0 >> 8u;
+	uint M = InMask;
+	// D-205: a level's window reaches at most ~17.4 of its cells from the camera (half-width 6 at
+	// the widest sensitivity, 3 of stretch, 1 of placement; times sqrt 3), so a sample at t lies
+	// in no window of a level with 2^L < t / 18: those would read fade 1 (nothing to add). Skip
+	// them, so a step far out tests only the few coarse levels that can hold it.
+	const int Lt = (int)floor(log2(max(InT, 1.0f) * (1.0f / 18.0f)));
+	if (Lt > (int)Lo)
+	{
+		const uint Sh = (uint)(Lt - (int)Lo);
+		M = Sh >= 32u ? 0u : (M & ~((1u << Sh) - 1u));
+	}
+	UNI_LOOP
+	for (uint It = 0u; It < UNI_VOL_GLOW_LEVELS; ++It)
+	{
+		if (M == 0u) { break; }
+		const uint Q = firstbitlow(M);
+		M = M & (M - 1u);
+		const uint E = E0 + countbits(InMask & ((1u << Q) - 1u));
+		const float Phi = Uni_CellGlowFade(InLut, InGlowBase, E, InX);
+		if (Phi < 1.0f) { Add = Add + Uni_VolumeLut(InLut, InDrawnBlock + Q, InT) * (1.0f - Phi); }
+	}
+	return Add;
+}
+
+/** D-206 (B-019): two periodic textured web carriers in the same frame (camera position,
+ *  period, rotation, prefilter) with the same texture resolution read the same texel at every
+ *  step: the background's galaxies (walls, filaments, void) and dwarfs (nodes) do. The march
+ *  reads it once for both and weights the channels per carrier (UniField_WebTexCh). */
+UNI_FN bool Uni_CarrierWebTex(FUniCarrier InC, FUniFieldParams InPar)
+{
+	return (InC.Flags & UNI_CARRIER_PERIODIC) != 0u && InC.FieldId == UNI_FIELD_WEB && Uni_WebIsTextured(InPar);
+}
+
+UNI_FN bool Uni_CarrierSameWebTexel(FUniCarrier InA, FUniFieldParams InPa, FUniCarrier InB, FUniFieldParams InPb)
+{
+	return Uni_CarrierWebTex(InA, InPa) && Uni_CarrierWebTex(InB, InPb)
+		&& InA.InvRadius == InB.InvRadius && InPa.C.w == InPb.C.w
+		&& (InA.Flags & UNI_CARRIER_PREFILTER) == (InB.Flags & UNI_CARRIER_PREFILTER)
+		&& InA.CamLocal.x == InB.CamLocal.x && InA.CamLocal.y == InB.CamLocal.y && InA.CamLocal.z == InB.CamLocal.z
+		&& InA.Rot0.x == InB.Rot0.x && InA.Rot0.y == InB.Rot0.y && InA.Rot0.z == InB.Rot0.z
+		&& InA.Rot1.x == InB.Rot1.x && InA.Rot1.y == InB.Rot1.y && InA.Rot1.z == InB.Rot1.z
+		&& InA.Rot2.x == InB.Rot2.x && InA.Rot2.y == InB.Rot2.y && InA.Rot2.z == InB.Rot2.z;
 }
 
 /** Carrier field point at distance t along world direction InDir. */
@@ -148,6 +278,161 @@ UNI_FN bool Uni_CarrierInterval(FUniCarrier InC, float3 InLocalDir, float InTSce
 	OutT0 = T0;
 	OutT1 = T1;
 	return T1 > T0;
+}
+
+/** D-210: one active carrier's step limit at InT (cm; 3e38 when it sets none): its field's step
+ *  hint, loosened (D-195, D-202), over its inverse radius. The march computes it for the next
+ *  step inside the sample pass, where the carrier and its parameters are already loaded (the
+ *  same point and arithmetic as at the next step's start: the march is unchanged bit for bit). */
+UNI_FN float Uni_CarrierStepLimit(FUniCarrier InCa, FUniFieldParams InPar, float3 InLd, float InT, bool InCluster,
+	float3 InC0, float3 InC1, float3 InC2, float3 InC3, StructuredBuffer<FUniFieldParams> InParams, FUniVolumeView InView)
+{
+	if (InCa.FeatureScale > 0.0f)
+	{
+		// Prefiltered fields need no hint once the pixel footprint is past the blend.
+		if (!(InT * InView.ThetaPixel * InCa.InvRadius < 4.0f * InCa.FeatureScale)) { return 3.0e38f; }
+	}
+	const float3 P = Uni_CarrierPoint(InCa, InLd, InT);
+	const float FootH = (InCa.Flags & UNI_CARRIER_PREFILTER) != 0u ? InT * InView.ThetaPixel * InCa.InvRadius : 0.0f;   // D-160
+	float H;
+	if (InCluster) { H = Uni_ClusterStepHintC(P, InPar, InC0, InC1, InC2, InC3); }
+	else if (InCa.FieldId == UNI_FIELD_GALAXY)
+	{
+		// D-210: the mode phase hash from the builder's constant block.
+		uint Hp;
+		if (InView.GalaxyConstBase != 0u) { const float4 Kb = InParams[InView.GalaxyConstBase + InCa.ParamIndex].B; Hp = Uni_GalaxyConstJoin(Kb.x, Kb.y); }
+		else { Hp = Uni_GalaxyConstOf(InPar).Hp; }
+		H = Uni_GalaxyStepHintFilteredK(P, InLd, InPar, FootH, Hp);
+	}
+	else { H = Uni_FieldStepHintFoot(InCa.FieldId, P, InLd, InPar, FootH); }
+	// D-195: from inside a carrier (the camera within its bounds) rays run along its structure
+	// and the hints can be looser (HintScale); from outside a ray crosses a disc steeply and
+	// keeps them as written (T3.vol.march: 5% per ray at x 2).
+	const bool bInside = (InCa.Flags & UNI_CARRIER_PERIODIC) == 0u && dot(InCa.CamLocal, InCa.CamLocal) < 1.0f;
+	// D-202: the background web's hints loosen with travel speed (WebHintScale): it is marched
+	// per pixel only then, and the glow is the fresh quarter alone there anyway.
+	const bool bPeriodic = (InCa.Flags & UNI_CARRIER_PERIODIC) != 0u;
+	const float Loose = bInside && InView.HintScale > 0.0f ? InView.HintScale : (bPeriodic && InView.WebHintScale > 0.0f ? InView.WebHintScale : 1.0f);
+	return Loose * H / InCa.InvRadius;
+}
+
+// ------------------------------------------------------------------------------------------
+// D-211: the galaxy cache. Inside a galaxy every march step evaluated its field (the spiral for
+// light and dust, three texture reads, ~55 transcendentals). The cache holds the camera's own
+// galaxy, prefiltered to the voxel, in K nested camera-centred levels of N^3 voxels (level L's
+// voxel 2^L x level 0's, in the carrier's field units), baked from the same field functions
+// (Uni_GalCacheBakeVoxel) and read with one or two filtered fetches a step.
+// Texture layout (both textures): N x N x K (N + 2). Level L's voxel with world index i (field
+// position (i + 0.5) v) lives at texel (i.x mod N, i.y mod N, L (N + 2) + 1 + i.z mod N): the
+// levels wrap toroidally as the camera moves (a move rebakes a slab); x and y wrap in the
+// sampler, and each level carries copies of its last and first z slices before and after it
+// (slices L (N + 2) and L (N + 2) + N + 1) so the hardware's z filter wraps within the level.
+// A: (light density, dust density) x the header's scale (half floats); B: the palette tint over
+// its largest channel (unorm; the tint is applied keeping luminance, so its scale is free).
+// D-211 (anisotropic levels): a level's voxel along the field's z (the disc's normal) is at most
+// the header's z cap, so the levels past it reach only so far in z (the disc and bulge live
+// there) and resolve the thin disc and its dust at any distance; the last level is isotropic and
+// holds the rest (the halo's smooth tails).
+// LUT header at CacheBase: (N, K, scale, 1 / scale); then per level (lo.xyz, v), (hi.xyz, v_z or 0 when not valid):
+// the baked window in field units (a level not yet baked, or one that could not keep up with the
+// camera, keeps its last window: samples outside it go to a coarser level).
+// ------------------------------------------------------------------------------------------
+#define UNI_GAL_CACHE_MAX_LEVELS 12u
+#define UNI_GAL_CACHE_MARGIN 1.5f   // voxels kept from a window's edge (the filter's reach)
+#define UNI_GAL_CACHE_BAND 4.0f     // voxels over which a level fades into the next coarser one
+
+UNI_FN float3 Uni_GalCacheUvw(float3 InP, float InV, float InVz, uint InLevel, uint InN, uint InK)
+{
+	const float Span = (float)InN * InV;
+	const float3 F = float3(InP.x * (1.0f / Span), InP.y * (1.0f / Span), InP.z * (1.0f / ((float)InN * InVz)));
+	const float Fz = F.z - floor(F.z);
+	const float Depth = (float)(InK * (InN + 2u));
+	return float3(F.x, F.y, ((float)(InLevel * (InN + 2u)) + 1.0f + Fz * (float)InN) / Depth);
+}
+
+/** The voxel's distance from its level's window edge (voxels); negative outside or not valid. */
+UNI_FN float Uni_GalCacheInside(float4 InLo, float4 InHi, float3 InP)
+{
+	if (!(InHi.w > 0.0f)) { return -1.0f; }
+	const float3 A = InP - float3(InLo.x, InLo.y, InLo.z);
+	const float3 B = float3(InHi.x, InHi.y, InHi.z) - InP;
+	return min(min(min(A.x, B.x), min(A.y, B.y)) / InLo.w, min(A.z, B.z) / InHi.w);
+}
+
+/** The cached light and dust densities (the field's units) and palette tint at field point InP.
+ *  False where no valid level holds it (the caller evaluates the field). */
+UNI_FN bool Uni_GalCacheSample(StructuredBuffer<float4> InLut, FUniVolumeView InView, float3 InP, float3 InCam,
+	UNI_OUT(float) OutRe, UNI_OUT(float) OutRd, UNI_OUT(float3) OutTint)
+{
+	OutRe = 0.0f; OutRd = 0.0f; OutTint = float3(1.0f, 1.0f, 1.0f);
+	const uint N = InView.CacheN, K = InView.CacheLevels;
+	const float4 Hd = InLut[InView.CacheBase];
+	const float V0 = InLut[InView.CacheBase + 1u].w;
+	const float3 Dd = abs(InP - InCam);
+	const float Dm = max(Dd.x, max(Dd.y, Dd.z));
+	const float Reach0 = ((float)N * 0.5f - UNI_GAL_CACHE_MARGIN - UNI_GAL_CACHE_BAND) * V0;
+	uint L = 0u;
+	if (Dm > Reach0) { L = (uint)min(ceil(log2(Dm / Reach0)), (float)K); }
+	UNI_LOOP
+	for (uint It = 0u; It < UNI_GAL_CACHE_MAX_LEVELS; ++It)
+	{
+		if (L >= K) { return false; }
+		const float4 Lo = InLut[InView.CacheBase + 1u + 2u * L];
+		const float4 Hi = InLut[InView.CacheBase + 2u + 2u * L];
+		const float E = Uni_GalCacheInside(Lo, Hi, InP);
+		if (E >= UNI_GAL_CACHE_MARGIN)
+		{
+			const float3 U = Uni_GalCacheUvw(InP, Lo.w, Hi.w, L, N, K);
+			float4 A = UNI_GAL_CACHE_A(U);
+			float4 B = UNI_GAL_CACHE_B(U);
+			// Toward the next coarser level over the window's outer band (no seam).
+			const float W = saturate((E - UNI_GAL_CACHE_MARGIN) * (1.0f / UNI_GAL_CACHE_BAND));
+			if (W < 1.0f && L + 1u < K)
+			{
+				const float4 Lo2 = InLut[InView.CacheBase + 3u + 2u * L];
+				const float4 Hi2 = InLut[InView.CacheBase + 4u + 2u * L];
+				if (Uni_GalCacheInside(Lo2, Hi2, InP) >= UNI_GAL_CACHE_MARGIN)
+				{
+					const float3 U2 = Uni_GalCacheUvw(InP, Lo2.w, Hi2.w, L + 1u, N, K);
+					const float4 A2 = UNI_GAL_CACHE_A(U2);
+					const float4 B2 = UNI_GAL_CACHE_B(U2);
+					A = float4(A2.x + (A.x - A2.x) * W, A2.y + (A.y - A2.y) * W, 0.0f, 0.0f);
+					B = float4(B2.x + (B.x - B2.x) * W, B2.y + (B.y - B2.y) * W, B2.z + (B.z - B2.z) * W, 1.0f);
+				}
+			}
+			OutRe = max(A.x, 0.0f) * Hd.w;
+			OutRd = max(A.y, 0.0f) * Hd.w;
+			OutTint = float3(max(B.x, 1.0e-3f), max(B.y, 1.0e-3f), max(B.z, 1.0e-3f));
+			return true;
+		}
+		L = L + 1u;
+	}
+	return false;
+}
+
+/** One voxel of the cache: the carrier's light and dust densities at InP prefiltered over InFoot
+ *  (field units), scaled, and its palette tint (over its largest channel; white without one). */
+UNI_FN void Uni_GalCacheBakeVoxel(FUniCarrier InCa, FUniFieldParams InPar, FUniFieldParams InDust, FUniGalaxyConst InK,
+	FUniFieldParams InPal, float3 InP, float InFoot, float InScale, UNI_OUT(float4) OutA, UNI_OUT(float4) OutB)
+{
+	float Re = 0.0f, Rd = 0.0f;
+	float4 Comp = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	if ((InCa.Flags & UNI_CARRIER_DUST) != 0u) { UniField_GalaxyPairCK(InP, InPar, InDust, InK, InFoot, Re, Rd, Comp); }
+	else { Re = UniField_GalaxyFilteredCK(InP, InPar, InK, InFoot, Comp); }
+	OutA = float4(Re * InScale, Rd * InScale, 0.0f, 0.0f);
+	OutB = float4(1.0f, 1.0f, 1.0f, 1.0f);
+	if ((InCa.Flags & UNI_CARRIER_PALETTE) != 0u)
+	{
+		FUniGalaxyPalette Pal;
+		Pal.Bulge = float3(InPal.A.x, InPal.A.y, InPal.A.z);
+		Pal.Disc = float3(InPal.B.x, InPal.B.y, InPal.B.z);
+		Pal.Arm = float3(InPal.C.x, InPal.C.y, InPal.C.z);
+		Pal.Knot = float3(InPal.D.x, InPal.D.y, InPal.D.z);
+		const float Far = saturate(2.0f * InFoot / max(InPar.A.x, 1.0e-4f) - 1.0f);
+		const float3 T = Uni_GalaxyTintFar(Pal, Comp, Far, float3(InPal.E.x, InPal.E.y, InPal.E.z));
+		const float M = max(max(T.x, T.y), max(T.z, 1.0e-6f));
+		OutB = float4(T.x / M, T.y / M, T.z / M, 1.0f);
+	}
 }
 
 UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
@@ -205,11 +490,48 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 	float TMin = 3.0e38f;
 	float TMax = 0.0f;
 	float AFade[UNI_VOL_MAX_ACTIVE];
+	uint AGlow[UNI_VOL_MAX_ACTIVE];     // D-203: the carrier's loading levels (bits from its first level)
+	uint AGlowE[UNI_VOL_MAX_ACTIVE];    // and its first level's grid entry
+	float AStepR[UNI_VOL_MAX_ACTIVE];   // D-210: its log step ratio
+	float AHint[UNI_VOL_MAX_ACTIVE];    // its step limit (Uni_CarrierStepLimit)
+	float AHintT[UNI_VOL_MAX_ACTIVE];   // at this T (-1: none yet)
 	for (uint Ia = 0u; Ia < NA; ++Ia)
 	{
+		{
+			const float Sr = InCarriers[Act[Ia]].StepRatio;
+			AStepR[Ia] = Sr > 0.0f ? Sr : InView.StepRatio;
+		}
+		AHint[Ia] = 3.0e38f;
+		AHintT[Ia] = -1.0f;
 		TMin = min(TMin, A0[Ia]);
 		TMax = max(TMax, A1[Ia]);
 		AFade[Ia] = KDrop > 0.0f ? saturate((AKey[Ia] - KDrop) / (0.25f * AKey[Ia])) : 1.0f;
+		AGlow[Ia] = 0u;
+		AGlowE[Ia] = 0u;
+		if (InView.GlowLevels > 0u)
+		{
+			uint Gm = 0u, Ge = 0u;
+			Uni_CellGlowCarrier(InView, InLut[InCarriers[Act[Ia]].LutIndex * UNI_VOL_LUT_SIZE].w, Gm, Ge);
+			AGlow[Ia] = Gm;
+			AGlowE[Ia] = Ge;
+		}
+	}
+
+	// D-206: a textured web carrier reading the same texel as an earlier one (its index; else
+	// UNI_VOL_MAX_ACTIVE) takes that one's channels at each step.
+	uint APair[UNI_VOL_MAX_ACTIVE];
+	for (uint Ip = 0u; Ip < NA; ++Ip)
+	{
+		APair[Ip] = UNI_VOL_MAX_ACTIVE;
+		if ((InView.MarchFlags & 1u) != 0u) { continue; }
+		const FUniCarrier Cp = InCarriers[Act[Ip]];
+		const FUniFieldParams Pp = InParams[Cp.ParamIndex];
+		if (!Uni_CarrierWebTex(Cp, Pp)) { continue; }
+		for (uint Iq = 0u; Iq < Ip; ++Iq)
+		{
+			const FUniCarrier Cq = InCarriers[Act[Iq]];
+			if (APair[Ip] == UNI_VOL_MAX_ACTIVE && Uni_CarrierSameWebTexel(Cp, Pp, Cq, InParams[Cq.ParamIndex])) { APair[Ip] = Iq; }
+		}
 	}
 
 	// D-160: the first cluster on the ray has its clump centres computed once here, not at every
@@ -251,22 +573,17 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 			if (T >= A1[I]) { continue; }
 			bAny = true;
 			Next = min(Next, A1[I]);
-			const FUniCarrier Ca = InCarriers[Act[I]];
-			const FUniFieldParams Par = InParams[Ca.ParamIndex];
-			const float3 P = Uni_CarrierPoint(Ca, ADir[I], T);
-			Ratio = min(Ratio, Ca.StepRatio > 0.0f ? Ca.StepRatio : InView.StepRatio);
-			bool bHint = true;
-			if (Ca.FeatureScale > 0.0f)
+			Ratio = min(Ratio, AStepR[I]);
+			// D-210: the limit at T was computed by the previous step's sample pass when this
+			// carrier was sampled there; otherwise (its first step, or it was not active at the
+			// sample) here.
+			if (!(AHintT[I] == T))
 			{
-				// Prefiltered fields need no hint once the pixel footprint is past the blend.
-				bHint = T * InView.ThetaPixel * Ca.InvRadius < 4.0f * Ca.FeatureScale;
+				const FUniCarrier Ca = InCarriers[Act[I]];
+				AHint[I] = Uni_CarrierStepLimit(Ca, InParams[Ca.ParamIndex], ADir[I], T, I == ClusterSlot, Cc0, Cc1, Cc2, Cc3, InParams, InView);
+				AHintT[I] = T;
 			}
-			if (bHint)
-			{
-				const float FootH = (Ca.Flags & UNI_CARRIER_PREFILTER) != 0u ? T * InView.ThetaPixel * Ca.InvRadius : 0.0f;   // D-160
-				const float H = I == ClusterSlot ? Uni_ClusterStepHintC(P, Par, Cc0, Cc1, Cc2, Cc3) : Uni_FieldStepHintFoot(Ca.FieldId, P, ADir[I], Par, FootH);
-				Hint = min(Hint, H / Ca.InvRadius);
-			}
+			Hint = min(Hint, AHint[I]);
 		}
 		if (!bAny)
 		{
@@ -280,6 +597,8 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 
 		float3 E = float3(0.0f, 0.0f, 0.0f);      // emission over this step
 		float3 Tau = float3(0.0f, 0.0f, 0.0f);    // optical depth over this step
+		float4 WebCh = float4(0.0f, 0.0f, 0.0f, 0.0f);   // D-206: this step's web texel
+		uint WebFrom = UNI_VOL_MAX_ACTIVE;                // and the carrier that read it
 		for (uint J = 0u; J < NA; ++J)
 		{
 			if (Tm < A0[J] || Tm >= A1[J]) { continue; }
@@ -305,20 +624,63 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 			const bool bPalette = (Ca.Flags & UNI_CARRIER_PALETTE) != 0u;
 			float4 Comp = float4(0.0f, 0.0f, 0.0f, 0.0f);
 			float RdPair = 0.0f;
-			if (bPair)
+			// D-212: the camera's own galaxy from its map.
+			const bool bMapped = InView.MapCarrier == Act[J] + 1u && Blend < 1.0f;
+			// D-211: the camera's own galaxy from the cache where a level holds the point.
+			bool bCached = false;
+			float3 CTint = float3(1.0f, 1.0f, 1.0f);
+			if (!bMapped && InView.CacheCarrier == Act[J] + 1u && Blend < 1.0f)
+			{
+				float Rc = 0.0f, Rdc = 0.0f;
+				if (Uni_GalCacheSample(InLut, InView, P, Ca.CamLocal, Rc, Rdc, CTint))
+				{
+					bCached = true;
+					Rho = Rc + (Ca.MeanDensity - Rc) * Blend;
+					RdPair = Rdc;
+				}
+			}
+			// D-210: a galaxy's per-object hashes, read once from the builder's block.
+			FUniGalaxyConst GK;
+			if (Ca.FieldId == UNI_FIELD_GALAXY && !bCached)
+			{
+				if (InView.GalaxyConstBase != 0u) { GK = Uni_GalaxyConstUnpack(InParams[InView.GalaxyConstBase + Ca.ParamIndex]); }
+				else { GK = Uni_GalaxyConstOf(Par); }
+			}
+			else { GK.Hs = 0u; GK.Ho = 0u; GK.Hp = 0u; GK.ArmH = uint4(0u, 0u, 0u, 0u); }
+			if (bCached) { }
+			else if (bMapped)
+			{
+				float Rm = 0.0f;
+				Uni_GalaxyMapEval(P, Par, InParams[Ca.DustParamIndex], (Ca.Flags & UNI_CARRIER_DUST) != 0u, GK, FootS, (float)InView.MapSize, Rm, RdPair, Comp);
+				Rho = Rm + (Ca.MeanDensity - Rm) * Blend;
+			}
+			else if (bPair)
 			{
 				float Re = 0.0f;
-				UniField_GalaxyPairC(P, Par, InParams[Ca.DustParamIndex], FootS, Re, RdPair, Comp);
+				UniField_GalaxyPairCK(P, Par, InParams[Ca.DustParamIndex], GK, FootS, Re, RdPair, Comp);
 				Rho = Blend < 1.0f ? Re + (Ca.MeanDensity - Re) * Blend : Ca.MeanDensity;
 			}
-			else if (bPalette && Blend < 1.0f)
+			else if ((bPalette || Ca.FieldId == UNI_FIELD_GALAXY) && Blend < 1.0f)
 			{
-				Rho = UniField_GalaxyFilteredC(P, Par, FootS, Comp);
+				Rho = UniField_GalaxyFilteredCK(P, Par, GK, FootS, Comp);
 				Rho = Rho + (Ca.MeanDensity - Rho) * Blend;
 			}
 			else if (Blend < 1.0f)
 			{
-				Rho = J == ClusterSlot ? UniField_ClusterC(P, Par, Cc0, Cc1, Cc2, Cc3) : Uni_FieldSampleFoot(Ca.FieldId, P, Par, FootS);
+				if (Uni_CarrierWebTex(Ca, Par))
+				{
+					// D-206: the texel once for every carrier that reads it (bit for bit the same).
+					if (APair[J] == UNI_VOL_MAX_ACTIVE || WebFrom != APair[J])
+					{
+						WebCh = UNI_WEB_TEX_SAMPLE(P, Uni_WebTexMip(Par, FootS));
+						WebFrom = J;
+					}
+					Rho = UniField_WebTexCh(WebCh, Par);
+				}
+				else
+				{
+					Rho = J == ClusterSlot ? UniField_ClusterC(P, Par, Cc0, Cc1, Cc2, Cc3) : Uni_FieldSampleFoot(Ca.FieldId, P, Par, FootS);
+				}
 				Rho = Rho + (Ca.MeanDensity - Rho) * Blend;
 				// D-189: the near-web glow (non-physical, an art choice): the periodic web's light
 				// lifted where it is overdense, so its structure shows in the sky.
@@ -336,9 +698,12 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 			if (Rho > 0.0f)
 			{
 				float3 L = Uni_VolumeLut(InLut, Ca.LutIndex, Tm);
+				// D-203: what this carrier's loading cells do not draw (its drawn blocks follow its tail).
+				if (AGlow[J] != 0u) { L = L + Uni_CellGlow(InLut, InView.GlowBase, AGlow[J], AGlowE[J], Ca.LutIndex + 2u, InDir * Tm, Tm); }
 				// D-191: intracluster light, on the same density (a rich cluster's diffuse glow).
 				if ((Ca.Flags & UNI_CARRIER_ICL) != 0u) { L = L + Uni_VolumeLut(InLut, Ca.PaletteIndex, Tm) * Ca.IclRatio; }
-				if (bPalette)
+				if (bPalette && bCached) { L = Uni_TintKeepLuminance(L, CTint); }   // D-211: the cached tint
+				else if (bPalette)
 				{
 					// Toward the whole-body tint (the sprite's) as the footprint passes the disc scale length.
 					const FUniFieldParams Pc = InParams[Ca.PaletteIndex];
@@ -359,6 +724,13 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 				const float Rd = bPair ? RdPair : Uni_FieldSampleFoot(Ca.FieldId, P, DPar, FootS);
 				if (Rd > 0.0f) { Tau = Tau + InView.DustSigmaRgb * (DPar.D.y * Rd * Du * AFade[J]); }
 			}
+			// D-210: this carrier's step limit at the next step's start, while it is loaded.
+			const float Tn = T + S;
+			if (Tn >= A0[J] && Tn < A1[J])
+			{
+				AHint[J] = Uni_CarrierStepLimit(Ca, Par, ADir[J], Tn, J == ClusterSlot, Cc0, Cc1, Cc2, Cc3, InParams, InView);
+				AHintT[J] = Tn;
+			}
 		}
 		// Exact within the step for constant emission and extinction.
 		const float3 Ex = float3(exp(-Tau.x), exp(-Tau.y), exp(-Tau.z));
@@ -371,7 +743,7 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 		// D-184: where the light comes from (the temporal reprojection's depth).
 		const float Ls = Uni_Luminance(Bs);
 		DepthW = DepthW + Ls;
-		DepthWL = DepthWL + Ls * log(Tm);
+		DepthWL = DepthWL + Ls * Uni_LightInvDepth(log(Tm));   // D-194: harmonic
 		T = T + S;
 		Res.Steps = Step + 1u;
 
@@ -408,7 +780,7 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 	Res.Radiance = B;
 	Res.Transmittance = Tr;
 	Res.DepthWeight = DepthW;
-	Res.LnDepth = DepthW > 0.0f ? DepthWL / DepthW : UNI_VOL_LN_DEPTH_NONE;
+	Res.LnDepth = DepthW > 0.0f && DepthWL > 0.0f ? Uni_LightLnDepthFromInv(DepthWL / DepthW) : UNI_VOL_LN_DEPTH_NONE;
 	return Res;
 }
 
@@ -421,6 +793,9 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 // a factor of 4 of the fresh neighbours' luminance; otherwise the fresh neighbours, bilinear
 // (depth-aware like the composite's upsample). The renderer and the CPU reference load the
 // textures; the decisions are here.
+// D-194 (ghosting at speed): instead of the luminance band, the history is clamped into the
+// fresh neighbours' per-channel range, widened at rest and tight once it moves
+// (Uni_TemporalClampK), and beyond a motion it is not used at all (the fresh neighbours).
 // ------------------------------------------------------------------------------------------
 
 /** The previous frame's view and the camera's move since, for the reprojection. */
@@ -431,24 +806,62 @@ struct FUniTemporalView
 	float3 PrevRight;
 	float PrevTanY;
 	float3 PrevUp;
-	uint Phase;              // this frame's fresh pixel of each 2 x 2 block (0..3)
+	uint Phase;              // this frame's fresh pixel of each N x N block: bits 0..7 the step (0..N^2-1), bits 8..15 N (D-208; 0: 2)
 	float3 CamStep;          // camera position now minus then, cm
 	uint bHistory;           // 0: no usable history (first frame, a jump, a new size): fresh neighbours only
 	float3 PrevVel;          // D-190: the previous frame's warp optics (its grid is in its apparent directions)
 	float PrevBeta;
 };
 
-/** The fresh pixel of each 2 x 2 block at a phase: (0,0), (1,1), (1,0), (0,1). */
+/** D-208 (B-017): the interleave N of a packed phase (bits 8..15; 0 or 2: 2 x 2, the D-184 slicing). */
+UNI_FN uint Uni_TemporalN(uint InPhase)
+{
+	const uint N = (InPhase >> 8u) & 255u;
+	return N >= 3u ? min(N, 4u) : 2u;
+}
+
+/** The fresh pixel of each N x N block at a phase. 2 x 2: (0,0), (1,1), (1,0), (0,1) (D-184);
+ *  4 x 4: the Bayer order (every 4 consecutive phases one per 2 x 2 quadrant); 3 x 3: a
+ *  diagonal walk (every 3 consecutive phases one per row and column). */
 UNI_FN uint2 Uni_TemporalOffset(uint InPhase)
 {
-	const uint P = InPhase & 3u;
-	return uint2(P == 1u || P == 2u ? 1u : 0u, P == 1u || P == 3u ? 1u : 0u);
+	const uint N = Uni_TemporalN(InPhase);
+	const uint K = (InPhase & 255u) % (N * N);
+	if (N == 4u)
+	{
+		const uint W = K < 8u ? 0xD7F582A0u : 0xC6E493B1u;
+		const uint P = (W >> (4u * (K & 7u))) & 15u;
+		return uint2(P & 3u, P >> 2u);
+	}
+	if (N == 3u) { return uint2(K % 3u, (K + K / 3u) % 3u); }
+	return uint2(K == 1u || K == 2u ? 1u : 0u, K == 1u || K == 3u ? 1u : 0u);
 }
 
 UNI_FN bool Uni_TemporalFresh(uint2 InPx, uint InPhase)
 {
+	const uint N = Uni_TemporalN(InPhase);
 	const uint2 O = Uni_TemporalOffset(InPhase);
-	return (InPx.x & 1u) == O.x && (InPx.y & 1u) == O.y;
+	return InPx.x % N == O.x && InPx.y % N == O.y;
+}
+
+/** D-208: the interleave for a frame from how far the image moves (march pixels, estimated:
+ *  the view's turn plus the camera's step over the nearest structure's distance). A pixel is
+ *  marched every N^2 frames and reprojected between, so N grows only while that is near still:
+ *  4 x 4 below 0.1 px a frame, 3 x 3 below 0.5, the D-184 2 x 2 beyond; at most InMaxN.
+ *  (Measured: at 0.17 px a frame from 60 kpc, 4 x 4's p95 was 3.0% against 2 x 2's 0.8%: a pixel
+ *  re-marched every 16 frames is resampled 16 times between.) */
+UNI_FN uint Uni_TemporalInterleave(float InMotionPx, uint InMaxN)
+{
+	if (InMaxN >= 4u && InMotionPx < 0.1f) { return 4u; }
+	if (InMaxN >= 3u && InMotionPx < 0.5f) { return 3u; }
+	return 2u;
+}
+
+/** D-208: a frame's packed phase: its step in the N x N order and N. */
+UNI_FN uint Uni_TemporalPack(uint InStep, uint InN)
+{
+	const uint N = InN >= 3u ? min(InN, 4u) : 2u;
+	return (InStep % (N * N)) | (N == 2u ? 0u : (N << 8u));
 }
 
 /** The four fresh pixels around InPx (bilinear on the fresh lattice, clamped to the grid) and
@@ -462,15 +875,16 @@ struct FUniTemporalTaps
 	float4 W;
 };
 
-/** One axis: the fresh lattice coordinate below a pixel and the fraction to the next. */
-UNI_FN uint Uni_TemporalAxis(uint InP, uint InO, uint InSize, UNI_OUT(uint) OutHi, UNI_OUT(float) OutFrac)
+/** One axis: the fresh lattice coordinate below a pixel and the fraction to the next (lattice
+ *  spacing InN, D-208). */
+UNI_FN uint Uni_TemporalAxis(uint InP, uint InO, uint InSize, uint InN, UNI_OUT(uint) OutHi, UNI_OUT(float) OutFrac)
 {
-	// Fresh pixels are O, O + 2, ...; the last below InSize is O + 2 * ((InSize - 1 - O) / 2).
-	const uint Last = InSize > InO ? InO + 2u * ((InSize - 1u - InO) / 2u) : InO;
-	uint Lo = InP >= InO ? InO + 2u * ((InP - InO) / 2u) : InO;
+	// Fresh pixels are O, O + N, ...; the last below InSize is O + N * ((InSize - 1 - O) / N).
+	const uint Last = InSize > InO ? InO + InN * ((InSize - 1u - InO) / InN) : InO;
+	uint Lo = InP >= InO ? InO + InN * ((InP - InO) / InN) : InO;
 	Lo = min(Lo, Last);
-	OutHi = min(Lo + 2u, Last);
-	OutFrac = OutHi > Lo ? ((float)InP - (float)Lo) * 0.5f : 0.0f;
+	OutHi = min(Lo + InN, Last);
+	OutFrac = OutHi > Lo ? ((float)InP - (float)Lo) / (float)InN : 0.0f;
 	OutFrac = InP < Lo ? 0.0f : OutFrac;
 	return Lo;
 }
@@ -478,10 +892,11 @@ UNI_FN uint Uni_TemporalAxis(uint InP, uint InO, uint InSize, UNI_OUT(uint) OutH
 UNI_FN FUniTemporalTaps Uni_TemporalTaps(uint2 InPx, uint InPhase, uint2 InSize)
 {
 	const uint2 O = Uni_TemporalOffset(InPhase);
+	const uint N = Uni_TemporalN(InPhase);
 	uint Xh = 0u, Yh = 0u;
 	float Fx = 0.0f, Fy = 0.0f;
-	const uint Xl = Uni_TemporalAxis(InPx.x, O.x, InSize.x, Xh, Fx);
-	const uint Yl = Uni_TemporalAxis(InPx.y, O.y, InSize.y, Yh, Fy);
+	const uint Xl = Uni_TemporalAxis(InPx.x, O.x, InSize.x, N, Xh, Fx);
+	const uint Yl = Uni_TemporalAxis(InPx.y, O.y, InSize.y, N, Yh, Fy);
 	FUniTemporalTaps Tp;
 	Tp.Q0 = uint2(Xl, Yl);
 	Tp.Q1 = uint2(Xh, Yl);
@@ -535,6 +950,32 @@ UNI_FN bool Uni_TemporalAccept(float InHist, float InLo, float InHi)
 	return InHist >= 0.25f * InLo - 1.0e-30f && InHist <= 4.0f * InHi + 1.0e-30f;
 }
 
+/** D-194: how far a reconstructed pixel's light moved since the previous frame, in march-grid
+ *  pixels (from where the history has it to this pixel's centre): the reprojection's motion. */
+UNI_FN float Uni_TemporalMotionPx(float2 InPrevPx, uint2 InPx)
+{
+	const float Dx = InPrevPx.x - ((float)InPx.x + 0.5f), Dy = InPrevPx.y - ((float)InPx.y + 0.5f);
+	return sqrt(Dx * Dx + Dy * Dy);
+}
+
+/** D-194: the history's clamp slack: it may lie between the fresh neighbours' lowest / K and
+ *  highest x K (per channel). K is 4 at rest (fine detail between the fresh pixels survives, as
+ *  the D-184 band allowed) and falls to 1 at InTightPx of motion and beyond (strictly inside the
+ *  neighbours' range: a moving image cannot leave trails or holes). */
+UNI_FN float Uni_TemporalClampK(float InMotionPx, float InTightPx)
+{
+	return lerp(4.0f, 1.0f, saturate(InMotionPx / max(InTightPx, 1.0e-3f)));
+}
+
+/** D-194: the history clamped into the fresh neighbours' box (InLo, InHi: their per-channel
+ *  lowest and highest; rgb radiance, a transmittance), widened by InK. */
+UNI_FN float4 Uni_TemporalClamp(float4 InHist, float4 InLo, float4 InHi, float InK)
+{
+	const float Ik = 1.0f / InK;
+	return float4(clamp(InHist.x, InLo.x * Ik, InHi.x * InK), clamp(InHist.y, InLo.y * Ik, InHi.y * InK),
+		clamp(InHist.z, InLo.z * Ik, InHi.z * InK), saturate(clamp(InHist.w, InLo.w * Ik, InHi.w * InK)));
+}
+
 /** The fresh taps' weights for a pixel on a scene surface at InLnTp: bilinear x depth-aware. */
 UNI_FN float4 Uni_TemporalSpatialW(float4 InWb, float InLnTp, float4 InLnSceneQ)
 {
@@ -551,7 +992,8 @@ UNI_FN float Uni_TemporalLightLnDepth(float4 InW, float4 InLnDepthQ)
 	const float Lim = UNI_VOL_LN_DEPTH_NONE - 1.0f;
 	const float4 Wl = float4(InLnDepthQ.x < Lim ? InW.x : 0.0f, InLnDepthQ.y < Lim ? InW.y : 0.0f, InLnDepthQ.z < Lim ? InW.z : 0.0f, InLnDepthQ.w < Lim ? InW.w : 0.0f);
 	const float S = Wl.x + Wl.y + Wl.z + Wl.w;
-	return S > 0.0f ? (Wl.x * InLnDepthQ.x + Wl.y * InLnDepthQ.y + Wl.z * InLnDepthQ.z + Wl.w * InLnDepthQ.w) / S : UNI_VOL_LN_DEPTH_NONE;
+	// D-194: harmonic, like the march's own.
+	return S > 0.0f ? Uni_LightLnDepthFromInv((Wl.x * Uni_LightInvDepth(InLnDepthQ.x) + Wl.y * Uni_LightInvDepth(InLnDepthQ.y) + Wl.z * Uni_LightInvDepth(InLnDepthQ.z) + Wl.w * Uni_LightInvDepth(InLnDepthQ.w)) / S) : UNI_VOL_LN_DEPTH_NONE;
 }
 
 /** The four history texels around a previous-grid position (PixelDir convention) and their

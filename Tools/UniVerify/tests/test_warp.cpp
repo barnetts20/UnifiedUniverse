@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include "../scenes/UniScenes.h"
 #include "UniStreamer.h"
+#include "UniTravel.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -430,4 +431,58 @@ UNI_TEST(warp, motes)
 		.Pass(Matched > 1000 && WorstPop < 0.02 && ScaleErr < 0.1 && MeanView >= 15.0 && Median >= 2.0 && Behind == 0 && AtRest == 0,
 			Uni::Fmt("%zu mote-frames found again, %zu faded out; worst appearance or loss in view %.4f of the brightest, worst frame-to-frame change %.3f; scale %.3f octaves off once settled; %.1f in view on average; median streak %.1f px at 30 Mpc/s; %zu behind the camera, %zu at rest",
 				Matched, Lost, WorstPop, WorstStep, ScaleErr, MeanView, Median, Behind, AtRest));
+}
+
+UNI_TEST(warp, speed)
+{
+	// D-199 (B-018, owner: at 425 kpc/s inside a cluster nearly every galaxy vanished with warp
+	// on). The warp optics' motion was the camera's step normalised in float: its length squared
+	// overflows past 1.8e19 cm (6 pc a frame), so at any warp speed the motion came out zero with
+	// the optics on. A zero motion shortened every direction by sqrt(1 - b^2): every sprite took a
+	// tail of that shortening whatever its distance (at full warp ~50 px off centre, its light
+	// spread that far), and the volume marched shortened rays. Now in double
+	// (UniCore::WarpMotion), and the shader's aberration and Doppler leave a direction alone when
+	// there is no motion.
+	const double Kpc = 3.0856775814913673e21;
+	const double Step[3] = { 7.0 * Kpc, 0.0, 0.0 };   // 425 kpc/s at 60 fps, strafing (+x is the view's right here)
+	float Vb[4];
+	UniCore::WarpMotion(Step[0], Step[1], Step[2], 0.5 * 0.25, Vb);
+	const double Ul = std::sqrt(double(Vb[0]) * Vb[0] + double(Vb[1]) * Vb[1] + double(Vb[2]) * Vb[2]);
+	// What UE's float Size() made of it.
+	const float Fs = float(Step[0]);
+	const float FloatLen = std::sqrt(Fs * Fs);
+	// The shader with a zero motion: nothing changes.
+	const H::float3 Dir(0.6f, 0.0f, 0.8f);
+	const H::float3 Ab = H::Uni_Aberrate(Dir, H::float3(0, 0, 0), 0.5f);
+	const float AbErr = std::abs(Ab.x - Dir.x) + std::abs(Ab.y - Dir.y) + std::abs(Ab.z - Dir.z);
+	const float Dz = H::Uni_DopplerFactor(Dir, H::float3(0, 0, 0), 0.5f);
+	// Streaks of galaxies 20 degrees off the view's centre, the view looking along +y, the step
+	// along +x: at 1 Mpc and 50 Mpc, with the fixed motion and with the old zero one.
+	const float Ppr = 1197.0f;
+	const H::float3 Side(1, 0, 0), Up(0, 0, 1), Look(0.3420201f, 0.9396926f, 0.0f);
+	const H::float4 Warp(0.25f, 1.0f, 64.0f, 6.0f);
+	const H::float3 Cs(float(Step[0]), 0.0f, 0.0f);
+	auto Streak = [&](double DistMpc, const H::float4& VelBeta)
+	{
+		return H::Uni_SpriteStreak(Look, float(DistMpc * 1000.0 * Kpc), Cs, Side, Up, Ppr, Warp, 1.0f, VelBeta).z;
+	};
+	const H::float4 Fixed(Vb[0], Vb[1], Vb[2], Vb[3]);
+	const float S1 = Streak(1.0, Fixed), S50 = Streak(50.0, Fixed);
+	// The camera's parallax x the warp amount (the streak's exposure), slightly squeezed by the optics.
+	const float Expected1 = float(7.0 / 1000.0 * std::cos(20.0 * 3.141592653589793 / 180.0) * Ppr) * Warp.x;
+	// The old streak with a zero motion, emulated (the aberration before D-199): the tail is the
+	// directions' shortening by sqrt(1 - b^2) projected on the view, whatever the distance. At full
+	// warp (amount 1, b 0.5) and at the owner's 425 kpc/s (amount ~0.23, b ~0.12).
+	auto OldTail = [&](float Amount, float Beta, float OffDeg)
+	{
+		const float Short = 1.0f - std::sqrt(1.0f - Beta * Beta);
+		return std::min(Short * std::sin(OffDeg * 3.14159265f / 180.0f) * Ppr * Amount, 64.0f);
+	};
+	const float OldFull20 = OldTail(1.0f, 0.5f, 20.0f), OldFull40 = OldTail(1.0f, 0.5f, 40.0f), Old425 = OldTail(0.23f, 0.115f, 40.0f);
+	Uni::Check(1, "T1.warp.speed", "D-199 (B-018) warp at intergalactic speed: the optics' motion for a 7 kpc step is a unit vector along it (1e-6; UE's float length was inf); a zero motion leaves directions and colours alone; a galaxy 20 degrees off centre at 1 Mpc streaks the camera's parallax x the warp amount (10%), and at 50 Mpc under 1 px")
+		.Metric("unit_err", std::abs(Ul - 1.0)).Metric("streak_1mpc_px", S1).Metric("streak_50mpc_px", S50).Metric("old_full_warp_20deg_px", OldFull20)
+		.Pass(std::abs(Ul - 1.0) < 1e-6 && Vb[0] > 0.999f && AbErr < 1e-6f && std::abs(Dz - 1.0f) < 1e-6f
+				&& std::abs(S1 / Expected1 - 1.0f) < 0.10f && S50 < 1.0f,
+			Uni::Fmt("motion %.7f %.7f %.7f (|v| - 1 = %.1e), beta %.3f; float length of the step %g; zero motion: direction change %.1e, Doppler %.6f; streaks at 1 Mpc %.2f px (parallax x warp %.2f), at 50 Mpc %.3f px. Before (zero motion): every sprite's tail %.0f px at 20 degrees off centre and %.0f px at 40 at full warp, at any distance (cap 64); %.1f px at 40 degrees at 425 kpc/s",
+				Vb[0], Vb[1], Vb[2], Ul - 1.0, Vb[3], double(FloatLen), AbErr, Dz, S1, Expected1, S50, OldFull20, OldFull40, Old425));
 }

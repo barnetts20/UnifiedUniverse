@@ -185,6 +185,21 @@ namespace UniCore
 		return int(PrevLo);
 	}
 
+	/** D-203: one level's per-cell fades, for the volume march. A cell still loading (not Ready)
+	 *  or fading in draws only part of its sprites; the march draws the rest of its children's
+	 *  expected light as glow, from the same field (Uni_CellGlow), so pop-in becomes glow
+	 *  condensing into points. OriginCm: the corner of the window's first cell (offsets Lo)
+	 *  relative to the camera; Fades: Side[0] x Side[1] x Side[2], x fastest, each the fraction of
+	 *  the cell's sprites drawn (0: not Ready; ramping to 1 once it is). */
+	struct FCellGlowLevel
+	{
+		int Level = 0;
+		double OriginCm[3] = { 0.0, 0.0, 0.0 };
+		double CellCm = 0.0;
+		int Side[3] = { 0, 0, 0 };
+		std::vector<float> Fades;
+	};
+
 	enum class ESlotStatus : uint8_t { Empty, Pending, Generated, Cached };
 
 	struct FSlot

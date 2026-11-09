@@ -30,4 +30,19 @@ Texture3D<float4> UniGalDetail;
 #define UNI_GAL_WARP_LARGE(P, Mip) UniGalWarpLarge.SampleLevel(UniWebSampler, (P), (Mip))
 #define UNI_GAL_DETAIL(P, Mip) UniGalDetail.SampleLevel(UniWebSampler, (P), (Mip))
 
+// D-211: the galaxy cache (UniVolume.ush, Uni_GalCacheSample): A RG16F light and dust densities,
+// B RGBA8 palette tint; N x N x K (N + 2), no mips, the same wrap / trilinear sampler (mip 0).
+// Bound by the volume passes; unbound: a 1^3 dummy (the view's CacheCarrier is then 0).
+Texture3D<float4> UniGalCacheA;
+Texture3D<float4> UniGalCacheB;
+
+#define UNI_GAL_CACHE_A(U) UniGalCacheA.SampleLevel(UniWebSampler, (U), 0.0f)
+#define UNI_GAL_CACHE_B(U) UniGalCacheB.SampleLevel(UniWebSampler, (U), 0.0f)
+
+// D-212: the galaxy map (UniFields.ush, Uni_GalaxyMapEval): RGBA16F 2D with mips over the field's
+// x, y in [-1, 1]; the same wrap / trilinear sampler (its border is zero: outside the cut).
+Texture2D<float4> UniGalMap;
+
+#define UNI_GAL_MAP(UV, Mip) UniGalMap.SampleLevel(UniWebSampler, (UV), (Mip))
+
 #endif // UNI_WEB_TEXTURE_USH

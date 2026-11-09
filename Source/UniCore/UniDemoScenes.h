@@ -77,6 +77,17 @@ namespace UniScenes
 		double BcgShare = 0.06;
 		double IclShare = 0.12;
 		double BcgMaxMag = -25.0;
+		/** D-197 (owner: ~30% fewer entities): the share of cluster members and group dwarfs, and
+		 *  of every galaxy's stars, that are generated and drawn (FUniEmitter::SpriteKeep). The
+		 *  rest of their light is glow (their parent's carrier), so nothing dims. Applied by
+		 *  UseSpriteKeep (the engine does at uu.Enable); 1: every child, as before D-197. */
+		double MemberKeep = 0.5;   // D-198: 0.7 -> 0.5 (owner: less pop-in of nearby stars, less to load in clusters)
+		double StarKeep = 0.35;    // D-205: 0.5 -> 0.35 (owner: speed inside galaxy cores; ~28% less generation there)
+		/** D-198 (owner: darker dust lanes): galaxies' dust optical depth x DustScale, and their
+		 *  textured lanes' contrast (FVolumeProfile::DustLanes). Applied by UseDustTuning (the
+		 *  engine does at uu.Enable); 1 and 2.2: the D-132 / D-180 dust. */
+		double DustScale = 2.0;
+		double DustLanes = 3.0;
 	};
 
 	/** The galaxy number density over the galaxy luminosity function (the D-012 placeholder). */
@@ -117,6 +128,7 @@ namespace UniScenes
 		P.V[8] = 0.6f;     // arm amplitude
 		P.V[9] = 3.0f;     // arm sharpness
 		P.V[10] = 0.0f;    // arm phase
+		P.V[11] = 0.25f;   // D-210: arms' inner radius (disc scale lengths): arms fade to their mean inside it, the disc warp shrinks to 0 at the centre
 		P.V[12] = 1.0f;    // cut radius (the influence sphere)
 		return P;
 	}
@@ -668,6 +680,31 @@ namespace UniScenes
 			++N;
 		}
 		return N;
+	}
+
+	/** D-197: thin a definition's children (FUniEmitter::SpriteKeep): stars (every emitter of
+	 *  kStar) by StarKeep; cluster members (every emitter of a kCluster) and group dwarfs (every
+	 *  emitter of kDwarf, root or not) by MemberKeep. Field galaxies are not thinned. */
+	inline void UseSpriteKeep(FUniverseDef& D, double StarKeep, double MemberKeep)
+	{
+		auto Apply = [&](FUniEmitter& E, u32 ParentArch)
+		{
+			if (E.ChildArchetypeId == kStar) { E.SpriteKeep = std::clamp(StarKeep, 0.05, 1.0); }
+			else if (ParentArch == kCluster || E.ChildArchetypeId == kDwarf) { E.SpriteKeep = std::clamp(MemberKeep, 0.05, 1.0); }
+		};
+		for (FUniEmitter& E : D.RootEmitters) { Apply(E, ~0u); }
+		for (FArchetype& A : D.Archetypes) { for (FUniEmitter& E : A.Emitters) { Apply(E, A.Id); } }
+	}
+
+	/** D-198: every dusty archetype's dust x DustScale, its textured lanes' contrast DustLanes. */
+	inline void UseDustTuning(FUniverseDef& D, double DustScale, double DustLanes)
+	{
+		for (FArchetype& A : D.Archetypes)
+		{
+			if (!A.Volume.bDust || !(A.Volume.DustTau > 0.0f)) { continue; }
+			A.Volume.DustTau = float(double(A.Volume.DustTau) * std::clamp(DustScale, 0.0, 10.0));
+			A.Volume.DustLanes = float(std::clamp(DustLanes, 0.0, 10.0));
+		}
 	}
 
 	inline FUniverseDef Base()

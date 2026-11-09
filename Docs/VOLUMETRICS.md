@@ -173,3 +173,76 @@ Every hook stays in the existing post-MotionBlur callback (`UniRenderHooks.cpp`)
 2. **Engine (written, uncompiled):** `UniVolume.usf`, the passes above, the sprite transmittance lookup, `uu.Volume`. Still to do: a debug view (density / steps / truncation, lesson #37).
 3. **v1.1:** temporal accumulation and the near/far split; sprite internal-extinction correction.
 4. **v2:** gas emission, nebula profiles, single scattering, baked volumes with mips.
+
+## 12. Performance controls as of D-200
+
+The march's cost is rays x steps per ray x cost per step. These are the console settings that move each term, with their defaults and the decision behind each. The offline numbers are T2.vol.perf_inside (inside the Milky Way, steps per pixel toward the centre / along the disc / out of the plane), against 198.5 / 158.4 / 134.3 at the D-130 settings.
+
+**Rays.**
+| Setting | Default | What it does | Decision |
+|---|---|---|---|
+| `uu.VolumeDivisor` | 2 | the march at output / divisor | D-129 |
+| `uu.VolumeMaxMarchPixels` | 262144 | at most this many march pixels; half the rays on a 1880 x 1120 viewport. 0: no limit | D-196 |
+| `uu.VolumeTravelPixelScale` | 0.35 | the pixel budget at full travel speed (10 Mpc/s), in quarter steps from 1 at 100 kpc/s | D-198 |
+| `uu.VolumeTargetFps` | 60 | the pixel budget steps down (7 levels, to x0.35) while the GPU frame is over this frame rate, and back up with headroom; `uu.VolumeAutoHold` (20) frames between changes. 0: off | D-200 |
+| `uu.VolumeTemporal` | 1 | march one pixel of every 2 x 2 a frame and reconstruct the rest | D-184, D-194 |
+| `uu.BackgroundMode` | 2 | the background from its direction map, marched per pixel only while travelling fast | D-166 |
+| `uu.BackgroundPerPixelInterval` | 0 (automatic) | how often the background must change to be marched per pixel | D-196 |
+
+**Steps per ray.**
+| Setting | Default | What it does | Decision |
+|---|---|---|---|
+| `uu.VolumeStepRatio` | 0.32 | log step ratio. With the defaults below: 52.8 / 38.9 / 30.7 steps/px, p95 error 0.40-0.61% | D-195, D-199 |
+| `uu.VolumeHintScale` | 3 | the field step hints x this, in carriers around the camera only (from outside, x 2 already costs 5% per ray) | D-195, D-198 |
+| `uu.VolumeStartPc` | 10 | local carriers start this far out | D-195 |
+| `uu.VolumeWebStepRatio` | 0.4 | the textured web's log step ratio (the background): 40 steps a texel | D-199 |
+| `uu.VolumeWebTravelHint` | 2 | the background web's step hints x this at full travel speed (lerped by the travel amount): 40 -> 27 steps a texel. 1: off | D-202 |
+| `uu.VolumeMaxSteps` | 512 | the step budget per ray | D-130 |
+
+**Cost per step.** With one carrier active (inside a galaxy), the CPU reference spends 306 ns on the dusty galaxy sample (emission + dust, D-181), 90 ns on its step hint and 9 ns on the LUT. The sample is the term left to attack (B-017).
+
+**Entities** (fewer sprites, cells and carriers; their light is kept as glow).
+| Setting | Default | What it does | Decision |
+|---|---|---|---|
+| `uu.Star.Keep` | 0.35 | share of every galaxy's stars generated and drawn | D-197, D-198, D-205 |
+| `uu.Cluster.MemberKeep` | 0.5 | share of cluster members and group dwarfs generated and drawn | D-197, D-198 |
+
+**Loading and speed** (D-203: work per frame no longer grows with speed; what has not loaded is glow).
+| Setting | Default | What it does | Decision |
+|---|---|---|---|
+| `uu.CellGlow` | 1 | a cell still loading (or fading in) is drawn as glow from the field; its sprites fade in once it is Ready (section 13). 0: a hole until it loads (before D-203) | D-203 |
+| `uu.VolumeGalaxyConst` | 1 | the march reads each galaxy's per-object hashes from blocks the builder writes once a frame (the same image). 0: hashed at every step (A/B for ProfileGPU) | D-210 |
+| `uu.GalaxyMap` | 1 | the galaxy the camera is in is marched from its baked 2D map (arms and modes; warp, vertical profile, bulge and detail per sample; D-212). 0: its field at every step | D-212 |
+| `uu.GalaxyMap.Size` | 2048 | the map's texels a side (power of two): 2048 ~43 MB, 1024 ~11 MB | D-212 |
+| `uu.GalaxyMap.Budget` | 1048576 | texels of the map the GPU bakes a frame (2048^2 in 4 frames) | D-212 |
+| `uu.GalaxyCache` | 0 | the D-211 clipmap, used only where no map is published (superseded by uu.GalaxyMap) | D-211, D-212 |
+| `uu.GalaxyCache.Size` | 128 | voxels a cache level side (64..256); 128 ~120 MB, 96 ~50 MB (a little softer far away) | D-211 |
+| `uu.GalaxyCache.Budget` | 1048576 | voxels baked a frame at most; levels that cannot follow keep their last window (coarser levels cover) | D-211 |
+| `uu.GalaxyCache.FinestPc` | 512 | how far the finest level reaches from the camera (pc) | D-211 |
+| `uu.CellFadeFrames` | 8 | frames a Ready cell's sprites take to fade in (its glow fades out by the same amount) | D-203 |
+| `uu.StreamBuildBudget` | 96 | cells built per frame over every level, those needed soonest first; the rest wait as glow. 0: D-173's per-level rule | D-203 |
+| `uu.WindowStretch` | 0 | cells a window stretches ahead at speed (D-162: 3). 0: rest size at any speed | D-203 |
+| `uu.TravelSensitivity` | 0 | magnitudes the sky deepens by at speed (widens every window) | D-154, D-201, D-203 |
+| `uu.VolumeInterleave` | 4 | most pixels per side of the temporal slicing's block: 4 x 4 below 0.1 march px of motion a frame, 3 x 3 below 0.5, else 2 x 2 | D-208 |
+| `uu.TravelExposure` | 1.5 | magnitudes everything is brightened by at full travel speed (render only; windows unchanged) | D-205 |
+
+**Look** (cost-neutral).
+| Setting | Default | What it does | Decision |
+|---|---|---|---|
+| `uu.Galaxy.DustScale` | 2 | galaxies' dust density multiplier | D-198 |
+| `uu.Galaxy.DustLanes` | 3.0 | textured lanes' contrast | D-198 |
+
+**Diagnostics.**
+- ProfileGPU shows Uni.Volume.March (or .March+Background), .Reconstruct, .Composite and .BackgroundMap.
+- `uu.perf` prints the march size, rays, slicing and the frames with the background per pixel.
+
+## 13. Cell glow (D-203)
+A cell that is not Ready draws no sprites, and one that has just become Ready fades its sprites in over `uu.CellFadeFrames`. Before D-203 that light was missing until the cell loaded (pop-in), so windows stretched ahead at speed to load cells before they were seen (D-139, D-162), and a level's fade waited for its visible cells (D-128's hold).
+
+Now the march draws what a cell does not: for each carrier, the LUT holds, after its emission and tail blocks, one block per child level q of the light drawn as sprites at that level, D_q(t) = sum over the level's slices of P keep F_L G (the term the emission block subtracts for it). Each frame the streamer lists the levels with a cell not fully drawn and their cells' fades over the window (`FUniStreamer::CellGlow`); the builder appends those grids to the LUT buffer (`FVolumeViewGPU::GlowMask`, `GlowBase`). A sample at distance t adds (1 - cell fade) D_q(t) for the cell of each loading level q that holds it (`Uni_CellGlow`). Sprites + glow stay the population's light whatever has loaded, and a loading cell reads as glow condensing into points.
+
+- Exact: every cell of a level at fade 0 is the level's fade at 0, and per-cell fades add linearly (T2.vol.cell_glow_exact).
+- Cost: nothing when no cell is loading (GlowLevels 0); otherwise, per step and active carrier, a grid read for each loading level of its children whose windows can reach the sample (D-205: levels with 2^L < t / 18 are skipped by a mask; in a galaxy core at speed +6% -> +0.5% on the march).
+- Not in the background map: it is kept across frames while cells load, so their glow would stay after their sprites arrive. Per pixel (while travelling fast) it is in.
+- Local carriers start at 10 pc (D-195): a loading cell's stars within 10 pc are still missing until it loads, as before.
+

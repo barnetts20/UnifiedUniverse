@@ -1,0 +1,110 @@
+// UniQuery.ush
+// D-193: the shared part of the runtime API's GPU lookups (Pick, QueryResident, FindNearest).
+// The engine's pick and query passes (UniPick.usf, UniQuery.usf) and the offline checks run
+// these same functions, so what a lookup returns is decided by one piece of code.
+//
+//  - Pick scores the frame's sprites under a cursor: the brightest wins, weighted by how close
+//    its centre is (so a faint star exactly under the cursor beats a bright one a few pixels
+//    away only when it is not much fainter).
+//  - Queries measure each resident object from a query centre exactly: the centre is passed
+//    as its 128-bit delta from the camera (computed on the CPU), and an object's position
+//    relative to it is (cell - camera) - (centre - camera) + offset in integers, converted to
+//    float last (D-104's rule). A whole cell is skipped when its bounding sphere misses.
+
+#ifndef UNI_QUERY_USH
+#define UNI_QUERY_USH
+
+#include "UniCoreDefs.ush"
+#include "UniCoord.ush"
+#include "UniPhotometry.ush"
+#include "UniPlacement.ush"
+#include "UniProject.ush"
+
+static const uint UNI_QUERY_MODE_SPHERE = 0u;    // every match within the radius (capped list)
+static const uint UNI_QUERY_MODE_NEAREST = 1u;   // the single nearest match (two passes: min, then select)
+
+/** Pick score of a sprite for a cursor at InCursorNdc ([-1, 1], y up, like FUniSprite::Ndc).
+ *  A sprite is under the cursor when its centre is within its reach: InMinPx, twice its core
+ *  sigma or its true radius, whichever is largest. The score is its luminance over
+ *  1 + (distance / InMinPx)^2; negative: not under the cursor. InHalfViewPx: half the view's
+ *  size in pixels; InPixelsPerRadian: at the view centre. */
+UNI_FN float Uni_PickScore(FUniSprite InS, float2 InCursorNdc, float2 InHalfViewPx, float InPixelsPerRadian, float InMinPx)
+{
+	if ((InS.Flags & UNI_SPRITE_VISIBLE) == 0u) { return -1.0f; }
+	const float Dx = (InS.NdcX - InCursorNdc.x) * InHalfViewPx.x;
+	const float Dy = (InS.NdcY - InCursorNdc.y) * InHalfViewPx.y;
+	const float D = sqrt(Dx * Dx + Dy * Dy);
+	const float MinPx = max(InMinPx, 0.5f);
+	const float Reach = max(MinPx, max(2.0f * InS.AngularRadius, InS.PhysAngularRadius) * InPixelsPerRadian);
+	if (!(D <= Reach)) { return -1.0f; }
+	const float Q = D / MinPx;
+	// Never 0 for a hit: the packed score 0 means "nothing" (positive floats order as uints).
+	return max(Uni_Luminance(InS.Radiance) / (1.0f + Q * Q), 1.0e-37f);
+}
+
+/** An object's position relative to the query centre (cm, float), exactly as
+ *  Uni_ObjectRelative: InCellDelta* = cell origin - camera, InQueryDelta* = centre - camera
+ *  (two's complement 128-bit, from the CPU). */
+UNI_FN float3 Uni_QueryRelative(uint4 InCellDeltaX, uint4 InCellDeltaY, uint4 InCellDeltaZ,
+	uint4 InQueryDeltaX, uint4 InQueryDeltaY, uint4 InQueryDeltaZ, FUniObject InObj, uint InLevel)
+{
+	return Uni_ObjectRelative(Uni_U128Sub(InCellDeltaX, InQueryDeltaX), Uni_U128Sub(InCellDeltaY, InQueryDeltaY), Uni_U128Sub(InCellDeltaZ, InQueryDeltaZ),
+		uint3(InObj.A.x, InObj.A.y, InObj.A.z), InLevel, float3(0.0f, 0.0f, 0.0f));
+}
+
+/** Can any object of a level-L cell (origin at InCellDelta* from the camera) lie within
+ *  InRadiusCm of the centre? Its bounding sphere against the query sphere, with a little slack
+ *  for the float conversion. A negative radius: always (FindNearest scans everything). */
+UNI_FN bool Uni_QueryCellMayHit(uint4 InCellDeltaX, uint4 InCellDeltaY, uint4 InCellDeltaZ,
+	uint4 InQueryDeltaX, uint4 InQueryDeltaY, uint4 InQueryDeltaZ, uint InLevel, float InRadiusCm)
+{
+	if (InRadiusCm < 0.0f) { return true; }
+	const float Half = 0.5f * exp2((float)InLevel);
+	const float3 Origin = float3(
+		Uni_S128ToFloat(Uni_U128Sub(InCellDeltaX, InQueryDeltaX)),
+		Uni_S128ToFloat(Uni_U128Sub(InCellDeltaY, InQueryDeltaY)),
+		Uni_S128ToFloat(Uni_U128Sub(InCellDeltaZ, InQueryDeltaZ)));
+	const float3 C = Origin + float3(Half, Half, Half);
+	const float Reach = InRadiusCm + Half * 1.7320508f;
+	return Uni_SafeLength(C) <= Reach * 1.0001f + 1.0f;
+}
+
+/** The filter: archetype bit (InArchMask over ids 0..31; 0: every archetype, planets'
+ *  dynamic records included), absolute magnitude at most InMaxAbsMag, never a hidden object
+ *  (deleted, or a blank slot a task reserved and did not fill: Uni_BlankObject). */
+UNI_FN bool Uni_QueryMatch(FUniObject InObj, uint InArchMask, float InMaxAbsMag)
+{
+	if ((Uni_ObjectFlags(InObj) & UNI_OBJ_FLAG_DELTA_HIDDEN) != 0u) { return false; }
+	const uint Arch = Uni_ObjectArchetype(InObj);
+	if (InArchMask != 0u && (Arch >= 32u || (InArchMask & (1u << Arch)) == 0u)) { return false; }
+	return Uni_ObjectAbsMag(InObj) <= InMaxAbsMag;
+}
+
+/** D-193: is the object seen at all this frame: inside the view (with its own size as margin;
+ *  the camera inside it counts) and bright enough by Uni_ProjectObject's photometry (as a point
+ *  or, once resolved, by surface brightness), its level faded in. Unlike the sprite's VISIBLE
+ *  flag this stays true while a galaxy's light is handed to its volume carrier (D-129) and
+ *  while a promoted body is drawn by its actor: it is the object, not its sprite. The visibility
+ *  watch (UniQuery.h) uses it for OnVisible / OnHidden. */
+UNI_FN bool Uni_ObjectSeen(uint4 InCellDeltaX, uint4 InCellDeltaY, uint4 InCellDeltaZ, uint InLevel, float InLevelFade, FUniObject InObj, FUniView InView)
+{
+	if ((Uni_ObjectFlags(InObj) & UNI_OBJ_FLAG_DELTA_HIDDEN) != 0u) { return false; }
+	if (!(InLevelFade > 0.0f)) { return false; }
+	const float3 Rel = Uni_ObjectRelative(InCellDeltaX, InCellDeltaY, InCellDeltaZ, uint3(InObj.A.x, InObj.A.y, InObj.A.z), InLevel, InView.CameraFraction);
+	const float R = max(Uni_SafeLength(Rel), 1.0e-3f);
+	const float Radius = exp2(Uni_ObjectRadiusLog2(InObj));
+	const float PhysAng = Radius / R;
+	if (!(Uni_ObjectVisibility(InObj, R, PhysAng, InView) > 0.0f)) { return false; }
+	if (R <= Radius) { return true; }   // inside it
+	const float3 Dir = Uni_Aberrate(Rel * (1.0f / R), InView.WarpVel, InView.WarpBeta);
+	const float Fz = dot(Dir, InView.Forward);
+	const float SinAng = min(PhysAng, 1.0f);
+	if (Fz <= -SinAng) { return false; }
+	const float Fzc = max(Fz, 1.0e-6f);
+	const float Nx = dot(Dir, InView.Right) / (Fzc * InView.TanHalfFovX);
+	const float Ny = dot(Dir, InView.Up) / (Fzc * InView.TanHalfFovY);
+	const float Margin = 1.0f + (PhysAng + InView.ThetaPixel) / min(InView.TanHalfFovX, InView.TanHalfFovY);
+	return Fz > 0.0f ? (abs(Nx) <= Margin && abs(Ny) <= Margin) : true;   // straddling the side plane: seen
+}
+
+#endif // UNI_QUERY_USH

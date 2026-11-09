@@ -108,7 +108,7 @@ uint WebDebugMode;          // D-169: 1 channels, 2 walls, 3 filaments, 4 nodes,
 float WebDebugDepthCm;
 float WebDebugThreshold;    // x the mean
 float WebDebugOpacity;      // per texel at full strength
-uint bSliceMarch;            // D-184: march one pixel of every 2 x 2 block, at SliceOffset
+uint bSliceMarch;            // D-184: march one pixel of every N x N block, at SliceOffset; D-208: N (1 is read as 2; 0: every pixel)
 uint2 SliceOffset;
 RWTexture2D<float4> OutVolume;
 RWTexture2DArray<float> OutSlices;
@@ -118,7 +118,8 @@ RWTexture2D<float2> OutDepth;   // D-184: ln depth of the light, ln scene distan
 void MarchCS(uint3 DispatchId : SV_DispatchThreadID)
 {
 	// No group-shared memory and no barriers in this pass, so an early return is safe.
-	const uint2 Pix = bSliceMarch != 0u ? DispatchId.xy * 2u + SliceOffset : DispatchId.xy;
+	const uint Sn = bSliceMarch == 1u ? 2u : bSliceMarch;
+	const uint2 Pix = Sn != 0u ? DispatchId.xy * Sn + SliceOffset : DispatchId.xy;
 	const uint3 Id = uint3(Pix, 0u);
 	if (Id.x >= MarchSize.x || Id.y >= MarchSize.y) { return; }
 	const FUniVolumeView V = InVolumeView[0];
@@ -169,7 +170,7 @@ void MarchCS(uint3 DispatchId : SV_DispatchThreadID)
 			ActiveMax = max(ActiveMax, R.Active);
 			AnyTruncated = max(AnyTruncated, R.Truncated);
 			DepthW += R.DepthWeight;
-			DepthWL += R.DepthWeight * R.LnDepth;
+			if (R.LnDepth < UNI_VOL_LN_DEPTH_NONE - 1.0f) { DepthWL += R.DepthWeight * Uni_LightInvDepth(R.LnDepth); }   // D-194: harmonic
 			for (uint K2 = 0u; K2 < UNI_VOL_SLICES; ++K2) { Slice[K2] += Uni_Luminance(R.SliceT[K2]); }
 		}
 	}
@@ -195,8 +196,99 @@ void MarchCS(uint3 DispatchId : SV_DispatchThreadID)
 		Out = float4(Tl, Tl, Tl, 0.0f);
 	}
 	OutVolume[Id.xy] = Out;
-	OutDepth[Id.xy] = float2(DepthW > 0.0f ? DepthWL / DepthW : UNI_VOL_LN_DEPTH_NONE, LnScene);
+	OutDepth[Id.xy] = float2(DepthW > 0.0f && DepthWL > 0.0f ? Uni_LightLnDepthFromInv(DepthWL / DepthW) : UNI_VOL_LN_DEPTH_NONE, LnScene);   // D-194: harmonic
 	for (uint K3 = 0u; K3 < UNI_VOL_SLICES; ++K3) { OutSlices[uint3(Id.x, Id.y, K3)] = Slice[K3] * Inv; }
+}
+
+#elif UNI_VOL_PASS == 4
+
+// D-211: the galaxy cache's bake (UniGalaxyCache.h decides the boxes; Uni_GalCacheBakeVoxel is the
+// same function the CPU reference bakes with). One thread a voxel, boxes in order (a later box
+// overwrites an earlier one's texels, as the CPU's frame-by-frame sequence does).
+StructuredBuffer<uint4> InCacheBoxes;   // per box: (level, lo.xyz as int bits), (size.xyz, first voxel)
+uint NumCacheBoxes;
+uint CacheVoxels;
+uint CacheThreadsPerRow;
+uint CacheN;
+uint CacheLevels;
+uint CacheCarrier;                       // the home carrier's index in InCarriers
+float CacheV0;                           // level 0's voxel (field units)
+float CacheZCap;                         // the z voxel cap (every level but the last)
+float CacheScale;
+float CacheFootScale;
+RWTexture3D<float2> OutCacheA;
+RWTexture3D<float4> OutCacheB;
+
+[numthreads(64, 1, 1)]
+void CacheBakeCS(uint3 Id : SV_DispatchThreadID)
+{
+	const uint T = Id.y * CacheThreadsPerRow + Id.x;
+	if (T >= CacheVoxels) { return; }
+	uint Bi = 0u;
+	for (uint B = 0u; B < NumCacheBoxes; ++B)
+	{
+		const uint4 S = InCacheBoxes[2u * B + 1u];
+		if (T >= S.w && T < S.w + S.x * S.y * S.z) { Bi = B; break; }
+	}
+	const uint4 H = InCacheBoxes[2u * Bi];
+	const uint4 S = InCacheBoxes[2u * Bi + 1u];
+	const uint Local = T - S.w;
+	const uint Lx = Local % S.x, Ly = (Local / S.x) % S.y, Lz = Local / (S.x * S.y);
+	const int3 I = int3(asint(H.y) + (int)Lx, asint(H.z) + (int)Ly, asint(H.w) + (int)Lz);
+	const uint L = H.x;
+	const float V = CacheV0 * exp2((float)L);
+	const float Vz = L + 1u < CacheLevels ? min(V, CacheZCap) : V;
+	const float3 P = float3(((float)I.x + 0.5f) * V, ((float)I.y + 0.5f) * V, ((float)I.z + 0.5f) * Vz);
+	const FUniCarrier Ca = InCarriers[CacheCarrier];
+	const FUniFieldParams Par = InParams[Ca.ParamIndex];
+	// HLSL: no conditional operator on structs.
+	FUniFieldParams Dust = Par;
+	FUniFieldParams Pal = Par;
+	if ((Ca.Flags & UNI_CARRIER_DUST) != 0u) { Dust = InParams[Ca.DustParamIndex]; }
+	if ((Ca.Flags & UNI_CARRIER_PALETTE) != 0u) { Pal = InParams[Ca.PaletteIndex]; }
+	float4 A, Bv;
+	Uni_GalCacheBakeVoxel(Ca, Par, Dust, Uni_GalaxyConstOf(Par), Pal, P, CacheFootScale * min(V, Vz), CacheScale, A, Bv);
+	const int Nn = (int)CacheN;
+	const int3 Tw = int3(((I.x % Nn) + Nn) % Nn, ((I.y % Nn) + Nn) % Nn, ((I.z % Nn) + Nn) % Nn);
+	const int Zs = (int)(L * (CacheN + 2u)) + 1 + Tw.z;
+	OutCacheA[uint3(Tw.x, Tw.y, Zs)] = A.xy;
+	OutCacheB[uint3(Tw.x, Tw.y, Zs)] = Bv;
+	// The level's wrap copies: its last slice before it, its first after it.
+	if (Tw.z == Nn - 1) { OutCacheA[uint3(Tw.x, Tw.y, L * (CacheN + 2u))] = A.xy; OutCacheB[uint3(Tw.x, Tw.y, L * (CacheN + 2u))] = Bv; }
+	if (Tw.z == 0) { OutCacheA[uint3(Tw.x, Tw.y, L * (CacheN + 2u) + CacheN + 1u)] = A.xy; OutCacheB[uint3(Tw.x, Tw.y, L * (CacheN + 2u) + CacheN + 1u)] = Bv; }
+}
+
+#elif UNI_VOL_PASS == 5
+
+// D-212: the galaxy map's GPU bake (the CPU's UniCore::FGalaxyMap::Bake, the same function):
+// MapBakeCS writes rows [MapRow0, MapRow0 + rows) of mip 0; MapDownCS averages a mip's 2 x 2
+// texels into the next.
+StructuredBuffer<FUniFieldParams> InMapParams;   // [0] the light's parameters, [1] the dust's
+uint MapSize;
+uint MapRow0;
+uint MapRows;
+uint bMapDust;
+RWTexture2D<float4> OutMap;
+Texture2D<float4> InMapMip;
+
+[numthreads(8, 8, 1)]
+void MapBakeCS(uint3 Id : SV_DispatchThreadID)
+{
+	const uint Y = MapRow0 + Id.y;
+	if (Id.x >= MapSize || Id.y >= MapRows || Y >= MapSize) { return; }
+	const FUniFieldParams Par = InMapParams[0];
+	const FUniFieldParams Dust = InMapParams[1];
+	const float Fx = ((float)Id.x + 0.5f) / (float)MapSize * 2.0f - 1.0f;
+	const float Fy = ((float)Y + 0.5f) / (float)MapSize * 2.0f - 1.0f;
+	OutMap[uint2(Id.x, Y)] = Uni_GalaxyMapTexel(Fx, Fy, Par, Dust, Uni_GalaxyConstOf(Par), bMapDust != 0u);
+}
+
+[numthreads(8, 8, 1)]
+void MapDownCS(uint3 Id : SV_DispatchThreadID)
+{
+	if (Id.x >= MapSize || Id.y >= MapSize) { return; }   // MapSize: the output mip's side
+	const uint2 B = Id.xy * 2u;
+	OutMap[Id.xy] = 0.25f * (InMapMip.Load(int3(B, 0)) + InMapMip.Load(int3(B + uint2(1u, 0u), 0)) + InMapMip.Load(int3(B + uint2(0u, 1u), 0)) + InMapMip.Load(int3(B + uint2(1u, 1u), 0)));
 }
 
 #elif UNI_VOL_PASS == 1
@@ -229,6 +321,7 @@ uint TemporalPhase;
 float3 CamStep;             // camera now minus then, cm
 uint bHistory;
 float4 PrevWarpVelBeta;     // D-190: the previous frame's warp optics
+float4 TemporalClamp;       // D-194: x 1: clamp the history into the fresh range (0: the D-184 band); y the motion (px) at which it is tight; z beyond which history is not used
 Texture2D<float4> FreshVolume;
 Texture2DArray<float> FreshSlices;
 Texture2D<float2> FreshDepth;
@@ -273,10 +366,11 @@ void ReconstructCS(uint3 Id : SV_DispatchThreadID)
 	const float Sw = Ws.x + Ws.y + Ws.z + Ws.w;
 	const float4 Sp = (F0 * Ws.x + F1 * Ws.y + F2 * Ws.z + F3 * Ws.w) / Sw;
 	float Lo = 3.0e38f, Hi = 0.0f;
-	if (Tp.W.x > 0.0f) { Lo = min(Lo, LumOf(F0)); Hi = max(Hi, LumOf(F0)); }
-	if (Tp.W.y > 0.0f) { Lo = min(Lo, LumOf(F1)); Hi = max(Hi, LumOf(F1)); }
-	if (Tp.W.z > 0.0f) { Lo = min(Lo, LumOf(F2)); Hi = max(Hi, LumOf(F2)); }
-	if (Tp.W.w > 0.0f) { Lo = min(Lo, LumOf(F3)); Hi = max(Hi, LumOf(F3)); }
+	float4 Lo4 = float4(3.0e38f, 3.0e38f, 3.0e38f, 3.0e38f), Hi4 = float4(0.0f, 0.0f, 0.0f, 0.0f);   // D-194: per channel
+	if (Tp.W.x > 0.0f) { Lo = min(Lo, LumOf(F0)); Hi = max(Hi, LumOf(F0)); Lo4 = min(Lo4, F0); Hi4 = max(Hi4, F0); }
+	if (Tp.W.y > 0.0f) { Lo = min(Lo, LumOf(F1)); Hi = max(Hi, LumOf(F1)); Lo4 = min(Lo4, F1); Hi4 = max(Hi4, F1); }
+	if (Tp.W.z > 0.0f) { Lo = min(Lo, LumOf(F2)); Hi = max(Hi, LumOf(F2)); Lo4 = min(Lo4, F2); Hi4 = max(Hi4, F2); }
+	if (Tp.W.w > 0.0f) { Lo = min(Lo, LumOf(F3)); Hi = max(Hi, LumOf(F3)); Lo4 = min(Lo4, F3); Hi4 = max(Hi4, F3); }
 	const float LnD = Uni_TemporalLightLnDepth(Ws, float4(D0.x, D1.x, D2.x, D3.x));
 
 	// The history, reprojected.
@@ -321,7 +415,13 @@ void ReconstructCS(uint3 Id : SV_DispatchThreadID)
 				}
 				if (bSame) { Hv = float4(max(Cr.xyz, float3(0.0f, 0.0f, 0.0f)), saturate(Cr.w)); }
 			}
-			bHist = Uni_TemporalAccept(LumOf(Hv), Lo, Hi);
+			if (TemporalClamp.x != 0.0f)
+			{
+				// D-194: clamp into the fresh range (tight once moving); moving too fast: not used.
+				const float Mo = Uni_TemporalMotionPx(Pp, Px);
+				if (Mo <= TemporalClamp.z) { Hv = Uni_TemporalClamp(Hv, Lo4, Hi4, Uni_TemporalClampK(Mo, TemporalClamp.y)); bHist = true; }
+			}
+			else { bHist = Uni_TemporalAccept(LumOf(Hv), Lo, Hi); }
 		}
 	}
 	if (bHist)

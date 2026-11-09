@@ -24,6 +24,7 @@ namespace UniHlsl
 #include "UniGenTask.ush"
 #include "UniVolume.ush"
 #include "UniSystem.ush"
+#include "UniQuery.ush"   // D-193
 }
 
 #include "UniCoord.h"

@@ -2,6 +2,7 @@
 
 #include "UnifiedUniverseRender.h"
 #include "UniShaders.h"
+#include "UniTravel.h"
 
 #include "GlobalShader.h"
 #include "PipelineStateCache.h"
@@ -40,11 +41,12 @@ static TAutoConsoleVariable<float> CVarUniWarpBeaming(TEXT("uu.Warp.Beaming"), 0
 /** D-190: the warp optics for a frame: the camera's motion (unit) and the effective speed. */
 static FVector4f WarpVelBetaOf(const FUniFrameData& F)
 {
-	const float L = F.CameraStepCm.Size();
 	const float Beta = FMath::Clamp(F.WarpAmount, 0.0f, 1.0f) * FMath::Clamp(CVarUniWarpAberration.GetValueOnRenderThread(), 0.0f, 0.9f);
-	if (!F.bCameraStepValid || !(L > 0.0f) || !(Beta > 0.0f)) { return FVector4f(0.0f, 0.0f, 0.0f, 0.0f); }
-	const FVector3f V = F.CameraStepCm / L;
-	return FVector4f(V.X, V.Y, V.Z, Beta);
+	if (!F.bCameraStepValid) { return FVector4f(0.0f, 0.0f, 0.0f, 0.0f); }
+	// D-199 (B-018): in double; FVector3f::Size() overflows past 6 pc a frame (UniCore::WarpMotion).
+	float Vb[4];
+	UniCore::WarpMotion(double(F.CameraStepCm.X), double(F.CameraStepCm.Y), double(F.CameraStepCm.Z), double(Beta), Vb);
+	return FVector4f(Vb[0], Vb[1], Vb[2], Vb[3]);
 }
 static FVector4f WarpDopplerKQOf()
 {
@@ -52,7 +54,13 @@ static FVector4f WarpDopplerKQOf()
 }
 
 static TAutoConsoleVariable<float> CVarUniSpriteHaloMax(TEXT("uu.Sprite.HaloMax"), UniHlsl::UNI_SPRITE_HALO_MAX_PX, TEXT("Largest halo of an unresolved sprite (Gaussian sigma, pixels)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<int32> CVarUniVolumeTemporalClamp(TEXT("uu.VolumeTemporal.Clamp"), 1, TEXT("D-194: reprojected history is clamped into its fresh neighbours' range, loose at rest and tight once it moves (less ghosting at speed). 0: the D-184 luminance band."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniVolumeTemporalTightPx(TEXT("uu.VolumeTemporal.TightPx"), 2.0f, TEXT("D-194: the motion (march pixels per frame) at which the history clamp is tight (no slack outside the fresh neighbours' range)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniVolumeTemporalMaxPx(TEXT("uu.VolumeTemporal.MaxMotionPx"), 8.0f, TEXT("D-194: beyond this motion (march pixels per frame) history is not used: the fresh neighbours are (blur instead of trails)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<int32> CVarUniVolumeInterleave(TEXT("uu.VolumeInterleave"), 4, TEXT("D-208: most pixels per side of the temporal slicing's block: 4 marches 1 pixel in 16 a frame while the image is near still (under 0.1 march pixels a frame), 3 one in 9 under 0.5, otherwise 2 x 2 (one in 4, D-184). 2: always 2 x 2."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniVolumeTemporal(TEXT("uu.VolumeTemporal"), 1, TEXT("D-184: temporal slicing of the volume march: each frame marches one pixel of every 2 x 2 block and reprojects the rest from the previous frame (about a quarter of the march's cost). 0: march every pixel every frame. Off in the debug views."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniVolumeTravelPixelScale(TEXT("uu.VolumeTravelPixelScale"), 0.35f, TEXT("D-198: the volume march's pixel budget (uu.VolumeMaxMarchPixels) at full travel speed (10 Mpc/s), as a fraction; it falls smoothly from 1 at 100 kpc/s. 1: no change with speed."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<int32> CVarUniVolumeMaxMarchPixels(TEXT("uu.VolumeMaxMarchPixels"), 262144, TEXT("D-196: the volume march is at most this many pixels (before temporal slicing): past it the march resolution drops below output / uu.VolumeDivisor, aspect kept. 0: no limit (half resolution on any viewport)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniVolumeDivisor(TEXT("uu.VolumeDivisor"), 2, TEXT("Volume march resolution divisor (1 = full, 2 = half, 4 = quarter)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniBackgroundSize(TEXT("uu.BackgroundSize"), 256, TEXT("Background direction-map face size (texels)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniVolumeDebug(TEXT("uu.VolumeDebug"), 0, TEXT("Volume debug view (lesson #37): 0 off, 1 steps per ray (magenta = truncated), 2 coverage (R carriers, G supersampling, B truncated), 3 emission (log10 heat), 4 dust transmittance."), ECVF_RenderThreadSafe);
@@ -62,6 +70,7 @@ static TAutoConsoleVariable<float> CVarUniWebDebugDepth(TEXT("uu.WebDebugDepth")
 static TAutoConsoleVariable<float> CVarUniWebDebugThreshold(TEXT("uu.WebDebugThreshold"), 2.0f, TEXT("D-169: uu.WebDebug shows density above this multiple of the mean (full strength 100x above it)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<float> CVarUniWebDebugOpacity(TEXT("uu.WebDebugOpacity"), 0.3f, TEXT("D-169: uu.WebDebug opacity per texel at full strength (higher: only the nearest structure shows)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniBackgroundMode(TEXT("uu.BackgroundMode"), 2, TEXT("D-166: how the background (the periodic web) is marched. 0: into the direction map (D-136/D-159), a few faces per frame. 1: per pixel with the local volume, every frame. 2: per pixel while the background is changing (travel), the map once it has been still for uu.BackgroundStillFrames."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<int32> CVarUniBackgroundPerPixelInterval(TEXT("uu.BackgroundPerPixelInterval"), 0, TEXT("D-196: uu.BackgroundMode 2 marches the background per pixel only while it changes at least this often (frames between changes): fast travel. Slower changes refresh the direction map (cross-faded). 0: automatic, where a map refresh per change costs more than marching it per pixel."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniBackgroundStillFrames(TEXT("uu.BackgroundStillFrames"), 30, TEXT("D-166: uu.BackgroundMode 2 switches to the direction map after this many frames without a background change."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniBackgroundFaces(TEXT("uu.BackgroundFacesPerFrame"), 2, TEXT("Background map faces marched per frame during a refresh (1..6; D-159: a refresh is always all six faces from one snapshot, cross-faded in)."), ECVF_RenderThreadSafe);
 
@@ -112,8 +121,174 @@ struct FUniRenderer::FActivateReadback
 	bool bPending = false;
 };
 
+// D-193: a pick's result words (UniQuery.usf OutPickResult), and a resident query's count,
+// hits and records, with the request they answer.
+struct FUniRenderer::FPickReadback
+{
+	TUniquePtr<FRHIGPUBufferReadback> Result;
+	uint64 FrameNumber = 0;
+	int32 RequestId = 0;
+	bool bPending = false;
+};
+
+struct FUniRenderer::FQueryReadback
+{
+	TUniquePtr<FRHIGPUBufferReadback> Count;
+	TUniquePtr<FRHIGPUBufferReadback> Hits;
+	TUniquePtr<FRHIGPUBufferReadback> Records;
+	uint64 FrameNumber = 0;
+	int32 RequestId = 0;
+	uint32 MaxResults = 0;
+	bool bPending = false;
+};
+
+void FUniRenderer::DrainPicks_GameThread(TArray<FUniPickReadback>& Out)
+{
+	check(IsInGameThread());
+	FScopeLock Lock(&ApiLock);
+	Out.Append(PicksReady);
+	PicksReady.Reset();
+}
+
+void FUniRenderer::DrainQueries_GameThread(TArray<FUniQueryReadback>& Out)
+{
+	check(IsInGameThread());
+	FScopeLock Lock(&ApiLock);
+	Out.Append(MoveTemp(QueriesReady));
+	QueriesReady.Reset();
+}
+
+void FUniRenderer::CollectApiReadbacks_RenderThread()
+{
+	// Finished readbacks only; never waited on (lesson #24).
+	for (const TSharedPtr<FPickReadback>& R : PickRing)
+	{
+		if (!R->bPending || !R->Result->IsReady()) { continue; }
+		const uint32* W = static_cast<const uint32*>(R->Result->Lock(UniGpuLayout::PickResultWords * sizeof(uint32)));
+		FUniPickReadback P;
+		P.FrameNumber = R->FrameNumber;
+		P.RequestId = R->RequestId;
+		if (W)
+		{
+			P.bFound = W[0] != 0u;
+			P.CellIndex = W[2];
+			P.Slot = W[3];
+			P.Score = FMath::Max(0.0f, *reinterpret_cast<const float*>(&W[4]));
+			for (int32 I = 0; I < 4; ++I) { P.Record.A[I] = W[8 + I]; P.Record.B[I] = W[12 + I]; }
+		}
+		R->Result->Unlock();
+		R->bPending = false;
+		FScopeLock Lock(&ApiLock);
+		PicksReady.Add(P);
+		if (PicksReady.Num() > 64) { PicksReady.RemoveAt(0, PicksReady.Num() - 64); }
+	}
+	for (const TSharedPtr<FQueryReadback>& R : QueryRing)
+	{
+		if (!R->bPending || !R->Count->IsReady() || !R->Hits->IsReady() || !R->Records->IsReady()) { continue; }
+		const uint32* CountPtr = static_cast<const uint32*>(R->Count->Lock(sizeof(uint32)));
+		const uint32 Total = CountPtr ? *CountPtr : 0u;
+		R->Count->Unlock();
+		FUniQueryReadback Q;
+		Q.FrameNumber = R->FrameNumber;
+		Q.RequestId = R->RequestId;
+		Q.Total = Total;
+		const uint32 N = FMath::Min(Total, R->MaxResults);
+		if (N > 0)
+		{
+			const FUintVector4* H = static_cast<const FUintVector4*>(R->Hits->Lock(N * sizeof(FUintVector4)));
+			TArray<FUintVector4> HitCopy;
+			HitCopy.Append(H, int32(N));
+			R->Hits->Unlock();
+			const UniCore::FObjectGPU* Rec = static_cast<const UniCore::FObjectGPU*>(R->Records->Lock(N * UniGpuLayout::ObjectBytes));
+			Q.Hits.Reserve(int32(N));
+			for (uint32 I = 0; I < N; ++I)
+			{
+				UniCore::FQueryHit Hit;
+				Hit.CellIndex = HitCopy[int32(I)].X;
+				Hit.Slot = HitCopy[int32(I)].Y;
+				const uint32 Bits = HitCopy[int32(I)].Z;
+				Hit.DistanceCm = *reinterpret_cast<const float*>(&Bits);
+				Hit.Record = Rec[I];
+				Q.Hits.Add(Hit);
+			}
+			R->Records->Unlock();
+		}
+		R->bPending = false;
+		FScopeLock Lock(&ApiLock);
+		QueriesReady.Add(MoveTemp(Q));
+		if (QueriesReady.Num() > 16) { QueriesReady.RemoveAt(0, QueriesReady.Num() - 16); }
+	}
+}
+
+void FUniRenderer::AddQuery_RenderThread(FRDGBuilder& GraphBuilder, const FUniFrameData& F, ERHIFeatureLevel::Type FeatureLevel, FRDGBufferRef CellBuf, FRDGBufferRef PoolBuf)
+{
+	if (QueryRing.Num() == 0) { for (int32 I = 0; I < 3; ++I) { QueryRing.Add(MakeShared<FQueryReadback>()); } }
+	TSharedPtr<FQueryReadback> Slot;
+	for (const TSharedPtr<FQueryReadback>& R : QueryRing) { if (!R->bPending) { Slot = R; break; } }
+	if (!Slot.IsValid()) { return; }   // all in flight: the request is dropped (the subsystem times it out and resends)
+	const uint32 MaxResults = FMath::Clamp(F.QueryMaxResults, 1u, UniGpuLayout::MaxQueryResults);
+	FRDGBufferDesc MinDesc = FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), 1);
+	FRDGBufferRef MinBuf = GraphBuilder.CreateBuffer(MinDesc, TEXT("UniQueryMin"));
+	FRDGBufferRef MinDummy = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), 1), TEXT("UniQueryMinDummy"));
+	FRDGBufferDesc HitDesc = FRDGBufferDesc::CreateStructuredDesc(sizeof(FUintVector4), MaxResults);
+	HitDesc.Usage |= EBufferUsageFlags::SourceCopy;
+	FRDGBufferRef HitBuf = GraphBuilder.CreateBuffer(HitDesc, TEXT("UniQueryHits"));
+	FRDGBufferDesc RecDesc = FRDGBufferDesc::CreateStructuredDesc(UniGpuLayout::ObjectBytes, MaxResults);
+	RecDesc.Usage |= EBufferUsageFlags::SourceCopy;
+	FRDGBufferRef RecBuf = GraphBuilder.CreateBuffer(RecDesc, TEXT("UniQueryRecords"));
+	FRDGBufferDesc CountDesc = FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), 1);
+	CountDesc.Usage |= EBufferUsageFlags::SourceCopy;
+	FRDGBufferRef CountBuf = GraphBuilder.CreateBuffer(CountDesc, TEXT("UniQueryCount"));
+	AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(MinBuf), 0xFFFFFFFFu);
+	AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(MinDummy), 0xFFFFFFFFu);
+	AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(HitBuf), 0u);
+	AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(RecBuf), 0u);
+	AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(CountBuf), 0u);
+	uint32 GroupsX = 1;
+	const FIntVector Groups = WrappedGroups(uint32(F.Cells.Num()), GroupsX);
+	TShaderMapRef<FUniQueryCS> CS(GetGlobalShaderMap(FeatureLevel));
+	const bool bNearest = F.QueryMode == UniHlsl::UNI_QUERY_MODE_NEAREST;
+	for (int32 Pass = 0; Pass < (bNearest ? 2 : 1); ++Pass)
+	{
+		FUniQueryCS::FParameters* P = GraphBuilder.AllocParameters<FUniQueryCS::FParameters>();
+		P->InCells = GraphBuilder.CreateSRV(CellBuf);
+		P->InPool = GraphBuilder.CreateSRV(PoolBuf);
+		// Mode 2 reads the minimum the mode-1 pass wrote; a buffer is never bound both ways in one pass.
+		P->OutQueryMin = GraphBuilder.CreateUAV(Pass == 1 ? MinDummy : MinBuf);
+		P->InQueryMin = GraphBuilder.CreateSRV(Pass == 1 ? MinBuf : MinDummy);
+		P->OutQueryHits = GraphBuilder.CreateUAV(HitBuf);
+		P->OutQueryRecords = GraphBuilder.CreateUAV(RecBuf);
+		P->OutQueryCount = GraphBuilder.CreateUAV(CountBuf);
+		P->NumCells = uint32(F.Cells.Num());
+		P->DispatchGroupsX = GroupsX;
+		P->QueryMode = bNearest ? (Pass == 0 ? 1u : 2u) : 0u;
+		P->QueryDeltaX = F.QueryDelta[0];
+		P->QueryDeltaY = F.QueryDelta[1];
+		P->QueryDeltaZ = F.QueryDelta[2];
+		P->QueryRadius = F.QueryRadiusCm;
+		P->QueryArchMask = F.QueryArchMask;
+		P->QueryMaxAbsMag = F.QueryMaxAbsMag;
+		P->QueryMaxResults = MaxResults;
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Query %s", bNearest ? (Pass == 0 ? TEXT("nearest (min)") : TEXT("nearest (select)")) : TEXT("sphere")), CS, P, Groups);
+	}
+	if (!Slot->Count.IsValid())
+	{
+		Slot->Count = MakeUnique<FRHIGPUBufferReadback>(TEXT("UniQueryCountReadback"));
+		Slot->Hits = MakeUnique<FRHIGPUBufferReadback>(TEXT("UniQueryHitsReadback"));
+		Slot->Records = MakeUnique<FRHIGPUBufferReadback>(TEXT("UniQueryRecordsReadback"));
+	}
+	AddEnqueueCopyPass(GraphBuilder, Slot->Count.Get(), CountBuf, sizeof(uint32));
+	AddEnqueueCopyPass(GraphBuilder, Slot->Hits.Get(), HitBuf, MaxResults * sizeof(FUintVector4));
+	AddEnqueueCopyPass(GraphBuilder, Slot->Records.Get(), RecBuf, MaxResults * UniGpuLayout::ObjectBytes);
+	Slot->FrameNumber = F.FrameNumber;
+	Slot->RequestId = F.QueryRequestId;
+	Slot->MaxResults = MaxResults;
+	Slot->bPending = true;
+}
+
 uint32 FUniRenderer::DynamicPoolBase() { return UniGpuLayout::DynamicPoolBase; }
 uint32 FUniRenderer::DynamicPoolSlots() { return UniGpuLayout::DynamicPoolSlots; }
+uint32 FUniRenderer::MaxQueryResults() { return UniGpuLayout::MaxQueryResults; }
 
 void FUniRenderer::DrainActivations_GameThread(TArray<FUniActivation>& Out)
 {
@@ -178,8 +353,48 @@ void FUniRenderer::SetFrame_GameThread(FUniFrameData&& Data)
 	ENQUEUE_RENDER_COMMAND(UniSetFrame)([Payload](FRHICommandListImmediate&)
 	{
 		TRACE_CPUPROFILER_EVENT_SCOPE(Uni_SetFrame_RT);
+		FUniRenderer::Get().QueueGalaxyCache_RenderThread(*Payload);   // D-211: every frame's boxes, even a frame not rendered
+		FUniRenderer::Get().QueueGalaxyMap_RenderThread(*Payload);     // D-212
 		FUniRenderer::Get().RenderFrame = MoveTemp(*Payload);   // the payload is not used again: move, not copy
 	});
+}
+
+void FUniRenderer::QueueGalaxyCache_RenderThread(const FUniFrameData& F)
+{
+	check(IsInRenderingThread());
+	if (F.GalCacheN == 0u)
+	{
+		GalCachePending.Reset();
+		GalCachePendingVoxels = 0;
+		bGalCacheReady = false;
+		GalCacheEpoch = ~0u;
+		return;
+	}
+	if (F.GalCacheEpoch != GalCacheEpoch)
+	{
+		// A reset bakes every level from scratch: what the textures held no longer counts.
+		GalCachePending.Reset();
+		GalCachePendingVoxels = 0;
+		GalCacheEpoch = F.GalCacheEpoch;
+		bGalCacheReady = true;
+	}
+	for (int32 I = 0; I + 1 < F.GalCacheBoxes.Num(); I += 2)
+	{
+		const FUintVector4& Sz = F.GalCacheBoxes[I + 1];
+		GalCachePending.Add(F.GalCacheBoxes[I]);
+		GalCachePending.Add(Sz);
+		GalCachePendingVoxels += uint64(Sz.X) * Sz.Y * Sz.Z;
+	}
+	// More than two full bakes waiting: the volume pass is not running (hidden viewport, uu.Volume 0).
+	// Drop the queue; the game thread resets the cache and the march leaves it until then.
+	const uint64 Full = uint64(F.GalCacheN) * F.GalCacheN * F.GalCacheN * FMath::Max(F.GalCacheLevels, 1u);
+	if (GalCachePendingVoxels > 2u * Full)
+	{
+		GalCachePending.Reset();
+		GalCachePendingVoxels = 0;
+		bGalCacheReady = false;
+		Stats.bGalCacheLost = true;
+	}
 }
 
 void FUniRenderer::SetTables_GameThread(TArray<UniCore::FSliceGPU> Slices, TArray<float> Lut)
@@ -300,6 +515,88 @@ void FUniRenderer::SetGalaxyTexture_GameThread(int32 Slot, uint32 Size, TArray<T
 	});
 }
 
+void FUniRenderer::QueueGalaxyMap_RenderThread(const FUniFrameData& F)
+{
+	check(IsInRenderingThread());
+	if (F.GalMapEpoch == 0u)
+	{
+		if (GalMapEpochRT != 0u) { GalMapTexture.SafeRelease(); GalMapEpochRT = 0u; bGalMapComplete = false; }
+		return;
+	}
+	if (F.GalMapEpoch != GalMapEpochRT)
+	{
+		// A new galaxy (or size): bake it from the first row; the old map stays out of use.
+		GalMapEpochRT = F.GalMapEpoch;
+		GalMapSizeRT = F.GalMapSize;
+		bGalMapDustRT = F.bGalMapDust != 0u;
+		GalMapParamsRT = { F.GalMapParams[0], F.GalMapParams[1] };
+		GalMapRowsDone = 0u;
+		bGalMapComplete = false;
+		GalMapTexture.SafeRelease();
+		Stats.GalMapBakeFrames = 0u;
+	}
+	GalMapBudgetRT = F.GalMapBudget;
+}
+
+FRDGTextureRef FUniRenderer::RegisterGalaxyMap_RenderThread(FRDGBuilder& GraphBuilder)
+{
+	check(IsInRenderingThread());
+	if (GalMapEpochRT != 0u && !bGalMapComplete && GalMapSizeRT > 0u && GalMapParamsRT.Num() == 2)
+	{
+		// D-212: bake a chunk of rows a frame (the GPU's share of the texel budget), then the mips.
+		const uint32 Size = GalMapSizeRT;
+		const uint32 NumMips = uint32(FMath::FloorLog2(Size)) + 1u;
+		FRDGTextureRef Tex;
+		if (!GalMapTexture.IsValid())
+		{
+			Tex = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(FIntPoint(int32(Size), int32(Size)), PF_FloatRGBA, FClearValueBinding::Black,
+				TexCreate_ShaderResource | TexCreate_UAV, uint8(NumMips)), TEXT("UniGalMap"));
+			GalMapTexture = GraphBuilder.ConvertToExternalTexture(Tex);
+		}
+		else { Tex = GraphBuilder.RegisterExternalTexture(GalMapTexture, TEXT("UniGalMap")); }
+		const uint32 Rows = FMath::Clamp(FMath::Max(GalMapBudgetRT, Size) / Size, 1u, Size - GalMapRowsDone);
+		{
+			FUniGalMapBakeCS::FParameters* P = GraphBuilder.AllocParameters<FUniGalMapBakeCS::FParameters>();
+			P->InMapParams = GraphBuilder.CreateSRV(UploadStructured(GraphBuilder, TEXT("UniGalMapParams"), GalMapParamsRT));
+			P->MapSize = Size;
+			P->MapRow0 = GalMapRowsDone;
+			P->MapRows = Rows;
+			P->bMapDust = bGalMapDustRT ? 1u : 0u;
+			P->OutMap = GraphBuilder.CreateUAV(FRDGTextureUAVDesc(Tex, 0));
+			TShaderMapRef<FUniGalMapBakeCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+			FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.GalaxyMap.Bake rows %u-%u of %u", GalMapRowsDone, GalMapRowsDone + Rows, Size), CS, P,
+				FIntVector(FMath::DivideAndRoundUp(int32(Size), 8), FMath::DivideAndRoundUp(int32(Rows), 8), 1));
+		}
+		GalMapRowsDone += Rows;
+		Stats.GalMapBakeFrames.fetch_add(1u);
+		if (GalMapRowsDone >= Size)
+		{
+			for (uint32 M = 1u; M < NumMips; ++M)
+			{
+				FUniGalMapDownCS::FParameters* P = GraphBuilder.AllocParameters<FUniGalMapDownCS::FParameters>();
+				const uint32 S = FMath::Max(Size >> M, 1u);
+				P->MapSize = S;
+				P->InMapMip = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::CreateForMipLevel(Tex, int32(M - 1u)));
+				P->OutMap = GraphBuilder.CreateUAV(FRDGTextureUAVDesc(Tex, uint8(M)));
+				TShaderMapRef<FUniGalMapDownCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.GalaxyMap.Mip %u (%u^2)", M, S), CS, P, FIntVector(FMath::DivideAndRoundUp(int32(S), 8), FMath::DivideAndRoundUp(int32(S), 8), 1));
+			}
+			bGalMapComplete = true;
+			Stats.GalMapReadyEpoch = GalMapEpochRT;
+		}
+		return Tex;
+	}
+	if (GalMapTexture.IsValid() && bGalMapComplete) { return GraphBuilder.RegisterExternalTexture(GalMapTexture, TEXT("UniGalMap")); }
+	if (!GalMapDummy.IsValid())
+	{
+		FRDGTextureRef D = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(FIntPoint(1, 1), PF_FloatRGBA, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV), TEXT("UniGalMapDummy"));
+		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(D), FLinearColor(0.0f, 0.0f, 0.0f, 0.0f));
+		GalMapDummy = GraphBuilder.ConvertToExternalTexture(D);
+		return D;
+	}
+	return GraphBuilder.RegisterExternalTexture(GalMapDummy, TEXT("UniGalMapDummy"));
+}
+
 FRDGTextureRef FUniRenderer::RegisterGalaxyTexture_RenderThread(FRDGBuilder& GraphBuilder, int32 Slot)
 {
 	check(IsInRenderingThread());
@@ -379,11 +676,20 @@ void FUniRenderer::Release_RenderThread()
 	WebDummy.SafeRelease();
 	WebMipsRT.Empty();
 	for (int32 S = 0; S < GalaxyTextureSlots; ++S) { GalTexture[S].SafeRelease(); GalMipsRT[S].Empty(); }   // D-179
+	GalMapTexture.SafeRelease(); GalMapDummy.SafeRelease(); GalMapEpochRT = 0u; bGalMapComplete = false; GalMapRowsDone = 0u;   // D-212
+	GalCacheA.SafeRelease(); GalCacheB.SafeRelease(); GalCachePending.Reset(); GalCachePendingVoxels = 0; bGalCacheReady = false; GalCacheEpoch = ~0u;   // D-211
 	PromoteRing.Empty();
 	ActivateRing.Empty();
 	{
 		FScopeLock Lock(&ActivationLock);
 		ActivationsReady.Reset();
+	}
+	PickRing.Empty();    // D-193
+	QueryRing.Empty();
+	{
+		FScopeLock Lock(&ApiLock);
+		PicksReady.Reset();
+		QueriesReady.Reset();
 	}
 	for (TRefCountPtr<IPooledRenderTarget>& M : BackgroundMaps) { M.SafeRelease(); }
 	TemporalVolume.SafeRelease(); TemporalSlices.SafeRelease(); TemporalDepth.SafeRelease();   // D-184
@@ -407,7 +713,16 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 	const float TanX = 1.0f / float(Proj.M[0][0]);
 	const float TanY = 1.0f / float(Proj.M[1][1]);
 	const int32 Div = FMath::Clamp(CVarUniVolumeDivisor.GetValueOnRenderThread(), 1, 8);
-	const FIntPoint MarchSize(FMath::Max(OutRect.Width() / Div, 1), FMath::Max(OutRect.Height() / Div, 1));
+	FIntPoint MarchSize(1, 1);
+	// D-196: a pixel budget; D-198: it falls with speed (the travel curve) to uu.VolumeTravelPixelScale
+	// of itself at 10 Mpc/s: past ~8 march pixels of motion a frame the history is dropped and the
+	// glow is the fresh quarter alone (D-194), so detail is not seen there anyway.
+	// Quantised to quarters of the curve: the march size (and so its history) changes only there.
+	const double SpeedQ = FMath::RoundToDouble(double(FMath::Clamp(F.SpeedAmount, 0.0f, 1.0f)) * 4.0) / 4.0;
+	const double TravelScale = FMath::Lerp(1.0, double(FMath::Clamp(CVarUniVolumeTravelPixelScale.GetValueOnRenderThread(), 0.05f, 1.0f)), SpeedQ);
+	// D-200: the auto budget (the GPU frame time) can take it lower still; the smaller wins.
+	const double BudgetScale = FMath::Min(TravelScale, double(FMath::Clamp(F.VolumeBudgetScale, 0.05f, 1.0f)));
+	UniCore::VolumeMarchSize(OutRect.Width(), OutRect.Height(), Div, double(FMath::Max(CVarUniVolumeMaxMarchPixels.GetValueOnRenderThread(), 0)) * BudgetScale, MarchSize.X, MarchSize.Y);
 	OutMarchSize = MarchSize;
 
 	// Shared inputs. The view's ThetaPixel is the march texel's, so prefiltering and
@@ -420,6 +735,72 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 	FRDGTextureRef GalTex[GalaxyTextureSlots];
 	for (int32 S = 0; S < GalaxyTextureSlots; ++S) { GalTex[S] = RegisterGalaxyTexture_RenderThread(GraphBuilder, S); }   // D-179
 	FRHISamplerState* WebSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Wrap>::GetRHI();
+	// D-211: the galaxy cache: bake the queued boxes, then the march reads the textures.
+	FRDGTextureRef CacheTexA = nullptr, CacheTexB = nullptr;
+	if (F.GalCacheN > 0u && VV.CacheCarrier != 0u && F.VolumeCarriers.IsValidIndex(int32(VV.CacheCarrier) - 1))
+	{
+		const FIntVector Size(int32(F.GalCacheN), int32(F.GalCacheN), int32(F.GalCacheLevels * (F.GalCacheN + 2u)));
+		if (!GalCacheA.IsValid() || !GalCacheB.IsValid() || GalCacheSize != Size)
+		{
+			// New textures hold nothing: the cache is usable only if every box since its last
+			// reset is still queued (the first frame after a reset), else the game thread resets.
+			const bool bWasBaking = GalCacheA.IsValid();
+			CacheTexA = GraphBuilder.CreateTexture(FRDGTextureDesc::Create3D(Size, PF_G16R16F, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV), TEXT("UniGalCacheA"));
+			CacheTexB = GraphBuilder.CreateTexture(FRDGTextureDesc::Create3D(Size, PF_R8G8B8A8, FClearValueBinding::White, TexCreate_ShaderResource | TexCreate_UAV), TEXT("UniGalCacheB"));
+			GalCacheA = GraphBuilder.ConvertToExternalTexture(CacheTexA);
+			GalCacheB = GraphBuilder.ConvertToExternalTexture(CacheTexB);
+			GalCacheSize = Size;
+			Stats.GalCacheBytes = uint32(FMath::Min<uint64>(uint64(Size.X) * Size.Y * Size.Z * 8u, 0xFFFFFFFFull));
+			if (bWasBaking) { bGalCacheReady = false; GalCachePending.Reset(); GalCachePendingVoxels = 0; Stats.bGalCacheLost = true; }
+		}
+		else
+		{
+			CacheTexA = GraphBuilder.RegisterExternalTexture(GalCacheA, TEXT("UniGalCacheA"));
+			CacheTexB = GraphBuilder.RegisterExternalTexture(GalCacheB, TEXT("UniGalCacheB"));
+		}
+		if (GalCachePending.Num() >= 2 && GalCachePendingVoxels > 0u)
+		{
+			// Each box's first voxel (the thread that starts it).
+			TArray<FUintVector4> Boxes = MoveTemp(GalCachePending);
+			uint32 First = 0u;
+			for (int32 I = 0; I + 1 < Boxes.Num(); I += 2) { Boxes[I + 1].W = First; First += Boxes[I + 1].X * Boxes[I + 1].Y * Boxes[I + 1].Z; }
+			const uint32 Rows = FMath::DivideAndRoundUp(First, 64u * 65535u);
+			const uint32 PerRow = FMath::DivideAndRoundUp(First, Rows);
+			FUniGalCacheBakeCS::FParameters* P = GraphBuilder.AllocParameters<FUniGalCacheBakeCS::FParameters>();
+			P->InCarriers = GraphBuilder.CreateSRV(UploadStructured(GraphBuilder, TEXT("UniGalCacheCarriers"), F.VolumeCarriers));
+			P->InParams = GraphBuilder.CreateSRV(ParamBuf);
+			P->InCacheBoxes = GraphBuilder.CreateSRV(UploadStructured(GraphBuilder, TEXT("UniGalCacheBoxes"), Boxes));
+			P->NumCacheBoxes = uint32(Boxes.Num() / 2);
+			P->CacheVoxels = First;
+			P->CacheThreadsPerRow = FMath::DivideAndRoundUp(PerRow, 64u) * 64u;
+			P->CacheN = F.GalCacheN;
+			P->CacheLevels = F.GalCacheLevels;
+			P->CacheCarrier = VV.CacheCarrier - 1u;
+			P->CacheV0 = F.GalCacheV0;
+			P->CacheZCap = F.GalCacheZCap;
+			P->CacheScale = F.GalCacheScale;
+			P->CacheFootScale = F.GalCacheFootScale;
+			P->UniGalWarpFine = GalTex[0];
+			P->UniGalWarpLarge = GalTex[1];
+			P->UniGalDetail = GalTex[2];
+			P->UniWebSampler = WebSampler;
+			P->OutCacheA = GraphBuilder.CreateUAV(CacheTexA);
+			P->OutCacheB = GraphBuilder.CreateUAV(CacheTexB);
+			TShaderMapRef<FUniGalCacheBakeCS> CS(GetGlobalShaderMap(View.GetFeatureLevel()));
+			FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Volume.CacheBake %u voxels, %d boxes", First, Boxes.Num() / 2), CS, P,
+				FIntVector(int32(P->CacheThreadsPerRow / 64u), int32(Rows), 1));
+			Stats.GalCacheVoxelsBaked.fetch_add(First);
+			GalCachePendingVoxels = 0;
+		}
+		if (!bGalCacheReady) { VV.CacheCarrier = 0u; }
+	}
+	else
+	{
+		VV.CacheCarrier = 0u;
+	}
+	if (!CacheTexA) { CacheTexA = RegisterNanDummy_RenderThread(GraphBuilder); CacheTexB = CacheTexA; }
+	FRDGTextureRef MapTex = RegisterGalaxyMap_RenderThread(GraphBuilder);   // D-212
+	if (!(bGalMapComplete && F.GalMapEpoch == GalMapEpochRT && GalMapEpochRT != 0u)) { VV.MapCarrier = 0u; }   // a map baked for this frame's request only
 	auto FillCommonWith = [&](FUniVolumeCommonParameters& C, const TArray<UniCore::FCarrierGPU>& Carriers, const UniCore::FVolumeViewGPU& V, FRDGBufferRef InParamBuf, FRDGBufferRef InLutBuf)
 	{
 		C.UniWebTexture = WebTex;
@@ -427,6 +808,9 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		C.UniGalWarpFine = GalTex[0];   // D-179
 		C.UniGalWarpLarge = GalTex[1];
 		C.UniGalDetail = GalTex[2];
+		C.UniGalCacheA = CacheTexA;     // D-211
+		C.UniGalCacheB = CacheTexB;
+		C.UniGalMap = MapTex;           // D-212
 		TArray<UniCore::FVolumeViewGPU> One; One.Add(V);
 		One[0].NumCarriers = uint32(Carriers.Num());
 		C.InCarriers = GraphBuilder.CreateSRV(UploadStructured(GraphBuilder, TEXT("UniVolumeCarriers"), Carriers));
@@ -465,12 +849,36 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 	// and costs about what marching it per pixel does now that the web is a texture (D-164), so
 	// it is marched with the local carriers instead; at rest the map is cheaper and is used.
 	const int32 BgMode = FMath::Clamp(CVarUniBackgroundMode.GetValueOnRenderThread(), 0, 2);
-	if (F.BackgroundVersion != BgLastVersion) { BgLastVersion = F.BackgroundVersion; BgStillFrames = 0; } else { ++BgStillFrames; }
+	if (F.BackgroundVersion != BgLastVersion)
+	{
+		BgDirtyInterval = BgLastVersion == ~0u ? (1 << 30) : BgStillFrames + 1;
+		BgLastVersion = F.BackgroundVersion;
+		BgStillFrames = 0;
+	}
+	else { ++BgStillFrames; }
 	// D-169: the web debug view marches the background carriers (the web) per pixel.
 	const int32 WebDebug = FMath::Clamp(CVarUniWebDebug.GetValueOnRenderThread(), 0, 6);
 	const uint32 VolDebugMode = WebDebug > 0 ? 5u : uint32(FMath::Clamp(CVarUniVolumeDebug.GetValueOnRenderThread(), 0, 4));
-	const bool bPerPixelBackground = F.BackgroundCarriers.Num() > 0
-		&& (WebDebug > 0 || BgMode == 1 || (BgMode == 2 && BgStillFrames < FMath::Max(CVarUniBackgroundStillFrames.GetValueOnRenderThread(), 1)));
+	{
+		// D-196: mode 2 marches the background per pixel only while it changes so often that a
+		// map refresh per change (six faces) would cost more than marching it with every pixel
+		// (about a quarter of the march's pixels a frame, sliced): fast travel. A change now and
+		// then (drifting inside a galaxy, a LUT tweak) refreshes the map, cross-faded, instead:
+		// before, any change put the background into every pixel's march for StillFrames frames,
+		// about doubling the march's steps inside a galaxy. It leaves per-pixel marching once
+		// the background has been still for StillFrames frames, as before (hysteresis).
+		const int32 Cs = FMath::Clamp(CVarUniBackgroundSize.GetValueOnRenderThread(), 16, 1024);
+		const double MapRays = 6.0 * double(Cs) * double(Cs);
+		const double PixelRays = FMath::Max(double(MarchSize.X) * double(MarchSize.Y) * 0.25, 1.0);
+		const int32 Want = CVarUniBackgroundPerPixelInterval.GetValueOnRenderThread();
+		const int32 Interval = Want > 0 ? Want : FMath::Clamp(int32(FMath::CeilToDouble(MapRays / PixelRays)), 2, 120);
+		const int32 Still = FMath::Max(CVarUniBackgroundStillFrames.GetValueOnRenderThread(), 1);
+		if (BgMode != 2) { bBgPerPixel = false; }
+		else if (!bBgPerPixel) { bBgPerPixel = BgStillFrames == 0 && BgDirtyInterval <= Interval; }
+		else if (BgStillFrames >= Still) { bBgPerPixel = false; }
+	}
+	const bool bPerPixelBackground = F.BackgroundCarriers.Num() > 0 && (WebDebug > 0 || BgMode == 1 || (BgMode == 2 && bBgPerPixel));
+	if (bPerPixelBackground) { Stats.BackgroundPerPixelFrames++; }
 	if (bPerPixelBackground)
 	{
 		// The map is stale once we move; when the map comes back it is marched whole first (no
@@ -517,6 +925,13 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 			BgSnapParams = F.VolumeParams;
 			BgSnapLut = F.VolumeLut;
 			BgSnapView = F.VolumeView;
+			BgSnapView.WebHintScale = 1.0f;   // D-202: the map is kept, so it is marched at full quality (the speed's looser hints are per-pixel only)
+			// D-203: no cell glow in the map: it is kept across frames while cells load and fade in,
+			// so their glow would stay baked in after their sprites arrive (per pixel it is fresh).
+			BgSnapView.GlowLevels = 0u;
+			for (int32 K = 0; K < 4; ++K) { BgSnapView.GlowMask[K] = 0u; }
+			BgSnapView.CacheCarrier = 0u;   // D-211: the map marches the background carriers alone
+			BgSnapView.MapCarrier = 0u;     // D-212
 			BgFillVersion = F.BackgroundVersion;
 			BgFillMask = 0x3Fu;
 			bBgFilling = true;
@@ -535,6 +950,7 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 				P->FaceBase = Face;
 				P->OutCube = GraphBuilder.CreateUAV(Maps[BgBack]);
 				TShaderMapRef<FUniVolumeBackgroundCS> CS(GetGlobalShaderMap(View.GetFeatureLevel()));
+				RDG_EVENT_SCOPE(GraphBuilder, "Uni.Volume.BackgroundMap");   // D-196: ProfileGPU shows scopes
 				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Volume.Background face %u", Face), CS, P, FIntVector(FMath::DivideAndRoundUp(CubeSize, 8), FMath::DivideAndRoundUp(CubeSize, 8), 1));
 				BgFillMask &= ~(1u << Face);
 				--Budget;
@@ -584,10 +1000,26 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 	// Without it every pixel is marched straight into the frame's volume (which becomes the
 	// history). Debug views march every pixel.
 	const bool bTemporalOn = CVarUniVolumeTemporal.GetValueOnRenderThread() != 0 && VolDebugMode == 0u && MarchSize.X >= 4 && MarchSize.Y >= 4;
-	const bool bSlice = bTemporalOn && bTemporalHave && TemporalSize == MarchSize && F.bCameraStepValid && F.FrameNumber == TemporalLastFrame + 1
-		&& TemporalVolume.IsValid() && TemporalSlices.IsValid() && TemporalDepth.IsValid();
-	const uint32 Phase = bSlice ? (TemporalPhase + 1u) & 3u : 0u;
-	const FUintVector2 SliceOffset(Phase == 1u || Phase == 2u ? 1u : 0u, Phase == 1u || Phase == 3u ? 1u : 0u);   // Uni_TemporalOffset
+	const bool bHistory = bTemporalHave && TemporalVolume.IsValid() && TemporalSlices.IsValid() && TemporalDepth.IsValid();
+	const bool bSlice = bTemporalOn && bHistory && TemporalSize == MarchSize && F.bCameraStepValid && F.FrameNumber == TemporalLastFrame + 1;
+	// D-209: why a frame was not sliced (uu.Perf), first reason only.
+	const int32 NoSlice = !bTemporalOn ? 5 : !bHistory ? 6 : TemporalSize != MarchSize ? 7 : !F.bCameraStepValid ? 8 : F.FrameNumber == TemporalLastFrame ? 9 : 10;
+	// D-208: the interleave from how far the image moves a frame (march pixels): the view's turn,
+	// plus the camera's step over the nearest marched structure's distance.
+	uint32 Interleave = 2u;
+	if (bSlice)
+	{
+		const float ThetaPix = 2.0f * TanX / float(FMath::Max(MarchSize.X, 1));
+		const FVector3f Fw(View.GetViewDirection()), Rt(View.GetViewRight());
+		const float Turn = FMath::Max(FVector3f::CrossProduct(Fw, TemporalPrevForward).Size(), FVector3f::CrossProduct(Rt, TemporalPrevRight).Size());
+		const float StepCm = F.CameraStepCm.Size();
+		const float Move = StepCm > 0.0f ? (F.VolumeNearCm > 0.0f ? StepCm / F.VolumeNearCm : 1.0e9f) : 0.0f;
+		const float MotionPx = (Turn + Move) / FMath::Max(ThetaPix, 1.0e-9f);
+		Interleave = UniHlsl::Uni_TemporalInterleave(MotionPx, uint32(FMath::Clamp(CVarUniVolumeInterleave.GetValueOnRenderThread(), 2, 4)));
+	}
+	const uint32 Phase = bSlice ? UniHlsl::Uni_TemporalPack(++TemporalStep, Interleave) : 0u;
+	const UniHlsl::uint2 SliceOff = UniHlsl::Uni_TemporalOffset(Phase);
+	const FUintVector2 SliceOffset(SliceOff.x, SliceOff.y);
 	FRDGTextureRef MarchVol = VolumeTex, MarchSlices = Slices, MarchDepth = DepthTex;
 	if (bSlice)
 	{
@@ -609,14 +1041,22 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		P->WebDebugDepthCm = float(double(FMath::Max(CVarUniWebDebugDepth.GetValueOnRenderThread(), 0.1f)) * 3.0856775814913673e24);
 		P->WebDebugThreshold = FMath::Max(CVarUniWebDebugThreshold.GetValueOnRenderThread(), 1.0e-3f);
 		P->WebDebugOpacity = FMath::Max(CVarUniWebDebugOpacity.GetValueOnRenderThread(), 0.0f);
-		P->bSliceMarch = bSlice ? 1u : 0u;
+		P->bSliceMarch = bSlice ? Interleave : 0u;   // D-208: N (2..4)
 		P->SliceOffset = SliceOffset;
 		P->OutVolume = GraphBuilder.CreateUAV(MarchVol);
 		P->OutSlices = GraphBuilder.CreateUAV(MarchSlices);
 		P->OutDepth = GraphBuilder.CreateUAV(MarchDepth);
 		TShaderMapRef<FUniVolumeMarchCS> CS(GetGlobalShaderMap(View.GetFeatureLevel()));
-		const FIntPoint Grid = bSlice ? FIntPoint((MarchSize.X + 1) / 2, (MarchSize.Y + 1) / 2) : MarchSize;
-		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Volume.March %dx%d, %d carriers%s%s", MarchSize.X, MarchSize.Y, MarchCarriers.Num(), bPerPixelBackground ? TEXT(" (with the background)") : TEXT(""), bSlice ? TEXT(", 1/4 sliced") : TEXT("")), CS, P, FComputeShaderUtils::GetGroupCount(Grid, 8));
+		const FIntPoint Grid = bSlice ? FIntPoint(FMath::DivideAndRoundUp(MarchSize.X, int32(Interleave)), FMath::DivideAndRoundUp(MarchSize.Y, int32(Interleave))) : MarchSize;
+		TemporalInterleave = bSlice ? Interleave : 1u;
+		Stats.VolumeMarchWidth = uint32(MarchSize.X);
+		Stats.VolumeMarchHeight = uint32(MarchSize.Y);
+		Stats.VolumeMarchRays = uint32(Grid.X) * uint32(Grid.Y);
+		Stats.VolumeMarchFlags = (bPerPixelBackground ? 1u : 0u) | (bSlice ? 2u : 0u) | ((bSlice ? Interleave : 1u) << 8);
+		Stats.VolumeSliceCounts[bSlice ? int32(Interleave) : NoSlice].fetch_add(1u);
+		// D-196: ProfileGPU shows scopes (not pass names): the scope says what was marched.
+		RDG_EVENT_SCOPE(GraphBuilder, "%s", bPerPixelBackground ? TEXT("Uni.Volume.March+Background") : TEXT("Uni.Volume.March"));
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Volume.March %dx%d, %d carriers%s%s", MarchSize.X, MarchSize.Y, MarchCarriers.Num(), bPerPixelBackground ? TEXT(" (with the background)") : TEXT(""), bSlice ? (Interleave == 4u ? TEXT(", 1/16 sliced") : (Interleave == 3u ? TEXT(", 1/9 sliced") : TEXT(", 1/4 sliced"))) : TEXT("")), CS, P, FComputeShaderUtils::GetGroupCount(Grid, 8));
 	}
 	if (bSlice)
 	{
@@ -632,6 +1072,8 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		P->PrevUp = TemporalPrevUp; P->TemporalPhase = Phase;
 		P->CamStep = F.CameraStepCm; P->bHistory = 1u;
 		P->PrevWarpVelBeta = TemporalPrevWarp;   // D-190
+		P->TemporalClamp = FVector4f(CVarUniVolumeTemporalClamp.GetValueOnRenderThread() != 0 ? 1.0f : 0.0f,
+			FMath::Max(CVarUniVolumeTemporalTightPx.GetValueOnRenderThread(), 0.01f), FMath::Max(CVarUniVolumeTemporalMaxPx.GetValueOnRenderThread(), 0.0f), 0.0f);   // D-194
 		P->FreshVolume = MarchVol; P->FreshSlices = MarchSlices; P->FreshDepth = MarchDepth;
 		P->HistVolume = GraphBuilder.RegisterExternalTexture(TemporalVolume, TEXT("UniVolumeHistory"));
 		P->HistSlices = GraphBuilder.RegisterExternalTexture(TemporalSlices, TEXT("UniVolumeHistorySlices"));
@@ -640,6 +1082,7 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		P->OutSlices = GraphBuilder.CreateUAV(Slices);
 		P->OutDepth = GraphBuilder.CreateUAV(DepthTex);
 		TShaderMapRef<FUniVolumeReconstructCS> CS(GetGlobalShaderMap(View.GetFeatureLevel()));
+		RDG_EVENT_SCOPE(GraphBuilder, "Uni.Volume.Reconstruct");   // D-196
 		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Volume.Reconstruct %dx%d", MarchSize.X, MarchSize.Y), CS, P, FComputeShaderUtils::GetGroupCount(MarchSize, 8));
 	}
 	// D-184: this frame's volume is the next frame's history.
@@ -691,6 +1134,7 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		P->RenderTargets[0] = FRenderTargetBinding(Output.Texture, ERenderTargetLoadAction::ELoad);
 		TShaderMapRef<FUniVolumeCompositeVS> VS(GetGlobalShaderMap(View.GetFeatureLevel()));
 		TShaderMapRef<FUniVolumeCompositePS> PS(GetGlobalShaderMap(View.GetFeatureLevel()));
+		RDG_EVENT_SCOPE(GraphBuilder, "Uni.Volume.Composite");   // D-196
 		GraphBuilder.AddPass(RDG_EVENT_NAME("Uni.Volume.Composite"), P, ERDGPassFlags::Raster,
 			[P, VS, PS, OutRect](FRHICommandList& RHICmdList)
 			{
@@ -755,6 +1199,19 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 	AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(ActIndexBuf), 0u);
 	AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(ActRecordBuf), 0u);
 
+	// D-193: finished pick / query readbacks; this frame's pick (once per frame: the first view
+	// drawing it) needs each sprite's source from the project pass.
+	CollectApiReadbacks_RenderThread();
+	if (PickRing.Num() == 0) { for (int32 I = 0; I < 3; ++I) { PickRing.Add(MakeShared<FPickReadback>()); } }
+	TSharedPtr<FPickReadback> PickSlot;
+	if (F.PickRequestId != 0 && F.FrameNumber != LastPickFrame)
+	{
+		for (const TSharedPtr<FPickReadback>& R : PickRing) { if (!R->bPending) { PickSlot = R; break; } }
+	}
+	const bool bPick = PickSlot.IsValid();
+	FRDGBufferRef SpriteSourceBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(FUintVector2), bPick ? UniGpuLayout::MaxSprites : 1u), TEXT("UniSpriteSource"));
+	if (!bPick) { AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(SpriteSourceBuf), 0u); }   // bound, never written
+
 	// Planet records (D-143) into the reserved pool tail, before the project pass reads them.
 	if (F.DynamicRecords.Num() > 0)
 	{
@@ -798,6 +1255,10 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 		P->OutActivate = GraphBuilder.CreateUAV(ActIndexBuf);
 		P->OutActivateRecord = GraphBuilder.CreateUAV(ActRecordBuf);
 		P->OutActivateCount = ActCountUAV;
+		P->OutSpriteSource = GraphBuilder.CreateUAV(SpriteSourceBuf);   // D-193
+		P->WriteSpriteSource = bPick ? 1u : 0u;
+		P->InHandoffs = GraphBuilder.CreateSRV(UploadStructured(GraphBuilder, TEXT("UniCarrierHandoffs"), F.CarrierHandoffs));   // D-196
+		P->NumHandoffs = uint32(F.CarrierHandoffs.Num());
 		P->NumCells = uint32(F.Cells.Num());
 		P->MaxSprites = UniGpuLayout::MaxSprites;
 		P->MaxPromote = UniGpuLayout::MaxPromote;
@@ -826,6 +1287,48 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 		P->DispatchGroupsX = GroupsX;
 		TShaderMapRef<FUniProjectCS> CS(GetGlobalShaderMap(View.GetFeatureLevel()));
 		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.ProjectAndCull %d cells", F.Cells.Num()), CS, P, Groups);
+	}
+
+	// D-193: the pick, over the sprites just written: best score, lowest index at it, then its
+	// source and record, read back through the ring.
+	if (bPick)
+	{
+		LastPickFrame = F.FrameNumber;
+		FRDGBufferRef BestBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), 2), TEXT("UniPickBest"));
+		FRDGBufferDesc ResultDesc = FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), UniGpuLayout::PickResultWords);
+		ResultDesc.Usage |= EBufferUsageFlags::SourceCopy;
+		FRDGBufferRef ResultBuf = GraphBuilder.CreateBuffer(ResultDesc, TEXT("UniPickResult"));
+		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(BestBuf), 0u);     // [0] best score bits, [1] ~index: 0 is "none"
+		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(ResultBuf), 0u);
+		auto Params = [&]()
+		{
+			FUniPickParameters* P = GraphBuilder.AllocParameters<FUniPickParameters>();
+			P->InCells = GraphBuilder.CreateSRV(CellBuf);
+			P->InPool = GraphBuilder.CreateSRV(PoolBuf);
+			P->InSprites = GraphBuilder.CreateSRV(SpriteBuf);
+			P->InSpriteSource = GraphBuilder.CreateSRV(SpriteSourceBuf);
+			P->InDrawArgs = GraphBuilder.CreateSRV(ArgsBuf, PF_R32_UINT);
+			P->OutPickBest = GraphBuilder.CreateUAV(BestBuf);
+			P->OutPickResult = GraphBuilder.CreateUAV(ResultBuf);
+			P->MaxSprites = UniGpuLayout::MaxSprites;
+			P->CursorNdc = F.PickCursorNdc;
+			P->HalfViewPx = FVector2f(float(OutRect.Width()) * 0.5f, float(OutRect.Height()) * 0.5f);
+			P->PixelsPerRadian = PixelsPerRadian;
+			P->PickMinPx = FMath::Max(F.PickMinPx, 0.5f);
+			return P;
+		};
+		const FIntVector SpriteGroups(int32(FMath::DivideAndRoundUp(UniGpuLayout::MaxSprites, 64u)), 1, 1);
+		TShaderMapRef<FUniPickScoreCS> ScoreCS(GetGlobalShaderMap(View.GetFeatureLevel()));
+		TShaderMapRef<FUniPickSelectCS> SelectCS(GetGlobalShaderMap(View.GetFeatureLevel()));
+		TShaderMapRef<FUniPickResolveCS> ResolveCS(GetGlobalShaderMap(View.GetFeatureLevel()));
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Pick.Score"), ScoreCS, Params(), SpriteGroups);
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Pick.Select"), SelectCS, Params(), SpriteGroups);
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Pick.Resolve"), ResolveCS, Params(), FIntVector(1, 1, 1));
+		if (!PickSlot->Result.IsValid()) { PickSlot->Result = MakeUnique<FRHIGPUBufferReadback>(TEXT("UniPickReadback")); }
+		AddEnqueueCopyPass(GraphBuilder, PickSlot->Result.Get(), ResultBuf, UniGpuLayout::PickResultWords * sizeof(uint32));
+		PickSlot->FrameNumber = F.FrameNumber;
+		PickSlot->RequestId = F.PickRequestId;
+		PickSlot->bPending = true;
 	}
 
 	// Promotion candidates: count readback (ring of 3, never waited on).
@@ -906,6 +1409,13 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 			R->bPending = true;
 			ActivateRingNext = (ActivateRingNext + 1) % ActivateRing.Num();
 		}
+	}
+
+	// D-193: this frame's resident query (once per frame), over the cell table and pool.
+	if (F.QueryRequestId != 0 && F.FrameNumber != LastQueryFrame)
+	{
+		LastQueryFrame = F.FrameNumber;
+		AddQuery_RenderThread(GraphBuilder, F, View.GetFeatureLevel(), CellBuf, PoolBuf);
 	}
 
 	// Volume (D-128..D-136): drawn first so sprites can read its transmittance slices.
@@ -1034,6 +1544,7 @@ struct FUniGpuGenBackend::FRequest
 	TUniquePtr<FRHIGPUBufferReadback> ObjectReadback;     // place: the read ranges, concatenated
 	FPhase Probe;
 	FPhase Place;
+	bool bFused = false;                                  // D-207: one trip; Place tracks it, counts come back with it
 };
 
 FUniGpuGenBackend::FUniGpuGenBackend() {}
@@ -1146,6 +1657,8 @@ void FUniGpuGenBackend::SubmitPlace(std::shared_ptr<UniCore::FGenBatch> Batch)
 			P->InLut = GraphBuilder.CreateSRV(LutBuf);
 			P->OutPool = GraphBuilder.CreateUAV(PoolBuf);
 			P->OutAccepted = GraphBuilder.CreateUAV(AccBuf);
+			P->InAlloc = GraphBuilder.CreateSRV(UploadStructured(GraphBuilder, TEXT("UniGenAllocNone"), TArray<FUintVector4>()));   // D-207: unused (UseAlloc 0)
+			P->UseAlloc = 0u;
 			P->NumTasks = NumTasks;
 			P->UniWebTexture = R.RegisterWebTexture_RenderThread(GraphBuilder);   // D-164
 			P->UniWebSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Wrap>::GetRHI();
@@ -1192,6 +1705,115 @@ void FUniGpuGenBackend::SubmitPlace(std::shared_ptr<UniCore::FGenBatch> Batch)
 	});
 }
 
+void FUniGpuGenBackend::SubmitFused(std::shared_ptr<UniCore::FGenBatch> Batch)
+{
+	check(IsInGameThread());
+	TRACE_CPUPROFILER_EVENT_SCOPE(Uni_GenSubmitFused);
+	TSharedPtr<FRequest, ESPMode::ThreadSafe> Req = MakeShared<FRequest, ESPMode::ThreadSafe>();
+	Req->Batch = Batch;
+	Req->bFused = true;
+	Req->Probe.bCopied = true;   // one phase: Place tracks the whole trip
+	Req->Place.StartTime = FPlatformTime::Seconds();
+	if (!UniShadersEnabled())
+	{
+		Batch->bFailed = true;
+		Req->Place.bCopied = true;
+		Requests.Add(Batch->Ticket, Req);
+		return;
+	}
+	// Allocated HERE, on the calling thread, not in the render command (lesson #24).
+	Req->CountReadback = MakeUnique<FRHIGPUBufferReadback>(TEXT("UniGenCountReadback"));
+	Req->AcceptedReadback = MakeUnique<FRHIGPUBufferReadback>(TEXT("UniGenAcceptedReadback"));
+	Requests.Add(Batch->Ticket, Req);
+
+	struct FFusedPayload
+	{
+		TArray<UniCore::FGenTaskGPU> Tasks;
+		uint32 ArenaBase = 0, ArenaCap = 0, MaxPerCell = 0;
+	};
+	TSharedRef<FFusedPayload, ESPMode::ThreadSafe> Payload = MakeShared<FFusedPayload, ESPMode::ThreadSafe>();
+	Payload->Tasks.Append(Batch->Tasks.data(), int32(Batch->Tasks.size()));
+	Payload->ArenaBase = Batch->ArenaBase;
+	Payload->ArenaCap = Batch->ArenaCap;
+	Payload->MaxPerCell = Batch->MaxPerCell;
+
+	ENQUEUE_RENDER_COMMAND(UniGenFused)([Req, Payload](FRHICommandListImmediate& RHICmdList)
+	{
+		Req->Place.StartTime = FPlatformTime::Seconds();   // the timeout runs from execution, not from enqueue
+		TRACE_CPUPROFILER_EVENT_SCOPE(Uni_GenFused_RT);
+		const uint32 NumTasks = uint32(Payload->Tasks.Num());
+		if (NumTasks == 0) { Req->Place.bSubmitted = true; return; }
+		FRDGBuilder GraphBuilder(RHICmdList);
+		FUniRenderer& R = FUniRenderer::Get();
+		FRDGBufferRef TaskBuf = UploadStructured(GraphBuilder, TEXT("UniGenTasks"), Payload->Tasks);
+		FRDGBufferDesc CountDesc = FRDGBufferDesc::CreateStructuredDesc(UniGpuLayout::TaskCountBytes, NumTasks);
+		CountDesc.Usage |= EBufferUsageFlags::SourceCopy;
+		FRDGBufferRef CountBuf = GraphBuilder.CreateBuffer(CountDesc, TEXT("UniGenCounts"));
+		FRDGBufferRef AllocBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(FUintVector4), NumTasks), TEXT("UniGenAlloc"));
+		FRDGBufferDesc AccDesc = FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), NumTasks);
+		AccDesc.Usage |= EBufferUsageFlags::SourceCopy;
+		FRDGBufferRef AccBuf = GraphBuilder.CreateBuffer(AccDesc, TEXT("UniGenAccepted"));
+		uint32 GroupsX = 1;
+		const FIntVector Groups = WrappedGroups(NumTasks, GroupsX);
+		{
+			FUniGenProbeCS::FParameters* P = GraphBuilder.AllocParameters<FUniGenProbeCS::FParameters>();
+			P->InTasks = GraphBuilder.CreateSRV(TaskBuf);
+			P->OutCounts = GraphBuilder.CreateUAV(CountBuf);
+			P->NumTasks = NumTasks;
+			P->DispatchGroupsX = GroupsX;
+			P->UniWebTexture = R.RegisterWebTexture_RenderThread(GraphBuilder);   // D-164
+			P->UniWebSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Wrap>::GetRHI();
+			P->UniGalWarpFine = R.RegisterGalaxyTexture_RenderThread(GraphBuilder, 0);   // D-179
+			P->UniGalWarpLarge = R.RegisterGalaxyTexture_RenderThread(GraphBuilder, 1);
+			P->UniGalDetail = R.RegisterGalaxyTexture_RenderThread(GraphBuilder, 2);
+			TShaderMapRef<FUniGenProbeCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+			FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Gen.Probe %u tasks (one trip)", NumTasks), CS, P, Groups);
+		}
+		{
+			FUniGenAllocCS::FParameters* P = GraphBuilder.AllocParameters<FUniGenAllocCS::FParameters>();
+			P->InTasks = GraphBuilder.CreateSRV(TaskBuf);
+			P->InCounts = GraphBuilder.CreateSRV(CountBuf);
+			P->OutAlloc = GraphBuilder.CreateUAV(AllocBuf);
+			P->NumTasks = NumTasks;
+			P->DispatchGroupsX = 1u;
+			P->ArenaBase = Payload->ArenaBase;
+			P->ArenaCap = Payload->ArenaCap;
+			P->MaxPerCell = Payload->MaxPerCell;
+			TShaderMapRef<FUniGenAllocCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+			FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Gen.Alloc %u tasks", NumTasks), CS, P, FIntVector(1, 1, 1));
+		}
+		{
+			FUniGenPlaceCS::FParameters* P = GraphBuilder.AllocParameters<FUniGenPlaceCS::FParameters>();
+			P->InTasks = GraphBuilder.CreateSRV(TaskBuf);
+			P->InCounts = GraphBuilder.CreateSRV(CountBuf);
+			P->InSlices = GraphBuilder.CreateSRV(R.RegisterSlices_RenderThread(GraphBuilder));
+			P->InLut = GraphBuilder.CreateSRV(R.RegisterLut_RenderThread(GraphBuilder));
+			P->OutPool = GraphBuilder.CreateUAV(R.RegisterPool_RenderThread(GraphBuilder));
+			P->OutAccepted = GraphBuilder.CreateUAV(AccBuf);
+			P->InAlloc = GraphBuilder.CreateSRV(AllocBuf);
+			P->UseAlloc = 1u;
+			P->NumTasks = NumTasks;
+			P->DispatchGroupsX = GroupsX;
+			P->UniWebTexture = R.RegisterWebTexture_RenderThread(GraphBuilder);
+			P->UniWebSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Wrap>::GetRHI();
+			P->UniGalWarpFine = R.RegisterGalaxyTexture_RenderThread(GraphBuilder, 0);
+			P->UniGalWarpLarge = R.RegisterGalaxyTexture_RenderThread(GraphBuilder, 1);
+			P->UniGalDetail = R.RegisterGalaxyTexture_RenderThread(GraphBuilder, 2);
+			TShaderMapRef<FUniGenPlaceCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+			FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Gen.Place %u tasks (one trip)", NumTasks), CS, P, Groups);
+		}
+		AddEnqueueCopyPass(GraphBuilder, Req->CountReadback.Get(), CountBuf, NumTasks * UniGpuLayout::TaskCountBytes);
+		AddEnqueueCopyPass(GraphBuilder, Req->AcceptedReadback.Get(), AccBuf, NumTasks * sizeof(uint32));
+		GraphBuilder.Execute();
+		Req->Place.bSubmitted = true;
+	});
+}
+
+bool FUniGpuGenBackend::PollFused(const UniCore::FGenBatch& Batch)
+{
+	return Poll(Batch, true);
+}
+
 bool FUniGpuGenBackend::Poll(const UniCore::FGenBatch& Batch, bool bPlace)
 {
 	check(IsInGameThread());
@@ -1224,7 +1846,7 @@ bool FUniGpuGenBackend::Poll(const UniCore::FGenBatch& Batch, bool bPlace)
 	if (!Ph.bSubmitted || Ph.bCopyEnqueued) { return false; }
 	if (!bPlace && Req->Batch->Tasks.empty()) { Req->Batch->Counts.clear(); Ph.bCopied = true; return true; }
 	FRHIGPUBufferReadback* RbA = bPlace ? Req->AcceptedReadback.Get() : Req->CountReadback.Get();
-	FRHIGPUBufferReadback* RbB = bPlace ? Req->ObjectReadback.Get() : nullptr;
+	FRHIGPUBufferReadback* RbB = bPlace ? (Req->bFused ? Req->CountReadback.Get() : Req->ObjectReadback.Get()) : nullptr;   // D-207: a one trip brings its counts back with it
 	if (!RbA->IsReady() || (RbB && !RbB->IsReady())) { return false; }
 	// Lock() is render-thread only (lesson #24): marshal the copy there.
 	Ph.bCopyEnqueued = true;
@@ -1252,6 +1874,19 @@ bool FUniGpuGenBackend::Poll(const UniCore::FGenBatch& Batch, bool bPlace)
 				const void* Src = Req->AcceptedReadback->Lock(uint32(N * sizeof(uint32)));
 				FMemory::Memcpy(B->Accepted.data(), Src, N * sizeof(uint32));
 				Req->AcceptedReadback->Unlock();
+			}
+			if (Req->bFused)
+			{
+				// D-207: the counts (the streamer recomputes the ranges from them, FuseAllocate).
+				B->Counts.resize(N);
+				if (N)
+				{
+					const void* Src = Req->CountReadback->Lock(uint32(N * sizeof(UniCore::FTaskCountGPU)));
+					FMemory::Memcpy(B->Counts.data(), Src, N * sizeof(UniCore::FTaskCountGPU));
+					Req->CountReadback->Unlock();
+				}
+				Req->Place.bCopied = true;
+				return;
 			}
 			size_t Total = 0;
 			for (const auto& R : B->ReadRanges) { Total += R.second; }

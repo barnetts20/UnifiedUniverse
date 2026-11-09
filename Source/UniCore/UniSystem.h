@@ -231,6 +231,21 @@ namespace UniCore
 		FCoord Star;
 		FSystem Sys;
 		u64 ActivatedFrame = 0;
+		FObjectId StarId;           // D-193: the star's identity, when the report named it
+		bool bStarIdKnown = false;
+		u32 StarArchetype = 0;      // D-193: its archetype id (from the record)
+	};
+
+	/** D-193: which planet a dynamic cell of Build's output is (for the API's events and
+	 *  lookups: a planet is named by its star and its ordinal). */
+	struct FPlanetCellRef
+	{
+		u32 StarSeed = 0;
+		FObjectId StarId;
+		bool bStarIdKnown = false;
+		int Planet = 0;
+		u32 PlanetSeed = 0;
+		FCellKey Cell;
 	};
 
 	/** D-143 amendment: each planet is drawn from its own small cell, rebuilt every frame, so its
@@ -250,7 +265,7 @@ namespace UniCore
 		/** A star inside its activation radius, as the project pass saw it. Duplicates are
 		 *  ignored (keyed by the star's seed); reports already outside the hysteresis radius
 		 *  (a stale readback) are rejected. */
-		void Report(const FCellKey& Cell, const FObjectGPU& Star, const FCoord& Camera, u64 Frame)
+		void Report(const FCellKey& Cell, const FObjectGPU& Star, const FCoord& Camera, u64 Frame, const FObjectId* StarId = nullptr)
 		{
 			const u32 Seed = Star.B[0];
 			if (Active.count(Seed)) { return; }
@@ -262,6 +277,8 @@ namespace UniCore
 			const double D = Length(ToDouble(Sub(A.Star, Camera)));
 			if (D > double(UniHlsl::UNI_SYSTEM_HYSTERESIS) * A.Sys.ActivationCm) { ++Rejected; return; }
 			A.ActivatedFrame = Frame;
+			if (StarId) { A.StarId = *StarId; A.bStarIdKnown = true; }
+			A.StarArchetype = Star.A[3] & 0xFFFFu;
 			Active.emplace(Seed, A);
 			++Activations;
 		}
@@ -281,12 +298,13 @@ namespace UniCore
 		 *  pass. Records start at pool slot PoolBase; at most Capacity are written. Planets in
 		 *  Promoted (D-147) are flagged UNI_OBJ_FLAG_PROMOTED: their actor draws them. */
 		void Build(const FCoord& Camera, double TimeS, u32 PoolBase, u32 Capacity, std::vector<FCellGPU>& OutCells, std::vector<FObjectGPU>& OutRecords,
-			const std::set<u32>* Promoted = nullptr) const
+			const std::set<u32>* Promoted = nullptr, std::vector<FPlanetCellRef>* OutRefs = nullptr) const
 		{
 			for (const auto& KV : Active)
 			{
 				const FActiveSystem& A = KV.second;
 				if (OutRecords.size() + A.Sys.Planets.size() > Capacity) { break; }
+				int Ordinal = 0;
 				for (const FPlanet& P : A.Sys.Planets)
 				{
 					FCoord Pc = A.Star;
@@ -308,6 +326,8 @@ namespace UniCore
 					OutRecords.push_back(PlanetRecord(A, P, Pc, K, Camera, TimeS));
 					if (Promoted && Promoted->count(P.Seed)) { OutRecords.back().A[3] |= (UniHlsl::UNI_OBJ_FLAG_PROMOTED << 16); }
 					OutCells.push_back(G);
+					if (OutRefs) { OutRefs->push_back(FPlanetCellRef{ A.Sys.StarSeed, A.StarId, A.bStarIdKnown, Ordinal, P.Seed, K }); }
+					++Ordinal;
 				}
 			}
 		}

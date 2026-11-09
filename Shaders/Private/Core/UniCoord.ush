@@ -314,4 +314,61 @@ UNI_FN float3 Uni_ObjectRelative(uint4 InCellDeltaX, uint4 InCellDeltaY, uint4 I
 		Uni_S128ToFloat(DZ) - InCameraFraction.z);
 }
 
+/** D-204: a cell's context for placing its objects relative to the camera. A cell the camera is
+ *  at least one cell width from, on some axis (its objects are then at least a cell width
+ *  away), keeps its origin as two floats, Hi + Lo (Uni_S128ToHiLo), and its objects cost float
+ *  adds: Hi + ((Lo + offset x 2^(L-32)) - camera fraction). The inner sum is at most about a
+ *  cell width, so it rounds by 2^-24 of that; the outer add by 2^-24 of the result: together at
+ *  most twice the exact path's 2^-24 of the object's distance. The cells around the camera (and
+ *  levels under 32, whose offsets truncate to whole cm) keep the exact integer path (D-104).
+ *  Built once per cell (per thread of the cell's group), not per object. */
+struct FUniCellRel
+{
+	uint4 DX;
+	uint4 DY;
+	uint4 DZ;
+	float3 Hi;
+	uint Level;
+	float3 Lo;
+	uint bFar;
+};
+
+UNI_FN FUniCellRel Uni_CellRel(uint4 InCellDeltaX, uint4 InCellDeltaY, uint4 InCellDeltaZ, uint InLevel)
+{
+	FUniCellRel C;
+	C.DX = InCellDeltaX;
+	C.DY = InCellDeltaY;
+	C.DZ = InCellDeltaZ;
+	C.Level = InLevel;
+	float Hx = 0.0f, Lx = 0.0f, Hy = 0.0f, Ly = 0.0f, Hz = 0.0f, Lz = 0.0f;
+	Uni_S128ToHiLo(InCellDeltaX, Hx, Lx);
+	Uni_S128ToHiLo(InCellDeltaY, Hy, Ly);
+	Uni_S128ToHiLo(InCellDeltaZ, Hz, Lz);
+	C.Hi = float3(Hx, Hy, Hz);
+	C.Lo = float3(Lx, Ly, Lz);
+	// The gap from the camera to the cell along each axis: the origin ahead (d >= 0) or the far
+	// side behind (-d - W). Past one cell width on any axis, every object is that far away.
+	const float W = exp2((float)InLevel);
+	const float Dx = Hx + Lx, Dy = Hy + Ly, Dz = Hz + Lz;
+	const float Gx = Dx >= 0.0f ? Dx : -Dx - W;
+	const float Gy = Dy >= 0.0f ? Dy : -Dy - W;
+	const float Gz = Dz >= 0.0f ? Dz : -Dz - W;
+	C.bFar = (InLevel >= 32u && InLevel < 128u && max(Gx, max(Gy, Gz)) >= W * 1.0001f) ? 1u : 0u;
+	return C;
+}
+
+/** D-204: an object's camera-relative vector from its cell's context: float adds for a far cell,
+ *  Uni_ObjectRelative (exact integer, D-104) otherwise. */
+UNI_FN float3 Uni_ObjectRelativeC(FUniCellRel InC, uint3 InOffset, float3 InCameraFraction)
+{
+	if (InC.bFar != 0u)
+	{
+		const float S = exp2((float)InC.Level - 32.0f);
+		return float3(InC.Hi.x + ((InC.Lo.x + (float)InOffset.x * S) - InCameraFraction.x),
+			InC.Hi.y + ((InC.Lo.y + (float)InOffset.y * S) - InCameraFraction.y),
+			InC.Hi.z + ((InC.Lo.z + (float)InOffset.z * S) - InCameraFraction.z));
+	}
+	return Uni_ObjectRelative(InC.DX, InC.DY, InC.DZ, InOffset, InC.Level, InCameraFraction);
+}
+
 #endif // UNI_COORD_USH

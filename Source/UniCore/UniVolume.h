@@ -72,14 +72,27 @@ namespace UniCore
 		float SliceLnTHi;
 		u32 MaxSubsamples;   // D-157
 		float DustSigmaRgb[3];
-		float Pad1;
+		float WebHintScale;     // D-202: the step hints of periodic (background) carriers x this (0: 1)
 		float TailDim;          // D-189 (0: physical)
 		float WebGlowGain;
 		float WebGlowDepthCm;
-		float SkyPad;
+		float HintScale;        // D-195: the step hints of carriers around the camera x this (0: 1)
+		u32 GlowMask[4];        // D-203: levels with cells still loading or fading in (their grids follow the LUT blocks)
+		u32 GlowBase;           // float4 index of the first grid header in the LUT buffer
+		u32 GlowLevels;         // set bits in GlowMask (0: no cell glow)
+		u32 MarchFlags;         // D-206: bit 0: no shared web texel reads (checks only)
+		u32 GalaxyConstBase;    // D-210: params index of the galaxy constant blocks (one per parameter block); 0: hash inline
+		u32 CacheBase;          // D-211: the galaxy cache's header in the LUT buffer
+		u32 CacheCarrier;       // the cached carrier's index + 1 (0: no cache)
+		u32 CacheN;             // voxels a level side
+		u32 CacheLevels;
+		u32 MapCarrier;         // D-212: the mapped carrier's index + 1 (0: none)
+		u32 MapSize;            // texels a side of the map's mip 0
+		u32 MapPad0;
+		u32 MapPad1;
 	};
-	static_assert(sizeof(FVolumeViewGPU) == 64, "FVolumeViewGPU must match FUniVolumeView (UniVolume.ush)");
-	static_assert(sizeof(HV::FUniVolumeView) == 64, "shim FUniVolumeView layout");
+	static_assert(sizeof(FVolumeViewGPU) == 128, "FVolumeViewGPU must match FUniVolumeView (UniVolume.ush)");
+	static_assert(sizeof(HV::FUniVolumeView) == 128, "shim FUniVolumeView layout");
 
 	inline HV::FUniCarrier ToHlsl(const FCarrierGPU& C) { HV::FUniCarrier H; std::memcpy(static_cast<void*>(&H), &C, sizeof(H)); return H; }
 	inline HV::FUniVolumeView ToHlsl(const FVolumeViewGPU& V) { HV::FUniVolumeView H; std::memcpy(static_cast<void*>(&H), &V, sizeof(H)); return H; }
@@ -203,8 +216,9 @@ namespace UniCore
 		return Fl;
 	}
 
-	/** l(t) per child not drawn as a sprite, horizon-dimmed and exposure-scaled. */
-	inline void UnresolvedAt(const FUnresolvedTable& T, const FLutFrame& F, const std::vector<double>& Fl, double Tcm, double Out[3])
+	/** l(t) per child not drawn as a sprite, horizon-dimmed and exposure-scaled. D-197: Keep, the
+	 *  share of the children generated (FUniEmitter::SpriteKeep): only those can be drawn. */
+	inline void UnresolvedAt(const FUnresolvedTable& T, const FLutFrame& F, const std::vector<double>& Fl, double Tcm, double Out[3], double Keep = 1.0)
 	{
 		Out[0] = Out[1] = Out[2] = 0.0;
 		const double Mu = 5.0 * std::log10(std::max(Tcm, 1.0) / kTenPcCm);
@@ -214,7 +228,7 @@ namespace UniCore
 			const FUnresolvedTable::FRow& R = T.Rows[I];
 			double G[3];
 			T.G(R, X, G);
-			for (int K = 0; K < 3; ++K) { Out[K] += R.P * (R.LbarRgb[K] - Fl[I] * G[K]); }
+			for (int K = 0; K < 3; ++K) { Out[K] += R.P * (R.LbarRgb[K] - Keep * Fl[I] * G[K]); }
 		}
 		const double Dim = double(HV::Uni_HorizonDimming(float(Tcm)));
 		const double Exp = std::pow(10.0, 0.4 * F.ExposureMag);
@@ -233,13 +247,18 @@ namespace UniCore
 		return F > 0.0 && std::isfinite(F) ? std::exp2(-std::round(std::log2(F))) : 1.0;
 	}
 
-	inline u32 BuildEmissionLut(const FUnresolvedTable& T, const FLutFrame& F, std::vector<HV::float4>& Lut, double Scale = 1.0)
+	/** D-203: bDrawn appends, after the emission and tail blocks, one block per child level q from
+	 *  the table's first level: D_q(t), the light drawn as sprites at that level (what the
+	 *  emission block subtracts for it), horizon-dimmed and exposure-scaled like l(t). The march
+	 *  adds (1 - cell fade) D_q(t) where a cell is still loading (Uni_CellGlow). The emission
+	 *  block's first entry's w holds first level + 256 x count (0: none). */
+	inline u32 BuildEmissionLut(const FUnresolvedTable& T, const FLutFrame& F, std::vector<HV::float4>& Lut, double Scale = 1.0, double Keep = 1.0, bool bDrawn = false)
 	{
 		const u32 Block = u32(Lut.size() / HV::UNI_VOL_LUT_SIZE);
 		const int N = int(HV::UNI_VOL_LUT_SIZE);
 		const std::vector<double> Fl = RowFades(T, F);
 		std::vector<std::array<double, 3>> E(static_cast<size_t>(N));
-		for (int I = 0; I < N; ++I) { UnresolvedAt(T, F, Fl, LutT(I), E[size_t(I)].data()); Lut.push_back(HV::float4(float(E[size_t(I)][0] * Scale), float(E[size_t(I)][1] * Scale), float(E[size_t(I)][2] * Scale), 0.0f)); }
+		for (int I = 0; I < N; ++I) { UnresolvedAt(T, F, Fl, LutT(I), E[size_t(I)].data(), Keep); Lut.push_back(HV::float4(float(E[size_t(I)][0] * Scale), float(E[size_t(I)][1] * Scale), float(E[size_t(I)][2] * Scale), 0.0f)); }
 		// Tail: past t_hi the integrand falls as t^-2 (dimming) at constant l, so the remainder is
 		// l(t_hi) t_hi. Inside, sub-sampled trapezoids in ln t (dt = t d ln t).
 		std::vector<std::array<double, 3>> Tail(static_cast<size_t>(N));
@@ -255,12 +274,42 @@ namespace UniCore
 				const double A = (double(S) + 0.5) / double(Sub);
 				const double Tm = std::exp(std::log(LutT(I)) + A * Dln);
 				double V[3];
-				UnresolvedAt(T, F, Fl, Tm, V);
+				UnresolvedAt(T, F, Fl, Tm, V, Keep);
 				for (int K = 0; K < 3; ++K) { Acc[size_t(K)] += V[K] * Tm * Dln / double(Sub); }
 			}
 			Tail[size_t(I)] = Acc;
 		}
 		for (int I = 0; I < N; ++I) { Lut.push_back(HV::float4(float(Tail[size_t(I)][0] * Scale), float(Tail[size_t(I)][1] * Scale), float(Tail[size_t(I)][2] * Scale), 0.0f)); }
+		if (bDrawn && !T.Rows.empty())
+		{
+			int Lo = T.Rows.front().Level, Hi = Lo;
+			for (const FUnresolvedTable::FRow& R : T.Rows) { Lo = std::min(Lo, R.Level); Hi = std::max(Hi, R.Level); }
+			const int Count = Hi - Lo + 1;
+			if (Lo >= 0 && Lo < 128 && Count <= int(HV::UNI_VOL_GLOW_LEVELS))
+			{
+				const double Exp = std::pow(10.0, 0.4 * F.ExposureMag);
+				for (int Q = 0; Q < Count; ++Q)
+				{
+					for (int I = 0; I < N; ++I)
+					{
+						const double Tcm = LutT(I);
+						const double X = F.LimitingMag - 5.0 * std::log10(std::max(Tcm, 1.0) / kTenPcCm);
+						double D[3] = { 0.0, 0.0, 0.0 };
+						for (size_t Ri = 0; Ri < T.Rows.size(); ++Ri)
+						{
+							const FUnresolvedTable::FRow& R = T.Rows[Ri];
+							if (R.Level != Lo + Q || !(Fl[Ri] > 0.0)) { continue; }
+							double G[3];
+							T.G(R, X, G);
+							for (int K = 0; K < 3; ++K) { D[K] += R.P * Keep * Fl[Ri] * G[K]; }
+						}
+						const double Dim = double(HV::Uni_HorizonDimming(float(Tcm)));
+						Lut.push_back(HV::float4(float(D[0] * Dim * Exp * Scale), float(D[1] * Dim * Exp * Scale), float(D[2] * Dim * Exp * Scale), 0.0f));
+					}
+				}
+				Lut[size_t(Block) * size_t(N)].w = float(Lo + 256 * Count);
+			}
+		}
 		return Block;
 	}
 
@@ -305,16 +354,84 @@ namespace UniCore
 	// Carriers (D-129)
 	// ======================================================================================
 
+	/** D-196: the volume march's size for an output view: the output / Divisor, then scaled
+	 *  down (aspect kept) to at most MaxPixels when that is positive. The glow is smooth, and
+	 *  its cost is the rays marched: on a large viewport half resolution was 0.5 Mpx (about
+	 *  130k rays a frame, sliced), for no visible gain over ~0.26 Mpx. Small carriers are
+	 *  supersampled by the march texel's size either way (Uni_CarrierSubsamplesRay). */
+	inline void VolumeMarchSize(int InOutW, int InOutH, int InDivisor, double InMaxPixels, int& OutW, int& OutH)
+	{
+		const int Div = std::max(InDivisor, 1);
+		OutW = std::max(InOutW / Div, 1);
+		OutH = std::max(InOutH / Div, 1);
+		const double N = double(OutW) * double(OutH);
+		if (InMaxPixels > 0.0 && N > InMaxPixels)
+		{
+			const double K = std::sqrt(InMaxPixels / N);
+			OutW = std::max(int(double(OutW) * K), 4);
+			OutH = std::max(int(double(OutH) * K), 4);
+		}
+	}
+
+	/** D-209: the end (float4 entries) of the LUT's blocks: the cell-glow grids (D-203) follow
+	 *  them and change size whenever a level starts or finishes loading, so a test for "the LUT's
+	 *  layout changed" (the background map's) compares this, not the buffer's size. */
+	inline u32 LutBlocksEnd(u32 InGlowLevels, u32 InGlowBase, size_t InLutSize, u32 InCacheBase = 0u)
+	{
+		u32 E = InGlowLevels > 0u ? std::min(InGlowBase, u32(InLutSize)) : u32(InLutSize);
+		if (InCacheBase > 0u) { E = std::min(E, InCacheBase); }   // D-211: the galaxy cache's header follows too
+		return E;
+	}
+
+	/** D-200: the volume march's pixel budget follows the GPU frame time (dynamic resolution for
+	 *  the glow alone). Levels are fixed (each ~0.92x the march's linear size; 1 down to 0.35 of
+	 *  the budget), changed at most once per HoldFrames, so the march size, and its history,
+	 *  changes rarely. Down when the smoothed GPU time is over the target by 3%; up when under it
+	 *  by 15% (hysteresis: a level that only just fits is kept). Off (scale 1) without a target. */
+	struct FVolumeAutoBudget
+	{
+		static constexpr int NumLevels = 7;
+		static constexpr double Scales[NumLevels] = { 1.0, 0.84, 0.71, 0.6, 0.5, 0.42, 0.35 };
+		int Level = 0;
+		int SinceChange = 0;
+		double SmoothMs = 0.0;
+		bool bPrimed = false;
+		u32 Changes = 0;
+
+		double Scale() const { return Scales[std::clamp(Level, 0, NumLevels - 1)]; }
+
+		/** One frame: the GPU's last frame time (ms) against the target (ms; <= 0: off). Returns
+		 *  the budget's scale for this frame. */
+		double Update(double InGpuMs, double InTargetMs, int InHoldFrames = 20)
+		{
+			if (!(InTargetMs > 0.0) || !(InGpuMs > 0.0) || !std::isfinite(InGpuMs))
+			{
+				if (!(InTargetMs > 0.0)) { Level = 0; SinceChange = 0; bPrimed = false; }
+				return Scale();
+			}
+			SmoothMs = bPrimed ? SmoothMs + 0.15 * (InGpuMs - SmoothMs) : InGpuMs;
+			bPrimed = true;
+			++SinceChange;
+			if (SinceChange < std::max(InHoldFrames, 1)) { return Scale(); }
+			if (SmoothMs > 1.03 * InTargetMs && Level < NumLevels - 1) { ++Level; SinceChange = 0; ++Changes; }
+			else if (SmoothMs < 0.85 * InTargetMs && Level > 0) { --Level; SinceChange = 0; ++Changes; }
+			return Scale();
+		}
+	};
+
 	struct FVolumeSettings
 	{
-		float StepRatio = 0.08f;
+		float StepRatio = 0.32f;  // D-195: 0.08 -> 0.24; D-199: 0.32 (T2.vol.perf_inside p95 <= 0.61%, T3.vol.march 0.72%)
+		float HintScale = 3.0f;   // D-195: step hints x 2 in carriers around the camera (uu.VolumeHintScale); D-198: x 3 (T2.vol.perf_inside p95 0.41%)
+		float WebHintScale = 1.0f; // D-202: the background web's step hints x this (the engine raises it with travel speed)
 		float MinStepCm = 1.0e15f;
 		u32 MaxSteps = 512;
 		u32 MaxSubsamples = 8;   // D-157: rays per pixel axis cap (uu.VolumeMaxSubsamples)
 		bool bLutStart = true;   // D-160: emission-only carriers start where their LUT becomes significant
 		bool bPrefilter = true;  // D-160: galaxies sampled prefiltered over the pixel footprint (no disc / arm supersampling)
 		u32 MaxCarriers = 128;   // D-161: 64 -> 128 (a cluster core had 62)
-		double LocalStartCm = 3.0856775814913673e18;      // 1 pc
+		double LocalStartCm = 3.0856775814913673e19;      // D-195: 1 -> 10 pc (uu.VolumeStartPc; the first 10 pc of a
+		                                                  // galaxy column is ~1e-4 of it and cost ~60 log steps)
 		double BackgroundStartCm = 3.0856775814913673e23; // 0.1 Mpc: nearer galaxies are resolved, and the first 0.1 Mpc of an
 		                                                  // r_H-long column is ~2e-5 of the background (log steps from 1 pc cost ~350)
 		double BackgroundPeriods = 0.5;                   // march extent (50 Mpc for the demo web); the analytic tail follows
@@ -324,16 +441,48 @@ namespace UniCore
 		float TailDim = 0.0f;                             // D-189: the web in the sky (uu.SkyWeb): 0 physical
 		float WebGlowGain = 0.0f;
 		float WebGlowDepthCm = 1.5428387907456837e26f;    // 50 Mpc
-		float TexturedWebStepRatio = 0.2f;                // D-164: log step ratio of a textured web carrier (T3.webtex.background: same light as 0.08, 30% fewer steps)
+		/** D-203: cell glow: the LUT carries each table's drawn light per level, and the source's
+		 *  loading cells (FVolumeSource::CellGlow) are drawn as glow by the march. */
+		bool bCellGlow = false;
+		/** D-210: write the galaxy constant blocks (FUniVolumeView::GalaxyConstBase): the march reads
+		 *  each galaxy's per-object hashes instead of computing them per step (bit for bit the same). */
+		bool bGalaxyConst = true;
+		float TexturedWebStepRatio = 0.4f;                // D-164: log step ratio of a textured web carrier (T3.webtex.background: same light as 0.08, 30% fewer steps);
+		                                                  // D-199: 0.2 -> 0.4 (50 -> 40 steps a texel; cube light -0.13%, correlation 0.999, unchanged: the texture's hint bounds it)
+	};
+
+	/** D-196: a local carrier's share of its parent object's light, as built this frame: the
+	 *  handoff curve (Uni_CarrierHandoff) x the cap fade (D-161). The object's sprite draws the
+	 *  rest (1 - Hand); an object with no entry (no carrier this frame: over the cap, its
+	 *  integral not ready, its contributor asleep, or no volume) keeps its whole sprite. */
+	struct FCarrierHandoff
+	{
+		FObjectId Parent;
+		float Hand = 0.0f;
+	};
+
+	/** D-211: the camera's own galaxy: the local prefiltered galaxy carrier whose cut sphere holds
+	 *  the camera (the most weighted when several do), for the galaxy cache. */
+	struct FCarrierHome
+	{
+		int Carrier = -1;           // its index among the scene's local (non-periodic) carriers, as the engine and Subset(false) order them; -1: none
+		FObjectId Parent;           // its object (the cache's identity)
+		double CamField[3] = { 0.0, 0.0, 0.0 };   // the camera in its field units, in double
 	};
 
 	struct FVolumeScene
 	{
 		std::vector<FCarrierGPU> Carriers;
+		std::vector<FCarrierHandoff> Handoffs;   // D-196: one per local carrier built
 		std::vector<FFieldParamsGPU> Params;
 		std::vector<HV::float4> Lut;
 		FVolumeViewGPU View{};
+		FCarrierHome Home;            // D-211
 		size_t CarriersSkipped = 0;   // over the cap
+		/** D-208: the nearest marched structure (cm): over the carriers, where the march starts
+		 *  (TStart) or, from outside a local carrier, its sphere if farther. The renderer's
+		 *  temporal slicing measures the camera's step against it. 0: no carrier. */
+		double NearCm = 0.0;
 
 		/** The same scene with only the periodic (background) carriers, or only the local ones.
 		 *  Parameters and LUTs are shared, so indices stay valid. The engine marches the
@@ -345,6 +494,7 @@ namespace UniCore
 			O.Carriers.clear();
 			for (const FCarrierGPU& C : Carriers) { if (((C.Flags & HV::UNI_CARRIER_PERIODIC) != 0u) == bPeriodic) { O.Carriers.push_back(C); } }
 			O.View.NumCarriers = u32(O.Carriers.size());
+			if (bPeriodic) { O.Home = FCarrierHome{}; O.View.CacheCarrier = 0u; }   // D-211: the home is a local carrier
 			return O;
 		}
 
@@ -370,9 +520,13 @@ namespace UniCore
 		 *  from the streamer's per-frame measured distances. The carrier build then rejects far
 		 *  contributors with no per-contributor map walk or 128-bit work. */
 		std::function<std::vector<const FContributor*>(double)> NearContributors;
+		/** D-203: optional: the levels with cells still loading or fading in (FUniStreamer). */
+		std::function<std::vector<FCellGlowLevel>()> CellGlow;
 
 		template <typename T, typename = void> struct THasMeasured : std::false_type {};
 		template <typename T> struct THasMeasured<T, std::void_t<decltype(std::declval<const T&>().NearContributors(0.0))>> : std::true_type {};
+		template <typename T, typename = void> struct THasCellGlow : std::false_type {};
+		template <typename T> struct THasCellGlow<T, std::void_t<decltype(std::declval<const T&>().CellGlow())>> : std::true_type {};
 		template <typename T, typename = void> struct THasRequestIntegral : std::false_type {};
 		template <typename T> struct THasRequestIntegral<T, std::void_t<decltype(std::declval<const T&>().RequestIntegral(std::declval<const FContributor&>()))>> : std::true_type {};
 
@@ -387,6 +541,7 @@ namespace UniCore
 			{
 				S.NearContributors = [&P](double MinTheta) { return P.NearContributors(MinTheta); };
 			}
+			if constexpr (THasCellGlow<T>::value) { S.CellGlow = [&P]() { return P.CellGlow(); }; }
 			return S;
 		}
 	};
@@ -421,6 +576,10 @@ namespace UniCore
 		float ForceLevelFade = -1.0f;
 		/** Test hook: skip local carriers, or the background. */
 		bool bLocal = true, bBackground = true;
+		/** D-203 test hooks: per-level fades (F_L) in place of the source's, and cell glow grids in
+		 *  place of the source's (with bCellGlow). */
+		std::map<int, float> ForceLevelFades;
+		const std::vector<FCellGlowLevel>* GlowOverride = nullptr;
 
 		/** From anything FVolumeSource::From accepts: FRefPipeline or FUniStreamer. */
 		template <typename T>
@@ -459,7 +618,8 @@ namespace UniCore
 			F.LimitingMag = View.LimitingMag;
 			F.ExposureMag = View.ExposureMag;
 			const float Force = ForceLevelFade;
-			F.LevelFade = [&P, Force](int L) { return Force >= 0.0f ? Force : P.LevelFade(L); };
+			const std::map<int, float>* ForceL = &ForceLevelFades;
+			F.LevelFade = [&P, Force, ForceL](int L) { const auto It = ForceL->find(L); return It != ForceL->end() ? It->second : (Force >= 0.0f ? Force : P.LevelFade(L)); };
 			std::map<u32, u32> Block;
 			for (const auto& KV : Tables)
 			{
@@ -467,7 +627,7 @@ namespace UniCore
 				// those change (most frames they do not; a rebuild is ~4k table evaluations).
 				// Quantised to 1e-3 (fades step by 1/8 per frame; magnitudes are user settings).
 				auto Q = [](double V) { return std::round(V * 1000.0) / 1000.0; };
-				std::vector<double> Key = { Q(F.LimitingMag), Q(F.ExposureMag) };
+				std::vector<double> Key = { Q(F.LimitingMag), Q(F.ExposureMag), S.bCellGlow ? 1.0 : 0.0 };
 				for (double Fv : RowFades(KV.second, F)) { Key.push_back(Q(Fv)); }
 				FLutCache& Cache = LutCache[KV.first];
 				Block[KV.first] = u32(Out.Lut.size() / HV::UNI_VOL_LUT_SIZE);
@@ -475,12 +635,42 @@ namespace UniCore
 				{
 					Cache.Key = Key;
 					Cache.Lut.clear();
-					BuildEmissionLut(KV.second, F, Cache.Lut, LutScale(KV.second));
+					BuildEmissionLut(KV.second, F, Cache.Lut, LutScale(KV.second), 1.0, S.bCellGlow);
 					++LutRebuilds;
 				}
 				Out.Lut.insert(Out.Lut.end(), Cache.Lut.begin(), Cache.Lut.end());
 				SigStart[KV.first] = LutSignificantStart(Cache.Lut);
 			}
+
+			// D-197: emission blocks for thinned emitters (SpriteKeep < 1: only Keep of the children
+			// exist to be drawn), per (child, keep), cached like the full blocks.
+			std::map<std::pair<u32, int>, u32> KeepBlock;
+			std::map<std::pair<u32, int>, double> KeepSigStart;
+			auto KeepBlockOf = [&](u32 Child, double Keep, double& OutSigStart) -> u32
+			{
+				const int Kq = int(std::lround(std::clamp(Keep, 0.0, 1.0) * 1000.0));
+				if (Kq >= 1000) { OutSigStart = SigStart[Child]; return Block.at(Child); }
+				const std::pair<u32, int> Id{ Child, Kq };
+				const auto It = KeepBlock.find(Id);
+				if (It != KeepBlock.end()) { OutSigStart = KeepSigStart[Id]; return It->second; }
+				auto Q = [](double V) { return std::round(V * 1000.0) / 1000.0; };
+				std::vector<double> Key = { Q(F.LimitingMag), Q(F.ExposureMag), double(Kq), S.bCellGlow ? 1.0 : 0.0 };
+				for (double Fv : RowFades(Tables.at(Child), F)) { Key.push_back(Q(Fv)); }
+				FLutCache& Cache = KeepLutCache[Id];
+				if (Cache.Key != Key)
+				{
+					Cache.Key = Key;
+					Cache.Lut.clear();
+					BuildEmissionLut(Tables.at(Child), F, Cache.Lut, LutScale(Tables.at(Child)), double(Kq) / 1000.0, S.bCellGlow);
+					++LutRebuilds;
+				}
+				const u32 B = u32(Out.Lut.size() / HV::UNI_VOL_LUT_SIZE);
+				Out.Lut.insert(Out.Lut.end(), Cache.Lut.begin(), Cache.Lut.end());
+				KeepBlock[Id] = B;
+				KeepSigStart[Id] = LutSignificantStart(Cache.Lut);
+				OutSigStart = KeepSigStart[Id];
+				return B;
+			};
 
 			// Background: one periodic carrier per root emitter.
 			if (bBackground)
@@ -501,7 +691,8 @@ namespace UniCore
 					G.FieldId = C.Emitter->FieldId;
 					G.ParamIndex = u32(Out.Params.size());
 					Out.Params.push_back(C.Params.Pack());
-					G.LutIndex = Block.at(C.Emitter->ChildArchetypeId);
+					double KeepSigRoot = 0.0;
+					G.LutIndex = KeepBlockOf(C.Emitter->ChildArchetypeId, C.Keep, KeepSigRoot);   // D-197
 					const double I = Gen.IntegralAll(C);   // the period mean
 					G.Amplitude = float(C.NTotal * kTenPcCm * kTenPcCm * Period / I / LutScale(Tables.at(C.Emitter->ChildArchetypeId)));
 					G.Weight = 1.0f;
@@ -547,7 +738,7 @@ namespace UniCore
 			};
 
 			// Local carriers: resident contributors, ranked by angular size, capped.
-			struct FCand { double Theta; FCarrierGPU G; FFieldParamsGPU Par; FFieldParamsGPU Dust; bool bDust; FFieldParamsGPU Palette; bool bPalette = false; };
+			struct FCand { double Theta; FCarrierGPU G; FFieldParamsGPU Par; FFieldParamsGPU Dust; bool bDust; FFieldParamsGPU Palette; bool bPalette = false; FObjectId Parent; float Hand = 0.0f; double CamD[3] = { 0.0, 0.0, 0.0 }; };
 			std::vector<FCand> Cands;
 			if (bLocal)
 			{
@@ -591,19 +782,23 @@ namespace UniCore
 					if (P.IntegralReady && !P.IntegralReady(C)) { continue; }
 					FCand Cd;
 					Cd.Theta = Theta;
+					Cd.Parent = C.Parent;   // D-196: the sprite hands over exactly what the carrier takes
+					Cd.Hand = W;
 					FCarrierGPU& G = Cd.G;
 					G = FCarrierGPU{};
 					const double Inv = 1.0 / C.InfluenceCm;
 					for (int A = 0; A < 3; ++A)
 					{
-						G.CamLocal[A] = float((double(C.Rot[A * 3 + 0]) * Dx + double(C.Rot[A * 3 + 1]) * Dy + double(C.Rot[A * 3 + 2]) * Dz) * Inv);
+						Cd.CamD[A] = (double(C.Rot[A * 3 + 0]) * Dx + double(C.Rot[A * 3 + 1]) * Dy + double(C.Rot[A * 3 + 2]) * Dz) * Inv;   // D-211
+						G.CamLocal[A] = float(Cd.CamD[A]);
 						G.Rot0[A] = C.Rot[A];
 						G.Rot1[A] = C.Rot[3 + A];
 						G.Rot2[A] = C.Rot[6 + A];
 					}
 					G.InvRadius = float(Inv);
 					G.FieldId = C.Emitter->FieldId;
-					G.LutIndex = Block.at(C.Emitter->ChildArchetypeId);
+					double KeepSig = 0.0;
+					G.LutIndex = KeepBlockOf(C.Emitter->ChildArchetypeId, C.Keep, KeepSig);   // D-197
 					const double I = Gen.IntegralAll(C);
 					G.Amplitude = float(C.NTotal * kTenPcCm * kTenPcCm / (I * C.InfluenceCm * C.InfluenceCm) / LutScale(Tables.at(C.Emitter->ChildArchetypeId)));
 					G.Weight = Weight;
@@ -633,7 +828,7 @@ namespace UniCore
 					// child is resolved (drawn as a sprite), so the unresolved emission is < 1e-6 of
 					// its peak, but the log-uniform steps from 1 pc there were ~190 per ray from inside
 					// a cluster. Dust absorbs at any distance, so dusty carriers keep the 1 pc start.
-					if (!Cd.bDust && S.bLutStart) { G.TStart = float(std::max(S.LocalStartCm, SigStart[C.Emitter->ChildArchetypeId])); }
+					if (!Cd.bDust && S.bLutStart) { G.TStart = float(std::max(S.LocalStartCm, KeepSig)); }
 					if (S.bPrefilter && C.Emitter->FieldId == HV::UNI_FIELD_GALAXY) { G.Flags |= HV::UNI_CARRIER_PREFILTER; }
 					// D-191: a rich cluster's intracluster light rides on its own carrier: the same
 					// field sample, a second LUT block (every child's light: never resolved as
@@ -660,9 +855,12 @@ namespace UniCore
 				for (size_t I = 0; I < S.MaxCarriers; ++I)
 				{
 					const double Th = Cands[I].Theta;
-					Cands[I].G.Weight = float(double(Cands[I].G.Weight) * std::clamp((Th - ThetaDrop) / (0.25 * Th), 0.0, 1.0));
+					const double Keep = std::clamp((Th - ThetaDrop) / (0.25 * Th), 0.0, 1.0);
+					Cands[I].G.Weight = float(double(Cands[I].G.Weight) * Keep);
+					Cands[I].Hand = float(double(Cands[I].Hand) * Keep);   // D-196
 				}
 			}
+			float HomeWeight = 0.0f;   // D-211
 			for (size_t I = 0; I < Cands.size(); ++I)
 			{
 				if (Out.Carriers.size() >= S.MaxCarriers) { Out.CarriersSkipped = Cands.size() - I; break; }
@@ -671,10 +869,81 @@ namespace UniCore
 				Out.Params.push_back(Cd.Par);
 				if (Cd.bDust) { Cd.G.DustParamIndex = u32(Out.Params.size()); Out.Params.push_back(Cd.Dust); }
 				if (Cd.bPalette) { Cd.G.PaletteIndex = u32(Out.Params.size()); Out.Params.push_back(Cd.Palette); }
+				// D-211: the camera's own galaxy (inside its cut sphere, prefiltered), the most weighted.
+				if (Cd.G.FieldId == HV::UNI_FIELD_GALAXY && (Cd.G.Flags & HV::UNI_CARRIER_PREFILTER) != 0u
+					&& Cd.CamD[0] * Cd.CamD[0] + Cd.CamD[1] * Cd.CamD[1] + Cd.CamD[2] * Cd.CamD[2] < 1.0
+					&& (Out.Home.Carrier < 0 || Cd.G.Weight > HomeWeight))
+				{
+					int Local = 0;
+					for (const FCarrierGPU& Q : Out.Carriers) { if ((Q.Flags & HV::UNI_CARRIER_PERIODIC) == 0u) { ++Local; } }
+					Out.Home.Carrier = Local;
+					Out.Home.Parent = Cd.Parent;
+					for (int A = 0; A < 3; ++A) { Out.Home.CamField[A] = Cd.CamD[A]; }
+					HomeWeight = Cd.G.Weight;
+				}
 				Out.Carriers.push_back(Cd.G);
+				if (Cd.Hand > 0.0f) { Out.Handoffs.push_back(FCarrierHandoff{ Cd.Parent, Cd.Hand }); }   // D-196
 			}
 
+			// D-208: the nearest marched structure.
+			Out.NearCm = 0.0;
+			for (const FCarrierGPU& C : Out.Carriers)
+			{
+				double D = double(C.TStart);
+				if ((C.Flags & HV::UNI_CARRIER_PERIODIC) == 0u && C.InvRadius > 0.0f)
+				{
+					const double L = std::sqrt(double(C.CamLocal[0]) * C.CamLocal[0] + double(C.CamLocal[1]) * C.CamLocal[1] + double(C.CamLocal[2]) * C.CamLocal[2]);
+					if (L > 1.0) { D = std::max(D, (L - 1.0) / double(C.InvRadius)); }
+				}
+				if (D > 0.0 && (Out.NearCm <= 0.0 || D < Out.NearCm)) { Out.NearCm = D; }
+			}
 			FVolumeViewGPU& V = Out.View;
+			// D-203: the loading levels' cell grids, after every LUT block: per level (ascending) a
+			// header pair, (corner relative to the camera, cm; cell width) and (sides; the float
+			// index of its first fade), then the fades, four to an entry.
+			if (S.bCellGlow)
+			{
+				std::vector<FCellGlowLevel> Glow;
+				if (GlowOverride) { Glow = *GlowOverride; }
+				else if (P.CellGlow) { Glow = P.CellGlow(); }
+				Glow.erase(std::remove_if(Glow.begin(), Glow.end(), [](const FCellGlowLevel& G) { return G.Level < 0 || G.Level >= 128 || G.Fades.empty() || !(G.CellCm > 0.0); }), Glow.end());
+				std::sort(Glow.begin(), Glow.end(), [](const FCellGlowLevel& A, const FCellGlowLevel& B) { return A.Level < B.Level; });
+				Glow.erase(std::unique(Glow.begin(), Glow.end(), [](const FCellGlowLevel& A, const FCellGlowLevel& B) { return A.Level == B.Level; }), Glow.end());
+				if (!Glow.empty())
+				{
+					V.GlowBase = u32(Out.Lut.size());
+					V.GlowLevels = u32(Glow.size());
+					size_t FadeAt = (Out.Lut.size() + 2u * Glow.size()) * 4u;
+					std::vector<float> Fades;
+					const double Fr[3] = { CamFrac.X, CamFrac.Y, CamFrac.Z };
+					for (const FCellGlowLevel& G : Glow)
+					{
+						V.GlowMask[G.Level >> 5] |= 1u << (G.Level & 31);
+						Out.Lut.push_back(HV::float4(float(G.OriginCm[0] - Fr[0]), float(G.OriginCm[1] - Fr[1]), float(G.OriginCm[2] - Fr[2]), float(G.CellCm)));
+						Out.Lut.push_back(HV::float4(float(G.Side[0]), float(G.Side[1]), float(G.Side[2]), float(FadeAt + Fades.size())));
+						Fades.insert(Fades.end(), G.Fades.begin(), G.Fades.end());
+					}
+					while (Fades.size() % 4u) { Fades.push_back(1.0f); }
+					for (size_t I = 0; I < Fades.size(); I += 4u) { Out.Lut.push_back(HV::float4(Fades[I], Fades[I + 1], Fades[I + 2], Fades[I + 3])); }
+				}
+			}
+			// D-210: one galaxy constant block per parameter block, after them all (the march reads
+			// a galaxy's hashes there instead of hashing at every step; other fields never read it).
+			V.GalaxyConstBase = 0u;
+			if (S.bGalaxyConst && !Out.Params.empty())
+			{
+				const size_t NP = Out.Params.size();
+				V.GalaxyConstBase = u32(NP);
+				for (size_t I = 0; I < NP; ++I)
+				{
+					HV::FUniFieldParams Hp;
+					std::memcpy(static_cast<void*>(&Hp), &Out.Params[I], sizeof(Hp));
+					const HV::FUniFieldParams Kb = HV::Uni_GalaxyConstPack(HV::Uni_GalaxyConstOf(Hp));
+					FFieldParamsGPU G;
+					std::memcpy(static_cast<void*>(&G), &Kb, sizeof(G));
+					Out.Params.push_back(G);
+				}
+			}
 			V.StepRatio = S.StepRatio;
 			V.MinStepCm = S.MinStepCm;
 			V.MaxSteps = S.MaxSteps;
@@ -684,11 +953,11 @@ namespace UniCore
 			V.SliceLnTLo = float(std::log(S.SliceLoCm));
 			V.SliceLnTHi = float(std::log(S.SliceHiCm));
 			for (int K = 0; K < 3; ++K) { V.DustSigmaRgb[K] = S.DustSigmaRgb[K]; }
-			V.Pad1 = 0.0f;
+			V.WebHintScale = S.WebHintScale;
 			V.TailDim = S.TailDim;
 			V.WebGlowGain = S.WebGlowGain;
 			V.WebGlowDepthCm = S.WebGlowDepthCm;
-			V.SkyPad = 0.0f;
+			V.HintScale = S.HintScale;
 			return Out;
 		}
 
@@ -702,5 +971,6 @@ namespace UniCore
 		std::map<u32, FUnresolvedTable> Tables;
 		mutable std::map<u32, FLutCache> LutCache;
 		mutable std::map<u32, FLutCache> TotalLutCache;   // D-191
+		mutable std::map<std::pair<u32, int>, FLutCache> KeepLutCache;   // D-197
 	};
 }

@@ -148,3 +148,42 @@ D-177 authors bright members only for catalogue clusters (node list), on the CPU
 
 ## B-014: Peripheral glow at warp (WARP_PLAN E4 rest; D-192 follow-up)
 WARP_PLAN E4 also proposed a slight brightening at the edges of the view at speed, to hide what pops in there (windows lead forward, so peripheral cells are the late ones). Not built: E2's arrival (D-187) already fades late cells in, and a vignette is a matter of taste. Render-only, a few lines in the composite; build it if the owner sees pop-in at the edges at speed.
+
+## B-015: Resolve anywhere (design doc runtime API; D-193 follow-up)
+`ResolveCell(FUniCellKey)` / `ResolveObject(FUniObjectId)`: generate a cell and its ancestry on demand, anywhere, for maps, navigation and lookups. A cell's contributors are parent objects whose influence reaches it, from neighbouring cells too, so "one cell per level" is really a minimal window per level. Two ways:
+- **(A, recommended) A second, small streamer** whose camera is the target: minimal windows, its own slice of the GPU pool (a few hundred thousand slots) and the same GPU backend, plus a readback of the target cell's range. What it returns is exactly what the renderer would draw there. About 2 GPU round trips per level: well under a second.
+- **(B) The CPU reference generator on a worker thread**, through the same shader cores. Simpler, but lesson #1: CPU and GPU float differences could flip a placement near a threshold, so a resolved object could differ from what is drawn (GPU parity, UE-4, is unverified in the engine).
+
+## B-016: OnVisible for leaf objects (stars) (D-193 follow-up)
+The visibility watch tests CPU-known objects only. Stars could be watched through the GPU: a small list of (cell index, slot) for watched objects in the frame's table, flagged per cell, tested in the project pass and read back. Build it if gameplay needs to know when a particular star comes into view.
+
+## B-017: Volume march phase 2: accumulating resolve (D-195 follow-up) — PART DONE (D-208: interleave up to 4 x 4 when near still; disc clipping measured, not adopted; jitter + accumulation not built: it adds lag at speed)
+Modelled on CloudAtmosphere (`AtmosphereTemporal.usf`, `MainResolveCS`; RenderReference.md):
+- one jittered sample per log step (blue noise, R2 rank, golden-ratio shift per frame), so the step can grow further without banding;
+- an age-weighted history (EMA) with a moments clamp (mean +/- gamma sigma, gamma 4 -> 1 with motion), replacing D-184/D-194's 2 x 2 slice and neighbour clamp;
+- a larger interleave (3 x 3 or 4 x 4 at the same divisor, or full resolution with N x N): a further 2-4x on the march;
+- possibly clipping each ray to the galaxy's disc slab (|z| < a few scale heights) and bulge sphere, skipping empty halo steps.
+Measure with T2.vol.perf_inside and T2.vol.temporal / temporal_fast. Start once the owner's D-195 numbers are in.
+
+## B-018: Warp effects dim the sky at intergalactic speed (D-196 follow-up)
+Owner, with `uu.Warp 1`: at 425 kpc/s inside a cluster almost every galaxy (and the brighter ones' glow) vanished until the camera stopped; `uu.Warp 0` fixed it. Warp is now off by default; the effects were not convincing yet anyway. Suspects to check before turning it back on:
+- the D-187 arrival fade (LevelFade x lerp(1, Arrival, warp) from cell ages);
+- streaks spreading light over up to 64 px;
+- the D-190 Doppler tint;
+- something driving Unreal's auto-exposure down (the pawn's own glow dimmed too).
+Reproduce offline with T1.warp.* at a cluster-core camera and 7 kpc a frame.
+
+B-018 update (D-199): one cause found and fixed. The warp optics' motion overflowed in float past 6 pc a frame: zero motion with the optics on. That gave every sprite a tail whatever its distance (~55-64 px at full warp) and shortened the volume's rays. At 425 kpc/s that tail is only ~1 px, so check again with `uu.Warp 1`. If galaxies still dim at speed, try `ShowFlag.EyeAdaptation 0` (the pawn dimmed too) and `uu.Warp.Motes 0`.
+
+
+## B-019: One texture fetch for the background web's two carriers (D-202 follow-up) — DONE (D-206)
+At an intergalactic camera the glow is the two periodic web carriers alone (galaxies on walls + filaments + void, dwarfs on the node matter: the same texture, different channel weights), 2 active carriers a step, each sampling the same texel. Evaluating them as a pair (as D-181 pairs a galaxy's emission and dust) halves the texture reads and step hints per step on that path, bit for bit. Build once the owner's profile at speed shows the GPU (not the game thread) over budget with the volume march the bulk of it.
+
+## B-020: One generation round trip (D-203 follow-up) — DONE for leaf cells (D-207; cells with authored objects or emitter children stay two-trip)
+With cell glow (D-203) a cell that has not loaded is glow, so latency no longer causes holes, but it decides how much of what is near the camera is glow at a given speed. A cell takes two backend round trips (probe for counts, CPU allocation, then place: ~6 frames, D-122). A GPU prefix sum and allocation for leaf levels (stars: their records never come back) would make it one. Worth it if the owner finds nearby stars stay glow too long at speed.
+
+## B-021: Clipmap density cache for the galaxy the camera is in (D-210 follow-up) — BUILT (D-211), SUPERSEDED by the galaxy map (D-212)
+Owner: cache the galaxy as a density volume instead of evaluating the analytic field at every step. Inside the galaxy the march's per-step cost is the field (D-210 cut ~6% on the CPU reference; the rest is the spiral twice, three texture reads and ~55 transcendentals). A camera-centred clipmap: ~5 nested 96^3-128^3 levels each twice as coarse (voxel size ~ distance, as the march's footprint), holding emission, the palette components and dust (two RGBA16F textures a level, ~30 MB a level at 128^3), baked by a compute pass from the same shader core (one field source) as the camera moves a voxel at that level (a shell, not the whole level); the march samples it for the camera's own galaxy (1-2 filtered reads a step) and keeps the analytic field for every other carrier and for placement. To decide: what the finest level resolves (the warp and knot detail within ~a voxel of the camera), the light kept against the analytic march (T2.vol.perf_inside's bars), the bake's cost per frame while moving, and the background map's interplay. Start: offline prototype in UniVolumeRef against T2.vol.perf_inside / T3.vol.march, then the engine pass.
+
+## B-022: Galaxy impostors from the 2D map (D-212 follow-up)
+Owner: the map makes impostors (and top-down views for UI: scanning a galaxy, picking a warp target) nearly free. Its face-on column is analytic (the light's in-plane factor x 2 x the flared scale height; the dust's likewise); an inclined view is that image foreshortened with the dust's attenuation offset by the disc's height, or a short march through the projected thickness at low resolution for the edge-on look. Small maps (128^2-256^2, ~0.1-0.5 MB) baked at the size a galaxy covers on screen, from the same bake, would replace the volume march for nearby galaxies seen from outside (clusters and groups march many at once) and give the sprite -> impostor -> glow handoff one source. Start with a UI top-down render of the home galaxy's map.

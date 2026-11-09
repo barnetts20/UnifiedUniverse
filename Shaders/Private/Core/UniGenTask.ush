@@ -40,7 +40,7 @@ struct FUniGenTask
 	uint PoolCapacity;        // n after truncation
 	uint IndexBase;
 	float4 Suppress;          // suppressor centre in cell units relative to the cell origin, radius in cell units (w <= 0: none)
-	uint4 BoxLo;              // D-153: sampling box in cell offsets (xyz; w unused). Probes and candidates
+	uint4 BoxLo;              // D-153: sampling box in cell offsets (xyz; w: D-207 the cell's ordinal in a one-trip batch). Probes and candidates
 	uint4 BoxSpan;            //        lie in [Lo, Lo + Span) per axis; Span 0 = the whole axis (identity)
 };
 

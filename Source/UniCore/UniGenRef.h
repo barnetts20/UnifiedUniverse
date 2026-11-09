@@ -110,6 +110,7 @@ namespace UniCore
 		FFieldParams Params;
 		bool bEarly = false;                  // D-172: the parent is an early type (its emitter's early shape; no dust)
 		double NTotal = 0.0;
+		double Keep = 1.0;                    // D-197: the emitter's SpriteKeep: counts x this, light NTotal's
 		double IclRatio = 0.0;                // D-191: intracluster light / its members' light (0: none)
 		mutable double IntegralAll = -1.0;   // field-space integral over the unit ball / period (lazy, cached)
 	};
@@ -173,6 +174,7 @@ namespace UniCore
 				C.Emitter = &D.RootEmitters[I];
 				C.Params = C.Emitter->Exemplar;
 				C.NTotal = C.Emitter->NTotal;
+				C.Keep = std::clamp(C.Emitter->SpriteKeep, 0.01, 1.0);   // D-197 (their glow is the background's)
 				Roots.push_back(C);
 			}
 			// Anchors: placed at their level, with reserved indices (2^15 + anchor index).
@@ -509,10 +511,10 @@ namespace UniCore
 			if (C.Emitter->bDensityMode || C.bRoot)
 			{
 				const double W = CellWidthCm(K.Level);
-				return C.NTotal * S.P * W * W * W / IntegralAll(C);
+				return C.NTotal * C.Keep * S.P * W * W * W / IntegralAll(C);   // D-197: counts x Keep
 			}
 			const double V = double(SizeP) * double(SizeP) * double(SizeP);
-			return C.NTotal * S.P * V / IntegralAll(C);
+			return C.NTotal * C.Keep * S.P * V / IntegralAll(C);
 		}
 
 		/** The GPU task for contributor C in cell K (lambda scale, frame, seed, slice, suppressor).
@@ -993,7 +995,7 @@ namespace UniCore
 				const u32 Ms = H::Uni_SeedMix(ObjSeed, H::UNI_CH_MEMBER);
 				// D-191: a rich entry's BCG takes rank 63, so its drawn members stop at 63.
 				const bool bBcg = Host.Objects[0].A[3] != 0u && Cat.BcgShareAt(H::Uni_ObjectAbsMag(UniCore::ToHlsl(Host.Objects[0]))) > 0.0;
-				const u32 Count = std::min(H::Uni_PoissonCount(float(C.NTotal * Cat.BrightRatio), Ms), bBcg ? 63u : 64u);
+				const u32 Count = std::min(H::Uni_PoissonCount(float(C.NTotal * C.Keep * Cat.BrightRatio), Ms), bBcg ? 63u : 64u);
 				const FSliceTable& St = Model.SlicesOf(Cat.MemberArchetypeId);
 				double PBright = 0.0;
 				for (const FSlice& Sl : St.Slices) { if (Sl.Level >= Cat.MemberMinLevel) { PBright += Sl.P; } }
@@ -1137,6 +1139,7 @@ namespace UniCore
 					// D-182: a galaxy's palette seed, from its object seed (as its record's colour takes it).
 					if (A.bPalette && Em.FieldId == H::UNI_FIELD_GALAXY) { Ct.Params.V[23] = float(H::Uni_PaletteSeed(O.B[0])); }
 					Ct.NTotal = std::isfinite(Em.NTotalRefMag) ? Em.NTotal * std::pow(10.0, -0.4 * (double(M) - Em.NTotalRefMag)) : Em.NTotal;
+					Ct.Keep = std::clamp(Em.SpriteKeep, 0.01, 1.0);   // D-197
 					// D-191: a rich catalogue cluster's light is shared with its BCG and ICL.
 					if (bAnchor && E == 0 && C.Indices[I] >= kFirstCatalogueIndex && C.Indices[I] < kFirstMemberIndex)
 					{

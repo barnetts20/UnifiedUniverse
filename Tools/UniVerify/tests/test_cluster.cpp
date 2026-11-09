@@ -539,8 +539,11 @@ UNI_TEST(cluster, volume_equivalence)
 	P.Update(Cam, FVec3f{});
 	FCamera Cm; Cm.Coord = Cam; Cm.Width = 242; Cm.Height = 159; Cm.DeltaMag = 0.0;
 	Cm.LookAlong({ -Off.X, -Off.Y, -Off.Z });
-	FVolumeSettings Old; Old.bLutStart = false; Old.bPrefilter = false;
-	const FVolumeSettings New;
+	// D-195: both at the step quality D-160 was measured with (ratio 0.08, hints as written, from
+	// 1 pc), so only the D-160 speed-ups differ; the D-195 defaults are compared after, against New.
+	FVolumeSettings New; New.StepRatio = 0.08f; New.HintScale = 1.0f; New.LocalStartCm = 3.0856775814913673e18;
+	FVolumeSettings Old = New; Old.bLutStart = false; Old.bPrefilter = false;
+	const FVolumeSettings D195;
 	auto Render = [&](const FVolumeSettings& S, u32 OnlyField, FImage& Img, bool bNoDust = false)
 	{
 		FVolumeScene Sc = VB.Build(P, Cam, FVec3f{}, Cm.View(), S).Subset(false);
@@ -577,6 +580,24 @@ UNI_TEST(cluster, volume_equivalence)
 			}
 		}
 	}
+	// D-195 (step ratio 0.24, hints x 2 around the camera, from 10 pc) against New: the same
+	// light inside the rich cluster's core (here the camera is inside the cluster's carrier).
+	FImage Dd(Cm.Width, Cm.Height), Dc(Cm.Width, Cm.Height);
+	const auto Rd = Render(D195, ~0u, Dd);
+	Render(D195, H::UNI_FIELD_CLUSTER, Dc);
+	const double D195TotalErr = std::abs(Sum(Dd) / Sum(B) - 1.0);
+	const double D195ClusterErr = std::abs(Sum(Dc) / Sum(Cb) - 1.0);
+	std::vector<double> PixE;
+	for (size_t I = 0; I < B.Rgb.size(); ++I) { if (B.Rgb[I] > 1.0e-3f) { PixE.push_back(std::abs(double(Dd.Rgb[I]) / double(B.Rgb[I]) - 1.0)); } }
+	std::sort(PixE.begin(), PixE.end());
+	const double D195P95 = PixE.empty() ? 0.0 : PixE[size_t(0.95 * double(PixE.size() - 1))];
+	Uni::Check(2, "T2.vol.cluster_d195", "D-195 march defaults inside a rich cluster's core (1 cluster + galaxy carriers, camera inside the cluster): total light and the cluster's light within 1% of the D-160 march at ratio 0.08 from 1 pc, visible pixels' p95 within 2%, fewer steps")
+		.Metric("total_err", D195TotalErr).Metric("cluster_err", D195ClusterErr).Metric("p95", D195P95)
+		.Metric("steps_d160", double(Rb.first.Steps)).Metric("steps_d195", double(Rd.first.Steps))
+		.Pass(D195TotalErr < 0.01 && D195ClusterErr < 0.01 && D195P95 < 0.02 && Rd.first.Steps < Rb.first.Steps,
+			Uni::Fmt("total light %+.3f%%, cluster %+.3f%%, visible pixels p95 %.2f%%; %.3g -> %.3g steps (%.2fx), %.0f -> %.0f ms",
+				100.0 * (Sum(Dd) / Sum(B) - 1.0), 100.0 * (Sum(Dc) / Sum(Cb) - 1.0), 100.0 * D195P95,
+				double(Rb.first.Steps), double(Rd.first.Steps), double(Rb.first.Steps) / std::max(double(Rd.first.Steps), 1.0), Rb.second, Rd.second));
 	const double TotalErr = std::abs(Sum(B) / Sum(A) - 1.0);
 	const double ClusterErr = std::abs(Sum(Cb) / Sum(Ca) - 1.0);
 	const double GalaxyErr = Sum(Ga) > 0.0 ? std::abs(Sum(Gb) / Sum(Ga) - 1.0) : 0.0;
@@ -591,6 +612,127 @@ UNI_TEST(cluster, volume_equivalence)
 			Uni::Fmt("total light %+.3f%%, cluster %+.4f%%, galaxies %+.2f%% (emission without dust %+.2f%%), worst visible pixel %.1f%%; %.0f -> %.0f ms, %.3g -> %.3g steps (%.1fx)",
 				100.0 * (Sum(B) / Sum(A) - 1.0), 100.0 * (Sum(Cb) / Sum(Ca) - 1.0), 100.0 * (Sum(Ga) > 0.0 ? Sum(Gb) / Sum(Ga) - 1.0 : 0.0), 100.0 * (Sum(Ea) > 0.0 ? Sum(Eb) / Sum(Ea) - 1.0 : 0.0), 100.0 * WorstPix,
 				Ra.second, Rb.second, double(Ra.first.Steps), double(Rb.first.Steps), Ra.second / std::max(Rb.second, 1e-9)));
+}
+
+UNI_TEST(cluster, handoff_cap)
+{
+	// D-196: a galaxy's sprite hands over only what its carrier takes this frame. Inside a rich
+	// cluster's core (over 128 carrier candidates) with the frame's carrier cap halved to 64, the
+	// galaxies left without a carrier keep their sprites: the light over the whole sphere
+	// (sprites + volume) matches the default cap's. With the handoff curve alone (before D-196)
+	// the dropped galaxies' light is lost: their sprites fade, and nothing replaces them.
+	// Measured caps (table / curve): 100 +0.07% / -3.5%; 64 -1.5% / -10.3%; 32 -11.4% / -21.1%:
+	// below ~40 the cap drops galaxies over UNI_THETA_PROMOTE (0.02 rad), which draw no sprite
+	// at any share (extended promotion candidates), so nothing can carry their light.
+	FUniverseModel M(AnchoredCluster());
+	FRefGenerator G(M);
+	FVolumeBuilder VB(M, G);
+	const double Mpc = Units::Mpc;
+	const FVec3d Off{ 0.4 * Mpc, 0.25 * Mpc, 0.1 * Mpc };
+	FRefPipeline P(G);
+	P.bVelocityLod = false;
+	const FCoord Cam = Moved(FCoord::Origin(), Off);
+	P.Update(Cam, FVec3f{});
+	// The whole sphere (six 90-degree faces): galaxies near the camera fill the view with glow
+	// while their centres (their sprites) are elsewhere, so one frame does not conserve.
+	const FV3 Looks[6] = { { 1, 0, 0 }, { -1, 0, 0 }, { 0, 1, 0 }, { 0, -1, 0 }, { 0.001, 0, 1 }, { 0.001, 0, -1 } };
+	FCamera Cm0; Cm0.Coord = Cam; Cm0.Width = 128; Cm0.Height = 128; Cm0.DeltaMag = 0.0; Cm0.LookAlong(Looks[0]);
+	auto Light = [&](u32 Cap, bool bCurve, size_t* OutCarriers, size_t* OutHandoffs)
+	{
+		FVolumeSettings S; S.MaxCarriers = Cap;
+		const FVolumeScene Sc = VB.Build(P, Cam, FVec3f{}, Cm0.View(), S);
+		if (OutCarriers) { *OutCarriers = Sc.Carriers.size(); }
+		if (OutHandoffs) { *OutHandoffs = Sc.Handoffs.size(); }
+		double L = 0.0, Sp = 0.0;
+		for (const FV3& Lk : Looks)
+		{
+			FCamera Cm = Cm0; Cm.LookAlong(Lk);
+			FImage Img(Cm.Width, Cm.Height);
+			FVolumeStats Vs;
+			RenderFrameWithVolume(P, Sc, Cm, Img, &Vs, true, bCurve);
+			L += 0.2126 * (Vs.Flux[0] + Vs.SpriteFlux[0]) + 0.7152 * (Vs.Flux[1] + Vs.SpriteFlux[1]) + 0.0722 * (Vs.Flux[2] + Vs.SpriteFlux[2]);
+			Sp += 0.2126 * Vs.SpriteFlux[0] + 0.7152 * Vs.SpriteFlux[1] + 0.0722 * Vs.SpriteFlux[2];
+		}
+		return std::make_pair(L, Sp);
+	};
+	size_t NFull = 0, NCap = 0, HCap = 0;
+	const auto Full = Light(128u, false, &NFull, nullptr);
+	const auto FullCurve = Light(128u, true, nullptr, nullptr);
+	const u32 CapN = 64u;
+	const auto Cap = Light(CapN, false, &NCap, &HCap);
+	const auto CapCurve = Light(CapN, true, nullptr, nullptr);
+	const double ErrFull = FullCurve.first / Full.first - 1.0;   // the default cap is passed here too
+	const double ErrCap = Cap.first / Full.first - 1.0;
+	const double ErrCapCurve = CapCurve.first / Full.first - 1.0;
+	Uni::Check(2, "T2.vol.handoff_cap", "D-196 sprites hand over only what their carriers take: inside a rich cluster's core with the carrier cap forced to 8, the light over the whole sphere (sprites + volume) with the carrier cap at 64 within 2.5% of the default cap's (128), at most a third of the handoff curve's loss")
+		.Metric("err_capped", ErrCap).Metric("err_capped_curve", ErrCapCurve).Metric("err_uncapped_table_vs_curve", ErrFull)
+		.Metric("carriers_full", double(NFull)).Metric("carriers_capped", double(NCap))
+		.Pass(std::abs(ErrCap) < 0.025 && std::abs(ErrCap) * 3.0 < std::abs(ErrCapCurve) && NCap <= CapN && NFull > CapN,
+			Uni::Fmt("%zu carriers at cap 128, %zu at cap %u (%zu handoffs); light over the sphere at that cap: %+.2f%% with the table, %+.2f%% with the curve (before D-196); at cap 128 the curve is %+.2f%% off the table (over 128 candidates here); sprite share of the light %.1f%% at cap 128, %.1f%% at the lower cap",
+				NFull, NCap, CapN, HCap, 100.0 * ErrCap, 100.0 * ErrCapCurve, 100.0 * ErrFull, 100.0 * Full.second / Full.first, 100.0 * Cap.second / Cap.first));
+}
+
+UNI_TEST(cluster, member_keep)
+{
+	// D-197 (owner: ~30% fewer galaxies per cluster; D-198: half): members thinned to 0.5, inside a
+	// rich cluster's core. Counts: resident members fall to ~0.5 (the authored bright members
+	// with them), the kept ones are the full draw's, and their own light to ~0.5. Light: the
+	// thinned members' light is the cluster's glow at its model value (Lbar - keep F_L G), so the
+	// glow is linear in keep: keep 0.5's lies on the line from keep 1's to keep 0.05's within 1%.
+	// The sphere's total is reported, not checked: it depends on which galaxies were thinned
+	// (one large galaxy near the camera can hold most of the light: 1.2 Mpc out, thinning one
+	// took 93% of the member carriers' light, while the glow is right in expectation), and in
+	// the core the per-ray carrier cap (12) drops more of the full draw's light than of a
+	// thinned one's (measured: glow 47 -> 207 -> 526 -> 845 -> 1562 at keep 1, 0.9, 0.7, 0.5,
+	// 0.05, linear; member carriers 1727 -> 1588 -> 1495 -> 1257 -> 29, not).
+	const double Mpc = Units::Mpc;
+	const FCoord Cam = Moved(FCoord::Origin(), FVec3d{ 0.4 * Mpc, 0.25 * Mpc, 0.1 * Mpc });
+	auto IsMember = [](const FObjectGPU& O) { const u32 A = H::Uni_ObjectArchetype(UniCore::ToHlsl(O)); return A == UniScenes::kGalaxy || A == UniScenes::kMember; };
+	auto Lum = [](const double* F) { return 0.2126 * F[0] + 0.7152 * F[1] + 0.0722 * F[2]; };
+	struct FRun { double N = 0.0, NIn = 0.0, Flux = 0.0, Glow = 0.0, Light = 0.0; };
+	std::unordered_set<u64> FullIds;
+	auto Run = [&](double Keep, bool bRecord)
+	{
+		FUniverseDef D = AnchoredCluster();
+		UniScenes::UseSpriteKeep(D, 1.0, Keep);
+		FUniverseModel M(D);
+		FRefGenerator G(M);
+		FVolumeBuilder VB(M, G);
+		FRefPipeline P(G);
+		P.bVelocityLod = false;
+		P.Update(Cam, FVec3f{});
+		FRun R;
+		P.ForEachResident([&](const FCellKey&, const FObjectGPU& O, float, u64 Hash)
+		{
+			if (!IsMember(O)) { return; }
+			R.N += 1.0;
+			R.Flux += std::pow(10.0, -0.4 * double(H::Uni_ObjectAbsMag(UniCore::ToHlsl(O))));
+			if (bRecord) { FullIds.insert(Hash); } else { R.NIn += FullIds.count(Hash) ? 1.0 : 0.0; }
+		});
+		FCamera Cm0; Cm0.Coord = Cam; Cm0.Width = 96; Cm0.Height = 96; Cm0.DeltaMag = 0.0; Cm0.LookAlong({ 1, 0, 0 });
+		const FVolumeScene Sc = VB.Build(P, Cam, FVec3f{}, Cm0.View());
+		FVolumeScene Glow = Sc;
+		for (FCarrierGPU& Ca : Glow.Carriers) { if (Ca.FieldId != H::UNI_FIELD_CLUSTER) { Ca.Weight = 0.0f; } }
+		const FV3 Looks[6] = { { 1, 0, 0 }, { -1, 0, 0 }, { 0, 1, 0 }, { 0, -1, 0 }, { 0.001, 0, 1 }, { 0.001, 0, -1 } };
+		for (const FV3& Lk : Looks)
+		{
+			FCamera Cm = Cm0; Cm.LookAlong(Lk);
+			FImage I1(Cm.Width, Cm.Height);
+			R.Glow += Lum(RenderVolume(Glow, Cm, I1).Flux);
+		}
+		R.Light = SphereLight(P, Sc, Cam, 96);
+		return R;
+	};
+	const double Keep = 0.5;   // D-198's default (D-197: 0.7)
+	const FRun Full = Run(1.0, true), Thin = Run(Keep, false), All = Run(0.05, false);
+	const double Ratio = Thin.N / std::max(Full.N, 1.0), Kept = Thin.NIn / std::max(Thin.N, 1.0), Own = Thin.Flux / std::max(Full.Flux, 1e-300);
+	const double Line = Full.Glow + (1.0 - Keep) / (1.0 - 0.05) * (All.Glow - Full.Glow);
+	const double OffLine = Thin.Glow / Line - 1.0;
+	Uni::Check(2, "T2.vol.member_keep", "D-197 cluster members thinned to 0.5, the D-198 default (UseSpriteKeep), inside a rich cluster's core: resident members 0.5 +/- 0.05 and their own light 0.5 +/- 0.06 of the full draw's, at least 98% of the kept are full-draw members, and the cluster's glow over the sphere within 1% of the line from keep 1's to keep 0.05's")
+		.Metric("count_ratio", Ratio).Metric("own_light_ratio", Own).Metric("kept_in_full", Kept).Metric("glow_off_line", OffLine)
+		.Pass(std::abs(Ratio - Keep) < 0.05 && std::abs(Own - Keep) < 0.06 && Kept > 0.98 && std::abs(OffLine) < 0.01,
+			Uni::Fmt("%.0f -> %.0f resident members (%.3f), %.2f%% of the kept in the full draw, their own light %.3f of the full draw's; cluster glow %.4g -> %.4g (keep 0.05: %.4g; the line predicts %.4g: %+.2f%% off); the sphere's light (sprites + glow, reported) %+.2f%% at keep 0.5, %+.2f%% at keep 0.05",
+				Full.N, Thin.N, Ratio, 100.0 * Kept, Own, Full.Glow, Thin.Glow, All.Glow, Line, 100.0 * OffLine, 100.0 * (Thin.Light / Full.Light - 1.0), 100.0 * (All.Light / Full.Light - 1.0)));
 }
 
 UNI_TEST(cluster, volume_build_cost)

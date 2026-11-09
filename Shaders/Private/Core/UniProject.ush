@@ -214,10 +214,22 @@ UNI_FN float Uni_SpriteEllipseR(float InX, float InY, float InAngle, float InQ)
 	return sqrt(U * U + (V / InQ) * (V / InQ));
 }
 
+/** D-196: true when an object can hand light to a volume carrier (an extended object with
+ *  children): its sprite share then comes from the frame's carrier handoffs. */
+UNI_FN bool Uni_ObjectIsCarrierParent(FUniObject InObj)
+{
+	const uint F = Uni_ObjectFlags(InObj);
+	return (F & (UNI_OBJ_FLAG_EXTENDED | UNI_OBJ_FLAG_HAS_CONTRIBUTOR)) == (UNI_OBJ_FLAG_EXTENDED | UNI_OBJ_FLAG_HAS_CONTRIBUTOR);
+}
+
 /** Project one object. Returns the sprite; Flags says whether it is visible and whether it is
- *  a promotion candidate (candidates are reported even when culled for being promoted). */
-UNI_FN FUniSprite Uni_ProjectObject(uint4 InCellDeltaX, uint4 InCellDeltaY, uint4 InCellDeltaZ, uint InLevel,
-	float InLevelFade, FUniObject InObj, FUniView InView, bool InWasPromoted)
+ *  a promotion candidate (candidates are reported even when culled for being promoted).
+ *  InCarrierShare (D-196): the share of the object's light its volume carrier draws this frame
+ *  (the volume builder's handoff, 0 when it has no carrier); negative: the handoff curve
+ *  (Uni_CarrierHandoff), as before D-196 (offline checks of the sprites alone). */
+/** D-204: from the cell's context (Uni_CellRel, built once per cell). */
+UNI_FN FUniSprite Uni_ProjectObjectC(FUniCellRel InCell,
+	float InLevelFade, FUniObject InObj, FUniView InView, bool InWasPromoted, float InCarrierShare)
 {
 	FUniSprite S;
 	S.RenderPos = float3(0.0f, 0.0f, 0.0f);
@@ -234,7 +246,7 @@ UNI_FN FUniSprite Uni_ProjectObject(uint4 InCellDeltaX, uint4 InCellDeltaY, uint
 	S.EllipseAxis = 0.0f;
 
 	const uint3 Off = uint3(InObj.A.x, InObj.A.y, InObj.A.z);
-	const float3 Rel = Uni_ObjectRelative(InCellDeltaX, InCellDeltaY, InCellDeltaZ, Off, InLevel, InView.CameraFraction);
+	const float3 Rel = Uni_ObjectRelativeC(InCell, Off, InView.CameraFraction);   // D-204
 	const float R = max(Uni_SafeLength(Rel), 1.0e-3f);
 	// D-190: at warp the source is seen at its aberrated direction, in its Doppler-shifted colour.
 	const float3 TrueDir = Rel * (1.0f / R);
@@ -264,7 +276,11 @@ UNI_FN FUniSprite Uni_ProjectObject(uint4 InCellDeltaX, uint4 InCellDeltaY, uint
 	// An extended object with children hands its light to its volume carrier as it grows
 	// (D-129), and every flux is horizon-dimmed (D-131). Both are render-only.
 	const bool bCarrier = (ObjFlags & (UNI_OBJ_FLAG_EXTENDED | UNI_OBJ_FLAG_HAS_CONTRIBUTOR)) == (UNI_OBJ_FLAG_EXTENDED | UNI_OBJ_FLAG_HAS_CONTRIBUTOR);
-	const float SpriteShare = bCarrier ? 1.0f - Uni_CarrierHandoff(S.PhysAngularRadius, InView.ThetaPixel) : 1.0f;
+	// D-196: the sprite keeps what the carrier did not take this frame. Before, it handed off by
+	// the curve alone, so a galaxy left without a carrier (over the frame's carrier cap in a
+	// cluster, its integral not ready, its contributor asleep) faded before its glow came in.
+	const float Hand = InCarrierShare >= 0.0f ? saturate(InCarrierShare) : Uni_CarrierHandoff(S.PhysAngularRadius, InView.ThetaPixel);
+	const float SpriteShare = bCarrier ? 1.0f - Hand : 1.0f;
 	const float Intensity = pow(10.0f, -0.4f * (AppMag - InView.ExposureMag)) * Fade * saturate(InLevelFade) * SpriteShare * Uni_HorizonDimming(R);
 	if (!(Intensity > 0.0f)) { return S; }
 
@@ -345,6 +361,19 @@ UNI_FN FUniSprite Uni_ProjectObject(uint4 InCellDeltaX, uint4 InCellDeltaY, uint
 		S.EllipseAngle = atan2(dot(Np, Up), dot(Np, Side));
 	}
 	return S;
+}
+
+UNI_FN FUniSprite Uni_ProjectObjectH(uint4 InCellDeltaX, uint4 InCellDeltaY, uint4 InCellDeltaZ, uint InLevel,
+	float InLevelFade, FUniObject InObj, FUniView InView, bool InWasPromoted, float InCarrierShare)
+{
+	return Uni_ProjectObjectC(Uni_CellRel(InCellDeltaX, InCellDeltaY, InCellDeltaZ, InLevel), InLevelFade, InObj, InView, InWasPromoted, InCarrierShare);
+}
+
+/** Project one object with the handoff curve (the sprites alone, offline). */
+UNI_FN FUniSprite Uni_ProjectObject(uint4 InCellDeltaX, uint4 InCellDeltaY, uint4 InCellDeltaZ, uint InLevel,
+	float InLevelFade, FUniObject InObj, FUniView InView, bool InWasPromoted)
+{
+	return Uni_ProjectObjectH(InCellDeltaX, InCellDeltaY, InCellDeltaZ, InLevel, InLevelFade, InObj, InView, InWasPromoted, -1.0f);
 }
 
 /** D-148: the disc fraction of a sprite, DiscFrac = PhysAngularRadius / AngularRadius for a

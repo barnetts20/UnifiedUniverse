@@ -703,3 +703,266 @@ A reviewer read the uncompiled engine code against UE 5.3–5.6 without seeing i
   - any motes at rest;
   - motes in front of nearby bodies (they are depth-tested like the stars).
 
+## 27. Runtime API: pick, queries and events (D-193, UE-30)
+*Design doc M4, first block. Verified offline: T2.query.identity, pick, resident, events, watch.*
+
+- **What changes:** gameplay can ask what is under the cursor, what is resident near a point, and the nearest object of a kind; and subscribe to objects becoming resident, visible, promoted. Nothing changes on screen.
+- **Content:** none.
+- **Test steps:**
+  1. Build:
+     - new: `UniQuery.usf`, `Core/UniQuery.ush`, `UniQuery.h`, `UniApiTypes.h`;
+     - shaders: `UniProject.usf`;
+     - core: `UniStreamer.h`, `UniSystem.h`, `UniShaderCores.h`;
+     - engine: `UniShaders.h/.cpp`, `UniRenderer.h/.cpp`, `UniSubsystem.h/.cpp`.
+  2. `uu.Enable flythrough`, look at a bright star and `uu.Pick`: the log names it (archetype, id, distance, magnitude). `uu.Pick` at empty sky: "nothing there".
+  3. `uu.Query 10` and `uu.Query 30 Star`: resident objects within 10 / 30 pc, nearest first. `uu.Nearest Galaxy`.
+  4. `uu.Events Galaxy` while flying at intergalactic speed: resident / evicted counts each second; `uu.Events off`.
+  5. In a system (`uu.GotoSystem planet`): `uu.Pick` on the planet names its star and the planet's ordinal.
+  6. Blueprint: the subsystem's Pick, QueryResident, FindNearest and the On... events are there; ProfileGPU shows Uni.Pick.* only on a pick frame and Uni.Query only on a query frame.
+- **Failure looks like:**
+  - nothing logged (the request was lost: no view drew its frame);
+  - a pick naming something far from the cursor;
+  - a query missing objects you can see;
+  - a hitch when many events fire.
+
+## 28. Volume ghosting at speed (D-194, UE-31)
+*Owner: the glow ghosts at high speed. Verified offline: T2.vol.temporal_fast (new), T2.vol.temporal unchanged.*
+
+- **What changes:** at speed the glow no longer trails or leaves dark holes behind moving structure: the reused history is clamped into what was just marched around it, tightly once it moves, and not used at all when it moves more than 8 march pixels a frame (a little blur there instead). At rest nothing changes.
+- **Content:** none.
+- **Test steps:**
+  1. Build: shaders `UniVolume.ush`, `UniVolume.usf`; engine `UniShaders.h`, `UniRenderer.cpp`.
+  2. Fly past a galaxy and through a cluster at intergalactic speed while turning; compare with `uu.VolumeTemporal.Clamp 0` (the old rule) and `uu.VolumeTemporal 0` (no slicing: the reference).
+  3. Tune: `uu.VolumeTemporal.MaxMotionPx` (8: higher keeps more history and detail at speed, lower more blur and fewer trails), `uu.VolumeTemporal.TightPx` (2).
+- **Failure looks like:**
+  - shimmer or a 2 x 2 pattern at rest or while turning slowly (the clamp too tight: raise TightPx);
+  - trails still behind fast structure (lower MaxMotionPx);
+  - galaxies at speed looking blocky (raise MaxMotionPx).
+
+## 29. Volume march cost inside a galaxy (D-195, UE-32)
+*Owner: 30-40 fps inside a galaxy, 15-20 moving through dense parts; Uni.Volume 85-90% of the GPU. Verified offline: T2.vol.perf_inside and T2.vol.cluster_d195 (new), T3.vol.march, T2.vol.equivalence, T2.vol.temporal.*
+
+- **What changes:** the glow's march takes 2.65-3.3x fewer steps per pixel from inside a galaxy. It steps in coarser log steps (0.24 of the distance, not 0.08) and loosens the galaxy's own step limits x 2 around the camera. Galaxies and clusters start at 10 pc, not 1 pc. Offline, 95% of pixels are within 0.33% of a fine march. Inside a rich cluster's core it takes 2.15x fewer steps for the same total light (p95 0.6%).
+- **Content:** none.
+- **Test steps:**
+  1. Build: shader `Core/UniVolume.ush`; engine `UniVolume.h` (UniCore), `UniSubsystem.cpp`.
+  2. Repeat the capture inside a galaxy (`uu.perf`, a GPU capture): compare the Uni.Volume time with the earlier 20-31 ms, at rest and moving through dense areas.
+  3. A/B the look: `uu.VolumeStepRatio 0.08`, `uu.VolumeHintScale 1` and `uu.VolumeStartPc 1` restore the old march. Then try `uu.VolumeHintScale 4` (another ~25% fewer steps toward the centre offline, p95 0.5%).
+- **Failure looks like:**
+  - banding or stepping in the disc toward the centre (lower `uu.VolumeHintScale`);
+  - near dust lanes or the glow right around the camera thinner than before (lower `uu.VolumeStartPc`);
+  - no time saved (tell me: the GPU may be bound by something other than the step count).
+
+## 30. Volume cost, sprite handoff, warp off (D-196, UE-33)
+*Owner: under 60 fps in dense galaxy cores (worst 35-40, needs ~50%); sprites fading before the glow; galaxies vanishing at speed (`uu.Warp 0` fixed it). Verified offline: T2.vol.march_budget and T2.vol.handoff_cap (new).*
+
+- **What changes:**
+  - the glow is marched at no more than 0.26 Mpx (about half the rays on your viewport);
+  - the background joins the per-pixel march only during fast travel (it was there for 30 frames after any change, doubling the march inside a galaxy);
+  - a galaxy's sprite only fades as far as its glow actually takes over;
+  - warp effects are off by default.
+- **Content:** none.
+- **Test steps:**
+  1. Build: shaders `UniProject.usf`, `Core/UniProject.ush`; engine `UniShaders.h`, `UniRenderer.h/.cpp`, `UniSubsystem.cpp`; core `UniVolume.h`, `UniQuery.h`, `UniStreamer.h`.
+  2. Same worst-case spot as before: `stat fps`, `uu.perf`, ProfileGPU. The volume now shows Uni.Volume.March (or .March+Background), .Reconstruct and .Composite separately; `uu.perf` prints the march size and how often the background was per pixel.
+  3. A/B the look: `uu.VolumeMaxMarchPixels 0` (half resolution as before); `uu.BackgroundPerPixelInterval 1000` (the old per-pixel behaviour).
+  4. Approach galaxies and fly through a cluster core: no sprite should fade before its glow comes in.
+- **Failure looks like:**
+  - the glow visibly softer or blockier (raise `uu.VolumeMaxMarchPixels`, e.g. 400000);
+  - the sky behind the glow lagging or popping while drifting (lower `uu.BackgroundPerPixelInterval`);
+  - galaxies doubled (sprite and glow both full) or missing (sprite gone, no glow) near the handoff size;
+  - a compile error around `InHandoffs` / `NumHandoffs` (UniShaders.h, UniProject.usf).
+
+## 31. Fewer stars and cluster galaxies (D-197, UE-34)
+*Owner: ~30% fewer galaxies per cluster or group and stars per galaxy. Verified offline: T2.vol.sprite_keep and T2.vol.member_keep (new).*
+
+- **What changes:**
+  - 70% of each galaxy's stars, and of each cluster's members and group's dwarfs, are generated and drawn. The rest of their light goes into the galaxy's or cluster's glow, so nothing gets dimmer.
+  - Every kept star or galaxy is exactly the one it was.
+  - From the dense core of the Milky Way, resident stars drop from 1.78 M to 1.25 M.
+- **Content:** none. Applies at `uu.Enable` (re-enable after changing the settings).
+- **Test steps:**
+  1. Build: core `UniArchetype.h`, `UniGenRef.h`, `UniVolume.h`, `UniDemoScenes.h`; engine `UniSubsystem.cpp`.
+  2. `uu.Enable flythrough`: compare `uu.perf` (sprites, cells, streamer time) and fps against D-196 at the same spots.
+  3. A/B: `uu.Star.Keep 1` and `uu.Cluster.MemberKeep 1`, then `uu.Enable flythrough` again, restore the full draw. Try 0.5 for a stronger cut.
+- **Failure looks like:**
+  - a galaxy's or cluster's glow visibly brighter or dimmer than before;
+  - stars or members popping on re-enable at the same spot (they should only vanish, never move);
+  - no change in the counts (the definition not re-enabled).
+
+## 32. Half the stars and members, darker dust, faster march (D-198, UE-35)
+*Owner: still too slow at intergalactic speeds and in dense parts of galaxies; thin to ~50%; darker dust lanes. Verified offline: T2.vol.sprite_keep, T2.vol.member_keep (now at 0.5), T2.vol.dust_tuning (new), T2.vol.perf_inside, T3.vol.march.*
+
+- **What changes:**
+  - half of each galaxy's stars and each cluster's or group's members are drawn; their light goes to the glow (D-197);
+  - galaxies' dust is twice as dense, with stronger lanes;
+  - inside a galaxy the glow takes ~20% fewer steps toward the centre;
+  - at intergalactic speed the glow is marched at down to 35% of its pixels.
+- **Content:** none. The thinning and the dust apply at `uu.Enable`.
+- **Test steps:**
+  1. Build: core `UniDemoScenes.h`, `UniVolume.h`; engine `UniSubsystem.cpp`, `UniRenderer.h/.cpp`.
+  2. `uu.Enable flythrough`. fps and ProfileGPU (Uni.Volume.March, .Reconstruct, .Composite) in a dense part of the Milky Way, and flying at 1-10 Mpc/s.
+  3. A/B:
+     - `uu.Galaxy.DustScale 1` + `uu.Galaxy.DustLanes 2.2` (the old dust; uu.Enable again);
+     - `uu.VolumeHintScale 2`;
+     - `uu.VolumeTravelPixelScale 1` (no speed scaling).
+- **Failure looks like:**
+  - the glow blocky or swimming at speed (raise `uu.VolumeTravelPixelScale`);
+  - banding in the disc toward the centre (lower `uu.VolumeHintScale`);
+  - lanes too black or too blotchy (lower `uu.Galaxy.DustScale` / `uu.Galaxy.DustLanes`).
+
+## 33. Polish: steps, background, warp at speed (D-199, UE-36)
+*Owner away; polish round 1. Verified offline: T2.vol.perf_inside, T3.vol.march, T3.webtex.background, T1.warp.speed (new); still_galaxy_dust_d198 (new image).*
+
+- **What changes:**
+  - the glow takes ~10-18% fewer steps inside a galaxy (step ratio 0.32);
+  - the background web, marched per pixel while travelling fast, takes 20% fewer steps (0.4);
+  - the warp effects no longer break at speed: their motion vector overflowed in float, smearing every sprite. Warp stays off by default.
+- **Content:** none.
+- **Test steps:**
+  1. Build: core `UniVolume.h`, `UniTravel.h`, `Core/UniPhotometry.ush`; engine `UniRenderer.cpp`, `UniSubsystem.cpp`.
+  2. fps and ProfileGPU in a dense part of the Milky Way and at 1-10 Mpc/s; A/B `uu.VolumeStepRatio 0.24`.
+  3. `uu.Warp 1` and fly at 0.4-10 Mpc/s: galaxies should streak along the motion, not vanish. If they still dim, `ShowFlag.EyeAdaptation 0` and `uu.Warp.Motes 0` (B-018).
+- **Failure looks like:**
+  - banding along the disc (lower `uu.VolumeStepRatio`);
+  - a blotchy background web while travelling (lower `uu.VolumeWebStepRatio`, 0.4; it was 0.2);
+  - galaxies still vanishing at warp.
+
+## 34. The glow holds 60 fps by itself (D-200, UE-37)
+*Polish round 2. Verified offline: T2.vol.auto_budget (new; the controller on a model frame).*
+
+- **What changes:** the glow's march resolution now steps down (7 levels, to 0.35 of its pixel budget) when the GPU frame runs over 60 fps, and back up when there is headroom. It changes at most every 20 frames.
+- **Content:** none.
+- **Test steps:**
+  1. Build: core `UniVolume.h`; engine `UniSubsystem.h/.cpp` (new include `DynamicRHI.h`, RHIGetGPUFrameCycles), `UniRenderer.h/.cpp`.
+  2. The worst spots (a dense galaxy core; 1-10 Mpc/s): `stat unit` and `uu.perf` ("volume auto budget: level ..."). The level should settle where the GPU fits 60 and hold.
+  3. A/B: `uu.VolumeTargetFps 0` (fixed budget).
+- **Failure looks like:**
+  - the glow's sharpness pumping (raise `uu.VolumeAutoHold`, e.g. 60);
+  - the level stuck at its floor while fps is fine (tell me what `uu.perf` says the GPU time is);
+  - a compile error at RHIGetGPUFrameCycles (UniSubsystem.cpp, D-200: it is in DynamicRHI.h in 5.5; tell me).
+
+## 35. Travel sensitivity's load at speed (D-201, UE-38)
+*Owner: intergalactic speed still ~30 fps. Verified offline: T2.vol.travel_load (new).*
+
+- **What changes:** while flying fast, the sky deepens by at most +0.5 mag (it was +2.5). At +2.5 an intergalactic view held ~18x the objects and cells of rest.
+- **Content:** none.
+- **Test steps:**
+  1. Live, before rebuilding: `uu.TravelSensitivity 0.5` (or 0) at 1-10 Mpc/s; fps.
+  2. If still slow: `stat unit` and `uu.perf` at speed (game thread or GPU), and ProfileGPU.
+- **Failure looks like:** still ~30 fps at speed with 0 (then it is not the windows: send `stat unit`).
+
+## 36. The background web marches coarser at speed (D-202, UE-39)
+*Owner: intergalactic speed still heavy; distant clusters from the density field? Verified offline: T2.webtex.travel_hint (new).*
+
+- **Answer:** yes, one cluster per web node, and distant clusters are already sprites only (their contributors wake lazily, D-177). At speed the glow is the background web marched per pixel (73 steps a pixel from intergalactic space).
+- **What changes:** while travelling fast the background web's step hints grow to x 2 (`uu.VolumeWebTravelHint`): 40 -> 27 steps a texel, light -0.11%.
+- **Content:** none.
+- **Test steps:**
+  1. Fly at 1-10 Mpc/s; fps, then `uu.VolumeWebTravelHint 1` against 2 (and 3).
+  2. Watch the web's filaments while accelerating: no visible change in brightness or shape.
+  3. If still slow: `stat unit`, `uu.perf` and `ProfileGPU` at speed, and send them.
+- **Failure looks like:** the web shimmers or dims at speed (lower the CVar); no fps change (the cost is elsewhere: the profile will say where).
+
+## 37. Cell glow: no window stretch, a fixed build budget (D-203, UE-40)
+*Owner: transit at any speed without slowdown, no stretched windows, a fade implicit in the march. Verified offline: T2.vol.cell_glow_exact, T2.stream.cell_glow, T2.webtex.cell_glow (new).*
+
+- **What changes:** a cell still loading is drawn as glow from the field and condenses into points once it is Ready (8 frames). Windows keep their rest size at any speed; at most 96 cells are built a frame; travel sensitivity is off by default.
+- **Offline:** at 30 Mpc/s in the owner's scene, generation 2.5 -> 0.6 ms a frame, worst frame 32-37 -> 5 ms, at most 96 cells a frame (was 336); light conserved.
+- **Content:** none.
+- **Test steps:**
+  1. Fly at 1-30 Mpc/s and through a galaxy at speed: fps and `stat unit` against before (`uu.CellGlow 0`, `uu.StreamBuildBudget 0`, `uu.WindowStretch 3`, `uu.TravelSensitivity 0.5`).
+  2. Watch nearby stars and galaxies arrive: a faint glow where they will be, sharpening into points; no holes and no flashes.
+  3. Try `uu.StreamBuildBudget` 48 / 192 and `uu.CellFadeFrames` 4 / 16 for the look against the cost.
+  4. Teleport (`uu.GotoCluster`): the scene arrives as glow that condenses over about a second.
+- **Failure looks like:** a bright patch that stays where stars have already appeared (glow not fading out: the grid or its fades), a dark gap where cells load (glow missing: a carrier whose children span over 32 levels, or the background map at moderate speed), or shader compile errors in UniVolume.ush (firstbitlow, countbits).
+
+## 38. Project pass: cell origins in float away from the camera (D-204, UE-41)
+*Owner: objects need not redo the digits their cell shares. Verified offline: T2.parallax.cell_rel (new).*
+
+- **What changes:** objects in cells a cell width or more from the camera are placed by float adds from their cell's hi + lo origin; the cells around the camera keep the exact 128-bit path. Within 1e-7 of exact.
+- **Content:** none.
+- **Test steps:**
+  1. ProfileGPU in a dense galaxy core: the project pass's time against the previous build.
+  2. Approach a star until its system activates and fly between nearby stars: no jitter or offset of sprites against their actors.
+- **Failure looks like:** sprites shimmering or jumping by a pixel as the camera crosses a cell boundary (the near/far switch), or a shader compile error in UniCoord.ush (FUniCellRel).
+
+## 39. Clusters at speed, galaxy cores at mid speed (D-205, UE-42)
+*Owner: clusters less visible at intergalactic speed; mid-speed travel in galaxy cores lags. Verified offline: T2.vol.cell_glow_exact, T2.vol.sprite_keep (0.35).*
+
+- **What changes:** everything brightens by up to 1.5 mag at speed (`uu.TravelExposure`, render only); the cell glow skips levels that cannot reach a sample (+6% -> +0.5% on the core's march offline); 0.35 of each galaxy's stars (was 0.5; ~28% less generation in the core offline).
+- **Content:** stars per galaxy thinned to 0.35 (the kept ones unchanged).
+- **Test steps:**
+  1. Intergalactic at 1-30 Mpc/s: nearby clusters as visible as before D-203? Tune `uu.TravelExposure` (0 / 1 / 2.5).
+  2. Mid speed through the Milky Way's core: fps and `stat unit`; then the A/B: `uu.CellGlow 0`, `uu.StreamBuildBudget 0` and 192, `uu.WindowStretch 3`. Send `uu.perf` at the worst moment.
+- **Failure looks like:** the sky blowing out at speed (lower uu.TravelExposure; check auto-exposure is not fighting it), or the core still lagging with uu.CellGlow 0 (then the cost is not the glow: the profile will say).
+
+## 40. One web texel for both background carriers (D-206, UE-43)
+*Owner: build B-019. Verified offline: T2.webtex.shared_texel (bit for bit).*
+
+- **What changes:** the background's galaxy and dwarf web carriers read each texel once between them. No visible change.
+- **Test steps:** at 1-30 Mpc/s, ProfileGPU `Uni.Volume.March+Background` before and after (`uu.VolumeWebTravelHint` aside).
+- **Failure looks like:** a shader compile error in UniVolume.ush (Uni_CarrierSameWebTexel) or UniFields.ush (UniField_WebTexCh).
+
+## 41. One generation round trip for stars (D-207, UE-44)
+*Owner: build B-020. Verified offline: T2.stream.one_trip (identical records, no leaks, 6.0 -> 3.5 frames).*
+
+- **What changes:** star cells are probed, allocated and placed in one GPU graph (new pass `Uni.Gen.Alloc`), so they arrive about twice as fast; nearby stars stay glow for less time at speed.
+- **Test steps:**
+  1. Build: UniGen.usf pass 3 (AllocCS), FUniGenAllocCS, the place pass's InAlloc / UseAlloc.
+  2. Fly through the Milky Way at mid speed: stars condense sooner. A/B `uu.GenOneTrip 0`.
+  3. `uu.perf`: pool use stays flat over a long flight (no leak); no "generation batch timed out" warnings.
+- **Failure looks like:** missing or duplicated stars in some cells (allocation mismatch between FuseAllocate and AllocCS), pool use creeping up, or timeouts.
+
+## 42. Larger temporal interleave when still (D-208, UE-45)
+*Owner: build B-017. Verified offline: T2.vol.interleave (new); T2.vol.temporal and temporal_fast unchanged. Disc clipping and step jitter measured and not adopted (DECISIONS D-208).*
+
+- **What changes:** while the view is near still the glow marches one pixel in 16 (4 x 4) or 9 (3 x 3) a frame instead of one in 4. Moving: as before.
+- **Test steps:**
+  1. Build: UniVolume.usf (bSliceMarch carries N), UniVolume.ush (Uni_TemporalOffset / Interleave / Pack).
+  2. Stand still in a dense galaxy core: ProfileGPU `Uni.Volume.March` (the pass name says 1/16 sliced) against `uu.VolumeInterleave 2`; fps.
+  3. Turn slowly and drift: the glow stays steady (no crawling or shimmer as N changes).
+- **Failure looks like:** a fixed 4 x 4 or 3 x 3 pattern in the glow (a phase sequence or offset mismatch between march and reconstruct), or shimmer when starting and stopping.
+
+## 43. Background re-marched at rest; slicing and re-march diagnostics (D-209, UE-46)
+*Owner profiling: the march is the cost, view dependent. Verified offline: T2.vol.bg_lut_layout (new). The engine-side test and the log lines need UE.*
+
+- **What changes:** the background (the periodic web) is no longer re-marched, and so no longer marched per pixel, just because cells start or finish loading (D-203's grids changed the LUT buffer's size). uu.Perf gains two lines: slicing per frame by reason, and background re-marches by reason; the march line shows the cap and the real slicing.
+- **Restore first:** `uu.VolumeMaxMarchPixels 262144` (the default; 0 means no cap, and the auto budget cannot act without one).
+- **Test steps:**
+  1. Build: UniSubsystem.cpp/.h, UniRenderer.cpp/.h, UniVolume.h.
+  2. At the costly spot at rest: `uu.Perf`, wait 5 s, `uu.Perf`. Expect "background per pixel in 0 of the last N frames", re-marches near 0 (camera moved only when moving), "1/16 sliced" in most frames. stat unit before and after.
+  3. Fly, stop: background per pixel while moving fast, back to the map within ~30 frames of stopping.
+- **Failure looks like:** background re-marches counted under "LUT layout" at rest (another size change), or many frames "not sliced" (the reason says which).
+
+## 44. Cheaper galaxy march steps; arms start outside the core (D-210, UE-47)
+*Owner: do 1, 2, 3 and 5 of the per-step list. Verified offline: T2.vol.galaxy_const and T2.galaxy.core (new); T2.galaxy.shape (D-172 field bit for bit with every new parameter at zero).*
+
+- **What changes:** the march no longer hashes each galaxy's seeds at every step (blocks written once a frame), shares terms between a galaxy's light and dust, and loads each carrier once a step. Every galaxy's arms now fade to their mean inside a quarter disc scale length (~0.5 kpc for the home galaxy) and the disc warp shrinks to zero at the centre: the core's swirls and rings are gone. Stars there are placed from the new field.
+- **Test steps:**
+  1. Build: UniFields.ush, UniVolume.ush (shaders); UniVolume.h, UniDemoScenes.h, UniSubsystem.cpp.
+  2. At the costly core spot at rest: ProfileGPU `Uni.Volume.March` with `uu.VolumeGalaxyConst 1` and `0` (the constants alone), and against D-209's numbers (everything).
+  3. Look toward the centre from ~0.5 kpc: no contour swirls or rings; the arms appear from ~0.5 kpc out.
+- **Failure looks like:** a shader compile error in the K forms; the glow changing between `uu.VolumeGalaxyConst 0` and `1` (it must not); a seam where the arms begin.
+
+## 45. The galaxy cache (D-211, UE-48)
+*Owner: cache the galaxy as a density volume (B-021). Verified offline: T2.vol.galaxy_cache (new). The engine pass, textures and queue need UE.*
+
+- **What changes:** inside a galaxy the glow no longer evaluates the galaxy's field at every step: it reads a camera-centred clipmap (7 levels of 128^3, ~120 MB) baked from the same field as you move. Everything else (other galaxies, the web, star placement) is unchanged.
+- **Test steps:**
+  1. Build: UniVolume.usf (CacheBakeCS), UniVolume.ush, UniFields.ush, UniWebTexture.ush; UniShaders.h/.cpp, UniRenderer.h/.cpp, UniSubsystem.cpp/.h, UniVolume.h, UniGalaxyCache.h (new).
+  2. At the costly core spot and at the solar circle, at rest: ProfileGPU `Uni.Volume.March` with `uu.GalaxyCache 1` and `0`; fps. `uu.Perf` prints the cache line (levels, MB, voxels baked).
+  3. Fly through the galaxy at mid speed: `Uni.Volume.CacheBake` per frame (a few slabs), no hitches; at high speed the fine levels may fall behind (softer near the camera, no holes).
+  4. Look for seams (rings or steps in the glow at fixed distances) and compare the look with `uu.GalaxyCache 0`.
+- **Failure looks like:** a shader compile error (CacheBakeCS, RWTexture3D<float2> with PF_G16R16F); black or NaN glow (textures not bound or not baked: `uu.GalaxyCache 0` restores); shells at level boundaries; a stale patch after a fast flight (a lost bake: uu.Perf shows resets).
+
+## 46. The galaxy map (D-212, UE-49)
+*Owner: go native 2D for the galaxy's density. Verified offline: T2.vol.galaxy_map (new). Engine bake, upload and binding need UE.*
+
+- **What changes:** inside a galaxy the glow reads a 2048^2 top-down map of its arms and modes (baked once on the GPU over ~4 frames when you enter it; the field until then) plus the warp and detail textures per sample, instead of evaluating the spiral at every step. The clipmap (D-211) is off by default now (`uu.GalaxyCache 1` brings it back where no map is published).
+- **Test steps:**
+  1. Build: UniFields.ush, UniVolume.ush, UniVolume.usf (MapBakeCS, MapDownCS), UniWebTexture.ush; UniShaders.h/.cpp, UniRenderer.h/.cpp, UniSubsystem.h/.cpp, UniVolume.h, UniGalaxyMap.h (new).
+  2. Enter the home galaxy: `uu.Perf` shows the map ready and the bake's frames; ProfileGPU `Uni.GalaxyMap.Bake` per frame. Try `uu.GalaxyMap.Size 1024` and `2048` (each rebakes).
+  3. At the core spot and at the solar circle: ProfileGPU `Uni.Volume.March` with `uu.GalaxyMap 1` and `0`; fps.
+  4. Look for blockiness or seams near the camera, and compare the look with `uu.GalaxyMap 0` (they should match closely).
+- **Failure looks like:** a shader compile error (Texture2D UniGalMap, the K forms); black or NaN glow (the map not uploaded: `uu.GalaxyMap 0` restores); a hitch on entering a galaxy (lower `uu.GalaxyMap.Budget`); a seam where the map takes over from the field after the bake.

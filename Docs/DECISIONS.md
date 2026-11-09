@@ -1304,3 +1304,401 @@ Rationale: T1.warp.motes, over a scripted flight (1 Mpc/s, then 3 s accelerating
 Known: motes are pure decoration. They are not in any light budget and not in the sky light, and they read as dust rather than stars.
 Reroll impact: None (render only; a new seed channel).
 Status: Provisional (UE-29)
+
+D-193 — Runtime API, first block: Pick, QueryResident, FindNearest and events (design doc, Spec: runtime API; M4)
+Question: Owner: start the gameplay-facing API (after the sprite pass). The design lists Resolve, Query, Pick, Events, Sensitivity shapes, Persistence and Readouts. This block is the part that works on what is resident; Resolve (generate anywhere) needs its own plan (BACKLOG B-015).
+Decision:
+- **Naming objects from the GPU.** A readback names an object by (cell index in a frame's cell table, slot in the cell's pool range), as the activation readback (D-142) already did.
+  - The game thread keeps the last 32 frames' tables (`FFrameCells`: keys, cell generations, and the planets' dynamic cells after them).
+  - `FUniStreamer::IdentityAt` turns a slot into the identity: generated objects fill a cell's range first in identity order (each task's IndexBase is the running sum of the capacities before it, so slot = index), anchors follow.
+  - A cell regenerated since the readback's frame (its new `Generation`) or evicted names nothing: the result is reported not found, never a wrong object.
+  - A planet's dynamic cell names its star and its ordinal: an activated system now keeps its star's identity (`FActiveSystem::StarId`, from the activation readback).
+- **Pick** (`UUniSubsystem::Pick`; `Uni_PickScore`, Core/UniQuery.ush): the project pass writes each sprite's (cell, slot) beside it on a frame with a pick. Three small passes (UniQuery.usf) then find the best score and the lowest sprite index at that score (as the max of ~index, so 0-cleared buffers suffice), and read back the source and record.
+  - The rule: a sprite is under the cursor when its centre is within its reach (`RadiusPx`, default 4 px; twice its core sigma; its true radius, whichever is largest). The winner has the highest luminance / (1 + (distance / RadiusPx)²): the brightest, but a much fainter star exactly under the cursor beats a slightly brighter one a few pixels away.
+- **QueryResident / FindNearest** (`Uni_QueryRelative`, `Uni_QueryCellMayHit`, `Uni_QueryMatch`): one group of 64 per cell over the cell table and pool, like the project pass.
+  - Distances are exact: the centre goes in as its 128-bit delta from the camera, and an object's offset from it is formed in integers before the float conversion (D-104's rule). Whole cells outside reach are skipped.
+  - Filters: archetype ids (0..31), maximum absolute magnitude, at most 4,096 results (nearest first).
+  - FindNearest is two passes (the smallest distance, then the matches at it).
+- **Events**, batched once per frame on the game thread:
+  - `OnObjectResident` / `OnObjectEvicted` for the objects the CPU knows (every emitter object read back, i.e. galaxies, clusters, groups; and anchors), by archetype (`SetResidentEventArchetypes`, off by default). They come from the streamer's cells that became Ready or left each frame (`ReadiedLastUpdate` / `LeftLastUpdate`), diffed per cell (`FResidentEvents`).
+  - `OnObjectVisible` / `OnObjectHidden` for watched objects (`WatchObject`), the CPU running the shared `Uni_ObjectSeen`: in view (with its size as margin) and bright enough by the project pass's photometry, level faded in. It stays true while a galaxy's light is handed to its volume and while a promoted body is drawn by its actor: the object, not its sprite.
+  - `OnBodyPromoted` / `OnBodyDemoted` from the promotion manager (M3).
+- **Requests** queue: at most one pick and one query a frame go to the renderer, two of each in flight (its rings hold three). A request no view answered within 90 frames fails (not found). Disabling or re-enabling the universe fails everything pending, without events.
+- **Blueprint**: `FUniObjectInfo` (id, planet ordinal, exact coordinate, archetype id and name, magnitude, radius, distance, seed) and `FUniQueryFilter` (UniApiTypes.h); dynamic delegates for results and events; `GetArchetypeId`, `GetKnownObject` (immediate, CPU-known objects). C++ has `...Native` variants taking TFunction.
+- Console: `uu.Pick [x y]`, `uu.Query <radius pc> [archetype]`, `uu.Nearest <archetype>`, `uu.Events [archetype ...|off]`.
+Rationale: T2.query.*:
+- identity: 64,907 objects in 1,652 Ready cells (the flythrough scene after a track) named through the frame's table are the reference pipeline's objects of those identities, bit for bit; none unnamed; a newer generation names nothing; 4 planets name their star and ordinal, within 3.2 cm of their orbit position;
+- pick: over 1,221 visible sprites, a cursor on each of the 957 that no other sprite reaches picks it; no winner out of reach; every winner names its own object; constructed pairs follow the rule;
+- resident: four centres (camera, a star 0.4 pc away, a point 3 kpc away) and radii from 1 pc to 30 kpc with archetype and magnitude filters match exact 128-bit distances (47,052 hits in the largest; distances within 2.2e-7; nearest exact);
+- events: 42 frames of flight, the wanted archetypes changed twice: 21,605 resident and 3,742 evicted events, and after every frame the reported set equals the Ready cells' wanted objects (no doubles, no ghosts);
+- watch: 64 galaxies over a 360 degree turn: 53 events, all consistent, agreeing with an independent double-precision frustum and visibility test.
+- T2.stream.* unchanged.
+Known:
+- Pick and queries see what is resident; Resolve (anywhere) is not built.
+- OnObjectVisible works for CPU-known objects only: a watched star is never seen (it would need a GPU watch list).
+- Resident events for every galaxy can be thousands per frame at speed: they are off by default.
+- The watch ignores the warp optics' aberration (true directions).
+- One pick and one query per frame; a burst of requests queues.
+Reroll impact: None.
+Status: Provisional (UE-30: compile; uu.Pick, uu.Query, uu.Nearest, uu.Events in the engine)
+
+D-194 — Volume ghosting at speed: history clamped into its fresh neighbours, harmonic light depth (render-only; amends D-184)
+Question: Owner: the glow's march ghosts at high speed; is that the trade-off for temporal slicing (D-184), or can it be reduced? Measured first (T2.vol.temporal_fast, new): passing the Milky Way at warp speeds, D-184 lost or misplaced up to 12% of a frame's light (turning at 3 kpc a frame from 60 kpc; per-pixel p95 39%), because:
+- the history was accepted while its luminance stayed within 4x of the fresh neighbours', which has no floor when one neighbour is dark (stale dark history accepted where the galaxy has arrived, and the reverse);
+- the reprojection depth was the light-weighted mean of ln distance: a pixel mixing a near galaxy with the far background reprojected as if all of it were megaparsecs away, so its predicted motion was nearly zero.
+Decision:
+- **Clamp, not reject** (`Uni_TemporalClamp`, `Uni_TemporalClampK`, `Uni_TemporalMotionPx`, UniVolume.ush). The reprojected history is clamped into its four fresh neighbours' per-channel range (radiance and transmittance), widened by K. K is 4 at rest (fine detail between the fresh pixels survives, as D-184's band allowed) and falls to 1 at `uu.VolumeTemporal.TightPx` (2) march pixels of motion: a moving image can't leave trails or holes outside its neighbours' range.
+- **Too fast, no history**: beyond `uu.VolumeTemporal.MaxMotionPx` (8) the fresh neighbours are used (blur instead of trails).
+- **Harmonic light depth** (`Uni_LightInvDepth`, `Uni_LightLnDepthFromInv`): the depth the reprojection uses is the light-weighted mean of 1/t, the mean parallax, carried scaled by e^60 so it never underflows. The march, its sub-rays (GPU and reference) and the fresh neighbours' combination all use it.
+- `uu.VolumeTemporal.Clamp 0` restores the D-184 band for an A/B.
+Rationale: T2.vol.temporal_fast, 320 x 200, 16 frames, against a full march every frame (D-184 band, then this):
+- 3 kpc a frame toward and across from 60 kpc: light 4.10% -> 0.62%, per-pixel p95 10.0% -> 4.7%;
+- 3 kpc a frame turning 0.5 degree a frame: light 12.28% -> 2.15%, p95 38.8% -> 8.1%;
+- 12 kpc a frame sideways at 150 kpc (~13 px a frame): light 3.65% -> 2.60%, p95 46.9% -> 60.7%: the history is dropped there and the fresh neighbours' quarter-resolution image is blurrier (excess light 0.43% -> 4.43% is that blur). `uu.VolumeTemporal.MaxMotionPx 16` keeps the history there instead (p95 35.7%, light 4.35%) at the cost of the close passes (light 1.50% and 6.01%).
+- Sweep of the fallback threshold, the close passes' light error: 16 px 1.5% / 6.0%; 12 px 1.0% / 4.8%; 8 px 0.6% / 2.2%; 4 px (measured before the harmonic depth) 0.2% / 0.7%, but half the pixels from the fresh neighbours. The tightness (1 to 4 px) changed little. 8 keeps most of the history while removing most of the error.
+- T2.vol.temporal (D-184's paths: at rest, turning, flying inside the galaxy, drifting at 60 kpc) unchanged to the printed precision.
+Known: temporal slicing still can't follow structure crossing many pixels a frame (the last case): there the image is a quarter-resolution blur for a few frames. A full-rate (or half-resolution, every pixel) march at warp would remove it at up to 4x the volume's cost: a later optimisation pass, with the owner's engine numbers.
+Reroll impact: None (render only).
+Status: Provisional (UE-31)
+
+D-195 — Volume march from inside a galaxy: step ratio 0.24, looser hints around the camera, local start 10 pc (render-only; amends D-129, D-160)
+Question: Owner's capture, inside a galaxy: about 30-40 fps, 15-20 moving through dense parts. The target is 60 fps with the ocean, atmosphere and meshing pipelines also on the GPU. Uni.Volume is 20-31 ms of a 24-36 ms GPU frame (85-90%). Where do the steps go, and what can be cut without visible change?
+Findings (T2.vol.perf_inside, new: flythrough scene, solar camera, 240 x 135, three views, against a fine reference of step ratio 0.02 at 20000 steps):
+- The march is emission plus dust absorption, with no light march. The CloudAtmosphere plugin's shadow-map trick (n^2 -> 2n for the light march) doesn't apply. Its steps already grow with distance (log steps), like CloudAtmosphere's lattice.
+- Inside the Milky Way there is about one active carrier per pixel, and almost no supersampling (0-0.6% of pixels). The cost is the step count: 134-198 steps per pixel at 0.08, and every step evaluates the field's step hint as well as the field sample itself.
+- The steps go to three things: the log ratio (0.08: ~29 steps per decade of distance), the galaxy's own step hints toward the centre, and the decades between 1 pc and 10 pc (light there is ~1e-4 of the column).
+- Sweep (steps per pixel toward the centre / along the disc / out of the plane; p95 per-pixel error):
+  - 0.08: 198.5 / 158.4 / 134.3 (p95 under 0.1%).
+  - 0.24: 136.9 / 87.4 / 67.7 (0.1%).
+  - 0.24 with hints x 2: 85.5 / 63.2 / 51.8 (0.2-0.3%).
+  - With hints x 4: 61.8 / 53.9 / 46.9 (0.4-0.5%).
+  - With no hints: 48.5 toward the centre, p95 6.4% (the hints matter there).
+  - From 10 pc: 126.2 / 75.7 / 57.0 (0.1%).
+  - From 100 pc: p95 2.7-3.0% (near dust and stars lost).
+Decision:
+- **`FVolumeSettings::StepRatio` 0.08 -> 0.24** (`uu.VolumeStepRatio`). The textured web keeps its own 0.2 (D-164).
+- **`HintScale` 2** (`uu.VolumeHintScale`, the former `SkyPad` slot of `FUniVolumeView` / `FVolumeViewGPU`). It multiplies the step hint of every non-periodic carrier the camera is inside (|CamLocal| < 1). From outside a carrier the hints stay as written: a ray crossing a disc steeply loses 5% per ray at x 2 (T3.vol.march, face-on at 60 kpc, unprefiltered), against 0.5% from inside.
+- **`LocalStartCm` 1 pc -> 10 pc** (`uu.VolumeStartPc`). Carriers whose LUT starts later (D-160) are unaffected.
+Rationale: T2.vol.perf_inside, D-195 defaults against the old ones:
+- 198.5 -> 74.8 steps/px toward the centre (2.65x fewer); 158.4 -> 52.2 along the disc (3.0x); 134.3 -> 41.1 out of the plane (3.3x).
+- Total light within 0.25%, p95 per-pixel error at most 0.33% (old: 0.05%), no truncation. CPU reference march time 3347 -> 1141 ms.
+- T3.vol.march (adaptive vs brute force, per ray, unprefiltered) stays under 1%: worst 0.67% (face-on 60 kpc, unchanged), inside 0.53%.
+- Inside a rich cluster's core (T2.vol.cluster_d195, new; camera inside the cluster's carrier, 1 cluster + galaxy carriers): 2.15x fewer steps, total light -0.03%, the cluster's light -0.40%, visible pixels' p95 0.60%, against the D-160 march at the old step quality.
+- T2.vol.equivalence (D-160's speed-ups) now pins both of its marches to the old step quality: at 0.24 the two step grids alone differ by 0.17% in the cluster's light, against its 0.1% bound. Its numbers are unchanged.
+- The GPU march costs about the same per step, so the volume pass should drop by about 2.5-3x where the owner measured 20-31 ms. Engine numbers: UE-32.
+Next (phase 2, B-017): a CloudAtmosphere-style accumulating resolve (a jittered sample within each step, an age-weighted history, a moments clamp, a larger interleave), and possibly clipping each ray to the galaxy's disc slab.
+Reroll impact: None (render only).
+Status: Provisional (UE-32)
+
+D-196 — Volume cost on large viewports and in motion; sprites hand over only what their carrier takes; warp effects off by default (render-only)
+Question: Owner, after D-195:
+- still under 60 fps in dense galaxy cores; the worst case is 35-40 fps and needs to be about 50% faster;
+- a galaxy's sprite (or the backdrop) can fade before its glow fades in;
+- inside a cluster, moving at intergalactic speed (425 kpc/s), nearly every galaxy vanished until the camera stopped.
+Findings:
+- The owner's capture (RTX 4090 laptop, 1880 x 1120 viewport): Uni.Volume 17.3 ms of a 20.9 ms GPU frame, two dispatches and a draw (march, reconstruct, composite). ProfileGPU shows scopes only, so the march's own time and mode were not visible.
+- Moving in vanishes: `uu.Warp 0` fixed it (owner). D-187/D-190/D-192's warp effects dim nearly everything at that speed; the cause is not found yet (B-018).
+- Per-pixel background (D-166): any background change (a LUT change over 1%, or 200 pc of travel) put the background carriers into every pixel's march for the next 30 frames. Offline, from inside the Milky Way, that doubles the steps per pixel (70 -> 142 toward the centre; 47 -> 120 along the disc) and triples the carriers each step evaluates (1 -> 3). The uu.perf log counted 10 refreshes in 40 s of flying inside the galaxy, so about a quarter of the frames had it.
+- The march ran at output / 2 whatever the viewport: 940 x 560 (0.53 Mpx) on the owner's viewport, about 130k rays a frame sliced.
+- Sprite handoff: the sprite handed off by the curve alone (Uni_CarrierHandoff), while the carrier exists only if the builder kept it. Galaxies over the frame's carrier cap (128; a rich cluster's core has more), a carrier whose integral is not ready (D-140), or one whose contributor sleeps (D-168/D-176) lost their light: sprite faded, no glow.
+Decision:
+- **Background per pixel only when it pays** (`uu.BackgroundMode 2`). The background goes per pixel only while it changes at least every `uu.BackgroundPerPixelInterval` frames; 0 (automatic) is where a six-face map refresh per change costs more than marching it per pixel (6 x 256^2 rays against a quarter of the march). It leaves per pixel after `uu.BackgroundStillFrames` still frames, as before. A change now and then refreshes the map, cross-faded (D-159).
+- **March pixel budget** (`uu.VolumeMaxMarchPixels`, 262144). The march is output / `uu.VolumeDivisor`, scaled down (aspect kept) to at most this many pixels (`UniCore::VolumeMarchSize`). On the owner's viewport, 663 x 395 instead of 940 x 560: about half the rays.
+- **GPU scopes** for ProfileGPU: Uni.Volume.March (or .March+Background), .Reconstruct, .Composite, .BackgroundMap. `uu.perf` prints the march's size, rays, slicing, and how many frames had the background per pixel.
+- **Carrier handoff table.** The builder lists each local carrier's parent and its share (`FCarrierHandoff`: the curve x the cap fade). The subsystem names them by this frame's (cell index, slot) (`CarrierHandoffTable`, `FUniStreamer::SlotOf`), sorted. The project pass binary-searches them for objects with a carrier (`Uni_ObjectIsCarrierParent`) and draws `1 - share` (`Uni_ProjectObjectH`). Without an entry (no carrier this frame, or the volume off), the sprite is whole. The curve stays for the offline sprite-only paths (`Uni_ProjectObject`).
+- **Warp effects off by default** (`uu.Warp` 0). Owner: they are not convincing yet; revisit after the optimisation passes (B-018).
+Rationale:
+- T2.vol.march_budget (new): on the solar camera, output 627 x 373 (a third of the owner's), half resolution 313 x 186 against the budget's 221 x 131 (2.0x fewer rays). Upsampled to the output against a full-resolution march: light +0.36% / +0.32% (half +0.11% / +0.10%); per-pixel p95 1.23% / 0.88% (half 0.41% / 0.30%). Steps per pixel unchanged.
+- T2.vol.handoff_cap (new): inside the rich cluster's core (over 128 candidates), with the carrier cap halved to 64, the light over the whole sphere is within -1.48% of the default cap's with the table, against -10.28% with the curve. At the default cap the curve is already 0.77% short there.
+  - Caps measured (table / curve): 100: +0.07% / -3.47%; 64: -1.48% / -10.28%; 32: -11.4% / -21.1%.
+  - Below about 40 the cap drops galaxies over UNI_THETA_PROMOTE (0.02 rad). Those draw no sprite at any share (extended promotion candidates), which is why the cap ranks by angular size.
+- Background rule: engine-only (UE-33). Offline it costs 2x the steps and 3x the carriers per step (above).
+Expected (UE-33): the march about 2x cheaper on the owner's viewport, more while moving. That is the 50% asked for if the march is still ~80% of the frame.
+Known: the per-ray carrier cap (UNI_VOL_MAX_ACTIVE 12, D-161) still fades the least significant carriers on a ray crossing more than 12 (a cluster core); their sprites have handed off.
+Reroll impact: None (render only).
+Status: Provisional (UE-33)
+
+D-197 — Fewer stars per galaxy and fewer galaxies per cluster or group: generated children thinned, their light kept as glow (amends D-133 counts; reroll: thinned objects removed, the kept unchanged)
+Question: Owner, after D-196: reduce the galaxies per cluster or group, and the stars (quantity or view distance) within a galaxy, by ~30% each.
+Findings:
+- From 1 kpc from the Milky Way's centre (the dense core), 1.78 M stars are resident against ~31k drawn in an 1880 x 1120 frame. The project pass walks every resident object each frame, and the streamer generates them all.
+- Shrinking star windows would not help in practice: windows are whole cells (5^3 at dm 0), so a 30% shorter reach changes nothing until it removes a whole shell (-78%). Stars past a window would also lose their light, since the LUT assumes they are drawn.
+- Thinning the draw is cleaner. Counts come from Uni_PoissonCount (inversion on one uniform), so a lower lambda keeps the first draws: the kept children keep their identities.
+Decision:
+- **FUniEmitter::SpriteKeep** (default 1). Counts (LambdaScale, and the authored bright members' Poisson draw) use NTotal x Keep; the light stays NTotal's.
+- **The carrier's LUT gives the thinned share to the glow**: unresolved = Lbar - Keep F_L G (UnresolvedAt, BuildEmissionLut). Blocks are per (child, keep), cached like the full ones (KeepBlockOf, KeepLutCache), with their own significance start (the glow is significant from the local start, 10 pc). Root emitters too (group dwarfs from the map); field galaxies are not thinned.
+- **UniScenes::UseSpriteKeep(Def, StarKeep, MemberKeep)**:
+  - every kStar emitter gets StarKeep;
+  - every kCluster emitter (members, catalogue clusters' included) and every kDwarf emitter (group dwarfs) gets MemberKeep.
+- **Engine defaults 0.7 and 0.7** (`uu.Star.Keep`, `uu.Cluster.MemberKeep`; FClusterTuning; applied at uu.Enable after the web). The offline scenes keep 1 unless a test applies it.
+Rationale:
+- T2.vol.sprite_keep (new), stars at 0.7:
+  - 1 kpc from the centre: 1,784,195 -> 1,248,898 resident (0.700), all of them full-draw stars, sphere light +1.17%;
+  - solar circle: 47,051 -> 33,022 (0.702), 99.94% full-draw, +0.23%.
+- T2.vol.member_keep (new), members at 0.7 in a rich cluster's core:
+  - 534 -> 390 resident (0.730), all full-draw; their own light 0.723;
+  - the cluster's glow is linear in keep (47 -> 526 -> 1562 at 1, 0.7, 0.05; 0.01% off the line).
+  - The sphere's total moves with which galaxies were thinned. One large galaxy near the camera can hold most of the light (1.2 Mpc out, its thinning took 93% of the member carriers' light), and the per-ray carrier cap (12) drops more of a full core's light than of a thinned one's, so the thinned core reads +6%. In expectation the glow is exact.
+Reroll impact: the thinned stars, members and dwarfs are gone; every kept object is unchanged (identity, position, properties). Saved references to a thinned object fail to resolve (the API reports not found).
+Status: Provisional (UE-34)
+
+D-198 — Half the stars and cluster members, darker dust, looser hints around the camera, a march budget that falls with speed (amends D-195, D-196, D-197; reroll: as D-197)
+Question: Owner, after D-197: still too slow at intergalactic speeds and in dense parts of galaxies. Specific asks:
+- thin stars and cluster or group members to ~50% (less pop-in of nearby stars in dense regions, less to load and march in clusters);
+- darker dust lanes;
+- any further raymarch ideas.
+Decision:
+- **Thinning defaults 0.7 -> 0.5** (`uu.Star.Keep`, `uu.Cluster.MemberKeep`; D-197's mechanism).
+- **Dust x 2 and lane contrast 2.2 -> 3.0** (`uu.Galaxy.DustScale`, `uu.Galaxy.DustLanes`; `UniScenes::UseDustTuning`, applied at uu.Enable; the offline scenes keep the D-132 dust unless a test applies it).
+- **`uu.VolumeHintScale` 2 -> 3** (D-195: carriers around the camera only).
+- **March budget falls with speed** (`uu.VolumeTravelPixelScale`, 0.35). `uu.VolumeMaxMarchPixels` x lerp(1, 0.35, the travel curve), the curve going 0 at 100 kpc/s to 1 at 10 Mpc/s (FUniFrameData::SpeedAmount, Warp.Current whatever uu.Warp). It is quantised to quarters of the curve, so the march size (and its history) changes at most four times on the way up. Past ~8 march pixels of motion a frame the history is dropped anyway (D-194), so the glow is the fresh quarter alone and detail is not seen.
+Rationale:
+- T2.vol.sprite_keep at 0.5: 1,784,195 -> 892,015 resident stars 1 kpc from the Milky Way's centre (0.500), identities kept, sphere light +1.93%; solar circle 0.503, +0.43%.
+- T2.vol.member_keep at 0.5: 534 -> 280 members (0.524), their light 0.482; glow on the line (0.00%).
+- T2.vol.dust_tuning (new): the dust takes 38.6% -> 51.5% of the Milky Way's glow edge-on from 40 kpc, and 46.9% -> 59.5% toward the centre from the solar camera. Steps unchanged (74.9 -> 74.0; not opaque enough to stop rays early).
+- T2.vol.perf_inside at hints x 3: 58.6 / 45.8 / 37.4 steps/px toward the centre / along the disc / out of the plane (D-195's x 2: 74.8 / 52.2 / 41.1). p95 0.27-0.41%; T3.vol.march worst 0.67% (inside 0.43%).
+- Speed budget: at full travel speed 0.35 of the rays: on the owner's viewport about 0.09 Mpx (~400 x 235), against D-196's 0.26 and the old 0.53.
+Next if still short (B-017 and the owner's capture decide):
+- the march's per-step cost (the textured galaxy sample and its hint, now the bulk with ~1 carrier active);
+- CloudAtmosphere's accumulating resolve with a 3 x 3 or 4 x 4 interleave (2.25-4x fewer rays a frame);
+- empty-space skipping outside the disc.
+Reroll impact: as D-197 (thinned objects gone, the kept unchanged); dust and the march are render-only.
+Status: Provisional (UE-35)
+
+D-199 — Polish: coarser log steps, a coarser textured-web march, the warp optics' motion in double (B-018), the D-198 dust still (render-only)
+Question: Owner, away for a few hours: keep polishing the stack, performance (especially at speed) first.
+Findings:
+- **Per-step cost** (CPU reference, inside the Milky Way, untextured): a dusty galaxy sample (emission + dust, D-181) 306 ns; the step hint 90 ns; the LUT 9 ns. The pair is twice an emission sample: the dust evaluates its own disc and arms. No safe cut there (D-181's pair test is bit-exact), so this round cuts steps.
+- **Step ratio, with hints x 3** (T2.vol.perf_inside, steps/px toward the centre / along the disc / out of the plane; p95):
+  - 0.24: 58.6 / 45.8 / 37.4, p95 0.27-0.41%;
+  - 0.32: 52.8 / 38.9 / 30.7, p95 0.40-0.61%, T3.vol.march 0.72%;
+  - 0.40: 49.5 / 34.9 / 26.9, p95 0.78%;
+  - 0.32 with hints x 4: 44.8 / 35.8 / 28.9, but T3.vol.march 2.2% per ray toward the centre.
+- **Textured web** (T3.webtex.background, cube light against the procedural web / correlation / median texel / steps per texel):
+  - 0.2: -0.14% / 0.999 / 1.3% / 50;
+  - 0.3: the same / 43;
+  - 0.4: -0.13% / 0.999 / 1.3% / 40.
+  - The texture's own hint bounds the step past 0.4. This is what the background costs per pixel while travelling fast (D-196).
+- **B-018: the warp optics' motion overflowed.** WarpVelBetaOf took FVector3f::Size() of the camera's step, and a float's square overflows past 1.8e19 cm (6 pc a frame). At any warp speed the motion came out zero with the effective speed non-zero. Uni_Aberrate with a zero motion shortened every direction by sqrt(1 - b^2). So every sprite took a tail of that shortening whatever its distance: ~55 px at 20 degrees off centre and the 64 px cap at 40 at full warp (light spread that far: gone). The volume marched shortened rays and reprojected with them.
+  - At the owner's 425 kpc/s (warp ~0.23, b ~0.12) that tail is ~1 px. So it is surely part of what the owner saw at speed with warp on, but maybe not all of it (the pawn dimmed too: auto-exposure is the other suspect).
+- **Dust look:** a dust arm sharpness of 6 (with dust arm share 0.9) was tried for crisper lanes: it aliased into rings at the centre. Rejected, not kept.
+Decision:
+- **`FVolumeSettings::StepRatio` and `uu.VolumeStepRatio` 0.24 -> 0.32.**
+- **`TexturedWebStepRatio` 0.2 -> 0.4** (`uu.VolumeWebStepRatio`, new).
+- **`UniCore::WarpMotion`** (UniTravel.h): the camera step normalised in double; WarpVelBetaOf uses it. Uni_Aberrate and Uni_DopplerFactor leave a direction and its colour alone when the motion is not a unit vector (|v|^2 <= 0.25). `uu.Warp` stays 0 by default until the owner has looked again.
+- **still_galaxy_dust_d198** (T2.galaxy.dust): the D-180 cloud dust over the engine's D-198 dust, one textured galaxy at 25 and 68 degrees.
+Rationale: T2.vol.perf_inside and T3.vol.march as above. T3.webtex.background as above. T1.warp.speed (new): a 7 kpc step gives a unit motion (0 error; the float length was inf); a zero motion changes nothing (0, Doppler 1); a galaxy 20 degrees off centre streaks 1.84 px at 1 Mpc (its parallax x the warp amount, 1.97) and 0 at 50 Mpc.
+Reroll impact: none (render only).
+Status: Provisional (UE-36)
+
+D-200 — The glow's march resolution follows the GPU frame time (dynamic resolution for the volume alone; render-only)
+Question: Polish round 2, the owner away. The target is 60 fps with the ocean, atmosphere and meshing pipelines also on the GPU. Fixed budgets (D-196, D-198) cannot know what else the frame holds.
+Findings:
+- Inside a rich cluster's core (offline, sliced grid at 331 x 197): 16.1 steps/px and no supersampled pixel. But the wave maximum is 37.4 (2.3x the mean: rays crossing galaxies take more steps than their neighbours). So clusters cost less per pixel than a galaxy's interior (50+), which stays the worst case.
+- Cutting the per-step cost needs the GPU profile (D-199). The one lever every scene shares is the march's pixel count.
+Decision:
+- **FVolumeAutoBudget** (UniVolume.h): seven fixed levels of the march pixel budget, 1, 0.84, 0.71, 0.6, 0.5, 0.42, 0.35 (~0.92x the march's linear size per level).
+  - Smoothed GPU frame time (EMA 0.15): down a level when it is 3% over the target, up when 15% under.
+  - At most one change per `uu.VolumeAutoHold` (20) frames, since each change restarts the glow's temporal history.
+- **Engine:** `uu.VolumeTargetFps` (60; 0 off). The GPU frame time is RHIGetGPUFrameCycles(0) (DynamicRHI.h). F.VolumeBudgetScale reaches the renderer, and the smaller of it and the travel scale (D-198) wins.
+- `uu.perf` prints the level, the scale, the smoothed GPU time and the changes so far.
+Rationale: T2.vol.auto_budget (new, a model frame with 5% noise at 60 fps):
+- with 6 ms of other work and the glow 17 ms at full budget, it settles on level 3 (x0.6, 16.2 ms) after 3 changes;
+- it holds for 1000 frames without a change;
+- it climbs back to full when the glow drops to 6 ms;
+- it stays full with no target.
+Known:
+- If the rest of the frame alone is over the target, the glow drops to its floor (x0.35) and stays: it cannot help, and it costs little there.
+- The GPU time comes from the RHI's own frame timing (what `stat unit` shows as GPU).
+Reroll impact: none (render only).
+Status: Provisional (UE-37)
+
+D-201 — Travel sensitivity default 2.5 -> 0.5 (amends D-154; render and streaming only)
+Question: Owner, after D-200: intergalactic speeds still drop to ~30 fps. D-200 only scales the glow.
+Findings: T2.vol.travel_load (new). Flythrough, thinned as the engine's (D-198), camera 100 Mpc out; resident objects / cells by the travel boost (dm):
+
+| dm | Objects | Cells | x rest |
+|---|---|---|---|
+| 0 | 17,349 | 584 | 1 |
+| +0.5 | 30,641 | 1,027 | 1.77 |
+| +1 | 71,870 | 2,435 | 4.14 |
+| +1.5 | 102,092 | 3,471 | 5.9 |
+| +2.5 | 307,803 | 10,490 | 17.7 |
+
+D-154 adds up to `uu.TravelSensitivity` (2.5) mag while flying fast, widening every window. All of that is generated, projected and drawn while the camera moves through it.
+Decision: `uu.TravelSensitivity` 2.5 -> 0.5. The boost and warp curves are otherwise unchanged (the warp amount and D-198's travel pixel scale have their own curve).
+Rationale: at +0.5 the view at speed holds 1.8x rest's objects, not 17.7x. Galaxies still brighten a little into view while travelling. Owner: 0 turns it off.
+Reroll impact: none (what is resident changes; what any cell generates does not).
+Status: Provisional (UE-38)
+
+D-202 — The background web's step hints loosen with travel speed (render only)
+Question: Owner: intergalactic speeds are still heavy; should distant clusters come from the density field rather than being spawned and marched?
+Findings: clusters are one per web-texture node (the 113 heaviest a 200 Mpc tile; the other 4,012 nodes are groups, labels only, D-174/D-177), and far ones are already sprites only: a cluster's contributors wake lazily (D-176/D-177), so nothing is marched for them. The engine-like textured scene at the void camera: 2 periodic background carriers + 1 cluster carrier with no contribution in view; 73 steps a pixel, all of them the background web, 2 active carriers a step. While travelling fast (D-196) that background is marched per pixel, so at speed the glow's cost is the web, not the clusters. Its step hints x k (T3.webtex.background cube, 6 x 96^2):
+
+| x | Steps/texel | Median texel | Correlation |
+|---|---|---|---|
+| 1 | 40 | 1.3% | - |
+| 2 | 27 | 1.9% | 0.997 |
+| 3 | 23 | 6.1% | 0.973 |
+
+Decision: `FVolumeViewGPU::WebHintScale` (was Pad1) multiplies the step hint in periodic carriers that do not contain the camera; the engine sets it to lerp(1, `uu.VolumeWebTravelHint` (2), travel amount). The direction map is always marched at x 1 (it is reused at rest).
+Rationale: x 2 is 32% fewer background steps for -0.11% light and a 1.9% median texel, and only while moving fast, when the march is also at reduced resolution (D-198) and the eye is least critical.
+Reroll impact: none.
+Status: Provisional (UE-39). T2.webtex.travel_hint.
+
+D-203 — Cell glow: what has not loaded is glow, windows keep their rest size, a fixed build budget (amends D-128, D-139, D-162, D-173, D-154; render and streaming only)
+Question: Owner, after D-202: "not have to use individual entities at that scale for raymarching, and to be able to transit at any speed scale without slowdown. Ideally our loading times would be fast enough that we don't need to stretch the windows and can just have a fade out implicit in the march." Owner chose to try it.
+Findings:
+- The glow already carries every child not drawn as a sprite (D-128), and distant clusters and galaxies are never marched one by one (D-129, D-177). But the drawn share was per level: a cell still loading inside the visible radius was a hole (pop-in). Windows stretched ahead at speed to load cells before they were seen (D-139, D-162), travel sensitivity widened them further (D-154), a level's fade waited for its visible cells (D-128's hold), and D-173 had to let "urgent" cells through unspread. So the work per frame grew with speed.
+Decision:
+- **Per-cell fade.** A cell draws its sprites x its own fade: 0 until it is Ready, then rising to 1 over `uu.CellFadeFrames` (8) frames from the frame it became Ready (`FCell::ReadyAt`; a regeneration fades in again). It goes to the GPU in the cell table's fade bits (the level's fade x the cell's). A level's fade no longer waits for its visible cells.
+- **Cell glow in the march.** Per carrier block the LUT holds, after its emission and tail blocks, one block per child level q of the light drawn as sprites at that level, D_q(t) = sum over the level's slices of P keep F_L G (what the emission block subtracts for it; `BuildEmissionLut(..., bDrawn)`; the emission block's first entry's w holds first level + 256 x count). Each frame the streamer lists the levels with a cell not fully drawn and their cells' fades over the window box (`FUniStreamer::CellGlow`, `FCellGlowLevel`); the builder appends those grids to the LUT buffer after every block (`FVolumeViewGPU` grows 64 -> 96 bytes: `GlowMask` over levels 0..127, `GlowBase`, `GlowLevels`). At each step the march adds (1 - cell fade) D_q(t) for the cell of each loading level q of the carrier's children that holds the sample (`Uni_CellGlow`, `Uni_CellGlowCarrier`, `Uni_CellGlowFade`). Nothing loading: no cost.
+- **Windows keep their rest size** (`FUniStreamer::WindowLeadMax`, `uu.WindowStretch` 0; D-162: 3). Suspension (velocity LOD) keeps D-162's threshold (`SuspendLeadCells` 3): a level whose cells would be crossed before they load is suspended into the glow, as before.
+- **A fixed build budget** (`FUniStreamer::BuildBudget`, `uu.StreamBuildBudget` 96 cells a frame over every level). Chosen across levels after the level loop (`SubmitBudgeted`): cells a finer level's parent gate waits on first, then the least slack (D-173's frames until visible at this speed), then the nearest, coarser levels first. Regenerated cells always go and count against it. The rest stay Waiting: glow. 0: D-173's per-level rule.
+- **Travel sensitivity default 0.5 -> 0** (`uu.TravelSensitivity`): it widened every window at speed.
+- The background map is marched without cell glow (it is kept while cells load and fade, so their glow would stay baked in); per pixel, while travelling fast, it has it. The project pass no longer multiplies the warp arrival into the fade (the cell's own fade is the arrival now; the streak stretch stays).
+- Engine: `uu.CellGlow` (1) switches the cell fade, the LUT's drawn blocks and the grids together. Offline the streamer's and builder's defaults stay off (the earlier checks keep testing the earlier rules).
+Rationale:
+- T2.vol.cell_glow_exact (new): solar camera, 18 star levels; every cell of every star level at fade 0 through the grids equals the levels' fades at 0 (total -0.0000%, worst pixel 0.000%); a hashed half of the cells plus its complement equals all plus none (-0.0000%, worst pixel 0.000%).
+- T2.stream.cell_glow (new): the Milky Way at 10 pc a frame (600 pc/s), 3-frame phases, no stretch, 96 cells a frame. Light over the sphere against the settled reference, over its sprite light (frames 16 / 32 / 48): -1.20 / -0.59 / -0.24% with the glow, -2.68 / -1.91 / -1.39% without. With local carriers from 1 pc instead of D-195's 10 pc: -0.58 / -0.09 / +0.20%: most of what is left is stars within 10 pc of suspended or loading levels, lost with or without the glow (as before D-203). At 2 pc a frame cells load in time either way (0.04%). At most 96 cells built a frame; windows 125 cells.
+- T2.webtex.cell_glow (new): the owner's scene (adhesion web, node list, galaxies, clusters, stars) from rest in intergalactic space to 30 Mpc/s, D-202 (stretch, D-173, travel sensitivity +0.5) against D-203: streamer bookkeeping 1.14 -> 0.35 ms a frame, generation (the CPU backend: the GPU's work in the engine) 2.54 -> 0.60 ms a frame, worst frame 32-37 -> 5 ms (two runs), cells submitted at most 336 -> 96 a frame, tasks over the flight 6,883 -> 2,793, largest window 441 -> 125 cells. Light within 0.3% of the reference's sprite light (glow or not: at intergalactic speed the levels that cannot keep up are suspended into the glow already; D-202 +0.9%, its travel sensitivity drawing more).
+Known:
+- A cell's stars within the local carriers' 10 pc start (D-195) are missing while it loads.
+- The first fill after uu.Enable or a teleport is glow condensing over ~(cells / 96) frames instead of a level fading in whole.
+- Not built: the generation round trips (probe, then place: ~6 frames) are unchanged; one round trip would put less of what is near the camera in glow at a given speed.
+Reroll impact: none (when a cell is built and how it is drawn; never what it holds).
+Status: Provisional (UE-40)
+
+D-204 — Objects placed from their cell's float origin away from the camera (amends D-104; render only)
+Question: Owner: on an implicit octree, an object should not redo the digits its cell (or parent) already fixes, all the way down the chain. Generation, the march and the CPU bookkeeping already work that way (objects store 32-bit in-cell offsets; fields are evaluated in the parent's float frame; carriers march in their own frame; contributors are measured from a nearby anchor). The project pass did not: every resident object, every frame, added its offset into its cell's exact 128-bit camera delta and converted to float (D-104), ~100 integer operations an object (~900k stars in a dense core). Owner: build it.
+Decision:
+- `Uni_CellRel` (UniCoord.ush) builds a cell's context once: the exact deltas, the origin as hi + lo floats (`Uni_S128ToHiLo`), and bFar: the camera is at least one cell width from the cell on some axis (so every object in it is at least that far), level 32 or above.
+- `Uni_ObjectRelativeC`: a far cell's object is Hi + ((Lo + offset x 2^(L-32)) - camera fraction), float adds; otherwise the exact integer path (D-104). The inner sum is about a cell width, so it rounds by 2^-24 of that; with the outer add, at most twice the exact path's 2^-24 of the object's distance.
+- The project pass builds the context once per thread of the cell's group, before its loop over the cell's objects (`Uni_ProjectObjectC`); `Uni_ProjectObjectH` builds it per call (offline, unchanged results within the bound). Pick and query stay exact.
+Rationale: T2.parallax.cell_rel (new): every resident object of the flythrough scene at four cameras (solar, the anchor's centre with 4.8M objects resident, just inside a level-66 cell's corner, intergalactic): direction within 8.8e-8 rad of exact double precision and distance within 1.2e-7 (the exact path alone 5.7e-8); 66% of 4,986,405 objects on the float path (the 27 cells around the camera's cell, per level, keep the exact one). On the CPU shim 98 -> 43 ns an object (a proxy: the GPU's 128-bit work is 32-bit integer lanes; the float path is ~12 adds and multiplies against ~100 integer operations).
+Reroll impact: none (render only; positions change below a few parts in 10^7 of the distance).
+Status: Provisional (UE-41: ProfileGPU's project pass in a dense core, before and after)
+
+D-205 — Clusters visible at speed again (render-only exposure); speed inside galaxy cores: cheaper cell glow, fewer stars, project pass guard (amends D-197/D-198, D-203, D-204)
+Question: Owner, after D-203/D-204 in the engine: intergalactic flight is faster, but nearby clusters are less visible at speed ("boost the density/opacity of the effect or something"); travel at mid speed inside a galaxy, worst around the core, became a pain point that lags and eventually resolves; how many warp octaves; fewer stars if it helps.
+Findings:
+- Sensitivity raises the exposure with the limiting magnitude (ExposureMag = LimitingMag - 1 + bias). Travel sensitivity brightened everything at speed by 10^(0.4 dm): x10 at D-154's +2.5, x1.6 at D-201's +0.5. D-203 set it to 0 (it widened every window), which took that brightening away.
+- Offline core flight (the Milky Way 1 kpc from its centre, stars at keep 0.5, 3-frame phases, 40 frames at 20 pc a frame), D-202 rules against D-203: streamer bookkeeping 11.2 -> 8.0 ms a frame, generation (the CPU backend: the GPU's work in the engine) 40.2 -> 22.3 ms (worst 661 -> 135 ms). So the offline model does not show D-203 as the regression; the engine's numbers are needed (UE-42).
+- The cell glow's march cost there (one carrier, 4-5 loading levels): +6% at 5 pc a frame, +2% at 20. Every loading level was tested at every step, though a sample far out lies in none of the fine levels' windows.
+- D-204's per-cell context was built by all 64 threads of a cell's group, including those with no object (most cells hold fewer than 64).
+- "Warp octaves": none at runtime. The galaxy field reads baked textures (D-179): warp_fine (discs and arms), warp_large (bulges, faded out past 0.5 of the radius), galaxy_detail; one read each per sample, at the footprint's mip, and the warps are skipped past mip 4-5 (D-181). Their octaves are baked into the textures. The warp travel effect (uu.Warp) is off.
+Decision:
+- **`uu.TravelExposure` (1.5 mag)**: render-only brightening at speed, x the travel curve (0 at 100 kpc/s, 1 at 10 Mpc/s, rising 2/s, falling 1/s), quantised to 0.05 mag; added to the exposure bias for sprites, glow and background (`UUniSubsystem::TravelExposureMag`). Windows, the limiting magnitude and everything generated are unchanged. 1.5 mag is x4.
+- **Cell glow pruned by distance** (`Uni_CellGlow`): a level's window reaches at most ~17.4 of its cells from the camera, so levels with 2^L < t / 18 are masked off at the step (they would read fade 1). The carrier's first level travels with its grid entry (bits 8..15). Exact (T2.vol.cell_glow_exact unchanged).
+- **Project pass**: only threads with an object build the cell's context.
+- **Stars per galaxy 0.5 -> 0.35** (`uu.Star.Keep`, FClusterTuning::StarKeep; owner's suggestion). Cluster members and dwarfs stay 0.5.
+Rationale:
+- Core flight, keep 0.5 -> 0.35: generation 22.3 -> 16.1 ms a frame (worst 135 -> 89 ms), resident objects 819k -> 579k.
+- Cell glow's march cost in the core at 5 pc a frame: +6% -> +0.5%.
+- T2.vol.sprite_keep at 0.35: 0.350 / 0.353 of the full draw resident, 100% of the kept in the full draw, light over the sphere +2.50% at 1 kpc from the centre (+1.93% at 0.5, +1.17% at 0.7: the excess grows with the thinning) and +0.48% at the solar circle; its bar is now 3%.
+Known: why the engine's mid-speed core flight got slower is not reproduced offline. The A/B to run there: uu.CellGlow 0, uu.StreamBuildBudget 0 / 192, uu.WindowStretch 3, with stat unit and uu.perf.
+Reroll impact: stars per galaxy thinned further (0.35); the kept stars are unchanged (D-197). Everything else render only.
+Status: Provisional (UE-42)
+
+D-206 — One web texel read for the background's two carriers (B-019; render only)
+Question: Owner: build B-019. At an intergalactic camera the glow is two periodic textured web carriers (field galaxies on walls, filaments and void matter; group dwarfs on the node matter), the same texture in the same frame, so every step read the same texel twice.
+Decision: At gather, a periodic textured web carrier in the same frame (camera position, period, rotation, prefilter) and texture resolution as an earlier one is paired with it (`Uni_CarrierSameWebTexel`); at each step the texel is read once and each carrier weights the channels itself (`UniField_WebTexCh`, which `UniField_WebTex` now calls). `FVolumeViewGPU::MarchFlags` (was a pad) bit 0 turns it off for checks.
+Rationale: T2.webtex.shared_texel (new): the owner's scene from the void camera, background map 6 x 64^2: 2 textured web carriers, 1 pair; 0 of 24,576 texels differ, same steps and truncation; the CPU reference 620 -> 384 ms (its trilinear emulation; on the GPU the saving is one trilinear fetch of two per step).
+Reroll impact: none (render only; bit for bit).
+Status: Provisional (UE-43)
+
+D-207 — One generation round trip for leaf cells (B-020; streaming only)
+Question: Owner: build B-020. With cell glow (D-203) latency decides how long what is near the camera stays glow at speed. A cell took two backend round trips (probe for counts, CPU allocation, then place: ~6 frames, D-122).
+Decision:
+- A cell whose objects never come back (every task's child archetype has no emitters: stars) and that holds no authored objects is generated in one trip: probe, allocation and place back to back on the backend, in a pool arena the streamer reserves; only the counts come back.
+- **Allocation rule** (`FuseAllocate`, UniStreamer.h, and UniGen.usf's new ALLOC pass, line for line): cells are runs of tasks with the same ordinal (`FGenTaskGPU::BoxLo[3]`, unused before) in order; a task's capacity is its count truncated so the cell holds at most 2^15 (lowest indices kept), its index base the running sum before it (as D-122); a cell whose total fits in the arena's remaining room is packed at the cursor, otherwise its tasks get capacity 0 and the next cells still try. The place pass reads the ranges from the ALLOC output (`UseAlloc`) instead of the task.
+- **Arena**: per cell 1.5 x its level's largest recent cell (decaying 1% a frame) + 64, or 2048 while the level has none yet; at most a quarter of the pool per batch (the rest go two-trip). On completion the streamer runs the same rule on the read-back counts: cells that fit are Ready; a cell that did not wrote nothing and goes two-trip from then on; the arena's unused tail and the ranges of cells evicted meanwhile are released; a batch whose cells were all evicted releases its whole arena.
+- `IGenBackend::SupportsFused / SubmitFused / PollFused` (CPU backend and the GPU backend: `FUniGenAllocCS`, one graph of probe, alloc and place); `FUniStreamer::bOneTrip` (engine `uu.GenOneTrip` 1; offline default off).
+Rationale: T2.stream.one_trip (new): the D-203 flight along the Milky Way's disc (10 pc a frame, 3 frames a trip), two-trip against one-trip against one-trip with a first arena of 1 slot a cell (every first try overflows): every cell Ready in both runs holds the same records in the same order (1,649 cells, 0 differ, both comparisons); identities resolve; the pool holds exactly the Ready cells' ranges (64,097 slots in all three: nothing leaked); 4,013 cells took one trip (0 overflowed; forced: 200 overflowed and fell back); frames from submission to Ready 6.00 -> 3.54 on average.
+Reroll impact: none (the same objects, sooner).
+Status: Provisional (UE-44: shaders compile, `Uni.Gen.Alloc` in ProfileGPU, stars arrive sooner at speed)
+
+D-208 — The volume's temporal slicing grows to 3 x 3 or 4 x 4 when the image is near still (B-017, part; render only)
+Question: Owner: build B-017 (the volume march's phase 2: a larger interleave, per-step jitter with an accumulating history, clipping rays to the galaxy's disc).
+Findings (each against a full march, offline):
+- **Larger interleave.** The D-184 slicing marches one pixel of each 2 x 2 block a frame and reprojects the rest; with N x N, one in N^2. Errors grow with the motion between a pixel's refreshes (it is resampled N^2 times between), so N may only grow while the image is near still. From 60 kpc turning 0.1 deg a frame (0.17 march px): 4 x 4 p95 3.0%, 3 x 3 2.0%, 2 x 2 0.8%.
+- **Clipping to the disc slab and bulge sphere** (12 footprint-widened flared scale heights plus the warps' reach; 18 widened effective radii; 99.9% of the light): 30.7 -> 29.3 steps per pixel over five views inside and outside the Milky Way, light within 0.005%, but the reference march no faster (the halo's steps are few and cheap already: the hints relax and the textures are gated off the disc). Not adopted, no code kept.
+- **Per-step jitter** only pays with a history that accumulates fresh samples (an EMA), which adds lag and ghosting exactly where the owner sees problems (at speed). Not built.
+Decision:
+- **Interleave N by motion** (`Uni_TemporalInterleave`): the renderer estimates how far the image moves a frame in march pixels (the view's turn, plus the camera's step over the nearest marched structure, `FVolumeScene::NearCm`: each carrier's march start, or its sphere from outside); 4 x 4 below 0.1 px, 3 x 3 below 0.5, the D-184 2 x 2 beyond. `uu.VolumeInterleave` (4; 2: always 2 x 2). N can change every frame (the history is the full grid either way).
+- **Phases** (`Uni_TemporalPack`: step | N << 8): 2 x 2 exactly as D-184 (its checks unchanged); 4 x 4 in the Bayer order; 3 x 3 a diagonal walk. Fresh pixels, their lattice taps and the march's dispatch (`bSliceMarch` now carries N) generalise to N.
+Rationale: T2.vol.interleave (new), 24-frame paths at 200 x 125 against a full march every frame (adaptive / 2 x 2):
+- inside the Milky Way at rest: N 4, 6% marched; light 0.00% / 0.00%, p95 0.00% / 0.00%;
+- turning 0.02 deg a frame: N 4; p95 0.12% / 0.03%;
+- turning 0.2 deg: N 3, 11% marched; light 0.02% / 0.02%, p95 0.37% / 0.19%;
+- drifting 0.002 pc a frame: N 4; 0.00%;
+- turning 1 deg: N 2 (unchanged), p95 0.44%;
+- from 60 kpc turning 0.1 deg: N 3; light 0.39% / 0.41%, p95 2.01% / 0.77%.
+T2.vol.temporal and temporal_fast unchanged (2 x 2).
+Known: it saves 2.3-4x of the march's rays only while the view is near still (inside a galaxy core at rest or drifting); in motion it is the D-184 2 x 2 as before. The march at speed is unchanged by this decision.
+Reroll impact: none (render only).
+Status: Provisional (UE-45)
+
+
+D-209 — The background map's re-march test ignores the cell-glow grids; uu.Perf says why the glow was or was not sliced and why the background was re-marched (render only)
+Question: Owner profiling (engine, at rest): the volume march is the cost (uu.Volume 0: 60 fps everywhere); some views chug and others do not; temporal slicing on; uu.CellGlow makes a trivial difference. uu.Perf in a costly view: "volume march 967x636, 615012 rays last frame, with the background", auto budget at its lowest level (x0.35) with GPU 31 ms; the background was marched per pixel in nearly every frame between the two logs, at rest.
+Findings:
+- **The background is re-marched at rest.** The subsystem re-marches the background map (and under uu.BackgroundMode 2 marches the background per pixel while that keeps happening) when the camera moves, its LUT blocks change, the sky-web settings change, or the LUT buffer's size changes. Since D-203 the cell-glow grids follow the LUT blocks in the same buffer and change size whenever any level starts or finishes loading (cells streaming in or fading, also at rest), so the size test fired every few frames: D-196's hysteresis then kept the whole periodic web in every pixel's march, the most expensive configuration (the uu.VolumeDebug 1 view in the costly spot shows uniform mid-heat over the whole sky: the web marched per pixel).
+- **The march was not capped.** 615,012 rays = the whole half-resolution grid of the owner's 1934 x 1272 output: uu.VolumeMaxMarchPixels was 0 (no limit). My profiling note had said to restore it with 0 after testing 65536; its default is 262144. With 0 the auto budget (a fraction of the cap) can do nothing either. Not a code change: the owner restores 262144.
+- **Slicing was not in either logged frame** (no "sliced" in the line), though the owner sees it apply. The log's text predates D-208 and does not say why a frame was not sliced.
+Decision:
+- `UniCore::LutBlocksEnd(GlowLevels, GlowBase, LutSize)`: the end of the LUT's blocks (the grids' start, or the size without cell glow). The re-march test compares it (and keeps only the blocks), not the buffer's size.
+- uu.Perf: the slicing actually used (1/N^2) and, since the last uu.Perf, frames sliced 1/16, 1/9, 1/4 and not sliced by reason (temporal off or a debug view, no history, march size changed, camera jump, the same frame rendered again, frames skipped); the march cap; background per pixel in how many of the frames since the last uu.Perf; background map re-marches by reason (camera moved, LUT layout, its LUT changed, sky web).
+Rationale: T2.vol.bg_lut_layout (new): the Flythrough scene at the solar camera with no grids, one level's and three levels': blocks end 9216 in all three while the buffer is 9216 / 9401 / 9769 entries, blocks identical; without cell glow the end is the buffer's size (2048).
+Reroll impact: none (render only).
+Status: Provisional (UE-46: uu.Perf at rest shows the background per pixel in ~0 frames and re-marches only when moving; fps at the owner's costly spot with uu.VolumeMaxMarchPixels 262144)
+
+D-210 — A galaxy march step does less work (constants once a frame, shared terms, the next step's limit in the sample pass); arms start outside the core and the disc warp is scale-free there
+Question: Owner, after the per-step breakdown: do (1) per-galaxy constants once, (2) share the spiral's terms between light and dust, (3) fold the step limit into the sample, (5) coarser or weaker warp in the core (the owner's core screenshot shows contour-like swirls); not (4) dust every other step. Then the clipmap (B-021).
+Findings:
+- **Per step, per dusty galaxy** (the camera's own galaxy): ~10 seed hashes (2 avalanches each) that are the same for the whole galaxy (texture offsets, mode phases, four arm hashes; two more in the step limit); the spiral evaluated twice (light and dust, up to 4 lobes each: pow and cos per lobe); up to 3 texture reads; ~60 transcendentals; the carrier and its parameters (15 float4) loaded twice (step limit, then sample).
+- **The core's rings and swirls** are the field, not the march: a log spiral winds without limit toward the centre (one more turn every ~1.5 e-folds of radius at the demo's pitch), so inside the bulge the arms (and the dust's, shifted in phase) were tight rings; the disc warp (a fixed displacement, ~225 pc for the home galaxy) bent them into swirls. Offline with the warp off the swirls go and the rings stay; with the bulge's warp off nothing changes.
+Decision:
+- **Galaxy constants** (`FUniGalaxyConst`, `Uni_GalaxyConstOf`, `Uni_GalaxyConstPack/Unpack`: 16-bit halves, exact in floats): the builder appends one block per parameter block after them (`FUniVolumeView::GalaxyConstBase`, the former pad; `FVolumeSettings::bGalaxyConst`, engine `uu.VolumeGalaxyConst` 1); the march reads them (`Uni_GalaxySharedK`, `UniField_GalaxyPairCK`, `UniField_GalaxyFilteredCK`, `Uni_GalaxyStepHintFilteredK`). Placement hashes inline as before (`Uni_GalaxyShared` wraps the K form).
+- **Shared terms**: the shared state carries -log(r) and the disc's radial exponential; an evaluation uses them when its parameters match (the dust's scale length, pitch and arm count are the emission's), else computes its own. Bit for bit.
+- **Step limit in the sample pass** (`Uni_CarrierStepLimit`): each carrier's limit at the next step's start is computed while its carrier and parameters are loaded for the sample (same point, same arithmetic); the step start uses it, and computes it only for a carrier not sampled in the previous step (its first step). Bit for bit.
+- **Core** (`Uni_GalaxyArmInner`, `Uni_GalaxyWarpInner`; galaxy C.w = V[11], the arms' inner radius in disc scale lengths; 0: off, every older field exactly; exemplar 0.25, so every galaxy and the home galaxy): the arms go to their azimuthal mean (light kept) between half the radius and the radius, and the disc warp's displacement grows linearly with radius up to it. The step limit sets no arm limit inside half the radius.
+- Not done: dust every other step (owner unsure).
+Rationale:
+- T2.vol.galaxy_const (new): bit for bit with and without the constant blocks in the core and from the solar camera.
+- Development checks (scratch, 5 views: the core toward the centre / along the disc / up, 0.13 kpc from the centre, the solar camera; 320 x 180, textured, palettes): constants + shared terms bit for bit against the D-209 march; the folded step limit bit for bit against the march before it.
+- T2.galaxy.core (new): outside the inner radius plus the warp's reach (20,000 points, filtered and not) the field is the old one bit for bit; ring means inside within 0.05% of the old field's (untextured, modes on); the arms' relative spread inside half the radius 0.00% (was 115%); stills still_galaxy_core_d209 / _d210 from the owner's spot (0.54 kpc from the centre toward it), the same display gain: the swirls are gone; 136.3 -> 133.2 steps/ray there.
+- T2.galaxy.shape: the D-172 field with every new parameter at zero, bit for bit (ModesOff now also zeroes C.w).
+- Cost (CPU reference, 5 views, 2 runs each, idle machine): D-209 870-888 ns/step; the exact cuts alone 833-880 (-4%); with the core 844-847 and 1.7% fewer steps (-6% in all). On the CPU the software texture reads and libm dominate; on the GPU hashes and buffer loads weigh more, so expect more there, but not a different order: the clipmap (B-021) is the lever. GPU unmeasured here. Per dusty galaxy step: ~10 hashes (~20 avalanches) and two transcendentals (a log and an exp) fewer, the carrier and parameters loaded once instead of twice; inside a quarter disc scale length (~0.5 kpc for the home galaxy) no arm lobes (up to 8 pow + 8 cos a step fewer) and steps 2% fewer there.
+Reroll impact: **stars inside a quarter of a disc scale length of every galaxy's centre** (~0.5 kpc for the home galaxy) (the arms' and the disc warp's change there) are placed from the new field; elsewhere nothing.
+Status: Provisional (UE-47: ProfileGPU Uni.Volume.March before/after (uu.VolumeGalaxyConst 0/1 isolates the constants); the core without swirls)
+
+D-211 — The galaxy the camera is in is marched from a camera-centred clipmap (the galaxy cache; B-021)
+Question: Owner: cache the galaxy as a density volume instead of evaluating its field at every step (after D-210 showed the per-step evaluation is the cost: the spiral twice, three texture reads, ~55 transcendentals).
+Findings:
+- **Resolution.** A camera-centred clipmap level reaches ~N/2 voxels, so a voxel subtends ~2/N rad at any distance (13 march pixels at the owner's resolution with N = 128). Emulated first by widening the analytic prefilter to 2/N: the core views did not change (p95 0.0%), the solar circle 0.9% at 128. The galaxy's structure is all >= ~40 pc.
+- **Built and measured** (T2.vol.galaxy_cache, six views inside the home galaxy, 160 x 90, against the analytic march): cubic voxels gave p95 6.0% (96) / 3.8% (128) at the solar circle: the thin disc and its dust blurred vertically by coarse voxels (without detail or warp textures the error stayed; without dust it grew). Anisotropic levels (a z voxel capped at 2 x 0.3 / N field units for every level but the last, so they reach +-4.5 kpc in z; the last level isotropic for the halo) -> 4.4% (96) / 2.3% (128). Level 0 reaching 128 or 512 pc: the same light (512: one level fewer).
+Decision:
+- **UniGalaxyCache.h** (UniCore): FGalaxyCache picks the camera's own galaxy (FVolumeScene::Home: the most weighted local prefiltered galaxy carrier whose cut sphere holds the camera, with the camera's field position in double), keeps K levels (level 0 reaches FinestHalfPc, each twice the last, until the last reaches 2 field units) of N^3 voxels in its field units, toroidal: each frame it emits the boxes the camera's move uncovered (at most three slabs a level; the whole level after a jump of a side), coarse levels first, within a voxel budget (a level that does not fit keeps its last window and coarser levels cover it). Publish writes the header (N, K, scale, 1/scale; per level its baked window in field units and its voxels) after the LUT and the view's CacheBase / CacheCarrier / CacheN / CacheLevels (FVolumeViewGPU 96 -> 112 bytes). Resets when the galaxy changes.
+- **Shader core** (UniVolume.ush): Uni_GalCacheBakeVoxel (light and dust densities prefiltered over the voxel, x a power-of-two scale for half floats; the palette tint over its largest channel), Uni_GalCacheSample (the finest level holding the point with 1.5 voxels to spare, faded into the next coarser over 4 voxels; false outside every level: the field then). The march uses it for the home carrier (light, dust, tint) where the prefilter has not already gone to the mean. Textures: A RG16F densities, B RGBA8 tint, N x N x K (N + 2): x, y wrap in the sampler, each level padded with copies of its last and first z slices so the hardware's z filter wraps within it.
+- **Engine**: UniVolume.usf CacheBakeCS (UNI_VOL_PASS 4, FUniGalCacheBakeCS), persistent textures, boxes queued on the render thread in order from every frame's data (a frame not rendered loses nothing; more than two full bakes waiting drops the queue and the game thread resets the cache), the march binding (UniGalCacheA/B in the common parameters), the background map never uses it. CVars uu.GalaxyCache 1, uu.GalaxyCache.Size 128 (~120 MB; 96: ~50 MB), uu.GalaxyCache.Budget 1048576 voxels a frame, uu.GalaxyCache.FinestPc 512. uu.Perf reports it.
+- The step limits stay the field's (correct, and cheap next to the sample); the cache does not change the steps.
+Rationale: T2.vol.galaxy_cache (new): core toward the centre / along the disc / out of the plane / 0.13 kpc from the centre / solar toward the centre / solar along the disc: light within 0.05%, p95 0.35 / 0.58 / 0.22 / 0.51 / 2.26 / 2.17%, the same steps; CPU reference march 2.4-3x faster. A 40-frame flight (7 pc a frame) baked incrementally equals a full bake texel for texel (2.0M voxels over 39 frames; a full bake is 16.8M). A 300 pc jump at a budget of N^3/20: 4 levels behind, light -0.01%, p95 0.43%.
+Reroll impact: none (render only; placement keeps the field).
+Status: Provisional (UE-48: shaders compile; Uni.Volume.March in the core and at the solar circle with uu.GalaxyCache 0 / 1; Uni.Volume.CacheBake cost while flying; no seams between levels; memory)
+
+D-212 — The galaxy the camera is in is marched from its baked 2D map (supersedes D-211's clipmap by default)
+Question: Owner: instead of forcing the galaxy's density into a volume texture, go native 2D: nearly everything costly lives in the disc's plane; bake a top-down map once per galaxy and pack the vertical information into its channels. Also: easy impostors (B-022), and top-down views for UI (scanning, warp targets).
+Findings:
+- **What is planar.** The arms (two lobe sums of pow and cos a sample, light and dust), the winding, the D-178 modes (lopsidedness, flare, the mode warp's height), the disc's radial fall-off: functions of the warped point's x, y only.
+- **What is not.** The texture warp (warp_fine, 3D curl sampled at (x, y, 2z)): its displacement changes over ~1.5 kpc in z, against a ~0.3 kpc disc. Baked at the mid-plane (first try) the arms became vertical columns: per-point error 46% of the disc term, per-pixel p95 54% at the solar circle and visible streaks looking down through the disc. The bulge's warp_large is 3D too (39% per point near the centre if dropped).
+- **So the map is unwarped and the warp is read per sample**: the warp fetch moves the point (as the field's), the map is read there. Per point the disc then matches the field to 0.9% (mean |error|; bilinear and half floats) and the bulge exactly.
+Decision:
+- **Map** (UniGalaxyMap.h, `Uni_GalaxyMapTexel`): RGBA16F over the field's x, y in [-1, 1], mips by 2 x 2 means: R the light's in-plane factor (DiscW exp(-R/h_R) (lop/flare) ((1-a) + a W (1+s)), with D-210's inner arms), G the dust's (its weight, phase, arms), B the mode warp's disc centre, A the light's arm part (the knots multiply it). Thickness is analytic (the flared scale height), not baked.
+- **Sample** (`Uni_GalaxyMapEval`): the twist, warp_fine (moves the point), galaxy_detail (disc noise, knots, dust lanes and holes), the map at the warped point (mip from the footprint), the vertical profile exp(-|z - B| / H_e) (H/H_e) for light and dust, the bulge displaced by warp_large: the field's terms but the arms and modes. Components as the field's (bulge, disc, arms, knots) for the palette.
+- **March**: the home carrier (FVolumeScene::Home) uses it where `FUniVolumeView::MapCarrier` names it (view 112 -> 128 bytes: MapCarrier, MapSize); it supersedes the cache.
+- **Engine**: baked on the GPU (owner: 0.8 s on the CPU is too long; bakes should be seamless and fast): when the camera's galaxy or the size changes, the game thread raises a request (an epoch, the size, the light's and dust's parameters) that rides every frame; the renderer bakes `uu.GalaxyMap.Budget` texels of rows a frame (UniVolume.usf MapBakeCS, the same Uni_GalaxyMapTexel; 1M: 2048^2 in 4 frames, 1024^2 in 1), then the mips (MapDownCS, 2 x 2 means), and reports the epoch; the frames after publish it. Until then the glow uses the field (no gap). Leaving the galaxy keeps the map for coming back. The background map never uses it. `uu.GalaxyMap` 1, `uu.GalaxyMap.Size` 2048 (~43 MB with mips; 1024 ~11 MB), `uu.GalaxyMap.Budget` 1048576. `uu.GalaxyCache` now 0 (used only where no map is published). uu.Perf reports both (the bake's frames). UniCore::FGalaxyMap::Bake (CPU) is the reference's (and the same function).
+- Placement keeps the field (the map is render only; it differs from the field by the filter's error).
+Rationale: T2.vol.galaxy_map (new; the six views of T2.vol.galaxy_cache, 160 x 90): at 2048^2 light within 0.02%, p95 0.07-0.32%; at 1024^2 light within 0.03%, p95 0.08-0.96%. CPU bake 0.8 s at 2048^2 (0.2 s at 1024^2) on two threads: ~4M evaluations of the planar terms (no textures), a few ms of GPU spread over 4 frames. CPU reference march ~20% faster than the field: on the CPU the three software texture fetches dominate; on the GPU the removed work is the arms' lobes (up to 8 pow + 8 cos), atan2, the modes' sin / cos and ~10 hashes, the fetches are hardware (expect much more there; measure).
+Reroll impact: none (render only).
+Status: Provisional (UE-49: ProfileGPU Uni.Volume.March with uu.GalaxyMap 0 / 1 in the core and at the solar circle; Uni.GalaxyMap.Bake per frame on entering a galaxy, at 1024 and 2048; no seams or blockiness near the camera)

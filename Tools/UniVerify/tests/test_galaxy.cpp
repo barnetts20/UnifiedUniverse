@@ -127,6 +127,7 @@ namespace
 	FFieldParams ModesOff(FFieldParams P)
 	{
 		for (int I = 16; I < 32; ++I) { P.V[I] = 0.0f; }
+		P.V[11] = 0.0f;   // D-210: the arms' inner radius (0: arms to the centre)
 		return P;
 	}
 
@@ -580,7 +581,12 @@ UNI_TEST(galaxy, dust)
 		MeanRatioWorst = std::max(MeanRatioWorst, std::abs(Sc / std::max(Ss, 1e-300) - 1.0));
 		SpreadGainMin = std::min(SpreadGainMin, Spread);
 	}
-	// Stills: two galaxies at 256 px, face-on-ish and inclined, smooth dust then cloud dust.
+	// Stills: two galaxies at 256 px, face-on-ish and inclined, smooth dust then cloud dust; and
+	// D-198's engine dust (x 2, lanes 3.0) under the D-180 cloud dust, for the look.
+	FVolumeProfile Tuned = Prof;
+	Tuned.DustTau = Prof.DustTau * 2.0f;
+	Tuned.DustLanes = 3.0f;
+	for (int Still = 0; Still < 2; ++Still)
 	{
 		const int Tile = 256;
 		FImage Img(Tile * 2, Tile * 2);
@@ -588,7 +594,8 @@ UNI_TEST(galaxy, dust)
 		{
 			const FFieldParams Pf = Rolled(E, H::Uni_SeedMix(0xD057u, 1u));
 			const H::FUniFieldParams P = Pf.ToHlsl();
-			const H::FUniFieldParams Pd = DustFrom(Pf, Row == 0 ? Smooth : Prof).ToHlsl();
+			const FVolumeProfile& Pr = Still == 0 ? (Row == 0 ? Smooth : Prof) : (Row == 0 ? Prof : Tuned);
+			const H::FUniFieldParams Pd = DustFrom(Pf, Pr).ToHlsl();
 			const double Inc = (Col == 0 ? 25.0 : 68.0) * 3.14159265358979 / 180.0, Az = 0.4;
 			const double Dv[3] = { std::sin(Inc) * std::cos(Az), std::sin(Inc) * std::sin(Az), -std::cos(Inc) };
 			const double Rt[3] = { -std::sin(Az), std::cos(Az), 0.0 };
@@ -624,8 +631,16 @@ UNI_TEST(galaxy, dust)
 				Img.Add(Col * Tile + X, Row * Tile + Y, C[0] * Gain * 0.95f, C[1] * Gain * 0.9f, C[2] * Gain * 0.8f);
 			}
 		}
-		WriteFrame(Img, "still_galaxy_dust", { "D-180: top, smooth dust lanes (D-132); bottom, cloud dust from galaxy_detail (ridged lanes, superbubble holes)",
-			"one textured galaxy at 25 and 68 deg inclination, each tile normalised to its peak" });
+		if (Still == 0)
+		{
+			WriteFrame(Img, "still_galaxy_dust", { "D-180: top, smooth dust lanes (D-132); bottom, cloud dust from galaxy_detail (ridged lanes, superbubble holes)",
+				"one textured galaxy at 25 and 68 deg inclination, each tile normalised to its peak" });
+		}
+		else
+		{
+			WriteFrame(Img, "still_galaxy_dust_d198", { "D-198: top, the D-180 cloud dust; bottom, the engine's dust since D-198 (x 2, lanes 3.0)",
+				"one textured galaxy at 25 and 68 deg inclination, each tile normalised to its peak" });
+		}
 	}
 	Uni::Check(2, "T2.galaxy.dust", "D-180 cloud dust (render only), D-181 pair evaluation: emission parameters carry no dust terms; the march's emission + dust pair equals the two separate evaluations bit for bit; a textured galaxy's face-on dust column keeps its mean within 25% of the smooth dust's and the column over the smooth one varies across the disc by at least 25% (rms); stills smooth / cloud")
 		.Metric("mean_change_worst", MeanRatioWorst).Metric("cloud_spread_min", SpreadGainMin)

@@ -151,7 +151,8 @@ UNI_FN float Uni_SpriteIntensity(float InApparentMag, float InExposureMag, float
  *  negative InBeta is the inverse (apparent -> true). */
 UNI_FN float3 Uni_Aberrate(float3 InDir, float3 InVel, float InBeta)
 {
-	if (InBeta == 0.0f) { return InDir; }
+	// D-199 (B-018): no motion (a zero vector with the optics on): unchanged, never shortened.
+	if (InBeta == 0.0f || !(dot(InVel, InVel) > 0.25f)) { return InDir; }
 	const float C = clamp(dot(InDir, InVel), -1.0f, 1.0f);
 	const float3 Perp = InDir - InVel * C;
 	const float Pl = sqrt(max(dot(Perp, Perp), 0.0f));
@@ -164,7 +165,7 @@ UNI_FN float3 Uni_Aberrate(float3 InDir, float3 InVel, float InBeta)
 /** The Doppler factor of a source at true direction InDir: g (1 + b cos t), above 1 ahead. */
 UNI_FN float Uni_DopplerFactor(float3 InDir, float3 InVel, float InBeta)
 {
-	if (InBeta == 0.0f) { return 1.0f; }
+	if (InBeta == 0.0f || !(dot(InVel, InVel) > 0.25f)) { return 1.0f; }   // D-199: no motion, no shift
 	const float G = 1.0f / sqrt(max(1.0f - InBeta * InBeta, 1.0e-6f));
 	return G * (1.0f + InBeta * dot(InDir, InVel));
 }

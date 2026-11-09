@@ -7,8 +7,9 @@
 // window state.
 //
 // Prototype scope (REVIEW_TONIGHT): camera, Local / Cruise motion modes (D-008), teleport,
-// sensitivity, the scripted flythrough, stats. Resolve, query, pick, events, persistence and the
-// promotion actor pool are stubs or absent (M3, M4).
+// sensitivity, the scripted flythrough, stats. D-193: Pick, QueryResident, FindNearest, events
+// (resident / evicted, visible / hidden for watched objects, promoted / demoted bodies) and
+// GetKnownObject. Resolve and persistence are absent (M4).
 //
 // Console (any level, PIE or standalone):
 //   uu.Enable [galaxy|web|flythrough]   start a universe at its demo camera
@@ -50,6 +51,10 @@
 //   uu.VolumeTemporal <0|1>             temporal slicing of the glow's march (D-184)
 //   uu.Sprite.HaloChroma / Floor        halo colour on bright stars (D-185); how far a sprite's quad
 //                                       reaches before its light is cut (D-188)
+//   uu.Pick [x y]                       log the object under the screen centre (or pixel x, y) (D-193)
+//   uu.Query <radius pc> [archetype]    log the resident objects within a radius of the camera
+//   uu.Nearest <archetype>              log the nearest resident object of an archetype
+//   uu.Events [archetype ...|off]       log resident / evicted events for archetypes (counts per second)
 //   uu.Disable
 
 #include "CoreMinimal.h"
@@ -60,6 +65,8 @@
 // UniSubsystem.gen.cpp, which sees only this header, and TUniquePtr must be able to delete them.
 #include "UniStreamer.h"
 #include "UniVolume.h"
+#include "UniGalaxyCache.h"
+#include "UniGalaxyMap.h"
 #include "UniSystem.h"
 #include "UniPromotion.h"
 #include "UniDemoScenes.h"
@@ -68,11 +75,13 @@
 #include "UniWebTexture.h"
 #include "UniSky.h"
 #include "UniMotes.h"
-#include "Async/Future.h"
+#include "UniQuery.h"   // D-193
+#include "UniApiTypes.h"
 #include "UniSubsystem.generated.h"
 
 class UTextureCube;
 class ASkyLight;
+struct FUniFrameData;
 
 /** D-157: game-thread phases of the universe's frame (plain C++, not reflected). */
 namespace UniPerf
@@ -192,6 +201,68 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Universe")
 	FUniCoord GetLocalAnchor() const { return LocalAnchor; }
 
+	// ---- Runtime API (D-193) --------------------------------------------------------------
+	// Lookups run on the GPU over what is resident and come back a few frames later; at most one
+	// pick and one query are in each frame (the rest queue). Every result names objects by
+	// FUniObjectId. Events are batched once per frame, on the game thread.
+
+	/** The object under a screen position (game viewport pixels, as GetMousePosition gives):
+	 *  the brightest sprite whose light reaches it, weighted by nearness (within RadiusPx at
+	 *  least). Returns the request id; OnResult is called with bFound false if nothing is there. */
+	UFUNCTION(BlueprintCallable, Category = "Universe|Query")
+	int32 Pick(FVector2D ScreenPosition, FUniOnPicked OnResult, float RadiusPx = 4.0f);
+	int32 PickNative(FVector2D ScreenPosition, TFunction<void(bool, const FUniObjectInfo&)> OnResult, float RadiusPx = 4.0f);
+
+	/** Resident objects within RadiusCm of Centre (exact distances), nearest first. Only what is
+	 *  loaded around the camera: a query far from it finds what the windows hold there. */
+	UFUNCTION(BlueprintCallable, Category = "Universe|Query")
+	int32 QueryResident(const FUniCoord& Centre, double RadiusCm, const FUniQueryFilter& Filter, FUniOnQueryResult OnResult);
+	int32 QueryResidentNative(const FUniCoord& Centre, double RadiusCm, const FUniQueryFilter& Filter, TFunction<void(const TArray<FUniObjectInfo>&, int32)> OnResult);
+
+	/** The nearest resident object of an archetype to From (bFound false if none is resident). */
+	UFUNCTION(BlueprintCallable, Category = "Universe|Query")
+	int32 FindNearest(int32 ArchetypeId, const FUniCoord& From, FUniOnPicked OnResult);
+	int32 FindNearestNative(int32 ArchetypeId, const FUniCoord& From, TFunction<void(bool, const FUniObjectInfo&)> OnResult);
+
+	/** The archetype id of a name in the current universe ("Star", "Galaxy", ...; -1: none). */
+	UFUNCTION(BlueprintPure, Category = "Universe|Query")
+	int32 GetArchetypeId(FName Name) const;
+
+	/** Immediately, an object the CPU knows (resident galaxies, clusters, groups and other
+	 *  parents; anchors). False for stars and anything not resident: use a query. */
+	UFUNCTION(BlueprintCallable, Category = "Universe|Query")
+	bool GetKnownObject(const FUniObjectId& Id, FUniObjectInfo& OutObject) const;
+
+	/** Which archetypes raise OnObjectResident / OnObjectEvicted (ids 0..31 of objects the CPU
+	 *  knows: galaxies, clusters, groups and anchors; empty: none, the default). Objects already
+	 *  resident are reported at once. */
+	UFUNCTION(BlueprintCallable, Category = "Universe|Events")
+	void SetResidentEventArchetypes(const TArray<int32>& ArchetypeIds);
+
+	/** OnObjectVisible / OnObjectHidden for this object (one the CPU knows) from now on. */
+	UFUNCTION(BlueprintCallable, Category = "Universe|Events")
+	void WatchObject(const FUniObjectId& Id);
+	UFUNCTION(BlueprintCallable, Category = "Universe|Events")
+	void UnwatchObject(const FUniObjectId& Id);
+
+	UPROPERTY(BlueprintAssignable, Category = "Universe|Events")
+	FUniOnObjectEvent OnObjectResident;
+	UPROPERTY(BlueprintAssignable, Category = "Universe|Events")
+	FUniOnObjectIdEvent OnObjectEvicted;
+	/** A watched object came into view and bright enough to see (as a sprite or as glow). */
+	UPROPERTY(BlueprintAssignable, Category = "Universe|Events")
+	FUniOnObjectEvent OnObjectVisible;
+	UPROPERTY(BlueprintAssignable, Category = "Universe|Events")
+	FUniOnObjectIdEvent OnObjectHidden;
+	/** A star or planet became an actor (M3) / went back to a sprite. */
+	UPROPERTY(BlueprintAssignable, Category = "Universe|Events")
+	FUniOnObjectEvent OnBodyPromoted;
+	UPROPERTY(BlueprintAssignable, Category = "Universe|Events")
+	FUniOnObjectEvent OnBodyDemoted;
+
+	/** uu.Events: log resident / evicted counts (console testing). */
+	void SetEventLogging(bool bOn) { bLogEvents = bOn; }
+
 private:
 	void PushFrame();
 	void SetupWebTexture(UniCore::FUniverseDef& Def);   // D-164
@@ -216,12 +287,26 @@ private:
 	UniCore::FCoord BackgroundAnchor;
 	TArray<FVector4f> BackgroundLutLast;
 	FVector3f SkyWebLast = FVector3f::ZeroVector;   // D-189: the sky-web settings the background map was marched with
+	uint32 BgDirtyCounts[4] = { 0u, 0u, 0u, 0u };   // D-209: background map re-marches since the last uu.Perf: moved, LUT layout, its LUT, sky web
+	uint32 BgPerPixelAtPerf = 0;                    // D-209: the renderer's per-pixel background count at the last uu.Perf
+	uint64 PerfFramesAtBg = 0;                      // D-209: PerfFrames at the last uu.Perf
 
 	// Travel sensitivity (D-154): the owner's sensitivity plus a speed-driven boost
 	UniCore::FTravelSensitivity Travel;
 	UniCore::FTravelSensitivity Warp;   // D-187: the same curve, 0..1, for the warp effects
+	UniCore::FVolumeAutoBudget VolumeBudget;   // D-200: the glow's pixel budget follows the GPU frame time
+	UniCore::FGalaxyCache GalaxyCache;          // D-211: the camera's own galaxy as a clipmap (uu.GalaxyCache)
+	// D-212: the camera's own galaxy's map: the request the GPU bakes (uu.GalaxyMap).
+	uint32 GalaxyMapEpoch = 0, GalaxyMapSerial = 0, GalaxyMapSize = 0;
+	UniCore::FObjectId GalaxyMapId;
+	UniCore::FFieldParamsGPU GalaxyMapParams[2] = {};
+	bool bGalaxyMapDust = false;
+	double GalaxyMapStart = 0.0, GalaxyMapBakeMs = 0.0;
+	uint64 GalaxyMapBakes = 0;
 	UniCore::FMoteScale MoteScale;      // D-192: the warp motes' lattice scale (follows the speed)
 	float EffectiveDeltaMag = 0.0f;
+	/** D-205: magnitudes everything is brightened by at speed (uu.TravelExposure x the travel curve). */
+	float TravelExposureMag = 0.0f;
 	FUniCoord PrevCamera;
 	bool bCameraJumped = true;
 	FVector3d CameraStepCm = FVector3d::ZeroVector;   // D-184: camera move this frame (cm), for the volume's reprojection
@@ -252,7 +337,9 @@ private:
 	uint32 FixedDiscSeeds[4] = { 0, 0, 0, 0 };   // D-183: seeds of fixed-orientation anchors (up to four)
 	double UniverseTime = 0.0;
 	double TimeScale = 1.0;
-	TMap<uint64, std::vector<UniCore::FCellKey>> CellKeysByFrame;   // the last few frames' cell tables, for activation readbacks
+	/** The last few frames' cell tables (keys, generations, planets' dynamic cells): GPU
+	 *  readbacks (activations, picks, queries) name objects by (cell index, slot) in them. */
+	TMap<uint64, UniCore::FFrameCells> FrameCellTables;
 	uint64 ActivationsUnmatched = 0;
 
 	// Promotion and real space (M3, D-146, D-147)
@@ -295,6 +382,52 @@ private:
 	float DeltaMag = 0.0f;
 	float ExposureBias = 0.0f;
 	uint64 FrameCounter = 0;
+
+	// Runtime API (D-193)
+	struct FApiPick
+	{
+		int32 Id = 0;
+		FVector2f CursorNdc = FVector2f::ZeroVector;
+		float MinPx = 4.0f;
+		FUniOnPicked Bp;
+		TFunction<void(bool, const FUniObjectInfo&)> Native;
+		uint64 SentFrame = 0;
+	};
+	struct FApiQuery
+	{
+		int32 Id = 0;
+		uint32 Mode = 0u;   // UNI_QUERY_MODE_SPHERE / _NEAREST
+		FUniCoord Centre;
+		double RadiusCm = 0.0;
+		uint32 ArchMask = 0u;
+		float MaxAbsMag = 99.0f;
+		int32 MaxResults = 256;
+		FUniOnQueryResult Bp;
+		FUniOnPicked BpNearest;
+		TFunction<void(const TArray<FUniObjectInfo>&, int32)> Native;
+		TFunction<void(bool, const FUniObjectInfo&)> NativeNearest;
+		uint64 SentFrame = 0;
+	};
+	TArray<FApiPick> PickQueue, PicksInFlight;
+	TArray<FApiQuery> QueryQueue, QueriesInFlight;
+	int32 NextApiRequestId = 1;
+	UniCore::FResidentEvents ResidentEvents;
+	UniCore::FVisibilityWatch VisibilityWatch;
+	TMap<uint32, FUniObjectInfo> PromotedReported;   // body seed -> as reported promoted
+	bool bLogEvents = false;
+	uint64 LoggedResident = 0, LoggedEvicted = 0;
+	double LastEventLog = 0.0;
+	uint32 EventArchMask = 0u;   // wanted resident-event archetypes; applied on the next tick
+	int32 QueuePick(FVector2D ScreenPosition, float RadiusPx, FApiPick&& P);
+	int32 QueueQuery(FApiQuery&& Q);
+	void ProcessApiReadbacks();
+	void FillApiRequests(FUniFrameData& F);
+	void FailApiRequests();
+	void UpdateApiEvents(const FRotator& ViewRot);
+	void DeliverQuery(FApiQuery& Q, TArray<FUniObjectInfo>&& Objects, int32 Total);
+	FUniObjectInfo MakeInfo(const UniCore::FObjectInfo& I) const;
+	FUniObjectInfo BodyInfo(const UniCore::FPromotedBody& B) const;
+	bool BuildApiView(const FRotator& ViewRot, UniHlsl::FUniView& OutV, FVector2D* OutViewportPx = nullptr) const;
 
 	// Free flight and latched cruise (test controls)
 	bool bFreeFly = false;

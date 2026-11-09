@@ -114,5 +114,85 @@
   {
     "id": "UE-29",
     "what": "Warp motes in the engine (D-192): faint motes fixed in space stream past and streak at speed in a void, none at rest, no pops while accelerating; uu.Warp.Motes, MoteFrames, MoteMag; the second sprite draw (Uni.WarpMotes) compiles and costs little (REVIEW_TONIGHT \u00a726)."
+  },
+  {
+    "id": "UE-30",
+    "what": "Runtime API in the engine (D-193): the pick and query passes (UniQuery.usf) and the project pass's sprite sources compile; uu.Pick names the star under the screen centre (nothing on empty sky; a planet names its star and ordinal); uu.Query / uu.Nearest list resident objects nearest first; uu.Events counts resident / evicted galaxies at speed; the Blueprint calls and events are exposed; no cost on frames without a request (REVIEW_TONIGHT \u00a727)."
+  },
+  {
+    "id": "UE-31",
+    "what": "Volume ghosting at speed in the engine (D-194): flying past galaxies and through clusters at intergalactic speed while turning, no trails or dark holes behind moving glow (A/B uu.VolumeTemporal.Clamp 0, reference uu.VolumeTemporal 0); no shimmer at rest; uu.VolumeTemporal.MaxMotionPx / TightPx tuning; reconstruct pass compiles (REVIEW_TONIGHT \u00a728)."
+  },
+  {
+    "id": "UE-32",
+    "what": "Volume march cost inside a galaxy (D-195): Uni.Volume time against the earlier 20-31 ms, at rest and moving through dense areas; the look against uu.VolumeStepRatio 0.08 / uu.VolumeHintScale 1 / uu.VolumeStartPc 1 (no banding toward the centre, no thinner near dust) (REVIEW_TONIGHT \u00a729)."
+  },
+  {
+    "id": "UE-33",
+    "what": "Volume cost, sprite handoff and warp default in the engine (D-196): fps and ProfileGPU's per-pass volume scopes at the worst-case spot; uu.perf march size and per-pixel background frames; the glow at uu.VolumeMaxMarchPixels 262144 against 0; no sprite fading before its glow (approach, cluster core); project pass compiles with InHandoffs (REVIEW_TONIGHT \u00a730)."
+  },
+  {
+    "id": "UE-34",
+    "what": "Fewer stars and cluster galaxies in the engine (D-197): uu.perf counts and fps against D-196 at the same spots; galaxies' and clusters' glow unchanged in brightness; uu.Star.Keep 1 / uu.Cluster.MemberKeep 1 (and uu.Enable) restore the full draw (REVIEW_TONIGHT \u00a731)."
+  },
+  {
+    "id": "UE-35",
+    "what": "D-198 in the engine: fps and ProfileGPU volume scopes in a dense part of the Milky Way and at 1-10 Mpc/s; the darker dust's look (uu.Galaxy.DustScale / DustLanes); no banding at uu.VolumeHintScale 3; the glow at speed with uu.VolumeTravelPixelScale 0.35 (REVIEW_TONIGHT \u00a732)."
+  },
+  {
+    "id": "UE-36",
+    "what": "D-199 in the engine: fps with uu.VolumeStepRatio 0.32 (no banding), the background while travelling fast (textured web ratio 0.4), and uu.Warp 1 at 0.4-10 Mpc/s: galaxies streak, do not vanish (REVIEW_TONIGHT \u00a733)."
+  },
+  {
+    "id": "UE-37",
+    "what": "D-200 volume auto budget in the engine: compiles (RHIGetGPUFrameCycles, DynamicRHI.h); at the worst spots uu.perf's level settles where the GPU fits 60 fps and holds; no visible pumping (REVIEW_TONIGHT \u00a734)."
+  },
+  {
+    "id": "UE-38",
+    "what": "D-201: fps at 1-10 Mpc/s with uu.TravelSensitivity 0.5 (and 0) against 2.5; if still slow, stat unit / uu.perf at speed (REVIEW_TONIGHT \u00a735)."
+  },
+  {
+    "id": "UE-39",
+    "what": "D-202: fps at 1-30 Mpc/s with uu.VolumeWebTravelHint 2 against 1 (and 3); the web's filaments keep their brightness and shape while accelerating (REVIEW_TONIGHT \u00a736)."
+  },
+  {
+    "id": "UE-40",
+    "what": "D-203 cell glow in the engine: shaders compile (UniVolume.ush: firstbitlow, countbits); fps and stat unit at 1-30 Mpc/s and through a galaxy against uu.CellGlow 0 / uu.StreamBuildBudget 0 / uu.WindowStretch 3; loading cells read as glow condensing into points, no holes, no glow left behind (REVIEW_TONIGHT \u00a737)."
+  },
+  {
+    "id": "UE-41",
+    "what": "D-204 in the engine: UniProject.usf compiles (FUniCellRel, Uni_ProjectObjectC); ProfileGPU's project pass in a dense galaxy core before and after; no sprite jitter across cell boundaries or against promoted actors (REVIEW_TONIGHT \u00a738)."
+  },
+  {
+    "id": "UE-42",
+    "what": "D-205 in the engine: nearby clusters visible at 1-30 Mpc/s with uu.TravelExposure; mid-speed travel through a galaxy core no longer lags (A/B uu.CellGlow, uu.StreamBuildBudget, uu.WindowStretch with stat unit and uu.perf) (REVIEW_TONIGHT \u00a739)."
+  },
+  {
+    "id": "UE-43",
+    "what": "D-206: UniVolume.ush / UniFields.ush compile with the shared web texel; ProfileGPU Uni.Volume.March+Background at speed before and after (REVIEW_TONIGHT \u00a740)."
+  },
+  {
+    "id": "UE-44",
+    "what": "D-207: UniGen.usf AllocCS and the place pass's InAlloc compile; stars arrive sooner at speed (uu.GenOneTrip A/B); pool use flat, no generation timeouts (REVIEW_TONIGHT \u00a741)."
+  },
+  {
+    "id": "UE-45",
+    "what": "D-208: the glow's slicing at 4 x 4 / 3 x 3 when near still: shaders compile, Uni.Volume.March 1/16 sliced at rest in a core, no pattern or shimmer when starting and stopping (REVIEW_TONIGHT \u00a742)."
+  },
+  {
+    "id": "UE-46",
+    "what": "D-209: at rest the background stays in its map (uu.Perf: per pixel in ~0 frames, re-marches only when moving); the slicing line counts 1/16 frames at rest; fps at the owner's costly view with uu.VolumeMaxMarchPixels 262144 (REVIEW_TONIGHT \u00a743)."
+  },
+  {
+    "id": "UE-47",
+    "what": "D-210: UniFields.ush / UniVolume.ush compile (FUniGalaxyConst, the K forms, Uni_CarrierStepLimit); ProfileGPU Uni.Volume.March in the core before/after and with uu.VolumeGalaxyConst 0 / 1 (same image); no swirls or rings toward the centre (REVIEW_TONIGHT \u00a744)."
+  },
+  {
+    "id": "UE-48",
+    "what": "D-211 galaxy cache in the engine: CacheBakeCS and the march compile; Uni.Volume.March in the core / at the solar circle with uu.GalaxyCache 0 / 1; Uni.Volume.CacheBake while flying; no seams; ~120 MB at 128 (REVIEW_TONIGHT \u00a745)."
+  },
+  {
+    "id": "UE-49",
+    "what": "D-212 galaxy map in the engine: shaders compile (UniGalMap, MapBakeCS, MapDownCS); the GPU bake over frames on entering a galaxy (Uni.GalaxyMap.Bake, at 1024 and 2048); Uni.Volume.March with uu.GalaxyMap 0 / 1 in the core and at the solar circle; the look matches the field (REVIEW_TONIGHT \u00a746)."
   }
 ]
