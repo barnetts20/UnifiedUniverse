@@ -200,64 +200,6 @@ void MarchCS(uint3 DispatchId : SV_DispatchThreadID)
 	for (uint K3 = 0u; K3 < UNI_VOL_SLICES; ++K3) { OutSlices[uint3(Id.x, Id.y, K3)] = Slice[K3] * Inv; }
 }
 
-#elif UNI_VOL_PASS == 4
-
-// D-211: the galaxy cache's bake (UniGalaxyCache.h decides the boxes; Uni_GalCacheBakeVoxel is the
-// same function the CPU reference bakes with). One thread a voxel, boxes in order (a later box
-// overwrites an earlier one's texels, as the CPU's frame-by-frame sequence does).
-StructuredBuffer<uint4> InCacheBoxes;   // per box: (level, lo.xyz as int bits), (size.xyz, first voxel)
-uint NumCacheBoxes;
-uint CacheVoxels;
-uint CacheThreadsPerRow;
-uint CacheN;
-uint CacheLevels;
-uint CacheCarrier;                       // the home carrier's index in InCarriers
-float CacheV0;                           // level 0's voxel (field units)
-float CacheZCap;                         // the z voxel cap (every level but the last)
-float CacheScale;
-float CacheFootScale;
-RWTexture3D<float2> OutCacheA;
-RWTexture3D<float4> OutCacheB;
-
-[numthreads(64, 1, 1)]
-void CacheBakeCS(uint3 Id : SV_DispatchThreadID)
-{
-	const uint T = Id.y * CacheThreadsPerRow + Id.x;
-	if (T >= CacheVoxels) { return; }
-	uint Bi = 0u;
-	for (uint B = 0u; B < NumCacheBoxes; ++B)
-	{
-		const uint4 S = InCacheBoxes[2u * B + 1u];
-		if (T >= S.w && T < S.w + S.x * S.y * S.z) { Bi = B; break; }
-	}
-	const uint4 H = InCacheBoxes[2u * Bi];
-	const uint4 S = InCacheBoxes[2u * Bi + 1u];
-	const uint Local = T - S.w;
-	const uint Lx = Local % S.x, Ly = (Local / S.x) % S.y, Lz = Local / (S.x * S.y);
-	const int3 I = int3(asint(H.y) + (int)Lx, asint(H.z) + (int)Ly, asint(H.w) + (int)Lz);
-	const uint L = H.x;
-	const float V = CacheV0 * exp2((float)L);
-	const float Vz = L + 1u < CacheLevels ? min(V, CacheZCap) : V;
-	const float3 P = float3(((float)I.x + 0.5f) * V, ((float)I.y + 0.5f) * V, ((float)I.z + 0.5f) * Vz);
-	const FUniCarrier Ca = InCarriers[CacheCarrier];
-	const FUniFieldParams Par = InParams[Ca.ParamIndex];
-	// HLSL: no conditional operator on structs.
-	FUniFieldParams Dust = Par;
-	FUniFieldParams Pal = Par;
-	if ((Ca.Flags & UNI_CARRIER_DUST) != 0u) { Dust = InParams[Ca.DustParamIndex]; }
-	if ((Ca.Flags & UNI_CARRIER_PALETTE) != 0u) { Pal = InParams[Ca.PaletteIndex]; }
-	float4 A, Bv;
-	Uni_GalCacheBakeVoxel(Ca, Par, Dust, Uni_GalaxyConstOf(Par), Pal, P, CacheFootScale * min(V, Vz), CacheScale, A, Bv);
-	const int Nn = (int)CacheN;
-	const int3 Tw = int3(((I.x % Nn) + Nn) % Nn, ((I.y % Nn) + Nn) % Nn, ((I.z % Nn) + Nn) % Nn);
-	const int Zs = (int)(L * (CacheN + 2u)) + 1 + Tw.z;
-	OutCacheA[uint3(Tw.x, Tw.y, Zs)] = A.xy;
-	OutCacheB[uint3(Tw.x, Tw.y, Zs)] = Bv;
-	// The level's wrap copies: its last slice before it, its first after it.
-	if (Tw.z == Nn - 1) { OutCacheA[uint3(Tw.x, Tw.y, L * (CacheN + 2u))] = A.xy; OutCacheB[uint3(Tw.x, Tw.y, L * (CacheN + 2u))] = Bv; }
-	if (Tw.z == 0) { OutCacheA[uint3(Tw.x, Tw.y, L * (CacheN + 2u) + CacheN + 1u)] = A.xy; OutCacheB[uint3(Tw.x, Tw.y, L * (CacheN + 2u) + CacheN + 1u)] = Bv; }
-}
-
 #elif UNI_VOL_PASS == 5
 
 // D-212: the galaxy map's GPU bake (the CPU's UniCore::FGalaxyMap::Bake, the same function):

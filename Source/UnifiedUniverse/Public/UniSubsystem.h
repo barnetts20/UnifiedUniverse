@@ -20,7 +20,6 @@
 //   uu.Cruise <cm/s>                    move along the view direction (0: stop, back to Local)
 //   uu.Teleport <solar|void>            jump the camera (coarse-to-fine rebuild)
 //   uu.Sensitivity <dm>                 limiting-magnitude offset, -5..5 (plus the travel boost)
-//   uu.TravelSensitivity <mag>          most sensitivity added while travelling fast (0: off; D-154)
 //   uu.TravelStart / uu.TravelFull <cm/s>  speeds where the travel boost starts / is full
 //   uu.Exposure <mag>                   exposure bias in magnitudes (negative = brighter)
 //   uu.Volume <0|1>                     the volume pass: unresolved glow, dust, background
@@ -65,7 +64,6 @@
 // UniSubsystem.gen.cpp, which sees only this header, and TUniquePtr must be able to delete them.
 #include "UniStreamer.h"
 #include "UniVolume.h"
-#include "UniGalaxyCache.h"
 #include "UniGalaxyMap.h"
 #include "UniSystem.h"
 #include "UniPromotion.h"
@@ -292,10 +290,8 @@ private:
 	uint64 PerfFramesAtBg = 0;                      // D-209: PerfFrames at the last uu.Perf
 
 	// Travel sensitivity (D-154): the owner's sensitivity plus a speed-driven boost
-	UniCore::FTravelSensitivity Travel;
 	UniCore::FTravelSensitivity Warp;   // D-187: the same curve, 0..1, for the warp effects
 	UniCore::FVolumeAutoBudget VolumeBudget;   // D-200: the glow's pixel budget follows the GPU frame time
-	UniCore::FGalaxyCache GalaxyCache;          // D-211: the camera's own galaxy as a clipmap (uu.GalaxyCache)
 	// D-212: the camera's own galaxy's map: the request the GPU bakes (uu.GalaxyMap).
 	uint32 GalaxyMapEpoch = 0, GalaxyMapSerial = 0, GalaxyMapSize = 0;
 	UniCore::FObjectId GalaxyMapId;

@@ -305,12 +305,6 @@ namespace UniCore
 			return D;
 		}
 
-		bool AllGenerated() const
-		{
-			for (const FSlot& S : Slots) { if (S.bOccupied && S.Status != ESlotStatus::Generated && S.Status != ESlotStatus::Cached) { return false; } }
-			return bValid;
-		}
-
 	private:
 		FWindowGeometry Geo;
 		std::vector<FSlot> Slots;

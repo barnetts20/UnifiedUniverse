@@ -31,7 +31,6 @@ static const uint UNI_SPRITE_EXTENDED = 4u;
 static const uint UNI_SPRITE_BODY = 8u;           // D-148: a resolved body (extended, no children): disc profile
 static const uint UNI_SPRITE_HALO_ONLY = 16u;     // D-158: a promoted star: its actor draws the disc, the sprite keeps its glare
 static const float UNI_SPRITE_DISC_MIN_PX = 1.5f; // below this a body is drawn as a plain Gaussian
-static const float UNI_ARRIVAL_RANGE = 4.0f;      // D-150: the brightness boost fades over the last 4x in distance
 
 // D-156 sprite style defaults (the owner tunes them live: uu.Sprite.*).
 static const float UNI_SPRITE_CORE_PX = 1.0f;         // core sigma, px: an unresolved source is a pinpoint
@@ -48,7 +47,6 @@ static const float UNI_SPRITE_REACH_MAX = 8.0f;       // the farthest reach, in 
 static const uint UNI_SPRITE_ARRIVAL_SHIFT = 24u;     // FUniSprite::Flags bits 24..31: arrival 0..255 (255 settled)
 static const uint UNI_CELL_AGE_SHIFT = 16u;           // FUniCellGPU::Flags bits 16..23: frames since the cell first became Ready (255: settled)
 
-
 /** D-150: the distance at which an object's sprite must be back at its true perceived size.
  *  A star whose archetype has systems: its activation radius, where its planets spawn. Anything
  *  else: its promotion distance, where an actor replaces the sprite (R / theta_promote). */
@@ -60,13 +58,6 @@ UNI_FN float Uni_ArrivalDistance(uint InArchetypeId, uint InSystemArchetypeMask,
 		return max(Uni_SystemActivationRadius(InAbsMag), Promote);
 	}
 	return Promote;
-}
-
-/** D-150: 0 far out (full brightness boost), 1 at and inside the arrival distance (true size),
- *  smooth in log distance over the last UNI_ARRIVAL_RANGE. */
-UNI_FN float Uni_ArrivalWeight(float InDistance, float InArrival)
-{
-	return 1.0f - smoothstep(0.0f, 1.0f, log(max(InDistance, 1.0f) / max(InArrival, 1.0f)) / log(UNI_ARRIVAL_RANGE));
 }
 
 struct FUniView

@@ -211,18 +211,11 @@ The march's cost is rays x steps per ray x cost per step. These are the console 
 | Setting | Default | What it does | Decision |
 |---|---|---|---|
 | `uu.CellGlow` | 1 | a cell still loading (or fading in) is drawn as glow from the field; its sprites fade in once it is Ready (section 13). 0: a hole until it loads (before D-203) | D-203 |
-| `uu.VolumeGalaxyConst` | 1 | the march reads each galaxy's per-object hashes from blocks the builder writes once a frame (the same image). 0: hashed at every step (A/B for ProfileGPU) | D-210 |
 | `uu.GalaxyMap` | 1 | the galaxy the camera is in is marched from its baked 2D map (arms and modes; warp, vertical profile, bulge and detail per sample; D-212). 0: its field at every step | D-212 |
 | `uu.GalaxyMap.Size` | 1024 | the map's texels a side (power of two): 1024 ~11 MB (one frame to bake), 2048 ~43 MB (no visible difference in the engine) | D-212 |
 | `uu.GalaxyMap.Budget` | 1048576 | texels of the map the GPU bakes a frame (1024^2 in one frame, 2048^2 in 4) | D-212 |
-| `uu.GalaxyCache` | 0 | the D-211 clipmap, used only where no map is published (superseded by uu.GalaxyMap) | D-211, D-212 |
-| `uu.GalaxyCache.Size` | 128 | voxels a cache level side (64..256); 128 ~120 MB, 96 ~50 MB (a little softer far away) | D-211 |
-| `uu.GalaxyCache.Budget` | 1048576 | voxels baked a frame at most; levels that cannot follow keep their last window (coarser levels cover) | D-211 |
-| `uu.GalaxyCache.FinestPc` | 512 | how far the finest level reaches from the camera (pc) | D-211 |
 | `uu.CellFadeFrames` | 8 | frames a Ready cell's sprites take to fade in (its glow fades out by the same amount) | D-203 |
 | `uu.StreamBuildBudget` | 96 | cells built per frame over every level, those needed soonest first; the rest wait as glow. 0: D-173's per-level rule | D-203 |
-| `uu.WindowStretch` | 0 | cells a window stretches ahead at speed (D-162: 3). 0: rest size at any speed | D-203 |
-| `uu.TravelSensitivity` | 0 | magnitudes the sky deepens by at speed (widens every window) | D-154, D-201, D-203 |
 | `uu.VolumeInterleave` | 4 | most pixels per side of the temporal slicing's block: 4 x 4 below 0.1 march px of motion a frame, 3 x 3 below 0.5, else 2 x 2 | D-208 |
 | `uu.TravelExposure` | 1.5 | magnitudes everything is brightened by at full travel speed (render only; windows unchanged) | D-205 |
 

@@ -49,17 +49,6 @@ struct FUniFrameData
 	float SpeedAmount = 0.0f;  // D-198: the travel curve itself (not x uu.Warp): the volume march's budget falls with it
 	float VolumeBudgetScale = 1.0f;   // D-200: the auto budget's scale of the march pixel budget (1: off)
 	float VolumeNearCm = 0.0f;        // D-208: the nearest marched structure's distance (FVolumeScene::NearCm; 0: unknown)
-	// D-211: the galaxy cache (UniGalaxyCache.h). This frame's boxes to bake (two uint4 each:
-	// (level, lo.xyz as int bits), (size.xyz, 0)), queued on the render thread in order; the
-	// layout, and an epoch that changes when the game thread resets the cache.
-	TArray<FUintVector4> GalCacheBoxes;
-	uint32 GalCacheN = 0;               // 0: no cache
-	uint32 GalCacheLevels = 0;
-	uint32 GalCacheEpoch = 0;
-	float GalCacheV0 = 0.0f;
-	float GalCacheZCap = 0.0f;
-	float GalCacheScale = 1.0f;
-	float GalCacheFootScale = 1.0f;
 	// D-212: the galaxy map's bake request (the camera's own galaxy): an epoch that changes per
 	// galaxy or size (0: no map), its size, the light's and dust's parameters, and the texels the
 	// GPU may bake a frame. The renderer bakes it over frames and reports the epoch when done.
@@ -167,11 +156,6 @@ struct FUniRenderStats
 	 *  size changed, [8] camera jump, [9] the same frame rendered again, [10] frames skipped. */
 	static constexpr int32 NumSliceCounts = 11;
 	std::atomic<uint32> VolumeSliceCounts[NumSliceCounts] = {};
-	/** D-211: the render thread lost cache work (its queue overflowed, or the textures were
-	 *  recreated): the game thread resets the cache (exchange to false). */
-	std::atomic<bool> bGalCacheLost{ false };
-	std::atomic<uint32> GalCacheVoxelsBaked{ 0 };    // voxels baked on the GPU (total)
-	std::atomic<uint32> GalCacheBytes{ 0 };          // the cache textures' size
 	std::atomic<uint32> GalMapReadyEpoch{ 0 };       // D-212: the galaxy map baked for this request
 	std::atomic<uint32> GalMapBakeFrames{ 0 };       // frames the last bake took
 	std::atomic<uint32> ActivationsLastReadback{ 0 };
@@ -314,14 +298,6 @@ private:
 	int32 BgStillFrames = 0;
 	int32 BgDirtyInterval = 1 << 30;   // D-196: frames between the background's last two changes
 	bool bBgPerPixel = false;          // D-196: marching the background per pixel (hysteresis)
-	// D-211: the galaxy cache's textures and its queue of boxes not yet baked (render thread).
-	TRefCountPtr<IPooledRenderTarget> GalCacheA, GalCacheB;
-	FIntVector GalCacheSize = FIntVector::ZeroValue;
-	TArray<FUintVector4> GalCachePending;
-	uint64 GalCachePendingVoxels = 0;
-	uint32 GalCacheEpoch = ~0u;
-	bool bGalCacheReady = false;       // the textures hold every box queued since the last reset
-	void QueueGalaxyCache_RenderThread(const FUniFrameData& F);
 	TArray<UniCore::FCarrierGPU> BgSnapCarriers;
 	TArray<UniCore::FFieldParamsGPU> BgSnapParams;
 	TArray<FVector4f> BgSnapLut;

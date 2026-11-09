@@ -353,165 +353,8 @@ void FUniRenderer::SetFrame_GameThread(FUniFrameData&& Data)
 	ENQUEUE_RENDER_COMMAND(UniSetFrame)([Payload](FRHICommandListImmediate&)
 	{
 		TRACE_CPUPROFILER_EVENT_SCOPE(Uni_SetFrame_RT);
-		FUniRenderer::Get().QueueGalaxyCache_RenderThread(*Payload);   // D-211: every frame's boxes, even a frame not rendered
 		FUniRenderer::Get().QueueGalaxyMap_RenderThread(*Payload);     // D-212
 		FUniRenderer::Get().RenderFrame = MoveTemp(*Payload);   // the payload is not used again: move, not copy
-	});
-}
-
-void FUniRenderer::QueueGalaxyCache_RenderThread(const FUniFrameData& F)
-{
-	check(IsInRenderingThread());
-	if (F.GalCacheN == 0u)
-	{
-		GalCachePending.Reset();
-		GalCachePendingVoxels = 0;
-		bGalCacheReady = false;
-		GalCacheEpoch = ~0u;
-		return;
-	}
-	if (F.GalCacheEpoch != GalCacheEpoch)
-	{
-		// A reset bakes every level from scratch: what the textures held no longer counts.
-		GalCachePending.Reset();
-		GalCachePendingVoxels = 0;
-		GalCacheEpoch = F.GalCacheEpoch;
-		bGalCacheReady = true;
-	}
-	for (int32 I = 0; I + 1 < F.GalCacheBoxes.Num(); I += 2)
-	{
-		const FUintVector4& Sz = F.GalCacheBoxes[I + 1];
-		GalCachePending.Add(F.GalCacheBoxes[I]);
-		GalCachePending.Add(Sz);
-		GalCachePendingVoxels += uint64(Sz.X) * Sz.Y * Sz.Z;
-	}
-	// More than two full bakes waiting: the volume pass is not running (hidden viewport, uu.Volume 0).
-	// Drop the queue; the game thread resets the cache and the march leaves it until then.
-	const uint64 Full = uint64(F.GalCacheN) * F.GalCacheN * F.GalCacheN * FMath::Max(F.GalCacheLevels, 1u);
-	if (GalCachePendingVoxels > 2u * Full)
-	{
-		GalCachePending.Reset();
-		GalCachePendingVoxels = 0;
-		bGalCacheReady = false;
-		Stats.bGalCacheLost = true;
-	}
-}
-
-void FUniRenderer::SetTables_GameThread(TArray<UniCore::FSliceGPU> Slices, TArray<float> Lut)
-{
-	check(IsInGameThread());
-	struct FTables { TArray<UniCore::FSliceGPU> Slices; TArray<float> Lut; };
-	TSharedRef<FTables, ESPMode::ThreadSafe> Payload = MakeShared<FTables, ESPMode::ThreadSafe>();
-	Payload->Slices = MoveTemp(Slices);
-	Payload->Lut = MoveTemp(Lut);
-	ENQUEUE_RENDER_COMMAND(UniSetTables)([Payload](FRHICommandListImmediate&)
-	{
-		FUniRenderer& R = FUniRenderer::Get();
-		R.SlicesRT = Payload->Slices;
-		R.LutRT = Payload->Lut;
-		R.bTablesDirty = true;
-	});
-}
-
-void FUniRenderer::SetWebTexture_GameThread(uint32 Size, TArray<TArray<FUintVector2>> Mips)
-{
-	check(IsInGameThread());
-	struct FWeb { uint32 Size = 0; TArray<TArray<FUintVector2>> Mips; };
-	TSharedRef<FWeb, ESPMode::ThreadSafe> Payload = MakeShared<FWeb, ESPMode::ThreadSafe>();
-	Payload->Size = Size;
-	Payload->Mips = MoveTemp(Mips);
-	ENQUEUE_RENDER_COMMAND(UniSetWebTexture)([Payload](FRHICommandListImmediate&)
-	{
-		FUniRenderer& R = FUniRenderer::Get();
-		R.WebSizeRT = Payload->Size;
-		R.WebMipsRT = MoveTemp(Payload->Mips);
-		R.bWebDirty = true;
-	});
-}
-
-FRDGTextureRef FUniRenderer::RegisterWebTexture_RenderThread(FRDGBuilder& GraphBuilder)
-{
-	check(IsInRenderingThread());
-	// One mip from a buffer of packed half texels (UniWebTexUpload.usf).
-	auto Upload = [&GraphBuilder](FRDGTextureRef Tex, int32 Mip, uint32 MipSize, const TArray<FUintVector2>& Texels)
-	{
-		FUniWebTexUploadCS::FParameters* P = GraphBuilder.AllocParameters<FUniWebTexUploadCS::FParameters>();
-		P->InTexels = GraphBuilder.CreateSRV(UploadStructured(GraphBuilder, TEXT("UniWebTexels"), Texels));
-		P->OutMip = GraphBuilder.CreateUAV(FRDGTextureUAVDesc(Tex, uint8(Mip)));
-		P->MipSize = MipSize;
-		const int32 G = FMath::DivideAndRoundUp(int32(MipSize), 4);
-		TShaderMapRef<FUniWebTexUploadCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.WebTexture.Upload mip %d (%u^3)", Mip, MipSize), CS, P, FIntVector(G, G, G));
-	};
-	if (bWebDirty)
-	{
-		bWebDirty = false;
-		WebTexture.SafeRelease();
-		if (WebSizeRT > 0u && WebMipsRT.Num() > 0)
-		{
-			const FRDGTextureDesc Desc = FRDGTextureDesc::Create3D(FIntVector(int32(WebSizeRT)), PF_FloatRGBA, FClearValueBinding::Black,
-				TexCreate_ShaderResource | TexCreate_UAV, uint8(WebMipsRT.Num()));
-			FRDGTextureRef Tex = GraphBuilder.CreateTexture(Desc, TEXT("UniWebTexture"));
-			for (int32 M = 0; M < WebMipsRT.Num(); ++M)
-			{
-				const uint32 S = FMath::Max(WebSizeRT >> M, 1u);
-				if (uint64(WebMipsRT[M].Num()) != uint64(S) * S * S) { UE_LOG(LogTemp, Error, TEXT("UnifiedUniverse: web texture mip %d has %d texels, expected %u^3"), M, WebMipsRT[M].Num(), S); continue; }
-				Upload(Tex, M, S, WebMipsRT[M]);   // UploadStructured copies the texels into the graph
-			}
-			WebMipsRT.Empty();
-			WebTexture = GraphBuilder.ConvertToExternalTexture(Tex);
-			return Tex;
-		}
-		WebMipsRT.Empty();
-	}
-	if (WebTexture.IsValid()) { return GraphBuilder.RegisterExternalTexture(WebTexture, TEXT("UniWebTexture")); }
-	return RegisterNanDummy_RenderThread(GraphBuilder);
-}
-
-/** One mip of a field texture from a buffer of packed half texels (UniWebTexUpload.usf). */
-static void UniUploadFieldMip(FRDGBuilder& GraphBuilder, FRDGTextureRef Tex, int32 Mip, uint32 MipSize, const TArray<FUintVector2>& Texels)
-{
-	FUniWebTexUploadCS::FParameters* P = GraphBuilder.AllocParameters<FUniWebTexUploadCS::FParameters>();
-	P->InTexels = GraphBuilder.CreateSRV(UploadStructured(GraphBuilder, TEXT("UniFieldTexels"), Texels));
-	P->OutMip = GraphBuilder.CreateUAV(FRDGTextureUAVDesc(Tex, uint8(Mip)));
-	P->MipSize = MipSize;
-	const int32 G = FMath::DivideAndRoundUp(int32(MipSize), 4);
-	TShaderMapRef<FUniWebTexUploadCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-	FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.FieldTexture.Upload mip %d (%u^3)", Mip, MipSize), CS, P, FIntVector(G, G, G));
-}
-
-FRDGTextureRef FUniRenderer::RegisterNanDummy_RenderThread(FRDGBuilder& GraphBuilder)
-{
-	check(IsInRenderingThread());
-	if (!WebDummy.IsValid())
-	{
-		// Fail closed: a field texture sampled without its texture reads NaN (nothing passes a
-		// density test), never a plausible value (lesson #1).
-		FRDGTextureRef D = GraphBuilder.CreateTexture(FRDGTextureDesc::Create3D(FIntVector(1, 1, 1), PF_FloatRGBA, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV, 1), TEXT("UniWebTextureDummy"));
-		TArray<FUintVector2> Nan;
-		Nan.Add(FUintVector2(0x7E007E00u, 0x7E007E00u));   // four half quiet NaNs
-		UniUploadFieldMip(GraphBuilder, D, 0, 1u, Nan);
-		WebDummy = GraphBuilder.ConvertToExternalTexture(D);
-		return D;
-	}
-	return GraphBuilder.RegisterExternalTexture(WebDummy, TEXT("UniWebTextureDummy"));
-}
-
-void FUniRenderer::SetGalaxyTexture_GameThread(int32 Slot, uint32 Size, TArray<TArray<FUintVector2>> Mips)
-{
-	check(IsInGameThread());
-	if (Slot < 0 || Slot >= GalaxyTextureSlots) { return; }
-	struct FGal { int32 Slot = 0; uint32 Size = 0; TArray<TArray<FUintVector2>> Mips; };
-	TSharedRef<FGal, ESPMode::ThreadSafe> Payload = MakeShared<FGal, ESPMode::ThreadSafe>();
-	Payload->Slot = Slot;
-	Payload->Size = Size;
-	Payload->Mips = MoveTemp(Mips);
-	ENQUEUE_RENDER_COMMAND(UniSetGalaxyTexture)([Payload](FRHICommandListImmediate&)
-	{
-		FUniRenderer& R = FUniRenderer::Get();
-		R.GalSizeRT[Payload->Slot] = Payload->Size;
-		R.GalMipsRT[Payload->Slot] = MoveTemp(Payload->Mips);
-		R.bGalDirty[Payload->Slot] = true;
 	});
 }
 
@@ -677,7 +520,6 @@ void FUniRenderer::Release_RenderThread()
 	WebMipsRT.Empty();
 	for (int32 S = 0; S < GalaxyTextureSlots; ++S) { GalTexture[S].SafeRelease(); GalMipsRT[S].Empty(); }   // D-179
 	GalMapTexture.SafeRelease(); GalMapDummy.SafeRelease(); GalMapEpochRT = 0u; bGalMapComplete = false; GalMapRowsDone = 0u;   // D-212
-	GalCacheA.SafeRelease(); GalCacheB.SafeRelease(); GalCachePending.Reset(); GalCachePendingVoxels = 0; bGalCacheReady = false; GalCacheEpoch = ~0u;   // D-211
 	PromoteRing.Empty();
 	ActivateRing.Empty();
 	{
@@ -735,70 +577,6 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 	FRDGTextureRef GalTex[GalaxyTextureSlots];
 	for (int32 S = 0; S < GalaxyTextureSlots; ++S) { GalTex[S] = RegisterGalaxyTexture_RenderThread(GraphBuilder, S); }   // D-179
 	FRHISamplerState* WebSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Wrap>::GetRHI();
-	// D-211: the galaxy cache: bake the queued boxes, then the march reads the textures.
-	FRDGTextureRef CacheTexA = nullptr, CacheTexB = nullptr;
-	if (F.GalCacheN > 0u && VV.CacheCarrier != 0u && F.VolumeCarriers.IsValidIndex(int32(VV.CacheCarrier) - 1))
-	{
-		const FIntVector Size(int32(F.GalCacheN), int32(F.GalCacheN), int32(F.GalCacheLevels * (F.GalCacheN + 2u)));
-		if (!GalCacheA.IsValid() || !GalCacheB.IsValid() || GalCacheSize != Size)
-		{
-			// New textures hold nothing: the cache is usable only if every box since its last
-			// reset is still queued (the first frame after a reset), else the game thread resets.
-			const bool bWasBaking = GalCacheA.IsValid();
-			CacheTexA = GraphBuilder.CreateTexture(FRDGTextureDesc::Create3D(Size, PF_G16R16F, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV), TEXT("UniGalCacheA"));
-			CacheTexB = GraphBuilder.CreateTexture(FRDGTextureDesc::Create3D(Size, PF_R8G8B8A8, FClearValueBinding::White, TexCreate_ShaderResource | TexCreate_UAV), TEXT("UniGalCacheB"));
-			GalCacheA = GraphBuilder.ConvertToExternalTexture(CacheTexA);
-			GalCacheB = GraphBuilder.ConvertToExternalTexture(CacheTexB);
-			GalCacheSize = Size;
-			Stats.GalCacheBytes = uint32(FMath::Min<uint64>(uint64(Size.X) * Size.Y * Size.Z * 8u, 0xFFFFFFFFull));
-			if (bWasBaking) { bGalCacheReady = false; GalCachePending.Reset(); GalCachePendingVoxels = 0; Stats.bGalCacheLost = true; }
-		}
-		else
-		{
-			CacheTexA = GraphBuilder.RegisterExternalTexture(GalCacheA, TEXT("UniGalCacheA"));
-			CacheTexB = GraphBuilder.RegisterExternalTexture(GalCacheB, TEXT("UniGalCacheB"));
-		}
-		if (GalCachePending.Num() >= 2 && GalCachePendingVoxels > 0u)
-		{
-			// Each box's first voxel (the thread that starts it).
-			TArray<FUintVector4> Boxes = MoveTemp(GalCachePending);
-			uint32 First = 0u;
-			for (int32 I = 0; I + 1 < Boxes.Num(); I += 2) { Boxes[I + 1].W = First; First += Boxes[I + 1].X * Boxes[I + 1].Y * Boxes[I + 1].Z; }
-			const uint32 Rows = FMath::DivideAndRoundUp(First, 64u * 65535u);
-			const uint32 PerRow = FMath::DivideAndRoundUp(First, Rows);
-			FUniGalCacheBakeCS::FParameters* P = GraphBuilder.AllocParameters<FUniGalCacheBakeCS::FParameters>();
-			P->InCarriers = GraphBuilder.CreateSRV(UploadStructured(GraphBuilder, TEXT("UniGalCacheCarriers"), F.VolumeCarriers));
-			P->InParams = GraphBuilder.CreateSRV(ParamBuf);
-			P->InCacheBoxes = GraphBuilder.CreateSRV(UploadStructured(GraphBuilder, TEXT("UniGalCacheBoxes"), Boxes));
-			P->NumCacheBoxes = uint32(Boxes.Num() / 2);
-			P->CacheVoxels = First;
-			P->CacheThreadsPerRow = FMath::DivideAndRoundUp(PerRow, 64u) * 64u;
-			P->CacheN = F.GalCacheN;
-			P->CacheLevels = F.GalCacheLevels;
-			P->CacheCarrier = VV.CacheCarrier - 1u;
-			P->CacheV0 = F.GalCacheV0;
-			P->CacheZCap = F.GalCacheZCap;
-			P->CacheScale = F.GalCacheScale;
-			P->CacheFootScale = F.GalCacheFootScale;
-			P->UniGalWarpFine = GalTex[0];
-			P->UniGalWarpLarge = GalTex[1];
-			P->UniGalDetail = GalTex[2];
-			P->UniWebSampler = WebSampler;
-			P->OutCacheA = GraphBuilder.CreateUAV(CacheTexA);
-			P->OutCacheB = GraphBuilder.CreateUAV(CacheTexB);
-			TShaderMapRef<FUniGalCacheBakeCS> CS(GetGlobalShaderMap(View.GetFeatureLevel()));
-			FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Volume.CacheBake %u voxels, %d boxes", First, Boxes.Num() / 2), CS, P,
-				FIntVector(int32(P->CacheThreadsPerRow / 64u), int32(Rows), 1));
-			Stats.GalCacheVoxelsBaked.fetch_add(First);
-			GalCachePendingVoxels = 0;
-		}
-		if (!bGalCacheReady) { VV.CacheCarrier = 0u; }
-	}
-	else
-	{
-		VV.CacheCarrier = 0u;
-	}
-	if (!CacheTexA) { CacheTexA = RegisterNanDummy_RenderThread(GraphBuilder); CacheTexB = CacheTexA; }
 	FRDGTextureRef MapTex = RegisterGalaxyMap_RenderThread(GraphBuilder);   // D-212
 	if (!(bGalMapComplete && F.GalMapEpoch == GalMapEpochRT && GalMapEpochRT != 0u)) { VV.MapCarrier = 0u; }   // a map baked for this frame's request only
 	auto FillCommonWith = [&](FUniVolumeCommonParameters& C, const TArray<UniCore::FCarrierGPU>& Carriers, const UniCore::FVolumeViewGPU& V, FRDGBufferRef InParamBuf, FRDGBufferRef InLutBuf)
@@ -808,8 +586,6 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		C.UniGalWarpFine = GalTex[0];   // D-179
 		C.UniGalWarpLarge = GalTex[1];
 		C.UniGalDetail = GalTex[2];
-		C.UniGalCacheA = CacheTexA;     // D-211
-		C.UniGalCacheB = CacheTexB;
 		C.UniGalMap = MapTex;           // D-212
 		TArray<UniCore::FVolumeViewGPU> One; One.Add(V);
 		One[0].NumCarriers = uint32(Carriers.Num());
@@ -930,8 +706,7 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 			// so their glow would stay baked in after their sprites arrive (per pixel it is fresh).
 			BgSnapView.GlowLevels = 0u;
 			for (int32 K = 0; K < 4; ++K) { BgSnapView.GlowMask[K] = 0u; }
-			BgSnapView.CacheCarrier = 0u;   // D-211: the map marches the background carriers alone
-			BgSnapView.MapCarrier = 0u;     // D-212
+			BgSnapView.MapCarrier = 0u;     // D-212: the background map marches the background carriers alone
 			BgFillVersion = F.BackgroundVersion;
 			BgFillMask = 0x3Fu;
 			bBgFilling = true;

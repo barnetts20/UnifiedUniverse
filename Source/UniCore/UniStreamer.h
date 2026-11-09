@@ -378,10 +378,6 @@ namespace UniCore
 		/** D-157: this frame's phase times and work counts (reset by Update; CellTable adds). */
 		mutable FStreamProfile Profile;
 		int VelocityK = UniHlsl::UNI_VELOCITY_LOD_K;
-		/** D-162: most forward stretch, in cells, a level's window takes for speed. D-203: 0 with
-		 *  cell glow (the engine's default): windows keep their rest size at any speed, and what
-		 *  cannot load in time is glow. */
-		int WindowLeadMax = 3;
 		/** D-162/D-203: a level whose lead (cells crossed while a cell fills) exceeds this is
 		 *  suspended (velocity LOD): its objects would cross the view faster than they load. */
 		double SuspendLeadCells = 3.0;
@@ -481,20 +477,13 @@ namespace UniCore
 				// LOD): its objects would cross the screen faster than they can be generated.
 				const double W = CellWidthCm(L);
 				const double MoveCells[3] = { MoveVec.X / W, MoveVec.Y / W, MoveVec.Z / W };
-				double LeadPos[3] = { 0.0, 0.0, 0.0 }, LeadNeg[3] = { 0.0, 0.0, 0.0 };
+				// D-213: windows keep their rest size at any speed (D-203; the D-162 forward stretch is
+				// gone): no lead on either side; the lead only decides suspension (velocity LOD).
+				const double LeadPos[3] = { 0.0, 0.0, 0.0 }, LeadNeg[3] = { 0.0, 0.0, 0.0 };
 				double Lead = 0.0;
 				if (bVelocityLod)
 				{
-					// Growing a window never at the cost of failing cells: above 70% pool use the
-					// stretch is dropped (suspension, as before D-139, takes over).
-					const bool bRoom = Pool.UsedCount() < u32(0.7 * double(Backend.PoolCapacity()));
-					for (int A = 0; A < 3; ++A)
-					{
-						const double La = MoveCells[A] * (LatencyEst + 1.0);
-						Lead = std::max(Lead, std::abs(La));
-						if (!bRoom) { continue; }
-						(La > 0.0 ? LeadPos[A] : LeadNeg[A]) = std::min(std::abs(La), double(std::max(WindowLeadMax, 0)));
-					}
+					for (int A = 0; A < 3; ++A) { Lead = std::max(Lead, std::abs(MoveCells[A] * (LatencyEst + 1.0))); }
 				}
 				// Shrink hysteresis: a side grows at once and shrinks one cell per ShrinkAfterFrames.
 				int MinSide[3] = { 1, 1, 1 };
@@ -800,28 +789,6 @@ namespace UniCore
 			std::sort(Out.begin(), Out.end(), [](const FContributor* A, const FContributor* B) { return A->Id < B->Id; });
 			return Out;
 		}
-		/** D-174: every resident emitter object of archetype ArchId (Ready cells), asleep or awake
-		 *  (D-168: Contributors() holds only the awake ones), as Fn(centre, object). */
-		template <typename F>
-		void ForEachEmitterObject(u32 ArchId, F&& Fn) const
-		{
-			for (const auto& LKV : Levels)
-			{
-				for (const auto& CKV : LKV.second.Cells)
-				{
-					const FCell& C = CKV.second;
-					if (C.State != ECellState::Ready) { continue; }
-					for (u32 I : C.EmitterObjects)
-					{
-						const FObjectGPU& O = C.Readback.Objects[I];
-						if ((O.A[3] & 0xFFFFu) != ArchId) { continue; }
-						const u32 Off[3] = { O.A[0], O.A[1], O.A[2] };
-						Fn(ObjectCoord(C.Key, Off), O);
-					}
-				}
-			}
-		}
-
 		/** D-177: every resident object of archetype ArchId (Ready cells), emitter or not (groups
 		 *  are labels with no emitter now), as Fn(centre, object). Walks every object of the levels
 		 *  the archetype is placed at: for console commands, not per frame. */
@@ -1252,7 +1219,7 @@ namespace UniCore
 			const double W = CellWidthCm(L);
 			R.Wp = CellWidthCm(LpLevel);
 			const FVec3d Oc = ToDouble(Sub(CellOrigin(CellOf(Camera, L)), Camera));
-			const double N = double(UniHlsl::UNI_WINDOW_N_MAX + std::max(WindowLeadMax, 0));   // D-162: the widest a stretched window gets
+			const double N = double(UniHlsl::UNI_WINDOW_N_MAX);   // the widest a window gets
 			R.NW = N * W;
 			R.CLo[0] = Oc.X - N * W; R.CLo[1] = Oc.Y - N * W; R.CLo[2] = Oc.Z - N * W;
 			R.CHi[0] = Oc.X + (N + 1.0) * W; R.CHi[1] = Oc.Y + (N + 1.0) * W; R.CHi[2] = Oc.Z + (N + 1.0) * W;
@@ -1823,7 +1790,7 @@ namespace UniCore
 		 *  most N_max + lead cells from the camera's cell per axis, plus that cell. */
 		double WindowReachCm(int L) const
 		{
-			return double(UniHlsl::UNI_WINDOW_N_MAX + std::max(WindowLeadMax, 0) + 1) * 1.7320508075688772 * CellWidthCm(L);
+			return double(UniHlsl::UNI_WINDOW_N_MAX + 1) * 1.7320508075688772 * CellWidthCm(L);
 		}
 
 		/** D-168: wake and sleep contributors by distance. An emitter object is registered (its

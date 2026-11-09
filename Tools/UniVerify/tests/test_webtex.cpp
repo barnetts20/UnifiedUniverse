@@ -988,7 +988,7 @@ UNI_TEST(webtex, cell_glow)
 		FLagBackend Be(Cpu, 3);
 		FUniStreamer S(G, Be);
 		S.bAsyncIntegrals = false;
-		if (bNew) { S.bCellFade = true; S.WindowLeadMax = 0; S.BuildBudget = 96; }
+		if (bNew) { S.bCellFade = true; S.BuildBudget = 96; }
 		FCoord C = UniScenes::VoidCamera();
 		FVec3f F{};
 		S.Update(C); ++Be.Frame;

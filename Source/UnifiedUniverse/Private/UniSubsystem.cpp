@@ -99,7 +99,6 @@ namespace UniClusterCVars
 }
 
 // D-154: travel sensitivity. Speeds in cm/s (100 kpc/s = 3.09e23, 10 Mpc/s = 3.09e25).
-static TAutoConsoleVariable<float> CVarUniTravelSensitivity(TEXT("uu.TravelSensitivity"), 0.0f, TEXT("Most sensitivity (mag) added while travelling fast (0: off). D-154: 2.5; D-201: 0.5 (at +2.5 an intergalactic view holds ~18x the objects and cells of rest, all generated while flying: 30 fps; +0.5 ~1.8x); D-203: 0 (it widens every window, and windows now keep their rest size at speed)."));
 static TAutoConsoleVariable<float> CVarUniTravelStart(TEXT("uu.TravelStart"), 3.0857e23f, TEXT("Speed (cm/s) where travel sensitivity starts (default 100 kpc/s)."));
 static TAutoConsoleVariable<int32> CVarUniSubmitDefer(TEXT("uu.SubmitDeferPerLevel"), 48, TEXT("D-173: entering cells not needed within the latency (plus a margin) are built at most this many per level per frame; -1: no limit (before D-173). Used only with uu.StreamBuildBudget 0."));
 // D-203: cell glow, a fixed build budget and windows that keep their rest size at speed.
@@ -108,14 +107,8 @@ static TAutoConsoleVariable<int32> CVarUniGenOneTrip(TEXT("uu.GenOneTrip"), 1, T
 static TAutoConsoleVariable<int32> CVarUniGalaxyMap(TEXT("uu.GalaxyMap"), 1, TEXT("D-212: the galaxy the camera is in is marched from its baked 2D map (in-plane light, dust, disc centre, arm part; baked once per galaxy on a worker) with the vertical profile, bulge, warp and detail read per sample. 0: its field at every step (A/B)."));
 static TAutoConsoleVariable<int32> CVarUniGalaxyMapSize(TEXT("uu.GalaxyMap.Size"), 1024, TEXT("D-212: the galaxy map's texels a side (a power of two, 256..4096): 1024 ~11 MB with mips, baked in one frame (p95 1% against the field; the owner sees no difference from 2048), 2048 ~43 MB (0.3%). Changing it rebakes."));
 static TAutoConsoleVariable<int32> CVarUniGalaxyMapBudget(TEXT("uu.GalaxyMap.Budget"), 1048576, TEXT("D-212: texels of the galaxy map the GPU bakes a frame (rows of the map): 1M bakes 1024^2 in one frame, 2048^2 in 4. The glow uses the field until the map is done."));
-static TAutoConsoleVariable<int32> CVarUniGalaxyCache(TEXT("uu.GalaxyCache"), 0, TEXT("D-211: the galaxy the camera is in is marched from a camera-centred clipmap (K levels of N^3 voxels baked from its field as the camera moves) instead of evaluating its field at every step. Superseded by uu.GalaxyMap (D-212: used only where no map is published); 0 by default."));
-static TAutoConsoleVariable<int32> CVarUniGalaxyCacheSize(TEXT("uu.GalaxyCache.Size"), 128, TEXT("D-211: voxels a cache level side (64..256). 128: ~120 MB of GPU memory; 96: ~50 MB, a little softer far away. Changing it rebakes the cache."));
-static TAutoConsoleVariable<int32> CVarUniGalaxyCacheBudget(TEXT("uu.GalaxyCache.Budget"), 1048576, TEXT("D-211: voxels baked a frame at most. A level that cannot follow the camera within it keeps its last window (coarser levels cover; softer at high speed)."));
-static TAutoConsoleVariable<float> CVarUniGalaxyCacheFinestPc(TEXT("uu.GalaxyCache.FinestPc"), 512.0f, TEXT("D-211: how far (pc) the finest cache level reaches from the camera (its voxel 2 x this / size). Changing it rebakes the cache."));
-static TAutoConsoleVariable<int32> CVarUniVolumeGalaxyConst(TEXT("uu.VolumeGalaxyConst"), 1, TEXT("D-210: the volume march reads each galaxy's per-object hashes from a block the builder writes once a frame instead of hashing ~10 times a step (bit for bit the same image). 0: hash inline (A/B for ProfileGPU)."));
 static TAutoConsoleVariable<int32> CVarUniCellGlow(TEXT("uu.CellGlow"), 1, TEXT("D-203: a cell still loading is drawn as glow (the volume adds its children's expected light from the field) and its sprites fade in once it is Ready, instead of a hole that pops. 0: before D-203."));
 static TAutoConsoleVariable<int32> CVarUniStreamBuildBudget(TEXT("uu.StreamBuildBudget"), 96, TEXT("D-203: at most this many cells built per frame over every level, those needed soonest first; the rest wait as glow. 0: D-173's per-level rule (uu.SubmitDeferPerLevel)."));
-static TAutoConsoleVariable<int32> CVarUniWindowStretch(TEXT("uu.WindowStretch"), 0, TEXT("D-203: most cells a level's window stretches ahead along the direction of travel (D-162: 3). 0: windows keep their rest size at any speed (what cannot load in time is glow, with uu.CellGlow)."));
 static TAutoConsoleVariable<float> CVarUniCellFadeFrames(TEXT("uu.CellFadeFrames"), 8.0f, TEXT("D-203: frames over which a cell's sprites fade in (and its glow out) once it is Ready."));
 static TAutoConsoleVariable<float> CVarUniTravelFull(TEXT("uu.TravelFull"), 3.0857e25f, TEXT("Speed (cm/s) where travel sensitivity is full (default 10 Mpc/s)."));
 
@@ -207,7 +200,7 @@ void UUniSubsystem::EnableUniverse(const FString& Scene)
 	}
 	SceneName = Scene.IsEmpty() ? TEXT("galaxy") : Scene.ToLower();
 	ClusterTuning = UniClusterCVars::Read();
-	Travel.Current = 0.0;
+	Warp.Current = 0.0;
 	bCameraJumped = true;
 	UniCore::FUniverseDef Def = SceneName == TEXT("web") ? UniScenes::WebToGalaxy(ClusterTuning) : (SceneName == TEXT("flythrough") ? UniScenes::Flythrough(ClusterTuning) : UniScenes::GalaxyToStar());
 	SetupWebTexture(Def);   // D-164: before the model, which bakes the definition's parameters
@@ -493,7 +486,7 @@ void UUniSubsystem::SetVelocity(const FVector& CmPerSecond)
 void UUniSubsystem::SetSensitivity(float InDeltaMag)
 {
 	DeltaMag = FMath::Clamp(InDeltaMag, -5.0f, 5.0f);
-	EffectiveDeltaMag = FMath::Clamp(DeltaMag + float(Travel.Current), -5.0f, 5.0f);
+	EffectiveDeltaMag = DeltaMag;
 	if (Streamer) { Streamer->DeltaMag = EffectiveDeltaMag; }
 }
 
@@ -552,11 +545,11 @@ void UUniSubsystem::DrawHud(double Speed) const
 	if (!GEngine) { return; }
 	const UniCore::FDelta FromOrigin = UniCore::Sub(Camera.ToCore(), UniCore::FCoord::Origin());
 	const double R = UniCore::Length(UniCore::ToDouble(FromOrigin));
-	const FString Line = FString::Printf(TEXT("UU %s  speed %s/s (%.3g cm/s)%s  |  %s from the demo origin  |  dm %+.1f (travel %+.1f)  exposure %+.1f  |  t %.4g s (x%.3g)  systems %d, planets %d, promoted %d"),
+	const FString Line = FString::Printf(TEXT("UU %s  speed %s/s (%.3g cm/s)%s  |  %s from the demo origin  |  dm %+.1f (travel exposure %+.2f)  exposure %+.1f  |  t %.4g s (x%.3g)  systems %d, planets %d, promoted %d"),
 		bFreeFly ? (MotionMode == EUniMotionMode::Local ? TEXT("FLY (local: real space, physics)") : TEXT("FLY (cruise)")) : TEXT("CRUISE"),
 		UTF8_TO_TCHAR(UniCore::FormatDistance(Speed).c_str()), Speed,
 		bFreeFly ? TEXT("  [WASD/QE move, wheel x2 / x0.5]") : TEXT(""),
-		UTF8_TO_TCHAR(UniCore::FormatDistance(R).c_str()), EffectiveDeltaMag, Travel.Current, ExposureBias,
+		UTF8_TO_TCHAR(UniCore::FormatDistance(R).c_str()), EffectiveDeltaMag, TravelExposureMag, ExposureBias,
 		UniverseTime, TimeScale, Systems ? int32(Systems->ActiveSystems().size()) : 0, Systems ? int32(Systems->PlanetCount()) : 0, int32(Promoter.Promoted().size()));
 	GEngine->AddOnScreenDebugMessage(int32(0x5EED0001), 0.0f, FColor(120, 220, 255), Line);
 }
@@ -711,15 +704,12 @@ void UUniSubsystem::Tick(float DeltaTime)
 		// D-184: the volume's temporal reprojection needs the camera's move (not across a jump).
 		CameraStepCm = bCameraJumped ? FVector3d::ZeroVector : FVector3d(Step.X, Step.Y, Step.Z);
 		bCameraStepValid = !bCameraJumped;
-		Travel.MaxDeltaMag = FMath::Clamp(double(CVarUniTravelSensitivity.GetValueOnGameThread()), 0.0, 5.0);
-		Travel.StartCmPerS = FMath::Max(double(CVarUniTravelStart.GetValueOnGameThread()), 1.0);
-		Travel.FullCmPerS = FMath::Max(double(CVarUniTravelFull.GetValueOnGameThread()), Travel.StartCmPerS * 1.01);
-		Travel.Update(Speed, Dt);
-		EffectiveDeltaMag = FMath::Clamp(DeltaMag + float(Travel.Current), -5.0f, 5.0f);
-		// D-187: the warp amount, the same curve normalised to 0..1 (render-only effects).
+		// D-187: the warp amount, the travel curve normalised to 0..1 (render-only effects). D-213:
+		// the D-154 travel sensitivity it was derived from is gone (D-205 replaced it with exposure).
+		EffectiveDeltaMag = DeltaMag;
 		Warp.MaxDeltaMag = 1.0;
-		Warp.StartCmPerS = Travel.StartCmPerS;
-		Warp.FullCmPerS = Travel.FullCmPerS;
+		Warp.StartCmPerS = FMath::Max(double(CVarUniTravelStart.GetValueOnGameThread()), 1.0);
+		Warp.FullCmPerS = FMath::Max(double(CVarUniTravelFull.GetValueOnGameThread()), Warp.StartCmPerS * 1.01);
 		Warp.RiseMagPerS = 2.0;
 		Warp.FallMagPerS = 1.0;
 		Warp.Update(Speed, Dt);
@@ -738,7 +728,6 @@ void UUniSubsystem::Tick(float DeltaTime)
 	Streamer->bOneTrip = CVarUniGenOneTrip.GetValueOnGameThread() != 0;           // D-207
 	Streamer->CellFadeFrames = FMath::Clamp(double(CVarUniCellFadeFrames.GetValueOnGameThread()), 0.0, 120.0);
 	Streamer->BuildBudget = FMath::Max(CVarUniStreamBuildBudget.GetValueOnGameThread(), 0);
-	Streamer->WindowLeadMax = FMath::Clamp(CVarUniWindowStretch.GetValueOnGameThread(), 0, 3);
 	{
 		// D-168: contributors the volume builder will ask for (above its reject angle) stay awake:
 		// half that angle, from last frame's pixel size (as the builder uses).
@@ -877,9 +866,6 @@ void UUniSubsystem::LogPerf()
 	UE_LOG(LogUnifiedUniverse, Log, TEXT("  galaxy map (uu.GalaxyMap): %s, %u^2 (%.1f MB with mips); last bake %u frames on the GPU (%.0f ms from request to use); %llu bakes"),
 		GalaxyMapEpoch == 0u ? TEXT("none") : (R.GalMapReadyEpoch.load() == GalaxyMapEpoch ? TEXT("ready") : TEXT("baking")), GalaxyMapSize, double(GalaxyMapSize) * GalaxyMapSize * 8.0 * 4.0 / 3.0 / 1048576.0,
 		R.GalMapBakeFrames.load(), GalaxyMapBakeMs, (unsigned long long)GalaxyMapBakes);
-	UE_LOG(LogUnifiedUniverse, Log, TEXT("  galaxy cache (uu.GalaxyCache): %s, %u levels of %u^3, %.0f MB on the GPU; last frame %llu voxels baked, %u levels behind; %llu voxels baked in all (GPU %u), %llu resets"),
-		GalaxyCache.bActive ? TEXT("on the camera's galaxy") : TEXT("idle (not inside a galaxy, or off)"), GalaxyCache.K, GalaxyCache.Settings.N, double(R.GalCacheBytes.load()) / 1048576.0,
-		(unsigned long long)GalaxyCache.LastBaked, GalaxyCache.LevelsBehind, (unsigned long long)GalaxyCache.BakedTotal, R.GalCacheVoxelsBaked.load(), (unsigned long long)GalaxyCache.Resets);
 	UE_LOG(LogUnifiedUniverse, Log, TEXT("  background map re-marched since the last uu.Perf: %u (camera moved %u, LUT layout %u, its LUT changed %u, sky web %u)"),
 		BgDirtyCounts[0] + BgDirtyCounts[1] + BgDirtyCounts[2] + BgDirtyCounts[3], BgDirtyCounts[0], BgDirtyCounts[1], BgDirtyCounts[2], BgDirtyCounts[3]);
 	for (uint32& C : BgDirtyCounts) { C = 0u; }
@@ -975,7 +961,6 @@ void UUniSubsystem::PushFrame()
 		Settings.TexturedWebStepRatio = FMath::Clamp(CVarUniVolumeWebStepRatio.GetValueOnGameThread(), 0.02f, 1.0f);   // D-199
 		Settings.WebHintScale = float(FMath::Lerp(1.0, double(FMath::Clamp(CVarUniVolumeWebTravelHint.GetValueOnGameThread(), 1.0f, 4.0f)), FMath::Clamp(Warp.Current, 0.0, 1.0)));   // D-202
 		Settings.bCellGlow = CVarUniCellGlow.GetValueOnGameThread() != 0;   // D-203
-		Settings.bGalaxyConst = CVarUniVolumeGalaxyConst.GetValueOnGameThread() != 0;   // D-210
 		Settings.LocalStartCm = double(FMath::Clamp(CVarUniVolumeStartPc.GetValueOnGameThread(), 0.01f, 1000.0f)) * 3.0856775814913673e18;
 		Settings.MaxSubsamples = UniCore::u32(FMath::Clamp(CVarUniVolumeMaxSubsamples.GetValueOnGameThread(), 1, 8));
 		Settings.bPrefilter = CVarUniVolumePrefilter.GetValueOnGameThread() != 0;
@@ -998,11 +983,10 @@ void UUniSubsystem::PushFrame()
 		F.VolumeView = Sc.View;
 		// D-212: the galaxy map: the GPU bakes it over a few frames when the camera's galaxy (or the
 		// size) changes; published once the renderer reports this request baked.
-		bool bMapPublished = false;
 		{
 			const bool bMap = CVarUniGalaxyMap.GetValueOnGameThread() != 0;
 			const uint32 WantSize = FMath::RoundUpToPowerOfTwo(uint32(FMath::Clamp(CVarUniGalaxyMapSize.GetValueOnGameThread(), 256, 4096)));
-			const UniCore::FCarrierGPU* Home = UniCore::FGalaxyCache::HomeCarrier(Sc);
+			const UniCore::FCarrierGPU* Home = UniCore::HomeCarrierOf(Sc);
 			if (bMap && Home)
 			{
 				if (!(GalaxyMapEpoch != 0u && GalaxyMapId == Sc.Home.Parent && GalaxyMapSize == WantSize))
@@ -1032,37 +1016,6 @@ void UUniSubsystem::PushFrame()
 			if (bMap && Home && bReady && GalaxyMapId == Sc.Home.Parent)
 			{
 				UniCore::PublishGalaxyMap(F.VolumeView, Sc.Home.Carrier, GalaxyMapSize);
-				bMapPublished = true;
-			}
-		}
-		// D-211: the galaxy cache: this frame's boxes to bake, and its header after the LUT
-		// (only where no map is published: the map supersedes it).
-		{
-			const bool bCache = CVarUniGalaxyCache.GetValueOnGameThread() != 0 && !bMapPublished;
-			const UniCore::u32 Nc = UniCore::u32(FMath::Clamp(CVarUniGalaxyCacheSize.GetValueOnGameThread(), 64, 256));
-			const double Fin = double(FMath::Clamp(CVarUniGalaxyCacheFinestPc.GetValueOnGameThread(), 16.0f, 16384.0f));
-			if (GalaxyCache.Settings.N != Nc || GalaxyCache.Settings.FinestHalfPc != Fin) { GalaxyCache.Settings.N = Nc; GalaxyCache.Settings.FinestHalfPc = Fin; GalaxyCache.Reset(); }
-			GalaxyCache.Settings.Budget = UniCore::u64(FMath::Max(CVarUniGalaxyCacheBudget.GetValueOnGameThread(), 4096));
-			if (FUniRenderer::Get().Stats.bGalCacheLost.exchange(false)) { GalaxyCache.Reset(); }
-			if (!bCache) { GalaxyCache.Reset(); }
-			const std::vector<UniCore::FGalCacheBox> Boxes = bCache ? GalaxyCache.Update(Sc) : std::vector<UniCore::FGalCacheBox>();
-			if (bCache && GalaxyCache.bActive)
-			{
-				std::vector<UniHlsl::float4> Hdr;
-				GalaxyCache.PublishAt(UniCore::u32(F.VolumeLut.Num()), Hdr, F.VolumeView, Sc.Home.Carrier);
-				for (const UniHlsl::float4& L : Hdr) { F.VolumeLut.Add(FVector4f(L.x, L.y, L.z, L.w)); }
-				for (const UniCore::FGalCacheBox& B : Boxes)
-				{
-					F.GalCacheBoxes.Add(FUintVector4(B.Level, uint32(B.Lo[0]), uint32(B.Lo[1]), uint32(B.Lo[2])));
-					F.GalCacheBoxes.Add(FUintVector4(uint32(B.Size[0]), uint32(B.Size[1]), uint32(B.Size[2]), 0u));
-				}
-				F.GalCacheN = GalaxyCache.Settings.N;
-				F.GalCacheLevels = GalaxyCache.K;
-				F.GalCacheEpoch = UniCore::u32(GalaxyCache.Resets);
-				F.GalCacheV0 = float(GalaxyCache.V0);
-				F.GalCacheZCap = float(2.0 * GalaxyCache.Settings.ZReach / double(GalaxyCache.Settings.N));
-				F.GalCacheScale = GalaxyCache.Scale;
-				F.GalCacheFootScale = float(GalaxyCache.Settings.FootScale);
 			}
 		}
 		F.VolumeNearCm = float(Sc.NearCm);   // D-208
@@ -1087,7 +1040,7 @@ void UUniSubsystem::PushFrame()
 		// D-209: the LUT's layout is its blocks' end, not the buffer's size: the cell-glow grids
 		// (D-203) after the blocks change size whenever a level starts or finishes loading, and
 		// comparing the size re-marched the background (per pixel, uu.BackgroundMode 2) at rest.
-		const int32 LutBlocks = int32(UniCore::LutBlocksEnd(F.VolumeView.GlowLevels, F.VolumeView.GlowBase, size_t(F.VolumeLut.Num()), F.VolumeView.CacheCarrier != 0u ? F.VolumeView.CacheBase : 0u));
+		const int32 LutBlocks = int32(UniCore::LutBlocksEnd(F.VolumeView.GlowLevels, F.VolumeView.GlowBase, size_t(F.VolumeLut.Num())));
 		const bool bMoved = FMath::Sqrt(Moved.X * Moved.X + Moved.Y * Moved.Y + Moved.Z * Moved.Z) > 0.25 * TexelRad * Settings.BackgroundStartCm;
 		const bool bLayout = BackgroundLutLast.Num() != LutBlocks;
 		bool bDirty = bMoved || bLayout;

@@ -362,40 +362,6 @@ namespace UniHlsl
 		return float4(A.x + (B.x - A.x) * T, A.y + (B.y - A.y) * T, A.z + (B.z - A.z) * T, A.w + (B.w - A.w) * T);
 	}
 
-	/** D-211: the galaxy cache's two textures (UniGalaxyCache.h), bound by UniCore::BindGalaxyCache:
-	 *  float4 texels (already rounded as the GPU stores them: half floats for A, unorm8 for B),
-	 *  W x H x D with x fastest; filtered like the GPU's trilinear sampler, wrapping on every
-	 *  axis. Unbound: NaN. */
-	struct FGalCacheTexView
-	{
-		const float* Texels = nullptr;
-		int W = 0, H = 0, D = 0;
-	};
-	inline FGalCacheTexView UniGalCacheViews[2];
-
-	inline float4 UniGalCacheSample(int Which, const float3& P)
-	{
-		const FGalCacheTexView& V = UniGalCacheViews[Which];
-		if (!V.Texels) { const float N = std::nanf(""); return float4(N, N, N, N); }
-		const float X = P.x * float(V.W) - 0.5f, Y = P.y * float(V.H) - 0.5f, Z = P.z * float(V.D) - 0.5f;
-		const float Fx = std::floor(X), Fy = std::floor(Y), Fz = std::floor(Z);
-		const float Ax = X - Fx, Ay = Y - Fy, Az = Z - Fz;
-		auto Wrap = [](int I, int S) { const int R = I % S; return R < 0 ? R + S : R; };
-		const int X0 = Wrap(int(Fx), V.W), Y0 = Wrap(int(Fy), V.H), Z0 = Wrap(int(Fz), V.D);
-		const int X1 = Wrap(X0 + 1, V.W), Y1 = Wrap(Y0 + 1, V.H), Z1 = Wrap(Z0 + 1, V.D);
-		auto At = [&](int I, int J, int K)
-		{
-			const float* T = V.Texels + ((size_t(K) * size_t(V.H) + size_t(J)) * size_t(V.W) + size_t(I)) * 4u;
-			return float4(T[0], T[1], T[2], T[3]);
-		};
-		auto Lerp4 = [](const float4& A, const float4& B, float T) { return float4(A.x + (B.x - A.x) * T, A.y + (B.y - A.y) * T, A.z + (B.z - A.z) * T, A.w + (B.w - A.w) * T); };
-		const float4 C00 = Lerp4(At(X0, Y0, Z0), At(X1, Y0, Z0), Ax);
-		const float4 C10 = Lerp4(At(X0, Y1, Z0), At(X1, Y1, Z0), Ax);
-		const float4 C01 = Lerp4(At(X0, Y0, Z1), At(X1, Y0, Z1), Ax);
-		const float4 C11 = Lerp4(At(X0, Y1, Z1), At(X1, Y1, Z1), Ax);
-		return Lerp4(Lerp4(C00, C10, Ay), Lerp4(C01, C11, Ay), Az);
-	}
-
 	/** D-212: the galaxy map (UniGalaxyMap.h), bound by UniCore::BindGalaxyMap: float4 texels per
 	 *  mip (already rounded to half floats), Size >> m a side, x fastest; filtered like the GPU's
 	 *  trilinear sampler (bilinear in a mip, linear between mips), wrapping. Unbound: NaN. */
@@ -435,8 +401,6 @@ namespace UniHlsl
 } // namespace UniHlsl
 
 #define UNI_GAL_MAP(UV, Mip) UniGalMapSample(UV, Mip)
-#define UNI_GAL_CACHE_A(U) UniGalCacheSample(0, U)
-#define UNI_GAL_CACHE_B(U) UniGalCacheSample(1, U)
 #define UNI_WEB_TEX_SAMPLE(P, Mip) UniWebTexSample(P, Mip)
 #define UNI_GAL_WARP_FINE(P, Mip) UniGalaxyTexSample(0, P, Mip)
 #define UNI_GAL_WARP_LARGE(P, Mip) UniGalaxyTexSample(1, P, Mip)

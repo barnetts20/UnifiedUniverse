@@ -148,10 +148,6 @@
     "what": "D-200 volume auto budget in the engine: compiles (RHIGetGPUFrameCycles, DynamicRHI.h); at the worst spots uu.perf's level settles where the GPU fits 60 fps and holds; no visible pumping (REVIEW_TONIGHT \u00a734)."
   },
   {
-    "id": "UE-38",
-    "what": "D-201: fps at 1-10 Mpc/s with uu.TravelSensitivity 0.5 (and 0) against 2.5; if still slow, stat unit / uu.perf at speed (REVIEW_TONIGHT \u00a735)."
-  },
-  {
     "id": "UE-39",
     "what": "D-202: fps at 1-30 Mpc/s with uu.VolumeWebTravelHint 2 against 1 (and 3); the web's filaments keep their brightness and shape while accelerating (REVIEW_TONIGHT \u00a736)."
   },
@@ -185,14 +181,14 @@
   },
   {
     "id": "UE-47",
-    "what": "D-210: UniFields.ush / UniVolume.ush compile (FUniGalaxyConst, the K forms, Uni_CarrierStepLimit); ProfileGPU Uni.Volume.March in the core before/after and with uu.VolumeGalaxyConst 0 / 1 (same image); no swirls or rings toward the centre (REVIEW_TONIGHT \u00a744)."
-  },
-  {
-    "id": "UE-48",
-    "what": "D-211 galaxy cache in the engine: CacheBakeCS and the march compile; Uni.Volume.March in the core / at the solar circle with uu.GalaxyCache 0 / 1; Uni.Volume.CacheBake while flying; no seams; ~120 MB at 128 (REVIEW_TONIGHT \u00a745)."
+    "what": "D-210: UniFields.ush / UniVolume.ush compile (FUniGalaxyConst, the K forms, Uni_CarrierStepLimit); ProfileGPU Uni.Volume.March in the core before/after; no swirls or rings toward the centre (REVIEW_TONIGHT \u00a744)."
   },
   {
     "id": "UE-49",
     "what": "D-212 galaxy map in the engine: shaders compile (UniGalMap, MapBakeCS, MapDownCS); the GPU bake over frames on entering a galaxy (Uni.GalaxyMap.Bake, at 1024 and 2048); Uni.Volume.March with uu.GalaxyMap 0 / 1 in the core and at the solar circle; the look matches the field (REVIEW_TONIGHT \u00a746)."
+  },
+  {
+    "id": "UE-50",
+    "what": "D-213 cleanup: the engine builds and shaders compile after the removals (clipmap, window stretch, travel sensitivity, uu.VolumeGalaxyConst); look and fps unchanged (REVIEW_TONIGHT \u00a747)."
   }
 ]

@@ -1703,3 +1703,17 @@ Rationale: T2.vol.galaxy_map (new; the six views of T2.vol.galaxy_cache, 160 x 9
 Reroll impact: none (render only).
 Status: Provisional (UE-49: ProfileGPU Uni.Volume.March with uu.GalaxyMap 0 / 1 in the core and at the solar circle; Uni.GalaxyMap.Bake per frame on entering a galaxy, at 1024 and 2048; no seams or blockiness near the camera)
 Amendment (owner, engine): no fidelity difference seen between uu.GalaxyMap.Size 2048 and 1024, so the default is 1024 (~11 MB, baked in one frame at the default budget; offline p95 <= 0.96% against the field, 2048: 0.32%).
+
+D-213 — Cleanup after the D-203..D-212 iterations: superseded paths removed, galaxy terms shared between the field and the map, dead code
+Question: Owner: a clean-up and review pass before moving further. Remove (owner's choice): the galaxy clipmap (D-211), the window stretch (pre-D-203), travel sensitivity (D-205 replaced it), the A/B toggle of the exact cuts (uu.VolumeGalaxyConst).
+Findings (audit): every CVar is read; no member field unused; no SCRATCH / TODO markers; the offline build has no warnings (-Wall -Wextra -Werror). Unused: shader functions Uni_ArrivalWeight (D-205 removed its use) and Uni_CellOriginAxis, UniCore's FLevelWindow::AllGenerated, FMagnitudeTable::CdfAt, FluxSliceForLevel, FUniStreamer::ForEachEmitterObject, the constant UNI_ARRIVAL_RANGE. Duplicated: Uni_GalaxyMapEval (D-212) carried its own copies of the field's texture terms (twist, warps, detail read), detail decoding and bulge.
+Decision:
+- **Clipmap removed** (D-211): UniGalaxyCache.h, Uni_GalCache*, CacheBakeCS (UNI_VOL_PASS 4), the cache textures and queue, uu.GalaxyCache*, the view's Cache* fields (FVolumeViewGPU 128 -> 112 bytes), LutBlocksEnd's cache argument, T2.vol.galaxy_cache. FGalaxyCache::HomeCarrier -> UniCore::HomeCarrierOf. The galaxy map's check moves to test_galaxymap.cpp.
+- **Window stretch removed**: FUniStreamer::WindowLeadMax and uu.WindowStretch; windows keep their rest size at any speed (the engine's default since D-203); the lead still decides suspension. T2.stream.responsive no longer requires every visible cell Ready in steady flight (that was the stretch's guarantee; what cannot load is glow, T2.stream.cell_glow); it reports the holes. T2.webtex.cell_glow's D-202 baseline runs without a stretch.
+- **Travel sensitivity removed**: uu.TravelSensitivity and the subsystem's Travel curve; the warp curve (D-187) reads uu.TravelStart / uu.TravelFull itself; the HUD shows the travel exposure instead. FTravelSensitivity stays (the warp curve).
+- **uu.VolumeGalaxyConst removed**: the blocks are always written in the engine; FVolumeSettings::bGalaxyConst stays for T2.vol.galaxy_const.
+- **Shared galaxy terms** (UniFields.ush): Uni_GalaxyTexTerms (warp_fine, warp_large, detail read), Uni_GalaxyDetailTerms (fBm, knots, dust lanes and holes), Uni_GalaxyBulgeAt (the widened Sersic bulge), used by the field (Uni_GalaxySharedK, Uni_GalaxyFromSharedC) and the map (Uni_GalaxyMapEval). The field is bit for bit the same (five views of the home galaxy against D-212, every pixel; T2.galaxy.shape, T2.vol.galaxy_const).
+- **Dead code removed**: the functions above.
+- Kept: the 128-bit helpers (Uni_U128, Uni_U128Equal, Uni_S128Abs: unused but part of the coordinate math's API); test-only helpers (Uni_ArrivalDistance, Uni_CellAxis ...).
+Reroll impact: none.
+Status: Provisional (UE-50: the engine builds with the removals; the look and fps unchanged)

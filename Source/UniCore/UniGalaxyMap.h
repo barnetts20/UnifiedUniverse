@@ -2,8 +2,8 @@
 // D-212: the galaxy map. A 2D RGBA16F map with mips over a galaxy's field x, y in [-1, 1], baked
 // once from the shader core (Uni_GalaxyMapTexel): (light's in-plane factor, dust's, the disc's
 // vertical centre, the light's arm part). The march evaluates the camera's own galaxy from it
-// (Uni_GalaxyMapEval). The CPU bake here is the reference's and the engine's (baked on a worker,
-// uploaded once): the same texels on both sides. Engine-agnostic (no UE includes).
+// (Uni_GalaxyMapEval). The CPU bake here is the reference's; the engine bakes the same texels on
+// the GPU (MapBakeCS / MapDownCS, spread over frames). Engine-agnostic (no UE includes).
 
 #pragma once
 

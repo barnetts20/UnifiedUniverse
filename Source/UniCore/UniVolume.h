@@ -82,17 +82,13 @@ namespace UniCore
 		u32 GlowLevels;         // set bits in GlowMask (0: no cell glow)
 		u32 MarchFlags;         // D-206: bit 0: no shared web texel reads (checks only)
 		u32 GalaxyConstBase;    // D-210: params index of the galaxy constant blocks (one per parameter block); 0: hash inline
-		u32 CacheBase;          // D-211: the galaxy cache's header in the LUT buffer
-		u32 CacheCarrier;       // the cached carrier's index + 1 (0: no cache)
-		u32 CacheN;             // voxels a level side
-		u32 CacheLevels;
 		u32 MapCarrier;         // D-212: the mapped carrier's index + 1 (0: none)
 		u32 MapSize;            // texels a side of the map's mip 0
 		u32 MapPad0;
 		u32 MapPad1;
 	};
-	static_assert(sizeof(FVolumeViewGPU) == 128, "FVolumeViewGPU must match FUniVolumeView (UniVolume.ush)");
-	static_assert(sizeof(HV::FUniVolumeView) == 128, "shim FUniVolumeView layout");
+	static_assert(sizeof(FVolumeViewGPU) == 112, "FVolumeViewGPU must match FUniVolumeView (UniVolume.ush)");
+	static_assert(sizeof(HV::FUniVolumeView) == 112, "shim FUniVolumeView layout");
 
 	inline HV::FUniCarrier ToHlsl(const FCarrierGPU& C) { HV::FUniCarrier H; std::memcpy(static_cast<void*>(&H), &C, sizeof(H)); return H; }
 	inline HV::FUniVolumeView ToHlsl(const FVolumeViewGPU& V) { HV::FUniVolumeView H; std::memcpy(static_cast<void*>(&H), &V, sizeof(H)); return H; }
@@ -376,11 +372,9 @@ namespace UniCore
 	/** D-209: the end (float4 entries) of the LUT's blocks: the cell-glow grids (D-203) follow
 	 *  them and change size whenever a level starts or finishes loading, so a test for "the LUT's
 	 *  layout changed" (the background map's) compares this, not the buffer's size. */
-	inline u32 LutBlocksEnd(u32 InGlowLevels, u32 InGlowBase, size_t InLutSize, u32 InCacheBase = 0u)
+	inline u32 LutBlocksEnd(u32 InGlowLevels, u32 InGlowBase, size_t InLutSize)
 	{
-		u32 E = InGlowLevels > 0u ? std::min(InGlowBase, u32(InLutSize)) : u32(InLutSize);
-		if (InCacheBase > 0u) { E = std::min(E, InCacheBase); }   // D-211: the galaxy cache's header follows too
-		return E;
+		return InGlowLevels > 0u ? std::min(InGlowBase, u32(InLutSize)) : u32(InLutSize);
 	}
 
 	/** D-200: the volume march's pixel budget follows the GPU frame time (dynamic resolution for
@@ -462,7 +456,7 @@ namespace UniCore
 	};
 
 	/** D-211: the camera's own galaxy: the local prefiltered galaxy carrier whose cut sphere holds
-	 *  the camera (the most weighted when several do), for the galaxy cache. */
+	 *  the camera (the most weighted when several do), for the galaxy map (D-212). */
 	struct FCarrierHome
 	{
 		int Carrier = -1;           // its index among the scene's local (non-periodic) carriers, as the engine and Subset(false) order them; -1: none
@@ -494,7 +488,7 @@ namespace UniCore
 			O.Carriers.clear();
 			for (const FCarrierGPU& C : Carriers) { if (((C.Flags & HV::UNI_CARRIER_PERIODIC) != 0u) == bPeriodic) { O.Carriers.push_back(C); } }
 			O.View.NumCarriers = u32(O.Carriers.size());
-			if (bPeriodic) { O.Home = FCarrierHome{}; O.View.CacheCarrier = 0u; }   // D-211: the home is a local carrier
+			if (bPeriodic) { O.Home = FCarrierHome{}; O.View.MapCarrier = 0u; }   // D-211: the home is a local carrier
 			return O;
 		}
 
@@ -973,4 +967,17 @@ namespace UniCore
 		mutable std::map<u32, FLutCache> TotalLutCache;   // D-191
 		mutable std::map<std::pair<u32, int>, FLutCache> KeepLutCache;   // D-197
 	};
+	/** D-211: the scene's home carrier (FVolumeScene::Home: its index among the local carriers). */
+	inline const FCarrierGPU* HomeCarrierOf(const FVolumeScene& Sc)
+	{
+		if (Sc.Home.Carrier < 0) { return nullptr; }
+		int Local = 0;
+		for (const FCarrierGPU& C : Sc.Carriers)
+		{
+			if ((C.Flags & HV::UNI_CARRIER_PERIODIC) != 0u) { continue; }
+			if (Local == Sc.Home.Carrier) { return &C; }
+			++Local;
+		}
+		return nullptr;
+	}
 }

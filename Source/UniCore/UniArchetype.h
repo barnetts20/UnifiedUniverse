@@ -129,14 +129,6 @@ namespace UniCore
 
 		double MAt(size_t I) const { return MMin + (MMax - MMin) * double(I) / double(Pdf.size() - 1); }
 
-		double CdfAt(double M) const
-		{
-			if (M <= MMin) { return 0.0; }
-			if (M >= MMax) { return 1.0; }
-			const double T = (M - MMin) / (MMax - MMin) * double(Pdf.size() - 1);
-			const size_t I = std::min(size_t(T), Pdf.size() - 2);
-			return Cdf[I] + (T - double(I)) * (Cdf[I + 1] - Cdf[I]);
-		}
 	};
 
 	// ======================================================================================

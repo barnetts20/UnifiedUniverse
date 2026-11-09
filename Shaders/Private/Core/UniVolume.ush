@@ -103,11 +103,6 @@ struct FUniVolumeView
 	uint GlowLevels;        // set bits in GlowMask (0: no cell glow)
 	uint MarchFlags;        // D-206: bit 0: no shared web texel reads (checks only)
 	uint GalaxyConstBase;   // D-210: params index of the galaxy constant blocks (one per parameter block, Uni_GalaxyConstPack); 0: hash inline
-	// D-211: the galaxy cache (a camera-centred clipmap of the camera's own galaxy, Uni_GalCacheSample).
-	uint CacheBase;         // float4 index of its header in the LUT buffer
-	uint CacheCarrier;      // the cached carrier's index + 1 (0: no cache)
-	uint CacheN;            // voxels a level side
-	uint CacheLevels;       // levels
 	// D-212: the galaxy map (Uni_GalaxyMapEval): the camera's own galaxy from its baked 2D map.
 	uint MapCarrier;        // the mapped carrier's index + 1 (0: none)
 	uint MapSize;           // texels a side of its mip 0
@@ -316,125 +311,6 @@ UNI_FN float Uni_CarrierStepLimit(FUniCarrier InCa, FUniFieldParams InPar, float
 	return Loose * H / InCa.InvRadius;
 }
 
-// ------------------------------------------------------------------------------------------
-// D-211: the galaxy cache. Inside a galaxy every march step evaluated its field (the spiral for
-// light and dust, three texture reads, ~55 transcendentals). The cache holds the camera's own
-// galaxy, prefiltered to the voxel, in K nested camera-centred levels of N^3 voxels (level L's
-// voxel 2^L x level 0's, in the carrier's field units), baked from the same field functions
-// (Uni_GalCacheBakeVoxel) and read with one or two filtered fetches a step.
-// Texture layout (both textures): N x N x K (N + 2). Level L's voxel with world index i (field
-// position (i + 0.5) v) lives at texel (i.x mod N, i.y mod N, L (N + 2) + 1 + i.z mod N): the
-// levels wrap toroidally as the camera moves (a move rebakes a slab); x and y wrap in the
-// sampler, and each level carries copies of its last and first z slices before and after it
-// (slices L (N + 2) and L (N + 2) + N + 1) so the hardware's z filter wraps within the level.
-// A: (light density, dust density) x the header's scale (half floats); B: the palette tint over
-// its largest channel (unorm; the tint is applied keeping luminance, so its scale is free).
-// D-211 (anisotropic levels): a level's voxel along the field's z (the disc's normal) is at most
-// the header's z cap, so the levels past it reach only so far in z (the disc and bulge live
-// there) and resolve the thin disc and its dust at any distance; the last level is isotropic and
-// holds the rest (the halo's smooth tails).
-// LUT header at CacheBase: (N, K, scale, 1 / scale); then per level (lo.xyz, v), (hi.xyz, v_z or 0 when not valid):
-// the baked window in field units (a level not yet baked, or one that could not keep up with the
-// camera, keeps its last window: samples outside it go to a coarser level).
-// ------------------------------------------------------------------------------------------
-#define UNI_GAL_CACHE_MAX_LEVELS 12u
-#define UNI_GAL_CACHE_MARGIN 1.5f   // voxels kept from a window's edge (the filter's reach)
-#define UNI_GAL_CACHE_BAND 4.0f     // voxels over which a level fades into the next coarser one
-
-UNI_FN float3 Uni_GalCacheUvw(float3 InP, float InV, float InVz, uint InLevel, uint InN, uint InK)
-{
-	const float Span = (float)InN * InV;
-	const float3 F = float3(InP.x * (1.0f / Span), InP.y * (1.0f / Span), InP.z * (1.0f / ((float)InN * InVz)));
-	const float Fz = F.z - floor(F.z);
-	const float Depth = (float)(InK * (InN + 2u));
-	return float3(F.x, F.y, ((float)(InLevel * (InN + 2u)) + 1.0f + Fz * (float)InN) / Depth);
-}
-
-/** The voxel's distance from its level's window edge (voxels); negative outside or not valid. */
-UNI_FN float Uni_GalCacheInside(float4 InLo, float4 InHi, float3 InP)
-{
-	if (!(InHi.w > 0.0f)) { return -1.0f; }
-	const float3 A = InP - float3(InLo.x, InLo.y, InLo.z);
-	const float3 B = float3(InHi.x, InHi.y, InHi.z) - InP;
-	return min(min(min(A.x, B.x), min(A.y, B.y)) / InLo.w, min(A.z, B.z) / InHi.w);
-}
-
-/** The cached light and dust densities (the field's units) and palette tint at field point InP.
- *  False where no valid level holds it (the caller evaluates the field). */
-UNI_FN bool Uni_GalCacheSample(StructuredBuffer<float4> InLut, FUniVolumeView InView, float3 InP, float3 InCam,
-	UNI_OUT(float) OutRe, UNI_OUT(float) OutRd, UNI_OUT(float3) OutTint)
-{
-	OutRe = 0.0f; OutRd = 0.0f; OutTint = float3(1.0f, 1.0f, 1.0f);
-	const uint N = InView.CacheN, K = InView.CacheLevels;
-	const float4 Hd = InLut[InView.CacheBase];
-	const float V0 = InLut[InView.CacheBase + 1u].w;
-	const float3 Dd = abs(InP - InCam);
-	const float Dm = max(Dd.x, max(Dd.y, Dd.z));
-	const float Reach0 = ((float)N * 0.5f - UNI_GAL_CACHE_MARGIN - UNI_GAL_CACHE_BAND) * V0;
-	uint L = 0u;
-	if (Dm > Reach0) { L = (uint)min(ceil(log2(Dm / Reach0)), (float)K); }
-	UNI_LOOP
-	for (uint It = 0u; It < UNI_GAL_CACHE_MAX_LEVELS; ++It)
-	{
-		if (L >= K) { return false; }
-		const float4 Lo = InLut[InView.CacheBase + 1u + 2u * L];
-		const float4 Hi = InLut[InView.CacheBase + 2u + 2u * L];
-		const float E = Uni_GalCacheInside(Lo, Hi, InP);
-		if (E >= UNI_GAL_CACHE_MARGIN)
-		{
-			const float3 U = Uni_GalCacheUvw(InP, Lo.w, Hi.w, L, N, K);
-			float4 A = UNI_GAL_CACHE_A(U);
-			float4 B = UNI_GAL_CACHE_B(U);
-			// Toward the next coarser level over the window's outer band (no seam).
-			const float W = saturate((E - UNI_GAL_CACHE_MARGIN) * (1.0f / UNI_GAL_CACHE_BAND));
-			if (W < 1.0f && L + 1u < K)
-			{
-				const float4 Lo2 = InLut[InView.CacheBase + 3u + 2u * L];
-				const float4 Hi2 = InLut[InView.CacheBase + 4u + 2u * L];
-				if (Uni_GalCacheInside(Lo2, Hi2, InP) >= UNI_GAL_CACHE_MARGIN)
-				{
-					const float3 U2 = Uni_GalCacheUvw(InP, Lo2.w, Hi2.w, L + 1u, N, K);
-					const float4 A2 = UNI_GAL_CACHE_A(U2);
-					const float4 B2 = UNI_GAL_CACHE_B(U2);
-					A = float4(A2.x + (A.x - A2.x) * W, A2.y + (A.y - A2.y) * W, 0.0f, 0.0f);
-					B = float4(B2.x + (B.x - B2.x) * W, B2.y + (B.y - B2.y) * W, B2.z + (B.z - B2.z) * W, 1.0f);
-				}
-			}
-			OutRe = max(A.x, 0.0f) * Hd.w;
-			OutRd = max(A.y, 0.0f) * Hd.w;
-			OutTint = float3(max(B.x, 1.0e-3f), max(B.y, 1.0e-3f), max(B.z, 1.0e-3f));
-			return true;
-		}
-		L = L + 1u;
-	}
-	return false;
-}
-
-/** One voxel of the cache: the carrier's light and dust densities at InP prefiltered over InFoot
- *  (field units), scaled, and its palette tint (over its largest channel; white without one). */
-UNI_FN void Uni_GalCacheBakeVoxel(FUniCarrier InCa, FUniFieldParams InPar, FUniFieldParams InDust, FUniGalaxyConst InK,
-	FUniFieldParams InPal, float3 InP, float InFoot, float InScale, UNI_OUT(float4) OutA, UNI_OUT(float4) OutB)
-{
-	float Re = 0.0f, Rd = 0.0f;
-	float4 Comp = float4(0.0f, 0.0f, 0.0f, 0.0f);
-	if ((InCa.Flags & UNI_CARRIER_DUST) != 0u) { UniField_GalaxyPairCK(InP, InPar, InDust, InK, InFoot, Re, Rd, Comp); }
-	else { Re = UniField_GalaxyFilteredCK(InP, InPar, InK, InFoot, Comp); }
-	OutA = float4(Re * InScale, Rd * InScale, 0.0f, 0.0f);
-	OutB = float4(1.0f, 1.0f, 1.0f, 1.0f);
-	if ((InCa.Flags & UNI_CARRIER_PALETTE) != 0u)
-	{
-		FUniGalaxyPalette Pal;
-		Pal.Bulge = float3(InPal.A.x, InPal.A.y, InPal.A.z);
-		Pal.Disc = float3(InPal.B.x, InPal.B.y, InPal.B.z);
-		Pal.Arm = float3(InPal.C.x, InPal.C.y, InPal.C.z);
-		Pal.Knot = float3(InPal.D.x, InPal.D.y, InPal.D.z);
-		const float Far = saturate(2.0f * InFoot / max(InPar.A.x, 1.0e-4f) - 1.0f);
-		const float3 T = Uni_GalaxyTintFar(Pal, Comp, Far, float3(InPal.E.x, InPal.E.y, InPal.E.z));
-		const float M = max(max(T.x, T.y), max(T.z, 1.0e-6f));
-		OutB = float4(T.x / M, T.y / M, T.z / M, 1.0f);
-	}
-}
-
 UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 	StructuredBuffer<FUniCarrier> InCarriers, StructuredBuffer<FUniFieldParams> InParams,
 	StructuredBuffer<float4> InLut, FUniVolumeView InView)
@@ -626,29 +502,15 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 			float RdPair = 0.0f;
 			// D-212: the camera's own galaxy from its map.
 			const bool bMapped = InView.MapCarrier == Act[J] + 1u && Blend < 1.0f;
-			// D-211: the camera's own galaxy from the cache where a level holds the point.
-			bool bCached = false;
-			float3 CTint = float3(1.0f, 1.0f, 1.0f);
-			if (!bMapped && InView.CacheCarrier == Act[J] + 1u && Blend < 1.0f)
-			{
-				float Rc = 0.0f, Rdc = 0.0f;
-				if (Uni_GalCacheSample(InLut, InView, P, Ca.CamLocal, Rc, Rdc, CTint))
-				{
-					bCached = true;
-					Rho = Rc + (Ca.MeanDensity - Rc) * Blend;
-					RdPair = Rdc;
-				}
-			}
 			// D-210: a galaxy's per-object hashes, read once from the builder's block.
 			FUniGalaxyConst GK;
-			if (Ca.FieldId == UNI_FIELD_GALAXY && !bCached)
+			if (Ca.FieldId == UNI_FIELD_GALAXY)
 			{
 				if (InView.GalaxyConstBase != 0u) { GK = Uni_GalaxyConstUnpack(InParams[InView.GalaxyConstBase + Ca.ParamIndex]); }
 				else { GK = Uni_GalaxyConstOf(Par); }
 			}
 			else { GK.Hs = 0u; GK.Ho = 0u; GK.Hp = 0u; GK.ArmH = uint4(0u, 0u, 0u, 0u); }
-			if (bCached) { }
-			else if (bMapped)
+			if (bMapped)
 			{
 				float Rm = 0.0f;
 				Uni_GalaxyMapEval(P, Par, InParams[Ca.DustParamIndex], (Ca.Flags & UNI_CARRIER_DUST) != 0u, GK, FootS, (float)InView.MapSize, Rm, RdPair, Comp);
@@ -702,8 +564,7 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 				if (AGlow[J] != 0u) { L = L + Uni_CellGlow(InLut, InView.GlowBase, AGlow[J], AGlowE[J], Ca.LutIndex + 2u, InDir * Tm, Tm); }
 				// D-191: intracluster light, on the same density (a rich cluster's diffuse glow).
 				if ((Ca.Flags & UNI_CARRIER_ICL) != 0u) { L = L + Uni_VolumeLut(InLut, Ca.PaletteIndex, Tm) * Ca.IclRatio; }
-				if (bPalette && bCached) { L = Uni_TintKeepLuminance(L, CTint); }   // D-211: the cached tint
-				else if (bPalette)
+				if (bPalette)
 				{
 					// Toward the whole-body tint (the sprite's) as the footprint passes the disc scale length.
 					const FUniFieldParams Pc = InParams[Ca.PaletteIndex];

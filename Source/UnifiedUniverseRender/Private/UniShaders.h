@@ -304,8 +304,6 @@ BEGIN_SHADER_PARAMETER_STRUCT(FUniVolumeCommonParameters, )
 	SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalWarpFine)    // D-179
 	SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalWarpLarge)
 	SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalDetail)
-	SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalCacheA)    // D-211
-	SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalCacheB)
 	SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float4>, UniGalMap)       // D-212
 END_SHADER_PARAMETER_STRUCT()
 
@@ -350,44 +348,6 @@ public:
 	{
 		FGlobalShader::ModifyCompilationEnvironment(P, Env);
 		Env.SetDefine(TEXT("UNI_VOL_PASS"), 5);
-	}
-};
-
-/** D-211: the galaxy cache's bake (UNI_VOL_PASS 4). Not the common parameters: the cache
- *  textures are written here (UAVs), read by the march. */
-class FUniGalCacheBakeCS : public FGlobalShader
-{
-public:
-	DECLARE_GLOBAL_SHADER(FUniGalCacheBakeCS);
-	SHADER_USE_PARAMETER_STRUCT(FUniGalCacheBakeCS, FGlobalShader);
-
-	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FUniCarrier>, InCarriers)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FUniFieldParams>, InParams)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint4>, InCacheBoxes)
-		SHADER_PARAMETER(uint32, NumCacheBoxes)
-		SHADER_PARAMETER(uint32, CacheVoxels)
-		SHADER_PARAMETER(uint32, CacheThreadsPerRow)
-		SHADER_PARAMETER(uint32, CacheN)
-		SHADER_PARAMETER(uint32, CacheLevels)
-		SHADER_PARAMETER(uint32, CacheCarrier)
-		SHADER_PARAMETER(float, CacheV0)
-		SHADER_PARAMETER(float, CacheZCap)
-		SHADER_PARAMETER(float, CacheScale)
-		SHADER_PARAMETER(float, CacheFootScale)
-		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalWarpFine)
-		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalWarpLarge)
-		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalDetail)
-		SHADER_PARAMETER_SAMPLER(SamplerState, UniWebSampler)
-		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture3D<float2>, OutCacheA)
-		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture3D<float4>, OutCacheB)
-	END_SHADER_PARAMETER_STRUCT()
-
-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
-	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& P, FShaderCompilerEnvironment& Env)
-	{
-		FGlobalShader::ModifyCompilationEnvironment(P, Env);
-		Env.SetDefine(TEXT("UNI_VOL_PASS"), 4);
 	}
 };
 

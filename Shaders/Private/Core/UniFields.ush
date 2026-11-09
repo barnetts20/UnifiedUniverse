@@ -586,18 +586,16 @@ UNI_FN bool Uni_GalaxyNeedsDetail(FUniFieldParams InPar)
 	return InPar.H.x != 0.0f || InPar.H.y != 0.0f || InPar.D.z != 0.0f || InPar.D.w != 0.0f;
 }
 
-/** D-179 texture terms and the shared state. InSlab: the widest disc slab of the evaluations that
- *  will use it; InTex / InDetail: whether any of them reads textures / the detail texture. The
- *  warps blend out as the footprint reads mips 4 to 5 (2^3 texels a period: the curl field's mean
- *  is ~0 there), so distant galaxies skip their warp reads; placement (footprint 0) always reads. */
-UNI_FN FUniGalaxyShared Uni_GalaxySharedK(float3 InP, FUniFieldParams InPar, FUniGalaxyConst InK, float InFoot, float InSlab, bool InTex, bool InDetail)
+/** D-179 / D-213: a galaxy sample's texture terms (the field's and the map's): the disc's point
+ *  displaced by warp_fine (OutPd), the bulge's by warp_large (OutPb), and galaxy_detail read at the
+ *  twisted unwarped point (OutDt, OutDetail 1 when read). Untextured: InP, InP, nothing read. */
+UNI_FN void Uni_GalaxyTexTerms(float3 InP, FUniFieldParams InPar, FUniGalaxyConst InK, float InFoot, float InSlab, bool InTex, bool InDetail,
+	UNI_OUT(float3) OutPd, UNI_OUT(float3) OutPb, UNI_OUT(float4) OutDt, UNI_OUT(uint) OutDetail)
 {
-	FUniGalaxyShared S;
-	S.Pd = InP;
-	S.Pb = InP;
-	S.Dt = float4(0.0f, 0.0f, 0.0f, 0.0f);
-	S.bDetail = 0u;
-	S.U = 0.0f; S.ExpR = 0.0f; S.Ax = 0.0f; S.bU = 0u;
+	OutPd = InP;
+	OutPb = InP;
+	OutDt = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	OutDetail = 0u;
 	const float Cut = InPar.D.x;
 	if (InTex)
 	{
@@ -618,7 +616,7 @@ UNI_FN FUniGalaxyShared Uni_GalaxySharedK(float3 InP, FUniFieldParams InPar, FUn
 			if (Wf > 0.0f)
 			{
 				const float4 W = UNI_GAL_WARP_FINE(Fr * InPar.G.z + Off, Mip);
-				S.Pd = InP + float3(W.x, W.y, W.z) * (InPar.G.x * Wf * Uni_GalaxyWarpInner(R0, InPar));   // D-210
+				OutPd = InP + float3(W.x, W.y, W.z) * (InPar.G.x * Wf * Uni_GalaxyWarpInner(R0, InPar));   // D-210
 			}
 		}
 		// The bulge's warp fades out between 0.3 and 0.5 (its light is ~all inside): no read beyond.
@@ -631,16 +629,73 @@ UNI_FN FUniGalaxyShared Uni_GalaxySharedK(float3 InP, FUniFieldParams InPar, FUn
 			{
 				const float4 W = UNI_GAL_WARP_LARGE(InP * (0.5f * InPar.G.z) + float3(Off.z, Off.x, Off.y), Mip);
 				const float Fb = 1.0f - saturate((sqrt(R2) - 0.3f) * 5.0f);
-				S.Pb = InP + float3(W.x, W.y, W.z) * (InPar.G.y * Fb * Wf);
+				OutPb = InP + float3(W.x, W.y, W.z) * (InPar.G.y * Fb * Wf);
 			}
 		}
 		if (InDetail && bInSlab)
 		{
 			const float Mip = log2(max(InFoot * InPar.G.w * TexN, 1.0f));
-			S.Dt = UNI_GAL_DETAIL(Fr * InPar.G.w + float3(Off.y, Off.z, Off.x), Mip);
-			S.bDetail = 1u;
+			OutDt = UNI_GAL_DETAIL(Fr * InPar.G.w + float3(Off.y, Off.z, Off.x), Mip);
+			OutDetail = 1u;
 		}
 	}
+}
+
+/** D-179 / D-213: galaxy_detail's terms for one parameter set: the disc's fBm and knot noise and
+ *  (dust: D.z, D.w) the cloud factor of lanes and holes. */
+UNI_FN void Uni_GalaxyDetailTerms(float4 InDt, FUniFieldParams InPar, UNI_OUT(float) OutN, UNI_OUT(float) OutKnot, UNI_OUT(float) OutCloud)
+{
+	OutN = 2.0f * InDt.z - 1.0f;   // fBm
+	OutKnot = 2.0f * InDt.y - 1.0f;   // Perlin-Worley clumps
+	OutCloud = 1.0f;
+	// D-180: dust only (D.z, D.w are zero for emission): ridged lanes and superbubble holes.
+	if (InPar.D.z != 0.0f) { OutCloud = max(1.0f + InPar.D.z * (2.0f * InDt.x - 1.0f), 0.0f); }
+	if (InPar.D.w != 0.0f) { OutCloud = OutCloud * max(1.0f - InPar.D.w * max(2.0f * InDt.w - 1.0f, 0.0f), 0.0f); }
+}
+
+/** The bulge at its (displaced) point InPb: Sersic-like, n = 2, widened to the footprint keeping
+ *  its light (D-163) inside the cut (D-172). The field's and the map's (D-213). */
+UNI_FN float Uni_GalaxyBulgeAt(float3 InPb, FUniFieldParams InPar, float InFoot)
+{
+	const float BulgeW = InPar.B.y;
+	if (!(BulgeW > 0.0f)) { return 0.0f; }
+	const float Cut = InPar.D.x;
+	const float Q = max(InPar.B.x, 0.05f);
+	float Re = max(InPar.A.w, 1.0e-5f);
+	float Amp = BulgeW;
+	if (InFoot > 0.0f)
+	{
+		// D-163: a bulge smaller than the footprint is widened to it, keeping its light (the
+		// profile's integral goes as r_e^3), so one ray per pixel sees its light wherever the
+		// pixel falls, without supersampling every carrier on that pixel.
+		// D-172: keeping the light inside the cut: a widened profile puts more of it past the
+		// influence radius, where the field is zero (an early type's large spheroid lost ~10%).
+		const float Rf = sqrt(Re * Re + InFoot * InFoot);
+		const float S = Re / Rf;
+		Amp = Amp * (S * S * S) * (Uni_BulgeInCut(Re, Cut) / max(Uni_BulgeInCut(Rf, Cut), 1.0e-6f));
+		Re = Rf;
+	}
+	const float Rcyl = sqrt(InPb.x * InPb.x + InPb.y * InPb.y);
+	const float Z = abs(InPb.z);
+	const float R3 = sqrt(Rcyl * Rcyl + (Z / Q) * (Z / Q));
+	// Sersic-like, n = 2: exp(-b ((r / re)^(1/2) - 1)), b = 3.67.
+	return Amp * exp(-3.67f * (sqrt(R3 / Re) - 1.0f));
+}
+
+/** D-179 texture terms and the shared state. InSlab: the widest disc slab of the evaluations that
+ *  will use it; InTex / InDetail: whether any of them reads textures / the detail texture. The
+ *  warps blend out as the footprint reads mips 4 to 5 (2^3 texels a period: the curl field's mean
+ *  is ~0 there), so distant galaxies skip their warp reads; placement (footprint 0) always reads. */
+UNI_FN FUniGalaxyShared Uni_GalaxySharedK(float3 InP, FUniFieldParams InPar, FUniGalaxyConst InK, float InFoot, float InSlab, bool InTex, bool InDetail)
+{
+	FUniGalaxyShared S;
+	S.Pd = InP;
+	S.Pb = InP;
+	S.Dt = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	S.bDetail = 0u;
+	S.U = 0.0f; S.ExpR = 0.0f; S.Ax = 0.0f; S.bU = 0u;
+	const float Cut = InPar.D.x;
+	Uni_GalaxyTexTerms(InP, InPar, InK, InFoot, InSlab, InTex, InDetail, S.Pd, S.Pb, S.Dt, S.bDetail);   // D-213: shared with the map
 	S.Rcyl = sqrt(S.Pd.x * S.Pd.x + S.Pd.y * S.Pd.y);
 	S.Theta = atan2(S.Pd.y, S.Pd.x);
 	S.ArmH = uint4(0u, 0u, 0u, 0u);
@@ -688,12 +743,7 @@ UNI_FN float Uni_GalaxyFromSharedC(FUniGalaxyShared InS, float3 InP, FUniFieldPa
 	float DetailN = 0.0f, Knot = 0.0f, DustCloud = 1.0f;
 	if (bTex && !bDiscOff && InS.bDetail != 0u && Uni_GalaxyNeedsDetail(InPar))
 	{
-		const float4 Dt = InS.Dt;
-		DetailN = 2.0f * Dt.z - 1.0f;   // fBm
-		Knot = 2.0f * Dt.y - 1.0f;      // Perlin-Worley clumps
-		// D-180: dust only (D.z, D.w are zero for emission): ridged lanes and superbubble holes.
-		if (InPar.D.z != 0.0f) { DustCloud = max(1.0f + InPar.D.z * (2.0f * Dt.x - 1.0f), 0.0f); }
-		if (InPar.D.w != 0.0f) { DustCloud = DustCloud * max(1.0f - InPar.D.w * max(2.0f * Dt.w - 1.0f, 0.0f), 0.0f); }
+		Uni_GalaxyDetailTerms(InS.Dt, InPar, DetailN, Knot, DustCloud);
 	}
 	const float3 Pd = InS.Pd;   // InP unless textured
 	float Rcyl = InS.Rcyl;
@@ -786,31 +836,8 @@ UNI_FN float Uni_GalaxyFromSharedC(FUniGalaxyShared InS, float3 InP, FUniFieldPa
 	}
 	// The bulge: never warped by the disc modes (it holds the inner disc rigid); D-179: displaced
 	// by warp_large when on.
-	const float3 Pb = InS.Pb;
-	Rcyl = sqrt(Pb.x * Pb.x + Pb.y * Pb.y);
-	Z = abs(Pb.z);
-
-	const float BulgeW = InPar.B.y;
-	if (BulgeW > 0.0f)
 	{
-		const float Q = max(InPar.B.x, 0.05f);
-		float Re = max(InPar.A.w, 1.0e-5f);
-		float Amp = BulgeW;
-		if (InFoot > 0.0f)
-		{
-			// D-163: a bulge smaller than the footprint is widened to it, keeping its light (the
-			// profile's integral goes as r_e^3), so one ray per pixel sees its light wherever the
-			// pixel falls, without supersampling every carrier on that pixel.
-			// D-172: keeping the light inside the cut: a widened profile puts more of it past the
-			// influence radius, where the field is zero (an early type's large spheroid lost ~10%).
-			const float Rf = sqrt(Re * Re + InFoot * InFoot);
-			const float S = Re / Rf;
-			Amp = Amp * (S * S * S) * (Uni_BulgeInCut(Re, Cut) / max(Uni_BulgeInCut(Rf, Cut), 1.0e-6f));
-			Re = Rf;
-		}
-		const float R3 = sqrt(Rcyl * Rcyl + (Z / Q) * (Z / Q));
-		// Sersic-like, n = 2: exp(-b ((r / re)^(1/2) - 1)), b = 3.67.
-		const float Bulge = Amp * exp(-3.67f * (sqrt(R3 / Re) - 1.0f));
+		const float Bulge = Uni_GalaxyBulgeAt(InS.Pb, InPar, InFoot);
 		OutComp.x = Bulge;
 		Rho += Bulge;
 	}
@@ -1085,41 +1112,19 @@ UNI_FN void Uni_GalaxyMapEval(float3 InP, FUniFieldParams InPar, FUniFieldParams
 	const float R2 = dot(InP, InP);
 	if (R2 >= Cut * Cut) { return; }
 	const bool bTex = Uni_GalaxyTextured(InPar);
-	const uint Ho = InK.Ho;
-	const float3 Off = float3(float(Ho & 0x3FFu), float((Ho >> 10u) & 0x3FFu), float((Ho >> 20u) & 0x3FFu)) * (1.0f / 1024.0f);
-	const float TexN = max(InPar.H.w, 1.0f);
-	const bool bInSlab = !(abs(InP.z) > Uni_GalaxyDiscSlab(InPar));
-	// The field's texture terms (Uni_GalaxyShared): the warp moves the disc's sample point, the
-	// detail is read at the twisted unwarped point.
-	float3 Pd = InP;
-	float DetailN = 0.0f, Knot = 0.0f, Cloud = 1.0f;
+	// The field's texture terms (D-213: the same function): the warp moves the disc's and the
+	// bulge's points, the detail is read at the twisted unwarped point.
 	const bool bNeed = (bTex && Uni_GalaxyNeedsDetail(InPar)) || (InDust2 && Uni_GalaxyTextured(InDust) && Uni_GalaxyNeedsDetail(InDust));
-	if ((bTex || bNeed) && bInSlab)
+	float3 Pd, Pb;
+	float4 Dt;
+	uint bDt;
+	Uni_GalaxyTexTerms(InP, InPar, InK, InFoot, Uni_GalaxyDiscSlab(InPar), bTex || bNeed, bNeed, Pd, Pb, Dt, bDt);
+	float DetailN = 0.0f, Knot = 0.0f, Cloud = 1.0f;
+	if (bDt != 0u)
 	{
-		const float R0 = sqrt(InP.x * InP.x + InP.y * InP.y);
-		const float Rn0 = saturate(R0 / max(Cut, 1.0e-6f));
-		const float U0 = min(-log(max(R0, 1.0e-4f)), 6.0f);
-		const float Tw = (U0 + 0.5f * max(InPar.F.y, 0.0f) * U0 * U0) / max(InPar.B.w, 1.0e-3f) * Rn0 * InPar.H.z;
-		const float St = sin(Tw), Ct = cos(Tw);
-		const float3 Fr = float3(InP.x * Ct - InP.y * St, InP.x * St + InP.y * Ct, 2.0f * InP.z);
-		if (bTex && InPar.G.x != 0.0f)
-		{
-			const float Mip = log2(max(InFoot * InPar.G.z * TexN, 1.0f));
-			const float Wf = saturate(5.0f - Mip);
-			if (Wf > 0.0f)
-			{
-				const float4 W = UNI_GAL_WARP_FINE(Fr * InPar.G.z + Off, Mip);
-				Pd = InP + float3(W.x, W.y, W.z) * (InPar.G.x * Wf * Uni_GalaxyWarpInner(R0, InPar));
-			}
-		}
-		if (bNeed)
-		{
-			const float4 Dt = UNI_GAL_DETAIL(Fr * InPar.G.w + float3(Off.y, Off.z, Off.x), log2(max(InFoot * InPar.G.w * TexN, 1.0f)));
-			DetailN = 2.0f * Dt.z - 1.0f;
-			Knot = 2.0f * Dt.y - 1.0f;
-			if (InDust.D.z != 0.0f) { Cloud = max(1.0f + InDust.D.z * (2.0f * Dt.x - 1.0f), 0.0f); }
-			if (InDust.D.w != 0.0f) { Cloud = Cloud * max(1.0f - InDust.D.w * max(2.0f * Dt.w - 1.0f, 0.0f), 0.0f); }
-		}
+		float Nd = 0.0f, Kd = 0.0f;
+		Uni_GalaxyDetailTerms(Dt, InPar, DetailN, Knot, Nd);
+		Uni_GalaxyDetailTerms(Dt, InDust, Nd, Kd, Cloud);
 	}
 	const float4 M = UNI_GAL_MAP(float2(Pd.x * 0.5f + 0.5f, Pd.y * 0.5f + 0.5f), log2(max(InFoot * InMapSize * 0.5f, 1.0f)));
 	const float Rn = saturate(sqrt(Pd.x * Pd.x + Pd.y * Pd.y) / max(Cut, 1.0e-6f));
@@ -1141,39 +1146,9 @@ UNI_FN void Uni_GalaxyMapEval(float3 InP, FUniFieldParams InPar, FUniFieldParams
 		OutComp.w = ArmLight * max(Wk - 1.0f, 0.0f);
 		Disc = Base * (max(M.x, 0.0f) + max(M.w, 0.0f) * (Wk - 1.0f));
 	}
-	// The bulge, analytically and displaced by warp_large as the field's (Uni_GalaxyShared: one
-	// fetch, inside half the cut only).
-	float Bulge = 0.0f;
-	if (InPar.B.y > 0.0f)
-	{
-		float3 Pb = InP;
-		if (bTex && InPar.G.y != 0.0f && R2 < 0.25f)
-		{
-			const float Mip = log2(max(InFoot * 0.5f * InPar.G.z * TexN, 1.0f));
-			const float Wf = saturate(5.0f - Mip);
-			if (Wf > 0.0f)
-			{
-				const float4 W = UNI_GAL_WARP_LARGE(InP * (0.5f * InPar.G.z) + float3(Off.z, Off.x, Off.y), Mip);
-				const float Fb = 1.0f - saturate((sqrt(R2) - 0.3f) * 5.0f);
-				Pb = InP + float3(W.x, W.y, W.z) * (InPar.G.y * Fb * Wf);
-			}
-		}
-		const float Q = max(InPar.B.x, 0.05f);
-		float Re = max(InPar.A.w, 1.0e-5f);
-		float Amp = InPar.B.y;
-		if (InFoot > 0.0f)
-		{
-			const float Rf = sqrt(Re * Re + InFoot * InFoot);
-			const float Sb = Re / Rf;
-			Amp = Amp * (Sb * Sb * Sb) * (Uni_BulgeInCut(Re, Cut) / max(Uni_BulgeInCut(Rf, Cut), 1.0e-6f));
-			Re = Rf;
-		}
-		const float Rc = sqrt(Pb.x * Pb.x + Pb.y * Pb.y);
-		const float Zb = abs(Pb.z);
-		const float R3 = sqrt(Rc * Rc + (Zb / Q) * (Zb / Q));
-		Bulge = Amp * exp(-3.67f * (sqrt(R3 / Re) - 1.0f));
-		OutComp.x = Bulge;
-	}
+	// The bulge, analytically at its warp_large-displaced point (the field's function).
+	const float Bulge = Uni_GalaxyBulgeAt(Pb, InPar, InFoot);
+	OutComp.x = Bulge;
 	const float R = sqrt(R2);
 	OutRe = (Disc + Bulge) * saturate((Cut - R) / (0.05f * Cut));
 	if (InDust2 && InDust.A.z > 0.0f)

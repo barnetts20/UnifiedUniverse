@@ -966,3 +966,11 @@ A reviewer read the uncompiled engine code against UE 5.3–5.6 without seeing i
   3. At the core spot and at the solar circle: ProfileGPU `Uni.Volume.March` with `uu.GalaxyMap 1` and `0`; fps.
   4. Look for blockiness or seams near the camera, and compare the look with `uu.GalaxyMap 0` (they should match closely).
 - **Failure looks like:** a shader compile error (Texture2D UniGalMap, the K forms); black or NaN glow (the map not uploaded: `uu.GalaxyMap 0` restores); a hitch on entering a galaxy (lower `uu.GalaxyMap.Budget`); a seam where the map takes over from the field after the bake.
+
+## 47. Cleanup pass (D-213, UE-50)
+*Owner: clean-up and review before moving on. Verified offline: the full gate; the galaxy field bit for bit against D-212.*
+
+- **Removed:** the galaxy clipmap (D-211: `uu.GalaxyCache*`, superseded by the map), window stretching (`uu.WindowStretch`), travel sensitivity (`uu.TravelSensitivity`; the HUD now shows the travel exposure), the `uu.VolumeGalaxyConst` toggle, and unused functions. Those CVars no longer exist.
+- **Refactored:** the galaxy map and the field share their texture, detail and bulge code (no change in output).
+- **Test steps:** rebuild (shaders change: UniFields.ush, UniVolume.ush, UniVolume.usf, UniWebTexture.ush, UniProject.ush, UniCoord.ush); the look and fps as before; `uu.Perf` without the cache line.
+- **Failure looks like:** a compile error from a removed symbol in code I did not see (tell me the file).

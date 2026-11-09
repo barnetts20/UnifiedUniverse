@@ -195,7 +195,6 @@ UNI_TEST(stream, cell_glow)
 	FUniStreamer S(G, Be);
 	S.bAsyncIntegrals = false;
 	S.bCellFade = true;
-	S.WindowLeadMax = 0;
 	S.BuildBudget = 96;
 	if (std::getenv("UNI_GLOW_NOLOD")) { S.bVelocityLod = false; }
 	FCoord Cam = UniScenes::SolarCamera();
@@ -294,8 +293,7 @@ namespace
 		FUniStreamer S(G, Be);
 		S.bAsyncIntegrals = false;
 		S.bCellFade = true;
-		S.WindowLeadMax = 0;
-		S.BuildBudget = 96;
+			S.BuildBudget = 96;
 		S.bOneTrip = bOneTrip;
 		S.OneTripFirstEstimate = FirstEstimate;
 		FCoord Cam = UniScenes::SolarCamera();

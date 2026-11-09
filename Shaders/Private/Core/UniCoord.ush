@@ -271,12 +271,6 @@ UNI_FN uint4 Uni_CellAxis(uint4 InCoordAxis, uint InLevel)
 	return Uni_U128Shr(InCoordAxis, InLevel);
 }
 
-/** Absolute coordinate of a cell's minimum corner on one axis. */
-UNI_FN uint4 Uni_CellOriginAxis(uint4 InCellAxis, uint InLevel)
-{
-	return Uni_U128Shl(InCellAxis, InLevel);
-}
-
 /** Cell coordinate plus a signed step, wrapping over the 2^(128-L) cells of the root torus. */
 UNI_FN uint4 Uni_CellStepAxis(uint4 InCellAxis, int InStep, uint InLevel)
 {

@@ -353,10 +353,10 @@ UNI_TEST(stream, responsive)
 		WorstPool = std::max(WorstPool, PoolPeak);
 		Failures += S.Stats().AllocFailures;
 	}
-	Detail += Uni::Fmt("; steady-flight holes %lld; holes in the %d frames after a standing start %lld (reported, not required)", Holes, AccelFrames, AccelHoles);
-	Uni::Check(2, "T2.stream.responsive", "In flight with 3-frame backend phases: every cell Ready within 6 frames of entering (not counting frames D-173 deferred it while not needed) per depth of its parent chain (1 for galaxy -> stars, 2 with clusters); in steady flight every cell inside N_eff of an active level is Ready on every frame")
+	Detail += Uni::Fmt("; steady-flight holes %lld (glow covers them, D-203); holes in the %d frames after a standing start %lld (reported, not required)", Holes, AccelFrames, AccelHoles);
+	Uni::Check(2, "T2.stream.responsive", "In flight with 3-frame backend phases: every cell Ready within 6 frames of entering (not counting frames D-173 deferred it while not needed) per depth of its parent chain (1 for galaxy -> stars, 2 with clusters), no allocation failures. Steady-flight holes are reported: D-213 removed the D-162 forward stretch that kept every visible cell Ready at speed; since D-203 what cannot load in time is drawn as glow (T2.stream.cell_glow)")
 		.Metric("worst_latency_frames", double(WorstLatency)).Metric("worst_visible_ready", WorstVisible).Metric("visible_holes", double(Holes)).Metric("accel_holes", double(AccelHoles)).Metric("update_ms_upper_bound", WorstMs).Metric("pool_peak", double(WorstPool))
-		.Pass(LatencyOver <= 0 && Holes == 0 && Failures == 0, Detail);
+		.Pass(LatencyOver <= 0 && Failures == 0, Detail);
 }
 
 UNI_TEST(stream, async_integrals)

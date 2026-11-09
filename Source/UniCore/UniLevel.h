@@ -51,14 +51,5 @@ namespace UniCore
 		return MRef - 5.0 * std::log10(RelevanceCm / kTenPcCm);
 	}
 
-	/** Absolute-magnitude interval [Bright, Faint) whose flux relevance maps to level L.
-	 *  Brighter (smaller M) means larger R and coarser L. Level L holds R in
-	 *  (N 2^(L-1), N 2^L], i.e. M in [M(N 2^L), M(N 2^(L-1))). */
-	inline void FluxSliceForLevel(int L, double& OutBrightM, double& OutFaintM, double N = double(UniHlsl::UNI_WINDOW_N_EFF))
-	{
-		OutBrightM = AbsMagForRelevance(std::ldexp(double(N), L));
-		OutFaintM = (L == 0) ? 1.0e30 : AbsMagForRelevance(std::ldexp(double(N), L - 1));
-	}
-
 	inline double CellWidthCm(int L) { return std::ldexp(1.0, L); }
 }
