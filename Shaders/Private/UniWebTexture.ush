@@ -32,8 +32,10 @@ Texture3D<float4> UniGalDetail;
 
 // D-212: the galaxy map (UniFields.ush, Uni_GalaxyMapEval): RGBA16F 2D with mips over the field's
 // x, y in [-1, 1]; the same wrap / trilinear sampler (its border is zero: outside the cut).
-Texture2D<float4> UniGalMap;
+// D-214: an array of slots, one galaxy's map each (UniCore::FGalaxyMapCache): the volume reads
+// the camera's galaxy's, generation the map of each galaxy it places stars in.
+Texture2DArray<float4> UniGalMap;
 
-#define UNI_GAL_MAP(UV, Mip) UniGalMap.SampleLevel(UniWebSampler, (UV), (Mip))
+#define UNI_GAL_MAP(UV, Slot, Mip) UniGalMap.SampleLevel(UniWebSampler, float3((UV), (float)(Slot)), (Mip))
 
 #endif // UNI_WEB_TEXTURE_USH

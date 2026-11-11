@@ -350,89 +350,235 @@ void FUniRenderer::SetFrame_GameThread(FUniFrameData&& Data)
 	check(IsInGameThread());
 	// One payload, moved once into a shared holder, captured by value (lesson #25).
 	TSharedRef<FUniFrameData, ESPMode::ThreadSafe> Payload = MakeShared<FUniFrameData, ESPMode::ThreadSafe>(MoveTemp(Data));
-	ENQUEUE_RENDER_COMMAND(UniSetFrame)([Payload](FRHICommandListImmediate&)
+	ENQUEUE_RENDER_COMMAND(UniSetFrame)([Payload](FRHICommandListImmediate& RHICmdList)
 	{
 		TRACE_CPUPROFILER_EVENT_SCOPE(Uni_SetFrame_RT);
 		FUniRenderer::Get().QueueGalaxyMap_RenderThread(*Payload);     // D-212
+		FUniRenderer::Get().BakeGalaxyMaps_RenderThread(RHICmdList);   // D-214: every frame, whatever renders
 		FUniRenderer::Get().RenderFrame = MoveTemp(*Payload);   // the payload is not used again: move, not copy
+	});
+}
+
+void FUniRenderer::SetTables_GameThread(TArray<UniCore::FSliceGPU> Slices, TArray<float> Lut)
+{
+	check(IsInGameThread());
+	struct FTables { TArray<UniCore::FSliceGPU> Slices; TArray<float> Lut; };
+	TSharedRef<FTables, ESPMode::ThreadSafe> Payload = MakeShared<FTables, ESPMode::ThreadSafe>();
+	Payload->Slices = MoveTemp(Slices);
+	Payload->Lut = MoveTemp(Lut);
+	ENQUEUE_RENDER_COMMAND(UniSetTables)([Payload](FRHICommandListImmediate&)
+	{
+		FUniRenderer& R = FUniRenderer::Get();
+		R.SlicesRT = Payload->Slices;
+		R.LutRT = Payload->Lut;
+		R.bTablesDirty = true;
+	});
+}
+
+void FUniRenderer::SetWebTexture_GameThread(uint32 Size, TArray<TArray<FUintVector2>> Mips)
+{
+	check(IsInGameThread());
+	struct FWeb { uint32 Size = 0; TArray<TArray<FUintVector2>> Mips; };
+	TSharedRef<FWeb, ESPMode::ThreadSafe> Payload = MakeShared<FWeb, ESPMode::ThreadSafe>();
+	Payload->Size = Size;
+	Payload->Mips = MoveTemp(Mips);
+	ENQUEUE_RENDER_COMMAND(UniSetWebTexture)([Payload](FRHICommandListImmediate&)
+	{
+		FUniRenderer& R = FUniRenderer::Get();
+		R.WebSizeRT = Payload->Size;
+		R.WebMipsRT = MoveTemp(Payload->Mips);
+		R.bWebDirty = true;
+	});
+}
+
+FRDGTextureRef FUniRenderer::RegisterWebTexture_RenderThread(FRDGBuilder& GraphBuilder)
+{
+	check(IsInRenderingThread());
+	// One mip from a buffer of packed half texels (UniWebTexUpload.usf).
+	auto Upload = [&GraphBuilder](FRDGTextureRef Tex, int32 Mip, uint32 MipSize, const TArray<FUintVector2>& Texels)
+	{
+		FUniWebTexUploadCS::FParameters* P = GraphBuilder.AllocParameters<FUniWebTexUploadCS::FParameters>();
+		P->InTexels = GraphBuilder.CreateSRV(UploadStructured(GraphBuilder, TEXT("UniWebTexels"), Texels));
+		P->OutMip = GraphBuilder.CreateUAV(FRDGTextureUAVDesc(Tex, uint8(Mip)));
+		P->MipSize = MipSize;
+		const int32 G = FMath::DivideAndRoundUp(int32(MipSize), 4);
+		TShaderMapRef<FUniWebTexUploadCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.WebTexture.Upload mip %d (%u^3)", Mip, MipSize), CS, P, FIntVector(G, G, G));
+	};
+	if (bWebDirty)
+	{
+		bWebDirty = false;
+		WebTexture.SafeRelease();
+		if (WebSizeRT > 0u && WebMipsRT.Num() > 0)
+		{
+			const FRDGTextureDesc Desc = FRDGTextureDesc::Create3D(FIntVector(int32(WebSizeRT)), PF_FloatRGBA, FClearValueBinding::Black,
+				TexCreate_ShaderResource | TexCreate_UAV, uint8(WebMipsRT.Num()));
+			FRDGTextureRef Tex = GraphBuilder.CreateTexture(Desc, TEXT("UniWebTexture"));
+			for (int32 M = 0; M < WebMipsRT.Num(); ++M)
+			{
+				const uint32 S = FMath::Max(WebSizeRT >> M, 1u);
+				if (uint64(WebMipsRT[M].Num()) != uint64(S) * S * S) { UE_LOG(LogTemp, Error, TEXT("UnifiedUniverse: web texture mip %d has %d texels, expected %u^3"), M, WebMipsRT[M].Num(), S); continue; }
+				Upload(Tex, M, S, WebMipsRT[M]);   // UploadStructured copies the texels into the graph
+			}
+			WebMipsRT.Empty();
+			WebTexture = GraphBuilder.ConvertToExternalTexture(Tex);
+			return Tex;
+		}
+		WebMipsRT.Empty();
+	}
+	if (WebTexture.IsValid()) { return GraphBuilder.RegisterExternalTexture(WebTexture, TEXT("UniWebTexture")); }
+	return RegisterNanDummy_RenderThread(GraphBuilder);
+}
+
+/** One mip of a field texture from a buffer of packed half texels (UniWebTexUpload.usf). */
+static void UniUploadFieldMip(FRDGBuilder& GraphBuilder, FRDGTextureRef Tex, int32 Mip, uint32 MipSize, const TArray<FUintVector2>& Texels)
+{
+	FUniWebTexUploadCS::FParameters* P = GraphBuilder.AllocParameters<FUniWebTexUploadCS::FParameters>();
+	P->InTexels = GraphBuilder.CreateSRV(UploadStructured(GraphBuilder, TEXT("UniFieldTexels"), Texels));
+	P->OutMip = GraphBuilder.CreateUAV(FRDGTextureUAVDesc(Tex, uint8(Mip)));
+	P->MipSize = MipSize;
+	const int32 G = FMath::DivideAndRoundUp(int32(MipSize), 4);
+	TShaderMapRef<FUniWebTexUploadCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.FieldTexture.Upload mip %d (%u^3)", Mip, MipSize), CS, P, FIntVector(G, G, G));
+}
+
+FRDGTextureRef FUniRenderer::RegisterNanDummy_RenderThread(FRDGBuilder& GraphBuilder)
+{
+	check(IsInRenderingThread());
+	if (!WebDummy.IsValid())
+	{
+		// Fail closed: a field texture sampled without its texture reads NaN (nothing passes a
+		// density test), never a plausible value (lesson #1).
+		FRDGTextureRef D = GraphBuilder.CreateTexture(FRDGTextureDesc::Create3D(FIntVector(1, 1, 1), PF_FloatRGBA, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV, 1), TEXT("UniWebTextureDummy"));
+		TArray<FUintVector2> Nan;
+		Nan.Add(FUintVector2(0x7E007E00u, 0x7E007E00u));   // four half quiet NaNs
+		UniUploadFieldMip(GraphBuilder, D, 0, 1u, Nan);
+		WebDummy = GraphBuilder.ConvertToExternalTexture(D);
+		return D;
+	}
+	return GraphBuilder.RegisterExternalTexture(WebDummy, TEXT("UniWebTextureDummy"));
+}
+
+void FUniRenderer::SetGalaxyTexture_GameThread(int32 Slot, uint32 Size, TArray<TArray<FUintVector2>> Mips)
+{
+	check(IsInGameThread());
+	if (Slot < 0 || Slot >= GalaxyTextureSlots) { return; }
+	struct FGal { int32 Slot = 0; uint32 Size = 0; TArray<TArray<FUintVector2>> Mips; };
+	TSharedRef<FGal, ESPMode::ThreadSafe> Payload = MakeShared<FGal, ESPMode::ThreadSafe>();
+	Payload->Slot = Slot;
+	Payload->Size = Size;
+	Payload->Mips = MoveTemp(Mips);
+	ENQUEUE_RENDER_COMMAND(UniSetGalaxyTexture)([Payload](FRHICommandListImmediate&)
+	{
+		FUniRenderer& R = FUniRenderer::Get();
+		R.GalSizeRT[Payload->Slot] = Payload->Size;
+		R.GalMipsRT[Payload->Slot] = MoveTemp(Payload->Mips);
+		R.bGalDirty[Payload->Slot] = true;
 	});
 }
 
 void FUniRenderer::QueueGalaxyMap_RenderThread(const FUniFrameData& F)
 {
 	check(IsInRenderingThread());
-	if (F.GalMapEpoch == 0u)
+	const uint32 Slots = FMath::Min(F.GalMapSlots, uint32(FUniRenderStats::MaxGalMapSlots));
+	if (Slots != GalMapSlotsRT || F.GalMapSize != GalMapSizeRT || F.GalMapConfig != GalMapConfigRT)
 	{
-		if (GalMapEpochRT != 0u) { GalMapTexture.SafeRelease(); GalMapEpochRT = 0u; bGalMapComplete = false; }
-		return;
-	}
-	if (F.GalMapEpoch != GalMapEpochRT)
-	{
-		// A new galaxy (or size): bake it from the first row; the old map stays out of use.
-		GalMapEpochRT = F.GalMapEpoch;
-		GalMapSizeRT = F.GalMapSize;
-		bGalMapDustRT = F.bGalMapDust != 0u;
-		GalMapParamsRT = { F.GalMapParams[0], F.GalMapParams[1] };
-		GalMapRowsDone = 0u;
-		bGalMapComplete = false;
+		// D-214: a new array (slots, size, or the cache emptied): every slot is baked again.
 		GalMapTexture.SafeRelease();
-		Stats.GalMapBakeFrames = 0u;
+		GalMapSlotsRT = Slots;
+		GalMapSizeRT = F.GalMapSize;
+		GalMapConfigRT = F.GalMapConfig;
+		GalMapSlotRT.Reset();
+		GalMapSlotRT.SetNum(int32(Slots));
+		for (int32 I = 0; I < FUniRenderStats::MaxGalMapSlots; ++I) { Stats.GalMapBaked[I] = 0u; }
+	}
+	for (const FUniFrameData::FGalMapBake& Bk : F.GalMapBakes)
+	{
+		if (int32(Bk.Slot) >= GalMapSlotRT.Num()) { continue; }
+		FGalMapSlotRT& Sl = GalMapSlotRT[Bk.Slot];
+		if (Sl.Epoch == Bk.Epoch) { continue; }   // under way, or done
+		// A new map in this slot (or the same galaxy with its dust): from the first row.
+		Sl.Epoch = Bk.Epoch;
+		Sl.RowsDone = 0u;
+		Sl.bComplete = false;
+		Sl.bDust = Bk.bDust != 0u;
+		Sl.Params = { Bk.Params[0], Bk.Params[1] };
 	}
 	GalMapBudgetRT = F.GalMapBudget;
 }
 
-FRDGTextureRef FUniRenderer::RegisterGalaxyMap_RenderThread(FRDGBuilder& GraphBuilder)
+void FUniRenderer::BakeGalaxyMaps_RenderThread(FRHICommandListImmediate& RHICmdList)
 {
 	check(IsInRenderingThread());
-	if (GalMapEpochRT != 0u && !bGalMapComplete && GalMapSizeRT > 0u && GalMapParamsRT.Num() == 2)
+	if (GalMapSlotsRT == 0u || GalMapSizeRT == 0u || !UniShadersEnabled()) { return; }
+	bool bWork = false;
+	for (const FGalMapSlotRT& Sl : GalMapSlotRT) { bWork = bWork || (Sl.Epoch != 0u && !Sl.bComplete && Sl.Params.Num() == 2); }
+	if (!bWork) { return; }
+	TRACE_CPUPROFILER_EVENT_SCOPE(Uni_GalaxyMapBake_RT);
+	FRDGBuilder GraphBuilder(RHICmdList);
 	{
-		// D-212: bake a chunk of rows a frame (the GPU's share of the texel budget), then the mips.
+		RDG_EVENT_SCOPE(GraphBuilder, "Uni.GalaxyMap.Bake");   // D-215
 		const uint32 Size = GalMapSizeRT;
 		const uint32 NumMips = uint32(FMath::FloorLog2(Size)) + 1u;
 		FRDGTextureRef Tex;
 		if (!GalMapTexture.IsValid())
 		{
-			Tex = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(FIntPoint(int32(Size), int32(Size)), PF_FloatRGBA, FClearValueBinding::Black,
-				TexCreate_ShaderResource | TexCreate_UAV, uint8(NumMips)), TEXT("UniGalMap"));
+			Tex = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(FIntPoint(int32(Size), int32(Size)), PF_FloatRGBA, FClearValueBinding::Black,
+				TexCreate_ShaderResource | TexCreate_UAV, uint16(GalMapSlotsRT), uint8(NumMips)), TEXT("UniGalMap"));
 			GalMapTexture = GraphBuilder.ConvertToExternalTexture(Tex);
 		}
 		else { Tex = GraphBuilder.RegisterExternalTexture(GalMapTexture, TEXT("UniGalMap")); }
-		const uint32 Rows = FMath::Clamp(FMath::Max(GalMapBudgetRT, Size) / Size, 1u, Size - GalMapRowsDone);
+		// The frame's texel budget, slot by slot: rows of mip 0, then the mips once a slot's last row is in.
+		uint32 Texels = FMath::Max(GalMapBudgetRT, Size);
+		for (int32 S = 0; S < GalMapSlotRT.Num() && Texels >= Size; ++S)
 		{
-			FUniGalMapBakeCS::FParameters* P = GraphBuilder.AllocParameters<FUniGalMapBakeCS::FParameters>();
-			P->InMapParams = GraphBuilder.CreateSRV(UploadStructured(GraphBuilder, TEXT("UniGalMapParams"), GalMapParamsRT));
-			P->MapSize = Size;
-			P->MapRow0 = GalMapRowsDone;
-			P->MapRows = Rows;
-			P->bMapDust = bGalMapDustRT ? 1u : 0u;
-			P->OutMap = GraphBuilder.CreateUAV(FRDGTextureUAVDesc(Tex, 0));
-			TShaderMapRef<FUniGalMapBakeCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-			FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.GalaxyMap.Bake rows %u-%u of %u", GalMapRowsDone, GalMapRowsDone + Rows, Size), CS, P,
-				FIntVector(FMath::DivideAndRoundUp(int32(Size), 8), FMath::DivideAndRoundUp(int32(Rows), 8), 1));
-		}
-		GalMapRowsDone += Rows;
-		Stats.GalMapBakeFrames.fetch_add(1u);
-		if (GalMapRowsDone >= Size)
-		{
-			for (uint32 M = 1u; M < NumMips; ++M)
+			FGalMapSlotRT& Sl = GalMapSlotRT[S];
+			if (Sl.Epoch == 0u || Sl.bComplete || Sl.Params.Num() != 2) { continue; }
+			const uint32 Rows = FMath::Clamp(Texels / Size, 1u, Size - Sl.RowsDone);
+			Texels -= Rows * Size;
 			{
-				FUniGalMapDownCS::FParameters* P = GraphBuilder.AllocParameters<FUniGalMapDownCS::FParameters>();
-				const uint32 S = FMath::Max(Size >> M, 1u);
-				P->MapSize = S;
-				P->InMapMip = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::CreateForMipLevel(Tex, int32(M - 1u)));
-				P->OutMap = GraphBuilder.CreateUAV(FRDGTextureUAVDesc(Tex, uint8(M)));
-				TShaderMapRef<FUniGalMapDownCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.GalaxyMap.Mip %u (%u^2)", M, S), CS, P, FIntVector(FMath::DivideAndRoundUp(int32(S), 8), FMath::DivideAndRoundUp(int32(S), 8), 1));
+				FUniGalMapBakeCS::FParameters* P = GraphBuilder.AllocParameters<FUniGalMapBakeCS::FParameters>();
+				P->InMapParams = GraphBuilder.CreateSRV(UploadStructured(GraphBuilder, TEXT("UniGalMapParams"), Sl.Params));
+				P->MapSize = Size;
+				P->MapRow0 = Sl.RowsDone;
+				P->MapRows = Rows;
+				P->bMapDust = Sl.bDust ? 1u : 0u;
+				P->MapSlot = uint32(S);
+				P->OutMap = GraphBuilder.CreateUAV(FRDGTextureUAVDesc(Tex, 0));
+				TShaderMapRef<FUniGalMapBakeCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.GalaxyMap.Bake slot %d rows %u-%u of %u", S, Sl.RowsDone, Sl.RowsDone + Rows, Size), CS, P,
+					FIntVector(FMath::DivideAndRoundUp(int32(Size), 8), FMath::DivideAndRoundUp(int32(Rows), 8), 1));
 			}
-			bGalMapComplete = true;
-			Stats.GalMapReadyEpoch = GalMapEpochRT;
+			Sl.RowsDone += Rows;
+			if (Sl.RowsDone >= Size)
+			{
+				for (uint32 M = 1u; M < NumMips; ++M)
+				{
+					FUniGalMapDownCS::FParameters* P = GraphBuilder.AllocParameters<FUniGalMapDownCS::FParameters>();
+					const uint32 Sm = FMath::Max(Size >> M, 1u);
+					P->MapSize = Sm;
+					P->MapSlot = uint32(S);
+					P->InMapMip = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::CreateForMipLevel(Tex, int32(M - 1u)));
+					P->OutMap = GraphBuilder.CreateUAV(FRDGTextureUAVDesc(Tex, uint8(M)));
+					TShaderMapRef<FUniGalMapDownCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+					FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.GalaxyMap.Mip slot %d %u (%u^2)", S, M, Sm), CS, P, FIntVector(FMath::DivideAndRoundUp(int32(Sm), 8), FMath::DivideAndRoundUp(int32(Sm), 8), 1));
+				}
+				Sl.bComplete = true;
+				Stats.GalMapBaked[S] = Sl.Epoch;
+			}
 		}
-		return Tex;
-	}
-	if (GalMapTexture.IsValid() && bGalMapComplete) { return GraphBuilder.RegisterExternalTexture(GalMapTexture, TEXT("UniGalMap")); }
+		Stats.GalMapBakeFrames.fetch_add(1u);
+	}   // D-215: the scope closes before Execute (RDG: no open scope at Execute)
+	GraphBuilder.Execute();
+}
+
+FRDGTextureRef FUniRenderer::RegisterGalaxyMap_RenderThread(FRDGBuilder& GraphBuilder)
+{
+	check(IsInRenderingThread());
+	if (GalMapTexture.IsValid()) { return GraphBuilder.RegisterExternalTexture(GalMapTexture, TEXT("UniGalMap")); }
 	if (!GalMapDummy.IsValid())
 	{
-		FRDGTextureRef D = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(FIntPoint(1, 1), PF_FloatRGBA, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV), TEXT("UniGalMapDummy"));
+		FRDGTextureRef D = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(FIntPoint(1, 1), PF_FloatRGBA, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV, 1, 1), TEXT("UniGalMapDummy"));
 		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(D), FLinearColor(0.0f, 0.0f, 0.0f, 0.0f));
 		GalMapDummy = GraphBuilder.ConvertToExternalTexture(D);
 		return D;
@@ -519,7 +665,7 @@ void FUniRenderer::Release_RenderThread()
 	WebDummy.SafeRelease();
 	WebMipsRT.Empty();
 	for (int32 S = 0; S < GalaxyTextureSlots; ++S) { GalTexture[S].SafeRelease(); GalMipsRT[S].Empty(); }   // D-179
-	GalMapTexture.SafeRelease(); GalMapDummy.SafeRelease(); GalMapEpochRT = 0u; bGalMapComplete = false; GalMapRowsDone = 0u;   // D-212
+	GalMapTexture.SafeRelease(); GalMapDummy.SafeRelease(); GalMapSlotRT.Reset(); GalMapSlotsRT = 0u; GalMapSizeRT = 0u;   // D-212 / D-214
 	PromoteRing.Empty();
 	ActivateRing.Empty();
 	{
@@ -578,7 +724,7 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 	for (int32 S = 0; S < GalaxyTextureSlots; ++S) { GalTex[S] = RegisterGalaxyTexture_RenderThread(GraphBuilder, S); }   // D-179
 	FRHISamplerState* WebSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Wrap>::GetRHI();
 	FRDGTextureRef MapTex = RegisterGalaxyMap_RenderThread(GraphBuilder);   // D-212
-	if (!(bGalMapComplete && F.GalMapEpoch == GalMapEpochRT && GalMapEpochRT != 0u)) { VV.MapCarrier = 0u; }   // a map baked for this frame's request only
+	if (!GalaxyMapComplete_RenderThread(VV.MapSlot, F.GalMapVolumeEpoch)) { VV.MapCarrier = 0u; }   // D-214: only the slot's bake of this frame's epoch
 	auto FillCommonWith = [&](FUniVolumeCommonParameters& C, const TArray<UniCore::FCarrierGPU>& Carriers, const UniCore::FVolumeViewGPU& V, FRDGBufferRef InParamBuf, FRDGBufferRef InLutBuf)
 	{
 		C.UniWebTexture = WebTex;
@@ -776,9 +922,13 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 	// history). Debug views march every pixel.
 	const bool bTemporalOn = CVarUniVolumeTemporal.GetValueOnRenderThread() != 0 && VolDebugMode == 0u && MarchSize.X >= 4 && MarchSize.Y >= 4;
 	const bool bHistory = bTemporalHave && TemporalVolume.IsValid() && TemporalSlices.IsValid() && TemporalDepth.IsValid();
-	const bool bSlice = bTemporalOn && bHistory && TemporalSize == MarchSize && F.bCameraStepValid && F.FrameNumber == TemporalLastFrame + 1;
+	// D-215: a new march size (the auto budget's level, D-200) keeps the history, reprojected at
+	// its own size, within 2x either way: re-marching every pixel there (16x the rays at 1/16)
+	// made the frame the auto budget changed level a 100+ ms spike.
+	const bool bSizeNear = TemporalSize.X > 0 && TemporalSize.Y > 0 && MarchSize.X * 2 >= TemporalSize.X && MarchSize.X <= 2 * TemporalSize.X && MarchSize.Y * 2 >= TemporalSize.Y && MarchSize.Y <= 2 * TemporalSize.Y;
+	const bool bSlice = bTemporalOn && bHistory && bSizeNear && F.bCameraStepValid && F.FrameNumber == TemporalLastFrame + 1;
 	// D-209: why a frame was not sliced (uu.Perf), first reason only.
-	const int32 NoSlice = !bTemporalOn ? 5 : !bHistory ? 6 : TemporalSize != MarchSize ? 7 : !F.bCameraStepValid ? 8 : F.FrameNumber == TemporalLastFrame ? 9 : 10;
+	const int32 NoSlice = !bTemporalOn ? 5 : !bHistory ? 6 : !bSizeNear ? 7 : !F.bCameraStepValid ? 8 : F.FrameNumber == TemporalLastFrame ? 9 : 10;
 	// D-208: the interleave from how far the image moves a frame (march pixels): the view's turn,
 	// plus the camera's step over the nearest marched structure's distance.
 	uint32 Interleave = 2u;
@@ -842,6 +992,7 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		P->SceneDepthTexture = SceneDepth;
 		P->SceneDepthSampler = PointClamp;
 		P->MarchSize = FUintVector2(uint32(MarchSize.X), uint32(MarchSize.Y));
+		P->HistSize = FUintVector2(uint32(TemporalSize.X), uint32(TemporalSize.Y));   // D-215
 		P->PrevForward = TemporalPrevForward; P->PrevTanX = TemporalPrevTanX;
 		P->PrevRight = TemporalPrevRight; P->PrevTanY = TemporalPrevTanY;
 		P->PrevUp = TemporalPrevUp; P->TemporalPhase = Phase;
@@ -1332,6 +1483,87 @@ FUniGpuGenBackend::~FUniGpuGenBackend()
 // The streamer allocates below the planet records' reserved tail (D-143).
 UniCore::u32 FUniGpuGenBackend::PoolCapacity() const { return UniGpuLayout::DynamicPoolBase; }
 
+namespace
+{
+	/** The textures every pass that samples a field binds (UniWebTexture.ush). */
+	template <typename TParams>
+	void UniFillGenTextures(FRDGBuilder& GraphBuilder, TParams* P)
+	{
+		FUniRenderer& R = FUniRenderer::Get();
+		P->UniWebTexture = R.RegisterWebTexture_RenderThread(GraphBuilder);   // D-164
+		P->UniWebSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Wrap>::GetRHI();
+		P->UniGalWarpFine = R.RegisterGalaxyTexture_RenderThread(GraphBuilder, 0);   // D-179
+		P->UniGalWarpLarge = R.RegisterGalaxyTexture_RenderThread(GraphBuilder, 1);
+		P->UniGalDetail = R.RegisterGalaxyTexture_RenderThread(GraphBuilder, 2);
+		P->UniGalMap = R.RegisterGalaxyMap_RenderThread(GraphBuilder);   // D-214: galaxies place from their maps
+	}
+
+	/** D-214: the split place pass (EVAL, SCAN, WRITE) over NumTasks tasks whose plans are in
+	 *  PlanBuf (chunk base, chunks, planned candidates) and PlanTotalBuf ([0] chunks in use), on a
+	 *  grid of MaxChunks groups (padding groups idle). AllocBuf: the one-trip ranges (null: the
+	 *  tasks' own). Writes the pool and AccBuf. */
+	void UniAddSplitPlace(FRDGBuilder& GraphBuilder, uint32 NumTasks, uint32 MaxChunks, FRDGBufferRef TaskBuf, FRDGBufferRef CountBuf,
+		FRDGBufferRef PlanBuf, FRDGBufferRef PlanTotalBuf, FRDGBufferRef AllocBuf, FRDGBufferRef AccBuf, const TCHAR* Suffix)
+	{
+		FUniRenderer& R = FUniRenderer::Get();
+		const bool bAlloc = AllocBuf != nullptr;
+		if (!bAlloc) { AllocBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(FUintVector4), 1), TEXT("UniGenAllocNone")); AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(AllocBuf), 0u); }
+		const uint32 Chunks = FMath::Max(MaxChunks, 1u);
+		FRDGBufferRef MaskBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), Chunks * 8u), TEXT("UniGenChunkMask"));
+		FRDGBufferRef ChunkCountBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), Chunks), TEXT("UniGenChunkCount"));
+		FRDGBufferRef PrefixBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), Chunks), TEXT("UniGenChunkPrefix"));
+		uint32 GroupsX = 1;
+		const FIntVector Groups = WrappedGroups(Chunks, GroupsX);
+		{
+			FUniGenEvalCS::FParameters* P = GraphBuilder.AllocParameters<FUniGenEvalCS::FParameters>();
+			P->InTasks = GraphBuilder.CreateSRV(TaskBuf);
+			P->InCounts = GraphBuilder.CreateSRV(CountBuf);
+			P->InPlan = GraphBuilder.CreateSRV(PlanBuf);
+			P->InPlanTotal = GraphBuilder.CreateSRV(PlanTotalBuf);
+			P->InAlloc = GraphBuilder.CreateSRV(AllocBuf);
+			P->OutChunkMask = GraphBuilder.CreateUAV(MaskBuf);
+			P->OutChunkCount = GraphBuilder.CreateUAV(ChunkCountBuf);
+			P->UseAlloc = bAlloc ? 1u : 0u;
+			P->NumTasks = NumTasks;
+			P->DispatchGroupsX = GroupsX;
+			UniFillGenTextures(GraphBuilder, P);
+			TShaderMapRef<FUniGenEvalCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+			FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Gen.Eval %u tasks, %u chunks%s", NumTasks, MaxChunks, Suffix), CS, P, Groups);
+		}
+		{
+			FUniGenScanCS::FParameters* P = GraphBuilder.AllocParameters<FUniGenScanCS::FParameters>();
+			P->InPlan = GraphBuilder.CreateSRV(PlanBuf);
+			P->InChunkCount = GraphBuilder.CreateSRV(ChunkCountBuf);
+			P->OutChunkPrefix = GraphBuilder.CreateUAV(PrefixBuf);
+			P->OutAccepted = GraphBuilder.CreateUAV(AccBuf);
+			P->NumTasks = NumTasks;
+			TShaderMapRef<FUniGenScanCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+			FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Gen.Scan %u tasks%s", NumTasks, Suffix), CS, P, FIntVector(FMath::DivideAndRoundUp(int32(NumTasks), 64), 1, 1));
+		}
+		{
+			FUniGenWriteCS::FParameters* P = GraphBuilder.AllocParameters<FUniGenWriteCS::FParameters>();
+			P->InTasks = GraphBuilder.CreateSRV(TaskBuf);
+			P->InCounts = GraphBuilder.CreateSRV(CountBuf);
+			P->InPlan = GraphBuilder.CreateSRV(PlanBuf);
+			P->InPlanTotal = GraphBuilder.CreateSRV(PlanTotalBuf);
+			P->InAlloc = GraphBuilder.CreateSRV(AllocBuf);
+			P->InSlices = GraphBuilder.CreateSRV(R.RegisterSlices_RenderThread(GraphBuilder));
+			P->InLut = GraphBuilder.CreateSRV(R.RegisterLut_RenderThread(GraphBuilder));
+			P->InChunkMask = GraphBuilder.CreateSRV(MaskBuf);
+			P->InChunkCount = GraphBuilder.CreateSRV(ChunkCountBuf);
+			P->InChunkPrefix = GraphBuilder.CreateSRV(PrefixBuf);
+			P->OutPool = GraphBuilder.CreateUAV(R.RegisterPool_RenderThread(GraphBuilder));
+			P->OutAccepted = GraphBuilder.CreateUAV(AccBuf);
+			P->UseAlloc = bAlloc ? 1u : 0u;
+			P->NumTasks = NumTasks;
+			P->DispatchGroupsX = GroupsX;
+			UniFillGenTextures(GraphBuilder, P);
+			TShaderMapRef<FUniGenWriteCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+			FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Gen.Write %u tasks%s", NumTasks, Suffix), CS, P, Groups);
+		}
+	}
+}
+
 void FUniGpuGenBackend::SubmitProbe(std::shared_ptr<UniCore::FGenBatch> Batch)
 {
 	check(IsInGameThread());
@@ -1361,25 +1593,24 @@ void FUniGpuGenBackend::SubmitProbe(std::shared_ptr<UniCore::FGenBatch> Batch)
 		const uint32 NumTasks = uint32(Payload->Num());
 		if (NumTasks == 0) { Req->Probe.bSubmitted = true; return; }
 		FRDGBuilder GraphBuilder(RHICmdList);
-		FRDGBufferRef TaskBuf = UploadStructured(GraphBuilder, TEXT("UniGenTasks"), *Payload);
-		FRDGBufferDesc CountDesc = FRDGBufferDesc::CreateStructuredDesc(UniGpuLayout::TaskCountBytes, NumTasks);
-		CountDesc.Usage |= EBufferUsageFlags::SourceCopy;
-		FRDGBufferRef CountBuf = GraphBuilder.CreateBuffer(CountDesc, TEXT("UniGenCounts"));
-		FUniGenProbeCS::FParameters* P = GraphBuilder.AllocParameters<FUniGenProbeCS::FParameters>();
-		P->InTasks = GraphBuilder.CreateSRV(TaskBuf);
-		P->OutCounts = GraphBuilder.CreateUAV(CountBuf);
-		P->NumTasks = NumTasks;
-		P->UniWebTexture = FUniRenderer::Get().RegisterWebTexture_RenderThread(GraphBuilder);   // D-164
-		P->UniWebSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Wrap>::GetRHI();
-		P->UniGalWarpFine = FUniRenderer::Get().RegisterGalaxyTexture_RenderThread(GraphBuilder, 0);   // D-179
-		P->UniGalWarpLarge = FUniRenderer::Get().RegisterGalaxyTexture_RenderThread(GraphBuilder, 1);
-		P->UniGalDetail = FUniRenderer::Get().RegisterGalaxyTexture_RenderThread(GraphBuilder, 2);
-		uint32 GroupsX = 1;
-		const FIntVector Groups = WrappedGroups(NumTasks, GroupsX);
-		P->DispatchGroupsX = GroupsX;
-		TShaderMapRef<FUniGenProbeCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Gen.Probe %u tasks", NumTasks), CS, P, Groups);
-		AddEnqueueCopyPass(GraphBuilder, Req->CountReadback.Get(), CountBuf, NumTasks * UniGpuLayout::TaskCountBytes);
+		{
+			RDG_EVENT_SCOPE(GraphBuilder, "Uni.Gen.Probe %u tasks", NumTasks);   // D-215
+			FRDGBufferRef TaskBuf = UploadStructured(GraphBuilder, TEXT("UniGenTasks"), *Payload);
+			FRDGBufferDesc CountDesc = FRDGBufferDesc::CreateStructuredDesc(UniGpuLayout::TaskCountBytes, NumTasks);
+			CountDesc.Usage |= EBufferUsageFlags::SourceCopy;
+			FRDGBufferRef CountBuf = GraphBuilder.CreateBuffer(CountDesc, TEXT("UniGenCounts"));
+			FUniGenProbeCS::FParameters* P = GraphBuilder.AllocParameters<FUniGenProbeCS::FParameters>();
+			P->InTasks = GraphBuilder.CreateSRV(TaskBuf);
+			P->OutCounts = GraphBuilder.CreateUAV(CountBuf);
+			P->NumTasks = NumTasks;
+			UniFillGenTextures(GraphBuilder, P);
+			uint32 GroupsX = 1;
+			const FIntVector Groups = WrappedGroups(NumTasks, GroupsX);
+			P->DispatchGroupsX = GroupsX;
+			TShaderMapRef<FUniGenProbeCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+			FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Gen.Probe %u tasks", NumTasks), CS, P, Groups);
+			AddEnqueueCopyPass(GraphBuilder, Req->CountReadback.Get(), CountBuf, NumTasks * UniGpuLayout::TaskCountBytes);
+		}   // D-215: the scope closes before Execute (RDG: no open scope at Execute)
 		GraphBuilder.Execute();
 		Req->Probe.bSubmitted = true;
 	});
@@ -1400,6 +1631,8 @@ void FUniGpuGenBackend::SubmitPlace(std::shared_ptr<UniCore::FGenBatch> Batch)
 	{
 		TArray<UniCore::FGenTaskGPU> Tasks;
 		TArray<UniCore::FTaskCountGPU> Counts;
+		TArray<FUintVector4> Plan;    // D-214: (chunk base, chunks, planned candidates, 0) per task
+		uint32 TotalChunks = 0;
 		TArray<TPair<uint32, uint32>> Ranges;
 		TArray<uint32> WriteIndex;
 		TArray<UniCore::FObjectGPU> WriteRecord;
@@ -1407,6 +1640,14 @@ void FUniGpuGenBackend::SubmitPlace(std::shared_ptr<UniCore::FGenBatch> Batch)
 	TSharedRef<FPlacePayload, ESPMode::ThreadSafe> Payload = MakeShared<FPlacePayload, ESPMode::ThreadSafe>();
 	Payload->Tasks.Append(Batch->Tasks.data(), int32(Batch->Tasks.size()));
 	Payload->Counts.Append(Batch->Counts.data(), int32(Batch->Counts.size()));
+	// D-214: the split place pass's plans (the CPU knows the capacities here).
+	for (int32 I = 0; I < Payload->Tasks.Num(); ++I)
+	{
+		const uint32 Pl = I < Payload->Counts.Num() ? UniCore::PlanCandidatesOf(Payload->Tasks[I].PoolCapacity, Payload->Counts[I]) : 0u;
+		const uint32 Ch = UniHlsl::Uni_PlanChunks(Pl);
+		Payload->Plan.Add(FUintVector4(Payload->TotalChunks, Ch, Pl, 0u));
+		Payload->TotalChunks += Ch;
+	}
 	for (const auto& R : Batch->ReadRanges) { Payload->Ranges.Add(TPair<uint32, uint32>(R.first, R.second)); }
 	for (const auto& W : Batch->Writes) { Payload->WriteIndex.Add(W.first); Payload->WriteRecord.Add(W.second); }
 
@@ -1416,65 +1657,57 @@ void FUniGpuGenBackend::SubmitPlace(std::shared_ptr<UniCore::FGenBatch> Batch)
 		TRACE_CPUPROFILER_EVENT_SCOPE(Uni_GenPlace_RT);
 		const uint32 NumTasks = uint32(Payload->Tasks.Num());
 		FRDGBuilder GraphBuilder(RHICmdList);
-		FUniRenderer& R = FUniRenderer::Get();
-		FRDGBufferRef PoolBuf = R.RegisterPool_RenderThread(GraphBuilder);
-		FRDGBufferRef SliceBuf = R.RegisterSlices_RenderThread(GraphBuilder);
-		FRDGBufferRef LutBuf = R.RegisterLut_RenderThread(GraphBuilder);
-		FRDGBufferDesc AccDesc = FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), FMath::Max(NumTasks, 1u));
-		AccDesc.Usage |= EBufferUsageFlags::SourceCopy;
-		FRDGBufferRef AccBuf = GraphBuilder.CreateBuffer(AccDesc, TEXT("UniGenAccepted"));
-		if (NumTasks > 0)
 		{
-			FUniGenPlaceCS::FParameters* P = GraphBuilder.AllocParameters<FUniGenPlaceCS::FParameters>();
-			P->InTasks = GraphBuilder.CreateSRV(UploadStructured(GraphBuilder, TEXT("UniGenTasks"), Payload->Tasks));
-			P->InCounts = GraphBuilder.CreateSRV(UploadStructured(GraphBuilder, TEXT("UniGenCountsIn"), Payload->Counts));
-			P->InSlices = GraphBuilder.CreateSRV(SliceBuf);
-			P->InLut = GraphBuilder.CreateSRV(LutBuf);
-			P->OutPool = GraphBuilder.CreateUAV(PoolBuf);
-			P->OutAccepted = GraphBuilder.CreateUAV(AccBuf);
-			P->InAlloc = GraphBuilder.CreateSRV(UploadStructured(GraphBuilder, TEXT("UniGenAllocNone"), TArray<FUintVector4>()));   // D-207: unused (UseAlloc 0)
-			P->UseAlloc = 0u;
-			P->NumTasks = NumTasks;
-			P->UniWebTexture = R.RegisterWebTexture_RenderThread(GraphBuilder);   // D-164
-			P->UniWebSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Wrap>::GetRHI();
-			P->UniGalWarpFine = R.RegisterGalaxyTexture_RenderThread(GraphBuilder, 0);   // D-179
-			P->UniGalWarpLarge = R.RegisterGalaxyTexture_RenderThread(GraphBuilder, 1);
-			P->UniGalDetail = R.RegisterGalaxyTexture_RenderThread(GraphBuilder, 2);
-			uint32 GroupsX = 1;
-			const FIntVector Groups = WrappedGroups(NumTasks, GroupsX);
-			P->DispatchGroupsX = GroupsX;
-			TShaderMapRef<FUniGenPlaceCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-			FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Gen.Place %u tasks", NumTasks), CS, P, Groups);
-		}
-		else
-		{
-			AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(AccBuf), 0u);
-		}
-		if (Payload->WriteIndex.Num() > 0)
-		{
-			FUniScatterCS::FParameters* P = GraphBuilder.AllocParameters<FUniScatterCS::FParameters>();
-			P->InScatterIndex = GraphBuilder.CreateSRV(UploadStructured(GraphBuilder, TEXT("UniScatterIndex"), Payload->WriteIndex));
-			P->InScatterRecord = GraphBuilder.CreateSRV(UploadStructured(GraphBuilder, TEXT("UniScatterRecord"), Payload->WriteRecord));
-			P->OutPool = GraphBuilder.CreateUAV(PoolBuf);
-			P->NumWrites = uint32(Payload->WriteIndex.Num());
-			TShaderMapRef<FUniScatterCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-			FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Gen.ScatterAnchors"), CS, P, FIntVector(FMath::DivideAndRoundUp(Payload->WriteIndex.Num(), 64), 1, 1));
-		}
-		// Emitter objects back to the CPU (contributors): copy the ranges into one staging buffer.
-		uint32 TotalObjects = 0;
-		for (const TPair<uint32, uint32>& Rg : Payload->Ranges) { TotalObjects += Rg.Value; }
-		FRDGBufferDesc StageDesc = FRDGBufferDesc::CreateStructuredDesc(UniGpuLayout::ObjectBytes, FMath::Max(TotalObjects, 1u));
-		StageDesc.Usage |= EBufferUsageFlags::SourceCopy;
-		FRDGBufferRef Stage = GraphBuilder.CreateBuffer(StageDesc, TEXT("UniGenReadObjects"));
-		uint64 Dst = 0;
-		for (const TPair<uint32, uint32>& Rg : Payload->Ranges)
-		{
-			AddCopyBufferPass(GraphBuilder, Stage, Dst, PoolBuf, uint64(Rg.Key) * UniGpuLayout::ObjectBytes, uint64(Rg.Value) * UniGpuLayout::ObjectBytes);
-			Dst += uint64(Rg.Value) * UniGpuLayout::ObjectBytes;
-		}
-		if (TotalObjects == 0) { AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(Stage), 0u); }
-		AddEnqueueCopyPass(GraphBuilder, Req->AcceptedReadback.Get(), AccBuf, FMath::Max(NumTasks, 1u) * sizeof(uint32));
-		AddEnqueueCopyPass(GraphBuilder, Req->ObjectReadback.Get(), Stage, FMath::Max(TotalObjects, 1u) * UniGpuLayout::ObjectBytes);
+			RDG_EVENT_SCOPE(GraphBuilder, "Uni.Gen.Place %u tasks", NumTasks);   // D-215
+			FUniRenderer& R = FUniRenderer::Get();
+			FRDGBufferRef PoolBuf = R.RegisterPool_RenderThread(GraphBuilder);
+			FRDGBufferRef SliceBuf = R.RegisterSlices_RenderThread(GraphBuilder);
+			FRDGBufferRef LutBuf = R.RegisterLut_RenderThread(GraphBuilder);
+			FRDGBufferDesc AccDesc = FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), FMath::Max(NumTasks, 1u));
+			AccDesc.Usage |= EBufferUsageFlags::SourceCopy;
+			FRDGBufferRef AccBuf = GraphBuilder.CreateBuffer(AccDesc, TEXT("UniGenAccepted"));
+			if (NumTasks > 0)
+			{
+				// D-214: the split place pass (EVAL, SCAN, WRITE), plans from the CPU.
+				(void)SliceBuf; (void)LutBuf;
+				TArray<uint32> Total; Total.Add(Payload->TotalChunks);
+				UniAddSplitPlace(GraphBuilder, NumTasks, Payload->TotalChunks,
+					UploadStructured(GraphBuilder, TEXT("UniGenTasks"), Payload->Tasks),
+					UploadStructured(GraphBuilder, TEXT("UniGenCountsIn"), Payload->Counts),
+					UploadStructured(GraphBuilder, TEXT("UniGenPlan"), Payload->Plan),
+					UploadStructured(GraphBuilder, TEXT("UniGenPlanTotal"), Total),
+					nullptr, AccBuf, TEXT(""));
+			}
+			else
+			{
+				AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(AccBuf), 0u);
+			}
+			if (Payload->WriteIndex.Num() > 0)
+			{
+				FUniScatterCS::FParameters* P = GraphBuilder.AllocParameters<FUniScatterCS::FParameters>();
+				P->InScatterIndex = GraphBuilder.CreateSRV(UploadStructured(GraphBuilder, TEXT("UniScatterIndex"), Payload->WriteIndex));
+				P->InScatterRecord = GraphBuilder.CreateSRV(UploadStructured(GraphBuilder, TEXT("UniScatterRecord"), Payload->WriteRecord));
+				P->OutPool = GraphBuilder.CreateUAV(PoolBuf);
+				P->NumWrites = uint32(Payload->WriteIndex.Num());
+				TShaderMapRef<FUniScatterCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Gen.ScatterAnchors"), CS, P, FIntVector(FMath::DivideAndRoundUp(Payload->WriteIndex.Num(), 64), 1, 1));
+			}
+			// Emitter objects back to the CPU (contributors): copy the ranges into one staging buffer.
+			uint32 TotalObjects = 0;
+			for (const TPair<uint32, uint32>& Rg : Payload->Ranges) { TotalObjects += Rg.Value; }
+			FRDGBufferDesc StageDesc = FRDGBufferDesc::CreateStructuredDesc(UniGpuLayout::ObjectBytes, FMath::Max(TotalObjects, 1u));
+			StageDesc.Usage |= EBufferUsageFlags::SourceCopy;
+			FRDGBufferRef Stage = GraphBuilder.CreateBuffer(StageDesc, TEXT("UniGenReadObjects"));
+			uint64 Dst = 0;
+			for (const TPair<uint32, uint32>& Rg : Payload->Ranges)
+			{
+				AddCopyBufferPass(GraphBuilder, Stage, Dst, PoolBuf, uint64(Rg.Key) * UniGpuLayout::ObjectBytes, uint64(Rg.Value) * UniGpuLayout::ObjectBytes);
+				Dst += uint64(Rg.Value) * UniGpuLayout::ObjectBytes;
+			}
+			if (TotalObjects == 0) { AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(Stage), 0u); }
+			AddEnqueueCopyPass(GraphBuilder, Req->AcceptedReadback.Get(), AccBuf, FMath::Max(NumTasks, 1u) * sizeof(uint32));
+			AddEnqueueCopyPass(GraphBuilder, Req->ObjectReadback.Get(), Stage, FMath::Max(TotalObjects, 1u) * UniGpuLayout::ObjectBytes);
+		}   // D-215: the scope closes before Execute (RDG: no open scope at Execute)
 		GraphBuilder.Execute();
 		Req->Place.bSubmitted = true;
 	});
@@ -1505,12 +1738,15 @@ void FUniGpuGenBackend::SubmitFused(std::shared_ptr<UniCore::FGenBatch> Batch)
 	{
 		TArray<UniCore::FGenTaskGPU> Tasks;
 		uint32 ArenaBase = 0, ArenaCap = 0, MaxPerCell = 0;
+		uint32 CandidateCap = 0, ChunkCap = 1;   // D-214
 	};
 	TSharedRef<FFusedPayload, ESPMode::ThreadSafe> Payload = MakeShared<FFusedPayload, ESPMode::ThreadSafe>();
 	Payload->Tasks.Append(Batch->Tasks.data(), int32(Batch->Tasks.size()));
 	Payload->ArenaBase = Batch->ArenaBase;
 	Payload->ArenaCap = Batch->ArenaCap;
 	Payload->MaxPerCell = Batch->MaxPerCell;
+	Payload->CandidateCap = uint32(FMath::Min<uint64>(Batch->CandidateCap, 0xFFFFFFFFull));
+	Payload->ChunkCap = FMath::Clamp<uint32>(Batch->ChunkCap, 1u, 1u << 20);
 
 	ENQUEUE_RENDER_COMMAND(UniGenFused)([Req, Payload](FRHICommandListImmediate& RHICmdList)
 	{
@@ -1519,66 +1755,53 @@ void FUniGpuGenBackend::SubmitFused(std::shared_ptr<UniCore::FGenBatch> Batch)
 		const uint32 NumTasks = uint32(Payload->Tasks.Num());
 		if (NumTasks == 0) { Req->Place.bSubmitted = true; return; }
 		FRDGBuilder GraphBuilder(RHICmdList);
-		FUniRenderer& R = FUniRenderer::Get();
-		FRDGBufferRef TaskBuf = UploadStructured(GraphBuilder, TEXT("UniGenTasks"), Payload->Tasks);
-		FRDGBufferDesc CountDesc = FRDGBufferDesc::CreateStructuredDesc(UniGpuLayout::TaskCountBytes, NumTasks);
-		CountDesc.Usage |= EBufferUsageFlags::SourceCopy;
-		FRDGBufferRef CountBuf = GraphBuilder.CreateBuffer(CountDesc, TEXT("UniGenCounts"));
-		FRDGBufferRef AllocBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(FUintVector4), NumTasks), TEXT("UniGenAlloc"));
-		FRDGBufferDesc AccDesc = FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), NumTasks);
-		AccDesc.Usage |= EBufferUsageFlags::SourceCopy;
-		FRDGBufferRef AccBuf = GraphBuilder.CreateBuffer(AccDesc, TEXT("UniGenAccepted"));
-		uint32 GroupsX = 1;
-		const FIntVector Groups = WrappedGroups(NumTasks, GroupsX);
 		{
-			FUniGenProbeCS::FParameters* P = GraphBuilder.AllocParameters<FUniGenProbeCS::FParameters>();
-			P->InTasks = GraphBuilder.CreateSRV(TaskBuf);
-			P->OutCounts = GraphBuilder.CreateUAV(CountBuf);
-			P->NumTasks = NumTasks;
-			P->DispatchGroupsX = GroupsX;
-			P->UniWebTexture = R.RegisterWebTexture_RenderThread(GraphBuilder);   // D-164
-			P->UniWebSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Wrap>::GetRHI();
-			P->UniGalWarpFine = R.RegisterGalaxyTexture_RenderThread(GraphBuilder, 0);   // D-179
-			P->UniGalWarpLarge = R.RegisterGalaxyTexture_RenderThread(GraphBuilder, 1);
-			P->UniGalDetail = R.RegisterGalaxyTexture_RenderThread(GraphBuilder, 2);
-			TShaderMapRef<FUniGenProbeCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-			FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Gen.Probe %u tasks (one trip)", NumTasks), CS, P, Groups);
-		}
-		{
-			FUniGenAllocCS::FParameters* P = GraphBuilder.AllocParameters<FUniGenAllocCS::FParameters>();
-			P->InTasks = GraphBuilder.CreateSRV(TaskBuf);
-			P->InCounts = GraphBuilder.CreateSRV(CountBuf);
-			P->OutAlloc = GraphBuilder.CreateUAV(AllocBuf);
-			P->NumTasks = NumTasks;
-			P->DispatchGroupsX = 1u;
-			P->ArenaBase = Payload->ArenaBase;
-			P->ArenaCap = Payload->ArenaCap;
-			P->MaxPerCell = Payload->MaxPerCell;
-			TShaderMapRef<FUniGenAllocCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-			FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Gen.Alloc %u tasks", NumTasks), CS, P, FIntVector(1, 1, 1));
-		}
-		{
-			FUniGenPlaceCS::FParameters* P = GraphBuilder.AllocParameters<FUniGenPlaceCS::FParameters>();
-			P->InTasks = GraphBuilder.CreateSRV(TaskBuf);
-			P->InCounts = GraphBuilder.CreateSRV(CountBuf);
-			P->InSlices = GraphBuilder.CreateSRV(R.RegisterSlices_RenderThread(GraphBuilder));
-			P->InLut = GraphBuilder.CreateSRV(R.RegisterLut_RenderThread(GraphBuilder));
-			P->OutPool = GraphBuilder.CreateUAV(R.RegisterPool_RenderThread(GraphBuilder));
-			P->OutAccepted = GraphBuilder.CreateUAV(AccBuf);
-			P->InAlloc = GraphBuilder.CreateSRV(AllocBuf);
-			P->UseAlloc = 1u;
-			P->NumTasks = NumTasks;
-			P->DispatchGroupsX = GroupsX;
-			P->UniWebTexture = R.RegisterWebTexture_RenderThread(GraphBuilder);
-			P->UniWebSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Wrap>::GetRHI();
-			P->UniGalWarpFine = R.RegisterGalaxyTexture_RenderThread(GraphBuilder, 0);
-			P->UniGalWarpLarge = R.RegisterGalaxyTexture_RenderThread(GraphBuilder, 1);
-			P->UniGalDetail = R.RegisterGalaxyTexture_RenderThread(GraphBuilder, 2);
-			TShaderMapRef<FUniGenPlaceCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-			FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Gen.Place %u tasks (one trip)", NumTasks), CS, P, Groups);
-		}
-		AddEnqueueCopyPass(GraphBuilder, Req->CountReadback.Get(), CountBuf, NumTasks * UniGpuLayout::TaskCountBytes);
-		AddEnqueueCopyPass(GraphBuilder, Req->AcceptedReadback.Get(), AccBuf, NumTasks * sizeof(uint32));
+			RDG_EVENT_SCOPE(GraphBuilder, "Uni.Gen.OneTrip %u tasks", NumTasks);   // D-215: a named scope, so traces and ProfileGPU show generation (pass names alone do not)
+			FUniRenderer& R = FUniRenderer::Get();
+			FRDGBufferRef TaskBuf = UploadStructured(GraphBuilder, TEXT("UniGenTasks"), Payload->Tasks);
+			FRDGBufferDesc CountDesc = FRDGBufferDesc::CreateStructuredDesc(UniGpuLayout::TaskCountBytes, NumTasks);
+			CountDesc.Usage |= EBufferUsageFlags::SourceCopy;
+			FRDGBufferRef CountBuf = GraphBuilder.CreateBuffer(CountDesc, TEXT("UniGenCounts"));
+			FRDGBufferRef AllocBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(FUintVector4), NumTasks), TEXT("UniGenAlloc"));
+			FRDGBufferRef PlanBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(FUintVector4), NumTasks), TEXT("UniGenPlan"));   // D-214
+			FRDGBufferRef PlanTotalBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), 1), TEXT("UniGenPlanTotal"));
+			FRDGBufferDesc AccDesc = FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), NumTasks);
+			AccDesc.Usage |= EBufferUsageFlags::SourceCopy;
+			FRDGBufferRef AccBuf = GraphBuilder.CreateBuffer(AccDesc, TEXT("UniGenAccepted"));
+			uint32 GroupsX = 1;
+			const FIntVector Groups = WrappedGroups(NumTasks, GroupsX);
+			{
+				FUniGenProbeCS::FParameters* P = GraphBuilder.AllocParameters<FUniGenProbeCS::FParameters>();
+				P->InTasks = GraphBuilder.CreateSRV(TaskBuf);
+				P->OutCounts = GraphBuilder.CreateUAV(CountBuf);
+				P->NumTasks = NumTasks;
+				P->DispatchGroupsX = GroupsX;
+				UniFillGenTextures(GraphBuilder, P);
+				TShaderMapRef<FUniGenProbeCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Gen.Probe %u tasks (one trip)", NumTasks), CS, P, Groups);
+			}
+			{
+				FUniGenAllocCS::FParameters* P = GraphBuilder.AllocParameters<FUniGenAllocCS::FParameters>();
+				P->InTasks = GraphBuilder.CreateSRV(TaskBuf);
+				P->InCounts = GraphBuilder.CreateSRV(CountBuf);
+				P->OutAlloc = GraphBuilder.CreateUAV(AllocBuf);
+				P->OutPlan = GraphBuilder.CreateUAV(PlanBuf);
+				P->OutPlanTotal = GraphBuilder.CreateUAV(PlanTotalBuf);
+				P->NumTasks = NumTasks;
+				P->DispatchGroupsX = 1u;
+				P->ArenaBase = Payload->ArenaBase;
+				P->ArenaCap = Payload->ArenaCap;
+				P->MaxPerCell = Payload->MaxPerCell;
+				P->CandidateCap = Payload->CandidateCap;
+				P->ChunkCap = Payload->ChunkCap;
+				TShaderMapRef<FUniGenAllocCS> CS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Gen.Alloc %u tasks", NumTasks), CS, P, FIntVector(1, 1, 1));
+			}
+			// D-214: the split place pass over the chunks ALLOC planned (a fixed grid of ChunkCap groups).
+			UniAddSplitPlace(GraphBuilder, NumTasks, Payload->ChunkCap, TaskBuf, CountBuf, PlanBuf, PlanTotalBuf, AllocBuf, AccBuf, TEXT(" (one trip)"));
+			AddEnqueueCopyPass(GraphBuilder, Req->CountReadback.Get(), CountBuf, NumTasks * UniGpuLayout::TaskCountBytes);
+			AddEnqueueCopyPass(GraphBuilder, Req->AcceptedReadback.Get(), AccBuf, NumTasks * sizeof(uint32));
+		}   // D-215: the scope closes before Execute (RDG: no open scope at Execute)
 		GraphBuilder.Execute();
 		Req->Place.bSubmitted = true;
 	});

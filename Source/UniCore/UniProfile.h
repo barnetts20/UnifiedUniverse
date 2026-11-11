@@ -62,6 +62,16 @@ namespace UniCore
 		}
 	}
 
+	/** The phase's name without the "Uni.Stream." prefix (HUD and log lines). Every name above
+	 *  carries the prefix; a name that does not is returned whole rather than cut mid-word. */
+	inline const char* StreamPhaseShortName(EStreamPhase P)
+	{
+		static constexpr char Prefix[] = "Uni.Stream.";
+		const char* Name = StreamPhaseName(P);
+		for (int I = 0; I < int(sizeof(Prefix)) - 1; ++I) { if (Name[I] != Prefix[I]) { return Name; } }
+		return Name + (sizeof(Prefix) - 1);
+	}
+
 	/** Optional profiler hooks (plain function pointers: no allocation, no captures). */
 	struct FProfileHooks
 	{

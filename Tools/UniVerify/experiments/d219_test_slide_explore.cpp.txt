@@ -1,0 +1,227 @@
+// test_slide.cpp
+// D-219 (owner: "slice sliding" in motion; CloudAtmosphere's march and resolve). The march's
+// samples sat at step midpoints on the same shells about the camera every frame: its error was a
+// set of bands fixed to the camera that the field slid through as it moved. Measured against a
+// fine reference (every step an eighth: MarchFlags bit 1), over flights inside and outside the
+// Milky Way: each frame's error, and how much the error pattern changes from one frame to the
+// next (the crawl the eye sees), for D-194 (midpoints, replace rule) and D-219 (jittered
+// samples, the accumulating resolve).
+
+#include "../src/UniTest.h"
+#include "../src/UniRenderRef.h"
+#include "../src/UniVerifyCommon.h"
+#include "../src/UniVolumeRef.h"
+#include "../scenes/UniScenes.h"
+#include "UniVolume.h"
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
+
+using namespace UniCore;
+using namespace UniRender;
+namespace H = UniHlsl;
+
+namespace
+{
+	/** The fine reference: every pixel, every step an eighth as long, midpoints. */
+	std::vector<H::float4> FineMarch(const FVolumeScene& Sc, const FCamera& Cam)
+	{
+		FVolumeScene F = Sc;
+		F.View.MarchFlags |= 2u;
+		F.View.MaxSteps *= 8u;
+		FTemporalVolume Full;
+		Full.Step(F, Cam, FV3{ 0, 0, 0 }, false, false, 2);
+		return Full.Vol;
+	}
+
+	FV3 Rotate(const FV3& V, const FV3& Axis, double A)
+	{
+		const FV3 K = Norm(Axis);
+		const double C = std::cos(A), S = std::sin(A);
+		return V * C + Cross(K, V) * S + K * (Dot(K, V) * (1.0 - C));
+	}
+
+	struct FSlide
+	{
+		double Error = 0.0;     // mean over frames of sum |A - R| / sum R (light-weighted relative error)
+		double P95 = 0.0;       // mean over frames of the per-pixel relative error's 95th percentile
+		double Crawl = 0.0;     // mean over frames of sum |E_t - E_t-1| / sum R (E = A - R): the error moving
+		double Content = 0.0;   // the reference's own change, sum |R_t - R_t-1| / sum R
+		double Light = 0.0;     // worst frame |sum A / sum R - 1|
+		int Frames = 0;
+	};
+
+	enum class EMode { D194, D219, AccNoJit, FullMid };
+
+	struct FCfg { bool bSlice = true; bool bAcc = false; bool bJit = false; float FreshW = 0.15f; u32 MaxN = 4u; float FillScale = 1.0f; bool bOracle = false; float TightPx = 2.0f; float MaxPx = 8.0f; };
+
+	FCfg CfgOf(EMode M)
+	{
+		FCfg C;
+		C.bSlice = M != EMode::FullMid;
+		C.bAcc = M == EMode::D219 || M == EMode::AccNoJit;
+		C.bJit = M == EMode::D219;
+		return C;
+	}
+
+	FSlide FlyCfg(const FUniverseDef& D, FCoord Cam, FV3 Look, FV3 StepCm, FV3 Axis, double Turn, int Frames, int Warm, int W, int Ht, const FCfg& Cf);
+
+	/** One flight; the first Warm frames fill the history and are not compared. */
+	FSlide Fly(const FUniverseDef& D, FCoord Cam, FV3 Look, FV3 StepCm, FV3 Axis, double Turn, int Frames, int Warm, int W, int Ht, EMode Mode)
+	{
+		return FlyCfg(D, Cam, Look, StepCm, Axis, Turn, Frames, Warm, W, Ht, CfgOf(Mode));
+	}
+
+	FSlide FlyCfg(const FUniverseDef& D, FCoord Cam, FV3 Look, FV3 StepCm, FV3 Axis, double Turn, int Frames, int Warm, int W, int Ht, const FCfg& Cf)
+	{
+		FUniverseModel M(D);
+		FRefGenerator G(M);
+		FVolumeBuilder VB(M, G);
+		FRefPipeline P(G);
+		P.bVelocityLod = false;
+		FTemporalVolume Tv;
+		Tv.bAccumulate = Cf.bAcc;
+		Tv.bJitter = Cf.bJit;
+		Tv.FreshWeight = Cf.FreshW;
+		Tv.FillScale = Cf.FillScale;
+		Tv.ClampTightPx = Cf.TightPx;
+		Tv.MaxMotionPx = Cf.MaxPx;
+		FSlide St;
+		FV3 Fwd = Norm(Look);
+		std::vector<double> PrevE;
+		for (int F = 0; F < Frames; ++F)
+		{
+			if (F > 0)
+			{
+				FVec3f Fr{};
+				AddDisplacement(Cam, Fr, FVec3d{ StepCm.X, StepCm.Y, StepCm.Z });
+				Fwd = Rotate(Fwd, Axis, Turn);
+			}
+			P.Update(Cam, FVec3f{});
+			FCamera Cm; Cm.Coord = Cam; Cm.Width = W; Cm.Height = Ht; Cm.DeltaMag = 0.0;
+			Cm.LookAlong(Fwd);
+			const FVolumeScene Sc = VB.Build(P, Cam, FVec3f{}, Cm.View()).Subset(false);
+			{
+				// The renderer's interleave rule (D-208), as in test_temporal.
+				const double ThetaPix = 2.0 * Cm.TanX() / double(W);
+				const double StepLen = std::sqrt(Dot(StepCm, StepCm));
+				const double Move = F > 0 && StepLen > 0.0 ? (Sc.NearCm > 0.0 ? StepLen / Sc.NearCm : 1.0e9) : 0.0;
+				const double MotionPx = ((F > 0 ? std::abs(Turn) : 0.0) + Move) / ThetaPix;
+				Tv.Interleave = H::Uni_TemporalInterleave(float(MotionPx), Cf.MaxN);
+			}
+			FTemporalVolume Or;
+			if (Cf.bOracle) { Or.Step(Sc, Cm, FV3{ 0, 0, 0 }, false, false, 2); Tv.OracleDepth = &Or.Depth; }
+			Tv.Step(Sc, Cm, F > 0 ? StepCm : FV3{ 0, 0, 0 }, F > 0, Cf.bSlice, 2);
+			Tv.OracleDepth = nullptr;
+			if (F < Warm - 1) { continue; }
+			const std::vector<H::float4> Ref = FineMarch(Sc, Cm);
+			std::vector<double> E(Ref.size()), La(Ref.size()), Lb(Ref.size());
+			double Sa = 0, Sb = 0, Se = 0;
+			for (size_t I = 0; I < Ref.size(); ++I)
+			{
+				const double Om = PixelSolidAngle(Cm, W, Ht, double(I % W) + 0.5, double(I / W) + 0.5);
+				La[I] = double(H::Uni_Luminance(H::float3(Tv.Vol[I].x, Tv.Vol[I].y, Tv.Vol[I].z))) * Om;
+				Lb[I] = double(H::Uni_Luminance(H::float3(Ref[I].x, Ref[I].y, Ref[I].z))) * Om;
+				E[I] = La[I] - Lb[I];
+				Sa += La[I]; Sb += Lb[I]; Se += std::abs(E[I]);
+			}
+			if (F >= Warm)
+			{
+				double Sc2 = 0.0;
+				for (size_t I = 0; I < E.size(); ++I) { Sc2 += std::abs(E[I] - PrevE[I]); }
+				St.Crawl += Sc2 / std::max(Sb, 1e-300);
+				St.Error += Se / std::max(Sb, 1e-300);
+				St.Light = std::max(St.Light, std::abs(Sa / std::max(Sb, 1e-300) - 1.0));
+				const double Mean = Sb / double(Ref.size());
+				std::vector<double> Rel;
+				for (size_t I = 0; I < Ref.size(); ++I) { if (Lb[I] > 0.01 * Mean) { Rel.push_back(std::abs(E[I]) / Lb[I]); } }
+				if (!Rel.empty()) { std::sort(Rel.begin(), Rel.end()); St.P95 += Rel[std::min(Rel.size() - 1, size_t(0.95 * double(Rel.size())))]; }
+				++St.Frames;
+			}
+			PrevE = E;
+		}
+		if (St.Frames > 0) { St.Error /= St.Frames; St.Crawl /= St.Frames; St.P95 /= St.Frames; }
+		return St;
+	}
+}
+
+UNI_TEST(volume, slide)
+{
+	const double Kpc = Units::Kpc, Pc = Units::Pc;
+	const FUniverseDef D = UniScenes::GalaxyToStar();
+	const FCoord Solar = UniScenes::SolarCamera();
+	FCoord Far = Solar;
+	{ FVec3f Fr{}; AddDisplacement(Far, Fr, FVec3d{ 0.0, -40.0 * Kpc, 45.0 * Kpc }); }
+	const double Deg = 3.14159265358979 / 180.0;
+	struct FCase { const char* Name; FCoord Cam; FV3 Look; FV3 Step; FV3 Axis; double Turn; };
+	const FCase Cases[] = {
+		{ "inside, at rest", Solar, { -1, -0.12, -0.02 }, { 0, 0, 0 }, { 0, 0, 1 }, 0.0 },
+		{ "inside, 0.5 pc/frame along the disc", Solar, { -1, -0.12, -0.02 }, { -0.5 * Pc, 0.05 * Pc, 0.0 }, { 0, 0, 1 }, 0.0 },
+		{ "inside, 3 pc/frame and turning 0.1 deg", Solar, { -1, -0.12, -0.02 }, { -3.0 * Pc, 0.4 * Pc, 0.0 }, { 0.2, 0, 1 }, 0.1 * Deg },
+		{ "60 kpc, drifting 0.1 kpc/frame", Far, { 0.0, 40.0, -45.0 }, { 0.1 * Kpc, 0.0, 0.0 }, { 0, 0, 1 }, 0.0 },
+	};
+	const int W = 160, Ht = 100, Frames = 24, Warm = 10;
+	std::string Detail;
+	double CrawlOld = 0.0, CrawlNew = 0.0, ErrOld = 0.0, ErrNew = 0.0, WorstLight = 0.0, RestErrNew = 0.0;
+	bool bCrawlDown = true, bErrOk = true;
+	for (const FCase& C : Cases)
+	{
+		const FSlide Mid = Fly(D, C.Cam, C.Look, C.Step, C.Axis, C.Turn, Frames, Warm, W, Ht, EMode::FullMid);
+		const FSlide Old = Fly(D, C.Cam, C.Look, C.Step, C.Axis, C.Turn, Frames, Warm, W, Ht, EMode::D194);
+		const FSlide New = Fly(D, C.Cam, C.Look, C.Step, C.Axis, C.Turn, Frames, Warm, W, Ht, EMode::D219);
+		const FSlide Acc = Fly(D, C.Cam, C.Look, C.Step, C.Axis, C.Turn, Frames, Warm, W, Ht, EMode::AccNoJit);
+		std::printf("  %s: accumulate without jitter: error %.2f%% p95 %.1f%% crawl %.2f%%\n", C.Name, 100.0 * Acc.Error, 100.0 * Acc.P95, 100.0 * Acc.Crawl);
+		const bool bRest = C.Turn == 0.0 && C.Step.X == 0.0 && C.Step.Y == 0.0;
+		if (bRest) { RestErrNew = New.Error; }
+		else
+		{
+			CrawlOld = std::max(CrawlOld, Old.Crawl); CrawlNew = std::max(CrawlNew, New.Crawl);
+			bCrawlDown = bCrawlDown && New.Crawl < Old.Crawl;
+		}
+		ErrOld = std::max(ErrOld, Old.Error); ErrNew = std::max(ErrNew, New.Error);
+		WorstLight = std::max(WorstLight, New.Light);
+		bErrOk = bErrOk && New.Error < Old.Error * 1.1 + 0.002;
+		Detail += Uni::Fmt("%s[%s] full-march midpoints: error %.2f%% crawl %.2f%%; D-194: error %.2f%% p95 %.1f%% crawl %.2f%%; D-219: error %.2f%% p95 %.1f%% crawl %.2f%% light %.2f%% (reference moves %.2f%%)",
+			Detail.empty() ? "" : "; ", C.Name, 100.0 * Mid.Error, 100.0 * Mid.Crawl, 100.0 * Old.Error, 100.0 * Old.P95, 100.0 * Old.Crawl,
+			100.0 * New.Error, 100.0 * New.P95, 100.0 * New.Crawl, 100.0 * New.Light, 100.0 * New.Content);
+	}
+	Uni::Check(2, "T2.vol.slide", "D-219 jittered march samples and the accumulating resolve against D-194's midpoints and replace rule, flying inside and outside the Milky Way, both against a fine reference (steps an eighth): in motion the error pattern moves less from frame to frame (the crawl) on every path; the error itself no worse than D-194's (+10%, +0.2 points); every frame's light within 2% of the reference")
+		.Metric("crawl_d194", CrawlOld).Metric("crawl_d219", CrawlNew).Metric("error_d194", ErrOld).Metric("error_d219", ErrNew).Metric("rest_error_d219", RestErrNew).Metric("worst_light", WorstLight)
+		.Pass(bCrawlDown && bErrOk && WorstLight < 0.02, Detail);
+}
+
+UNI_TEST(volume, slide_x)
+{
+	// Exploration (temporary).
+	const double Kpc = Units::Kpc;
+	const FUniverseDef D = UniScenes::GalaxyToStar();
+	const FCoord Solar = UniScenes::SolarCamera();
+	FCoord Far = Solar;
+	{ FVec3f Fr{}; AddDisplacement(Far, Fr, FVec3d{ 0.0, -40.0 * Kpc, 45.0 * Kpc }); }
+	struct FCase { const char* Name; FCoord Cam; FV3 Look; FV3 Step; FV3 Axis; double Turn; };
+	const FCase Cases[] = {
+		{ "60 kpc drift 0.4+turn", Far, { 0.0, 40.0, -45.0 }, { 0.3 * Kpc, 0.2 * Kpc, 0.0 }, { 0.3, 0.2, 1 }, 0.005 },
+		{ "60 kpc drift 0.1", Far, { 0.0, 40.0, -45.0 }, { 0.1 * Kpc, 0.0, 0.0 }, { 0, 0, 1 }, 0.0 },
+	};
+	const int Rw = std::getenv("UNI_SLIDE_W") ? std::atoi(std::getenv("UNI_SLIDE_W")) : 160;
+	const int Rh = Rw * 5 / 8;
+	struct FNamed { const char* Name; FCfg C; };
+	std::vector<FNamed> Cfgs;
+	{ FCfg C; C.MaxN = 2; Cfgs.push_back({ "D-194 N=2", C }); }
+	{ FCfg C; C.MaxN = 2; C.TightPx = 0.5f; Cfgs.push_back({ "D-194 tight 0.5", C }); }
+	{ FCfg C; C.MaxN = 2; C.TightPx = 0.1f; Cfgs.push_back({ "D-194 tight 0.1", C }); }
+	{ FCfg C; C.MaxN = 2; C.MaxPx = 0.5f; Cfgs.push_back({ "D-194 no history >0.5px", C }); }
+	for (const FCase& Cs : Cases)
+	{
+		for (const FNamed& N : Cfgs)
+		{
+			const FSlide S = FlyCfg(D, Cs.Cam, Cs.Look, Cs.Step, Cs.Axis, Cs.Turn, 18, 8, Rw, Rh, N.C);
+			std::printf("  %-22s %-20s error %6.2f%% p95 %6.1f%% crawl %6.2f%% light %5.2f%%\n", Cs.Name, N.Name, 100.0 * S.Error, 100.0 * S.P95, 100.0 * S.Crawl, 100.0 * S.Light);
+			std::fflush(stdout);
+		}
+	}
+	Uni::Check(2, "T2.vol.slide_x", "exploration").Pass(true, "");
+}

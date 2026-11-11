@@ -101,12 +101,12 @@ struct FUniVolumeView
 	uint4 GlowMask;
 	uint GlowBase;          // float4 index of the first grid header in the LUT buffer
 	uint GlowLevels;        // set bits in GlowMask (0: no cell glow)
-	uint MarchFlags;        // D-206: bit 0: no shared web texel reads (checks only)
+	uint MarchFlags;        // D-206: bit 0: no shared web texel reads (checks only); D-219: bit 1: every step an eighth (the checks' fine reference)
 	uint GalaxyConstBase;   // D-210: params index of the galaxy constant blocks (one per parameter block, Uni_GalaxyConstPack); 0: hash inline
 	// D-212: the galaxy map (Uni_GalaxyMapEval): the camera's own galaxy from its baked 2D map.
 	uint MapCarrier;        // the mapped carrier's index + 1 (0: none)
 	uint MapSize;           // texels a side of its mip 0
-	uint MapPad0;
+	uint MapSlot;           // D-214: its slot in the map array
 	uint MapPad1;
 };
 
@@ -434,6 +434,7 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 	float3 B = float3(0.0f, 0.0f, 0.0f);
 	float DepthW = 0.0f, DepthWL = 0.0f;   // D-184
 	bool bDone = false;
+	const float RefDiv = (InView.MarchFlags & 2u) != 0u ? 0.125f : 1.0f;   // D-219: the checks' fine reference
 	UNI_LOOP
 	for (uint Step = 0u; Step < InView.MaxSteps; ++Step)
 	{
@@ -467,7 +468,7 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 			T = Next;   // a gap between intervals: nothing to integrate
 			continue;
 		}
-		float S = min(max(Ratio * T, InView.MinStepCm), Hint);
+		float S = min(max(Ratio * T, InView.MinStepCm), Hint) * RefDiv;
 		S = max(min(S, Next - T), 1.0e-6f * T);
 		const float Tm = T + 0.5f * S;
 
@@ -513,7 +514,7 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 			if (bMapped)
 			{
 				float Rm = 0.0f;
-				Uni_GalaxyMapEval(P, Par, InParams[Ca.DustParamIndex], (Ca.Flags & UNI_CARRIER_DUST) != 0u, GK, FootS, (float)InView.MapSize, Rm, RdPair, Comp);
+				Uni_GalaxyMapEval(P, Par, InParams[Ca.DustParamIndex], (Ca.Flags & UNI_CARRIER_DUST) != 0u, GK, FootS, (float)InView.MapSize, InView.MapSlot, Rm, RdPair, Comp);
 				Rho = Rm + (Ca.MeanDensity - Rm) * Blend;
 			}
 			else if (bPair)
@@ -813,6 +814,13 @@ UNI_FN bool Uni_TemporalAccept(float InHist, float InLo, float InHi)
 
 /** D-194: how far a reconstructed pixel's light moved since the previous frame, in march-grid
  *  pixels (from where the history has it to this pixel's centre): the reprojection's motion. */
+/** D-215: a pixel position on a grid of InFrom pixels mapped to the same direction's position on
+ *  a grid of InTo (the history kept across a resize of the march). */
+UNI_FN float2 Uni_TemporalToGrid(float2 InPx, float2 InFrom, float2 InTo)
+{
+	return float2(InPx.x * InTo.x / max(InFrom.x, 1.0f), InPx.y * InTo.y / max(InFrom.y, 1.0f));
+}
+
 UNI_FN float Uni_TemporalMotionPx(float2 InPrevPx, uint2 InPx)
 {
 	const float Dx = InPrevPx.x - ((float)InPx.x + 0.5f), Dy = InPrevPx.y - ((float)InPx.y + 0.5f);

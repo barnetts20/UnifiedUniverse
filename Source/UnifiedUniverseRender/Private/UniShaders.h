@@ -23,7 +23,7 @@ namespace UniGpuLayout
 {
 	inline constexpr uint32 ObjectBytes = sizeof(UniCore::FObjectGPU);          // 32
 	inline constexpr uint32 TaskBytes = sizeof(UniCore::FGenTaskGPU);           // 272 (D-153 sampling box, D-178 field params 128)
-	inline constexpr uint32 TaskCountBytes = sizeof(UniCore::FTaskCountGPU);    // 16
+	inline constexpr uint32 TaskCountBytes = sizeof(UniCore::FTaskCountGPU);    // 48 (D-214)
 	inline constexpr uint32 SliceBytes = sizeof(UniCore::FSliceGPU);            // 64
 	inline constexpr uint32 CellBytes = sizeof(UniCore::FCellGPU);              // 64
 	inline constexpr uint32 SpriteBytes = 64;                                   // FUniSprite in UniProject.ush (D-156: + halo)
@@ -82,6 +82,7 @@ public:
 		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalWarpFine)    // D-179 (UniWebTexture.ush)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalWarpLarge)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalDetail)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float4>, UniGalMap)   // D-214: galaxies place from their maps
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
@@ -92,28 +93,30 @@ public:
 	}
 };
 
-class FUniGenPlaceCS : public FGlobalShader
+/** D-214: the split place pass, EVAL (UniGen.usf pass 1): one group per chunk of candidates. */
+class FUniGenEvalCS : public FGlobalShader
 {
 public:
-	DECLARE_GLOBAL_SHADER(FUniGenPlaceCS);
-	SHADER_USE_PARAMETER_STRUCT(FUniGenPlaceCS, FGlobalShader);
+	DECLARE_GLOBAL_SHADER(FUniGenEvalCS);
+	SHADER_USE_PARAMETER_STRUCT(FUniGenEvalCS, FGlobalShader);
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FUniGenTask>, InTasks)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FUniTaskCount>, InCounts)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FUniSlice>, InSlices)
-		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, InLut)
-		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<FUniObject>, OutPool)
-		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutAccepted)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint4>, InPlan)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InPlanTotal)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint4>, InAlloc)   // D-207: with UseAlloc (one-trip batches)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutChunkMask)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutChunkCount)
 		SHADER_PARAMETER(uint32, UseAlloc)
 		SHADER_PARAMETER(uint32, NumTasks)
 		SHADER_PARAMETER(uint32, DispatchGroupsX)
-		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniWebTexture)   // D-164
+		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniWebTexture)
 		SHADER_PARAMETER_SAMPLER(SamplerState, UniWebSampler)
-		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalWarpFine)    // D-179 (UniWebTexture.ush)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalWarpFine)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalWarpLarge)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalDetail)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float4>, UniGalMap)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
@@ -124,8 +127,69 @@ public:
 	}
 };
 
-/** Scatters authored records (anchors) into the pool: OutPool[Index[i]] = Record[i]. */
-/** D-207 (B-020): a one-trip batch's allocation (UniGen.usf pass 3). */
+/** D-214: SCAN (pass 4): one thread per task, each chunk's accepted count before it. */
+class FUniGenScanCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FUniGenScanCS);
+	SHADER_USE_PARAMETER_STRUCT(FUniGenScanCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint4>, InPlan)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InChunkCount)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutChunkPrefix)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutAccepted)
+		SHADER_PARAMETER(uint32, NumTasks)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& P, FShaderCompilerEnvironment& Env)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(P, Env);
+		Env.SetDefine(TEXT("UNI_GEN_PASS"), 4);
+	}
+};
+
+/** D-214: WRITE (pass 5): one group per chunk: ranks, records, a task's tail and blanks. */
+class FUniGenWriteCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FUniGenWriteCS);
+	SHADER_USE_PARAMETER_STRUCT(FUniGenWriteCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FUniGenTask>, InTasks)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FUniTaskCount>, InCounts)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint4>, InPlan)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InPlanTotal)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint4>, InAlloc)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FUniSlice>, InSlices)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, InLut)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InChunkMask)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InChunkCount)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InChunkPrefix)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<FUniObject>, OutPool)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutAccepted)
+		SHADER_PARAMETER(uint32, UseAlloc)
+		SHADER_PARAMETER(uint32, NumTasks)
+		SHADER_PARAMETER(uint32, DispatchGroupsX)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniWebTexture)
+		SHADER_PARAMETER_SAMPLER(SamplerState, UniWebSampler)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalWarpFine)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalWarpLarge)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalDetail)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float4>, UniGalMap)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& P, FShaderCompilerEnvironment& Env)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(P, Env);
+		Env.SetDefine(TEXT("UNI_GEN_PASS"), 5);
+	}
+};
+
+/** D-207 / D-214: ALLOC (pass 3), one thread: pool ranges and plans of a one-trip batch. */
 class FUniGenAllocCS : public FGlobalShader
 {
 public:
@@ -136,11 +200,15 @@ public:
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FUniGenTask>, InTasks)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FUniTaskCount>, InCounts)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint4>, OutAlloc)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint4>, OutPlan)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutPlanTotal)
 		SHADER_PARAMETER(uint32, NumTasks)
 		SHADER_PARAMETER(uint32, DispatchGroupsX)
 		SHADER_PARAMETER(uint32, ArenaBase)
 		SHADER_PARAMETER(uint32, ArenaCap)
 		SHADER_PARAMETER(uint32, MaxPerCell)
+		SHADER_PARAMETER(uint32, CandidateCap)
+		SHADER_PARAMETER(uint32, ChunkCap)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
@@ -151,6 +219,7 @@ public:
 	}
 };
 
+/** Scatters authored records (anchors) into the pool: OutPool[Index[i]] = Record[i]. */
 class FUniScatterCS : public FGlobalShader
 {
 public:
@@ -304,7 +373,7 @@ BEGIN_SHADER_PARAMETER_STRUCT(FUniVolumeCommonParameters, )
 	SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalWarpFine)    // D-179
 	SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalWarpLarge)
 	SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalDetail)
-	SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float4>, UniGalMap)       // D-212
+	SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float4>, UniGalMap)  // D-212; D-214: one slot per galaxy
 END_SHADER_PARAMETER_STRUCT()
 
 /** D-212: the galaxy map's GPU bake (UNI_VOL_PASS 5): rows of mip 0, then 2 x 2 mip means. */
@@ -320,7 +389,8 @@ public:
 		SHADER_PARAMETER(uint32, MapRow0)
 		SHADER_PARAMETER(uint32, MapRows)
 		SHADER_PARAMETER(uint32, bMapDust)
-		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutMap)
+		SHADER_PARAMETER(uint32, MapSlot)   // D-214: the array slot baked
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float4>, OutMap)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
@@ -339,8 +409,9 @@ public:
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER(uint32, MapSize)
-		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<float4>, InMapMip)
-		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutMap)
+		SHADER_PARAMETER(uint32, MapSlot)   // D-214
+		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2DArray<float4>, InMapMip)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float4>, OutMap)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
@@ -399,6 +470,7 @@ public:
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneDepthTexture)
 		SHADER_PARAMETER_SAMPLER(SamplerState, SceneDepthSampler)
 		SHADER_PARAMETER(FUintVector2, MarchSize)
+		SHADER_PARAMETER(FUintVector2, HistSize)   // D-215: the history's size (kept across a resize)
 		SHADER_PARAMETER(FVector3f, PrevForward)
 		SHADER_PARAMETER(float, PrevTanX)
 		SHADER_PARAMETER(FVector3f, PrevRight)

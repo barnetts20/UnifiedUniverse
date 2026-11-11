@@ -864,7 +864,7 @@ UNI_TEST(webtex, travel)
 			if (std::getenv("UNI_TRAVEL_DUMP") && Ms > 25.0)
 			{
 				std::printf("    %s frame %d (%.2g Mpc/s, +%.2f mag): %.1f ms bookkeeping, gen %.1f |", K ? "lazy" : "eager", Fr, Speed / Units::Mpc, S.DeltaMag, Ms, Be.GenMs);
-				for (int P = 0; P < int(EStreamPhase::Count); ++P) { if (S.Profile.Ms[P] > 0.5) { std::printf(" %s %.1f", StreamPhaseName(EStreamPhase(P)) + 11, S.Profile.Ms[P]); } }
+				for (int P = 0; P < int(EStreamPhase::Count); ++P) { if (S.Profile.Ms[P] > 0.5) { std::printf(" %s %.1f", StreamPhaseShortName(EStreamPhase(P)), S.Profile.Ms[P]); } }
 				std::printf(" | Submit-own %.1f Batches-own %.1f deferred %u", S.Profile.Ms[int(EStreamPhase::Submit)] - S.Profile.Ms[int(EStreamPhase::Backend)], S.Profile.Ms[int(EStreamPhase::Batches)] - S.Profile.Ms[int(EStreamPhase::BackendPlace)], unsigned(S.Profile.CellsDeferred));
 				std::printf(" | woke %u slept %u awake %u, +%u -%u, cells %u\n", unsigned(S.Profile.Woken), unsigned(S.Profile.Slept), unsigned(S.Profile.Awake), unsigned(S.Profile.ContributorsAdded), unsigned(S.Profile.ContributorsRemoved), unsigned(S.Profile.CellsSubmitted));
 			}

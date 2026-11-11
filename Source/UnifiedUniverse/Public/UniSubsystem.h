@@ -108,6 +108,8 @@ class UNIFIEDUNIVERSE_API UUniSubsystem : public UWorldSubsystem, public FTickab
 public:
 	virtual void Initialize(FSubsystemCollectionBase& Collection) override;
 	virtual void Deinitialize() override;
+	/** D-216: play begins with the universe on (uu.AutoStart) and in free flight (uu.AutoFly). */
+	virtual void OnWorldBeginPlay(UWorld& InWorld) override;
 	virtual bool ShouldCreateSubsystem(UObject* Outer) const override;
 
 	// FTickableGameObject
@@ -292,13 +294,12 @@ private:
 	// Travel sensitivity (D-154): the owner's sensitivity plus a speed-driven boost
 	UniCore::FTravelSensitivity Warp;   // D-187: the same curve, 0..1, for the warp effects
 	UniCore::FVolumeAutoBudget VolumeBudget;   // D-200: the glow's pixel budget follows the GPU frame time
-	// D-212: the camera's own galaxy's map: the request the GPU bakes (uu.GalaxyMap).
-	uint32 GalaxyMapEpoch = 0, GalaxyMapSerial = 0, GalaxyMapSize = 0;
-	UniCore::FObjectId GalaxyMapId;
-	UniCore::FFieldParamsGPU GalaxyMapParams[2] = {};
-	bool bGalaxyMapDust = false;
-	double GalaxyMapStart = 0.0, GalaxyMapBakeMs = 0.0;
-	uint64 GalaxyMapBakes = 0;
+	// D-212 / D-214: the galaxy maps (a cache of GPU array slots): generation places a galaxy's
+	// stars from its map, the volume marches the camera's galaxy from it (uu.GalaxyMap).
+	UniCore::FGalaxyMapCache GalaxyMaps;
+	int32 GalaxyMapVolumeSlot = -1;          // the camera's galaxy's slot last frame (-1: none)
+	uint64 GalaxyMapBakesSeen = 0;           // maps baked (MarkBaked accepted), for uu.Perf
+	uint32 GalaxyMapEpochSeen[16] = {};
 	UniCore::FMoteScale MoteScale;      // D-192: the warp motes' lattice scale (follows the speed)
 	float EffectiveDeltaMag = 0.0f;
 	/** D-205: magnitudes everything is brightened by at speed (uu.TravelExposure x the travel curve). */
@@ -427,6 +428,8 @@ private:
 
 	// Free flight and latched cruise (test controls)
 	bool bFreeFly = false;
+	bool bAutoFlyPending = false;   // D-216: free flight once the player's pawn exists
+	double CameraSpeedCmPerS = 0.0;  // D-216: the camera's speed this frame (the sky light refreshes below uu.SkyLightMaxSpeed)
 	bool bCruiseLatched = false;
 	double FlySpeed = 1.0e5;   // 1 km/s
 	void DrawHud(double Speed) const;

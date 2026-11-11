@@ -72,16 +72,33 @@ namespace UniCore
 		// counts come back (FuseAllocate gives the same ranges on both sides).
 		bool bFused = false;
 		u32 ArenaBase = 0, ArenaCap = 0, MaxPerCell = 0;
+		u64 CandidateCap = 0;   // D-214: the batch's cap on planned candidates (0: none)
+		u32 ChunkCap = 0xFFFFFFFFu;   // D-214: chunks the backend's split place pass holds
 	};
 
-	/** D-207: one task's range in a one-trip batch. */
+	/** D-207: one task's range in a one-trip batch. D-214: and its share of the split place pass
+	 *  (chunks of UNI_GEN_CHUNK candidates from ChunkBase; Plan candidates evaluated up front). */
 	struct FFusedSlot
 	{
 		u32 PoolBase = 0;
 		u32 Capacity = 0;
 		u32 IndexBase = 0;
 		bool bFits = false;
+		bool bDeferred = false;     // D-214: its cell fit but went past the batch's candidate cap: nothing written, retried
+		u32 Plan = 0;
+		u32 ChunkBase = 0;
+		u32 Chunks = 0;
 	};
+
+	/** D-214: the CPU side of Uni_PlanCandidates for a task of capacity InCap. */
+	inline u32 PlanCandidatesOf(u32 InCap, const FTaskCountGPU& C)
+	{
+		UniHlsl::FUniTaskCount H;
+		H.Count = C.Count; H.CandidateBudget = C.CandidateBudget; H.Mean = C.Mean; H.Envelope = C.Envelope;
+		H.OctLo = UniHlsl::float4(C.Oct[0], C.Oct[1], C.Oct[2], C.Oct[3]);
+		H.OctHi = UniHlsl::float4(C.Oct[4], C.Oct[5], C.Oct[6], C.Oct[7]);
+		return UniHlsl::Uni_PlanCandidates(InCap, H);
+	}
 
 	/** D-207 (B-020): the one-trip allocation, the same rule as UniGen.usf's ALLOC pass (pass 3).
 	 *  Cells (runs of tasks with the same ordinal) in order: each task's capacity is its count,
@@ -89,37 +106,60 @@ namespace UniCore
 	 *  running sum of the capacities before it in the cell (as the two-trip allocation, D-122). A
 	 *  cell whose total fits in the arena's remaining room is packed at the cursor; one that does
 	 *  not gets capacity 0 everywhere (written nothing) and the next cells still try. Returns the
-	 *  arena slots used. */
-	inline u32 FuseAllocate(const std::vector<FGenTaskGPU>& Tasks, const std::vector<FTaskCountGPU>& Counts, u32 ArenaBase, u32 ArenaCap, u32 MaxPerCell, std::vector<FFusedSlot>& Out)
+	 *  arena slots used.
+	 *  D-214: a cell must also fit in the split place pass's ChunkCap chunks (else it does not fit:
+	 *  two trips); and once the batch's planned candidates pass CandidateCap (0: none), a later
+	 *  cell that would add to them is deferred (capacity 0, retried next frame; the first cell
+	 *  always goes, so a cell bigger than the cap still gets built). Cells come in priority
+	 *  order, so the cap keeps the most needed ones. */
+	inline u32 FuseAllocate(const std::vector<FGenTaskGPU>& Tasks, const std::vector<FTaskCountGPU>& Counts, u32 ArenaBase, u32 ArenaCap, u32 MaxPerCell,
+		u64 CandidateCap, u32 ChunkCap, std::vector<FFusedSlot>& Out, u64* OutPlanned = nullptr)
 	{
 		Out.assign(Tasks.size(), FFusedSlot{});
 		u32 Cursor = 0;
+		u32 ChunkCursor = 0;
+		u64 Planned = 0;
 		size_t I = 0;
 		while (I < Tasks.size())
 		{
 			const u32 Cell = Tasks[I].BoxLo[3];
 			size_t J = I;
 			u32 Index = 0;
+			u64 CellPlan = 0;
+			u32 CellChunks = 0;
 			for (; J < Tasks.size() && Tasks[J].BoxLo[3] == Cell; ++J)
 			{
 				const u32 Room = Index < MaxPerCell ? MaxPerCell - Index : 0u;
-				Index += std::min(J < Counts.size() ? Counts[J].Count : 0u, Room);
+				const u32 Cap = std::min(J < Counts.size() ? Counts[J].Count : 0u, Room);
+				Index += Cap;
+				const u32 Pl = J < Counts.size() ? PlanCandidatesOf(Cap, Counts[J]) : 0u;
+				CellPlan += Pl;
+				CellChunks += UniHlsl::Uni_PlanChunks(Pl);
 			}
-			const bool bFits = Index <= ArenaCap - Cursor;
+			const bool bFits = Index <= ArenaCap - Cursor && CellChunks <= ChunkCap - ChunkCursor;
+			const bool bDeferred = bFits && CandidateCap > 0u && Planned > 0u && Planned + CellPlan > CandidateCap;
+			const bool bPack = bFits && !bDeferred;
 			u32 Idx = 0;
+			u32 Ch = ChunkCursor;
 			for (size_t K = I; K < J; ++K)
 			{
 				const u32 Room = Idx < MaxPerCell ? MaxPerCell - Idx : 0u;
 				const u32 Cap = std::min(K < Counts.size() ? Counts[K].Count : 0u, Room);
 				Out[K].IndexBase = Idx;
 				Out[K].bFits = bFits;
-				Out[K].PoolBase = bFits ? ArenaBase + Cursor + Idx : ArenaBase;
-				Out[K].Capacity = bFits ? Cap : 0u;
+				Out[K].bDeferred = bDeferred;
+				Out[K].PoolBase = bPack ? ArenaBase + Cursor + Idx : ArenaBase;
+				Out[K].Capacity = bPack ? Cap : 0u;
+				Out[K].Plan = bPack && K < Counts.size() ? PlanCandidatesOf(Cap, Counts[K]) : 0u;
+				Out[K].ChunkBase = Ch;
+				Out[K].Chunks = UniHlsl::Uni_PlanChunks(Out[K].Plan);
+				Ch += Out[K].Chunks;
 				Idx += Cap;
 			}
-			if (bFits) { Cursor += Index; }
+			if (bPack) { Cursor += Index; ChunkCursor = Ch; Planned += CellPlan; }
 			I = J;
 		}
+		if (OutPlanned) { *OutPlanned = Planned; }
 		return Cursor;
 	}
 
@@ -180,7 +220,7 @@ namespace UniCore
 		{
 			SubmitProbe(B);
 			std::vector<FFusedSlot> Sl;
-			FuseAllocate(B->Tasks, B->Counts, B->ArenaBase, B->ArenaCap, B->MaxPerCell, Sl);
+			FuseAllocate(B->Tasks, B->Counts, B->ArenaBase, B->ArenaCap, B->MaxPerCell, B->CandidateCap, B->ChunkCap, Sl);
 			B->Accepted.assign(B->Tasks.size(), 0u);
 			for (size_t I = 0; I < B->Tasks.size(); ++I)
 			{
@@ -281,6 +321,7 @@ namespace UniCore
 			u64 ReadyAt = 0;                         // D-203: frame it last became Ready (its sprites fade in from it)
 			u32 FuseOrdinal = 0;                     // D-207: its ordinal in a one-trip batch
 			bool bNoFuse = false;                    // D-207: overflowed its arena once: two trips from now on
+			u32 SubmitRank = 0;                      // D-214: its place in this frame's build order (the one-trip batch packs in it)
 			u32 Generation = 0;                      // D-193: times it has become Ready (a readback naming an older one is stale)
 		};
 
@@ -402,6 +443,27 @@ namespace UniCore
 		double OneTripArenaShare = 0.25;   // most of the pool one batch's arena may take
 		double OneTripFirstEstimate = 2048.0;   // a level's arena per cell before it has a cell to go by
 		u64 FusedCells = 0, FusedOverflows = 0, FusedBatches = 0;
+		/** D-214: at most this many candidates (galaxy stars and every other one-trip cell's) are
+		 *  evaluated up front by a frame's one-trip batch; cells past it wait for the next frame
+		 *  (glow meanwhile), the most needed first (0: no cap). The hard limit on a frame's
+		 *  generation work, enforced on the backend with the real counts (FuseAllocate). */
+		u64 FrameCandidateCap = 0;
+		/** D-214: chunks of UNI_GEN_CHUNK candidates the backend's split place pass holds per batch. */
+		u32 GenChunkCap = 0xFFFFFFFFu;
+		u64 FusedDeferred = 0, MapWaits = 0;
+		/** D-215: candidates the one-trip batches planned up front (what the GPU evaluated first):
+		 *  summed, and the largest batch, since ResetGenStats. */
+		u64 FusedPlannedSum = 0, FusedPlannedMax = 0, FusedPlannedBatches = 0;
+		void ResetGenStats() { FusedPlannedSum = 0; FusedPlannedMax = 0; FusedPlannedBatches = 0; }
+		/** D-214: build cells in view first (after the cells finer levels wait on, before the rest):
+		 *  ViewDir (unit, world axes) and the cosine of the view's half angle (with margin). Off,
+		 *  or ViewCos below -1: every cell counts as in view. */
+		bool bViewPriority = false;
+		FVec3d ViewDir{ 1.0, 0.0, 0.0 };
+		double ViewCos = -2.0;
+		/** D-214: tick the generator's map cache (Gen.Maps) once per Update: offline, where nobody
+		 *  else owns it. The engine's subsystem ticks it. */
+		bool bTickMaps = false;
 		u64 TripFramesSum = 0, TripCells = 0;   // D-207: frames from submission to Ready, summed over generated cells
 
 		/** D-140: compute normalising integrals on worker threads (runtime). Offline checks that
@@ -442,6 +504,7 @@ namespace UniCore
 		/** One frame. Window bookkeeping, then the generation protocol advanced by one step. */
 		void Update(const FCoord& Coord)
 		{
+			if (bTickMaps && Gen.Maps) { Gen.Maps->Tick(); }   // D-214
 			Profile.BeginFrame();
 			FProfileScope ScopeUpdate(Profile, EStreamPhase::Update);
 			Readied.clear();
@@ -617,6 +680,7 @@ namespace UniCore
 				for (auto& KV : Lv.Cells) { ++KV.second.Frames; }
 			}
 			if (!FrameBuilds.empty()) { FProfileScope S(Profile, EStreamPhase::Submit); SubmitBudgeted(); }
+			if (!PendingFuse.empty()) { FProfileScope S(Profile, EStreamPhase::Submit); FlushFused(); }   // D-214: one one-trip batch a frame
 			bFirstFrame = false;
 		}
 
@@ -1240,6 +1304,22 @@ namespace UniCore
 		};
 		std::vector<FFrameBuild> FrameBuilds;
 
+		/** D-214: is cell K (width W) in the view cone, its bounding sphere counted? */
+		bool InView(const FCellKey& K, double W) const
+		{
+			if (!bViewPriority || ViewCos < -1.0) { return true; }
+			const FVec3d O = ToDouble(Sub(CellOrigin(K), Camera));
+			const FVec3d C{ O.X + 0.5 * W, O.Y + 0.5 * W, O.Z + 0.5 * W };
+			const double D = Length(C);
+			const double Rad = 0.8660254037844386 * W;
+			if (D <= Rad) { return true; }
+			const double Cos = (C.X * ViewDir.X + C.Y * ViewDir.Y + C.Z * ViewDir.Z) / D;
+			// cos(a - r) >= ViewCos, a the angle to the centre, r the sphere's angular radius.
+			const double SinR = Rad / D, CosR = std::sqrt(std::max(0.0, 1.0 - SinR * SinR));
+			const double SinA = std::sqrt(std::max(0.0, 1.0 - Cos * Cos));
+			return Cos * CosR + SinA * SinR >= ViewCos;
+		}
+
 		/** D-203: build at most BuildBudget cells this frame over every level. A waiting cell's slack
 		 *  is D-173's (frames until the camera brings it inside the visible radius at this frame's
 		 *  speed; 0 inside it); a cell a finer level's parent gate waits on comes first. Ties: the
@@ -1247,7 +1327,8 @@ namespace UniCore
 		 *  stay Waiting, drawn as glow (CellGlow). Regenerated cells always go (they were drawn). */
 		void SubmitBudgeted()
 		{
-			struct FCand { double Slack; int64_t Jump; int Level; size_t Fb; FCell* C; };
+			struct FCand { int Class; double Slack; int64_t Jump; int Level; size_t Fb; FCell* C; };
+			const double Urgent = LatencyEst + SubmitSlackFrames;
 			std::vector<FCand> Cands;
 			size_t Forced = 0;
 			const double SensScale = double(UniHlsl::Uni_SensitivityScale(float(DeltaMag)));
@@ -1278,19 +1359,26 @@ namespace UniCore
 						const double LenOp = Length(Op);
 						for (const FParentReach& Pr : Children) { if (Pr.Reaches(Op, LenOp)) { Slack = -1.0; break; } }
 					}
-					Cands.push_back({ Slack, Jump, G.Level, I, C });
+					// D-214: classes: cells a finer level waits on, needed within the latency, the
+					// rest; in each, those in view first. Within a class the least slack, then the
+					// nearest (Chebyshev cells: the largest on screen), coarser levels first.
+					const bool bView = InView(C->Key, W);
+					const int Class = (Slack < 0.0 ? 0 : (Slack <= Urgent ? 2 : 4)) + (bView ? 0 : 1);
+					Cands.push_back({ Class, Slack, Jump, G.Level, I, C });
 				}
 			}
 			std::stable_sort(Cands.begin(), Cands.end(), [](const FCand& A, const FCand& B)
 			{
+				if (A.Class != B.Class) { return A.Class < B.Class; }
 				if (A.Slack != B.Slack) { return A.Slack < B.Slack; }
 				if (A.Jump != B.Jump) { return A.Jump < B.Jump; }
 				return A.Level > B.Level;
 			});
+			for (FFrameBuild& Fb : FrameBuilds) { for (FCell* C : Fb.Regenerated) { C->SubmitRank = 0u; } }   // they were drawn: first
 			const size_t Room = size_t(BuildBudget) > Forced ? size_t(BuildBudget) - Forced : 0u;
 			for (size_t I = 0; I < Cands.size(); ++I)
 			{
-				if (I < Room) { FrameBuilds[Cands[I].Fb].Chosen.push_back(Cands[I].C); continue; }
+				if (I < Room) { Cands[I].C->SubmitRank = u32(I + 1u); FrameBuilds[Cands[I].Fb].Chosen.push_back(Cands[I].C); continue; }
 				++Cands[I].C->DeferredFrames;
 				++Profile.CellsDeferred;
 			}
@@ -1391,16 +1479,25 @@ namespace UniCore
 				std::sort(Mine.begin(), Mine.end(), [](const FContributor* A, const FContributor* Bc) { return A->Id != Bc->Id ? A->Id < Bc->Id : A->EmitterIndex < Bc->EmitterIndex; });
 				C->ContributorSet.clear(); C->Tasks.clear(); C->TaskContributor.clear(); C->BatchTaskIndex.clear();
 				bool bLeaf = true;
+				bool bMaps = true;
 				for (const FContributor* Ct : Mine)
 				{
 					C->ContributorSet.push_back(Ct->Id);
 					FGenTaskGPU T;
 					if (!Gen.BuildTask(*Ct, C->Key, T)) { continue; }
+					bMaps = Gen.ResolveMap(T, *Ct) && bMaps;   // D-214: a galaxy's stars wait for its map
 					bLeaf = bLeaf && Def.Arch(T.ChildArchetypeId).Emitters.empty();
 					C->Tasks.push_back(T);
 					C->TaskContributor.push_back(Ct->Id);
 				}
 				std::sort(C->ContributorSet.begin(), C->ContributorSet.end());
+				if (!bMaps)
+				{
+					// Waiting (glow) until the maps are baked; requested above.
+					C->ContributorSet.clear(); C->Tasks.clear(); C->TaskContributor.clear();
+					++MapWaits;
+					continue;
+				}
 				// A cell with neither tasks nor anchors is empty and Ready at once. A cell with
 				// anchors but no tasks still goes through the batch, so its anchors are allocated,
 				// uploaded and registered like everything else.
@@ -1416,8 +1513,30 @@ namespace UniCore
 				// D-207: leaf cells without authored objects go one trip.
 				((bFuseOk && bLeaf && !bHasAnchor && !C->bNoFuse) ? Fuse : Two).push_back(C);
 			}
-			// D-207: the one-trip arena, from each level's largest recent cell; what does not fit
-			// in the share of the pool a batch may take goes two-trip.
+			// D-214: one-trip cells wait for the frame's one batch (FlushFused), in build order.
+			for (FCell* C : Fuse) { PendingFuse.push_back(C); }
+			Fuse.clear();
+			if (!Two.empty())
+			{
+				auto B = std::make_shared<FGenBatch>();
+				B->Ticket = ++NextTicket;
+				for (FCell* C : Two) { C->Batch = B; JoinBatch(*B, C, ECellState::Probing, 0u); }
+				{ FProfileScope S(Profile, EStreamPhase::Backend); Backend.SubmitProbe(B); }
+				Inflight.push_back(B);
+				++BatchesSubmitted;
+			}
+		}
+
+		/** D-214: the frame's one-trip cells as one batch, in build order (SubmitRank, then the
+		 *  order they came in). The arena, from each level's largest recent cell; what does not fit
+		 *  in the share of the pool a batch may take goes two-trip. */
+		std::vector<FCell*> PendingFuse;
+		void FlushFused()
+		{
+			std::vector<FCell*> Fuse = std::move(PendingFuse);
+			PendingFuse.clear();
+			std::stable_sort(Fuse.begin(), Fuse.end(), [](const FCell* A, const FCell* B) { return A->SubmitRank < B->SubmitRank; });
+			std::vector<FCell*> Two;
 			u32 ArenaBase = 0, ArenaCap = 0;
 			if (!Fuse.empty())
 			{
@@ -1440,26 +1559,11 @@ namespace UniCore
 					ArenaCap = 0;
 				}
 			}
-			auto Join = [&](FGenBatch& B, FCell* C, ECellState State, u32 Ordinal)
-			{
-				for (FGenTaskGPU& T : C->Tasks)
-				{
-					if (State == ECellState::Fusing) { T.BoxLo[3] = Ordinal; }
-					C->BatchTaskIndex.push_back(B.Tasks.size());
-					B.Tasks.push_back(T);
-				}
-				B.CellKeys.push_back(C->Key);
-				C->FuseOrdinal = Ordinal;
-				C->State = State;
-				C->SubmittedAt = FrameNo;
-				++Profile.CellsSubmitted;
-				Profile.TasksSubmitted += C->Tasks.size();
-			};
 			if (!Two.empty())
 			{
 				auto B = std::make_shared<FGenBatch>();
 				B->Ticket = ++NextTicket;
-				for (FCell* C : Two) { C->Batch = B; Join(*B, C, ECellState::Probing, 0u); }
+				for (FCell* C : Two) { C->Batch = B; JoinBatch(*B, C, ECellState::Probing, 0u); }
 				{ FProfileScope S(Profile, EStreamPhase::Backend); Backend.SubmitProbe(B); }
 				Inflight.push_back(B);
 				++BatchesSubmitted;
@@ -1472,12 +1576,31 @@ namespace UniCore
 				B->ArenaBase = ArenaBase;
 				B->ArenaCap = ArenaCap;
 				B->MaxPerCell = Gen.MaxPerCell;
-				for (size_t I = 0; I < Fuse.size(); ++I) { Fuse[I]->Batch = B; Join(*B, Fuse[I], ECellState::Fusing, u32(I)); }
+				B->CandidateCap = FrameCandidateCap;
+				B->ChunkCap = GenChunkCap;
+				for (size_t I = 0; I < Fuse.size(); ++I) { Fuse[I]->Batch = B; JoinBatch(*B, Fuse[I], ECellState::Fusing, u32(I)); }
 				{ FProfileScope S(Profile, EStreamPhase::Backend); Backend.SubmitFused(B); }
 				Inflight.push_back(B);
 				++BatchesSubmitted;
 				++FusedBatches;
 			}
+			for (FCell* C : Fuse) { C->SubmitRank = 0u; }
+		}
+
+		void JoinBatch(FGenBatch& B, FCell* C, ECellState State, u32 Ordinal)
+		{
+			for (FGenTaskGPU& T : C->Tasks)
+			{
+				if (State == ECellState::Fusing) { T.BoxLo[3] = Ordinal; }
+				C->BatchTaskIndex.push_back(B.Tasks.size());
+				B.Tasks.push_back(T);
+			}
+			B.CellKeys.push_back(C->Key);
+			C->FuseOrdinal = Ordinal;
+			C->State = State;
+			C->SubmittedAt = FrameNo;
+			++Profile.CellsSubmitted;
+			Profile.TasksSubmitted += C->Tasks.size();
 		}
 
 		/** D-207: the arena a one-trip cell of level L is given: 1.5 x the level's largest recent
@@ -1673,7 +1796,9 @@ namespace UniCore
 		void AdvanceFused(const std::shared_ptr<FGenBatch>& B, const std::vector<FCell*>& Mine)
 		{
 			std::vector<FFusedSlot> Sl;
-			const u32 Used = B->bFailed ? 0u : FuseAllocate(B->Tasks, B->Counts, B->ArenaBase, B->ArenaCap, B->MaxPerCell, Sl);
+			u64 Planned = 0;
+			const u32 Used = B->bFailed ? 0u : FuseAllocate(B->Tasks, B->Counts, B->ArenaBase, B->ArenaCap, B->MaxPerCell, B->CandidateCap, B->ChunkCap, Sl, &Planned);
+			if (!B->bFailed) { FusedPlannedSum += Planned; FusedPlannedMax = std::max(FusedPlannedMax, Planned); ++FusedPlannedBatches; }   // D-215
 			if (B->bFailed)
 			{
 				Pool.Release(B->ArenaBase, B->ArenaCap);
@@ -1682,14 +1807,15 @@ namespace UniCore
 			}
 			// Each ordinal's range, and which ones are still live.
 			std::vector<u32> Start, Total;
-			std::vector<char> Fits, Live;
+			std::vector<char> Fits, Live, Deferred;
 			for (size_t I = 0; I < B->Tasks.size(); ++I)
 			{
 				const u32 O = B->Tasks[I].BoxLo[3];
-				if (O >= Start.size()) { Start.resize(O + 1u, 0u); Total.resize(O + 1u, 0u); Fits.resize(O + 1u, 0); Live.resize(O + 1u, 0); }
+				if (O >= Start.size()) { Start.resize(O + 1u, 0u); Total.resize(O + 1u, 0u); Fits.resize(O + 1u, 0); Live.resize(O + 1u, 0); Deferred.resize(O + 1u, 0); }
 				if (Sl[I].Capacity && Total[O] == 0u) { Start[O] = Sl[I].PoolBase; }
 				Total[O] += Sl[I].Capacity;
 				Fits[O] = Sl[I].bFits ? 1 : 0;
+				Deferred[O] = Sl[I].bDeferred ? 1 : 0;
 			}
 			for (FCell* C : Mine) { if (C->State == ECellState::Fusing && C->FuseOrdinal < Live.size()) { Live[C->FuseOrdinal] = 1; } }
 			for (size_t O = 0; O < Start.size(); ++O) { if (Fits[O] && !Live[O] && Total[O]) { Pool.Release(Start[O], Total[O]); } }
@@ -1706,6 +1832,14 @@ namespace UniCore
 					CellTotal += std::min(B->Counts[Bi].Count, Room);
 				}
 				NoteCellTotal(C->Key.Level, CellTotal);
+				if (O < Deferred.size() && Deferred[O])
+				{
+					// D-214: past the frame's candidate cap: nothing was written. Next frame, one trip.
+					C->State = ECellState::Waiting;
+					C->Batch.reset();
+					++FusedDeferred;
+					continue;
+				}
 				if (O >= Fits.size() || !Fits[O])
 				{
 					// Did not fit: nothing was written. Two trips next time (its level's estimate now knows it).

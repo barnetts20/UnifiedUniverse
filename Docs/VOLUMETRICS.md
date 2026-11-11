@@ -214,6 +214,7 @@ The march's cost is rays x steps per ray x cost per step. These are the console 
 | `uu.GalaxyMap` | 1 | the galaxy the camera is in is marched from its baked 2D map (arms and modes; warp, vertical profile, bulge and detail per sample; D-212). 0: its field at every step | D-212 |
 | `uu.GalaxyMap.Size` | 1024 | the map's texels a side (power of two): 1024 ~11 MB (one frame to bake), 2048 ~43 MB (no visible difference in the engine) | D-212 |
 | `uu.GalaxyMap.Budget` | 1048576 | texels of the map the GPU bakes a frame (1024^2 in one frame, 2048^2 in 4) | D-212 |
+| `uu.GalaxyMap.Slots` | 4 | galaxy maps on the GPU at once (a texture array): every galaxy stars are placed in (D-214: placement reads the map too) and the camera's own; a galaxy past them waits as glow until a slot is unused for 64 frames | D-214 |
 | `uu.CellFadeFrames` | 8 | frames a Ready cell's sprites take to fade in (its glow fades out by the same amount) | D-203 |
 | `uu.StreamBuildBudget` | 96 | cells built per frame over every level, those needed soonest first; the rest wait as glow. 0: D-173's per-level rule | D-203 |
 | `uu.VolumeInterleave` | 4 | most pixels per side of the temporal slicing's block: 4 x 4 below 0.1 march px of motion a frame, 3 x 3 below 0.5, else 2 x 2 | D-208 |

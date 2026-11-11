@@ -172,7 +172,7 @@ bool FUniLayoutTest::RunTest(const FString&)
 	TestEqual(TEXT("FCellGPU"), int32(sizeof(UniCore::FCellGPU)), 64);
 	TestEqual(TEXT("FGenTaskGPU"), int32(sizeof(UniCore::FGenTaskGPU)), 272);   // D-178
 	TestEqual(TEXT("FSliceGPU"), int32(sizeof(UniCore::FSliceGPU)), 64);
-	TestEqual(TEXT("FTaskCountGPU"), int32(sizeof(UniCore::FTaskCountGPU)), 16);
+	TestEqual(TEXT("FTaskCountGPU"), int32(sizeof(UniCore::FTaskCountGPU)), 48);   // D-214
 	return true;
 }
 

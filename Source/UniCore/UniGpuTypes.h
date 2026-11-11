@@ -89,8 +89,9 @@ namespace UniCore
 		uint32_t CandidateBudget;
 		float Mean;
 		float Envelope;
+		float Oct[8];   // D-214: octant envelopes (galaxy fields; others: Envelope each)
 	};
-	static_assert(sizeof(FTaskCountGPU) == 16, "FTaskCountGPU must match FUniTaskCount (UniGenTask.ush)");
+	static_assert(sizeof(FTaskCountGPU) == 48, "FTaskCountGPU must match FUniTaskCount (UniGenTask.ush)");
 
 	// GPU-MIRROR
 	struct FSliceGPU

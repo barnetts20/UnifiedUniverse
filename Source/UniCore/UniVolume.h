@@ -80,11 +80,11 @@ namespace UniCore
 		u32 GlowMask[4];        // D-203: levels with cells still loading or fading in (their grids follow the LUT blocks)
 		u32 GlowBase;           // float4 index of the first grid header in the LUT buffer
 		u32 GlowLevels;         // set bits in GlowMask (0: no cell glow)
-		u32 MarchFlags;         // D-206: bit 0: no shared web texel reads (checks only)
+		u32 MarchFlags;         // D-206: bit 0: no shared web texel reads (checks only); D-219: bit 1: every step an eighth (the checks' fine reference)
 		u32 GalaxyConstBase;    // D-210: params index of the galaxy constant blocks (one per parameter block); 0: hash inline
 		u32 MapCarrier;         // D-212: the mapped carrier's index + 1 (0: none)
 		u32 MapSize;            // texels a side of the map's mip 0
-		u32 MapPad0;
+		u32 MapSlot;            // D-214: its slot in the map array
 		u32 MapPad1;
 	};
 	static_assert(sizeof(FVolumeViewGPU) == 112, "FVolumeViewGPU must match FUniVolumeView (UniVolume.ush)");

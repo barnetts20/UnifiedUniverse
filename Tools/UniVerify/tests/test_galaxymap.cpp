@@ -149,9 +149,9 @@ UNI_TEST(volume, galaxy_map)
 		{
 			FVolumeScene Sc = Sa;
 			PublishGalaxyMap(Sc.View, Sc.Home.Carrier, Sizes[K]);
-			BindGalaxyMap(&Maps[K]);
+			BindGalaxyMap(0u, &Maps[K]);
 			const FRun Cr = March(Sc, Cm);
-			BindGalaxyMap(nullptr);
+			BindGalaxyMap(0u, nullptr);
 			double Le = 0.0, P95 = 0.0;
 			Compare(Cr, A, Le, P95);
 			WorstLight[K] = std::max(WorstLight[K], std::abs(Le));

@@ -20,6 +20,7 @@
 // regenerated with the full set (D-113). Tier 2's determinism check verifies the contract.
 
 #include "UniArchetype.h"
+#include "UniGalaxyMapCache.h"
 #include "UniVol.h"
 #include "UniWindow.h"
 
@@ -378,6 +379,9 @@ namespace UniCore
 
 		/** Configurable for tests (lesson #17: config, not rolled). */
 		u32 MaxPerCell = H::UNI_MAX_GENERATED_PER_CELL;
+		/** D-214: the galaxy maps placement reads (null: galaxies placed from the field, the
+		 *  pre-D-214 placement). Not owned. */
+		FGalaxyMapCache* Maps = nullptr;
 		/** Test hook: scale every lambda (fidelity tests force large counts). 1 in production. */
 		double LambdaMultiplier = 1.0;
 
@@ -554,6 +558,21 @@ namespace UniCore
 			return true;
 		}
 
+		/** D-214: a galaxy task places from its galaxy's map: its slot in T.BoxSpan[3] (slot + 1).
+		 *  False while that map is not baked (the cell waits; the map has been requested). Other
+		 *  fields, or no map cache: the field (slot 0), true. */
+		bool ResolveMap(FGenTaskGPU& T, const FContributor& C) const
+		{
+			T.BoxSpan[3] = 0u;
+			if (!Maps || C.Emitter->FieldId != H::UNI_FIELD_GALAXY) { return true; }
+			FGalaxyMapRequest R;
+			R.Par = C.Params.Pack();
+			const int Slot = Maps->AcquireLight(R);
+			if (Slot < 0) { return false; }
+			T.BoxSpan[3] = u32(Slot) + 1u;
+			return true;
+		}
+
 		/** D-153: the part of cell K that C's influence sphere's bounding box overlaps, as in-cell
 		 *  offsets per axis, widened outward to whole 2^-32 steps; returns its volume fraction
 		 *  (0: no overlap). Span 0 = whole axis. Without bSampleBox, or for root contributors, the
@@ -614,14 +633,39 @@ namespace UniCore
 			return S;
 		}
 
+		static FTaskCountGPU CountFromHlsl(const H::FUniTaskCount& C)
+		{
+			FTaskCountGPU R;
+			R.Count = C.Count; R.CandidateBudget = C.CandidateBudget; R.Mean = C.Mean; R.Envelope = C.Envelope;
+			R.Oct[0] = C.OctLo.x; R.Oct[1] = C.OctLo.y; R.Oct[2] = C.OctLo.z; R.Oct[3] = C.OctLo.w;
+			R.Oct[4] = C.OctHi.x; R.Oct[5] = C.OctHi.y; R.Oct[6] = C.OctHi.z; R.Oct[7] = C.OctHi.w;
+			return R;
+		}
+		static H::FUniTaskCount ToHlsl(const FTaskCountGPU& C)
+		{
+			H::FUniTaskCount R;
+			R.Count = C.Count; R.CandidateBudget = C.CandidateBudget; R.Mean = C.Mean; R.Envelope = C.Envelope;
+			R.OctLo = H::float4(C.Oct[0], C.Oct[1], C.Oct[2], C.Oct[3]);
+			R.OctHi = H::float4(C.Oct[4], C.Oct[5], C.Oct[6], C.Oct[7]);
+			return R;
+		}
+
 		/** Probe phase on the CPU: the GPU's PASS 0 for one task. */
 		FTaskCountGPU RunProbe(const FGenTaskGPU& T) const
 		{
 			const H::FUniGenTask HT = ToHlsl(T);
+			const H::FUniTaskEval Ev = H::Uni_TaskEvalOf(HT);
 			float Sum = 0.0f, Max = 0.0f;
-			for (u32 K = 0; K < H::UNI_PROBES_PER_CELL; ++K) { const float V = H::Uni_TaskProbe(HT, K); Sum += V; Max = std::max(Max, V); }
-			const H::FUniTaskCount C = H::Uni_TaskCount(HT, Sum, Max);
-			return FTaskCountGPU{ C.Count, C.CandidateBudget, C.Mean, C.Envelope };
+			float Oct[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+			for (u32 K = 0; K < H::UNI_PROBES_PER_CELL; ++K)
+			{
+				const float V = H::Uni_TaskProbe(HT, Ev, K);
+				Sum += V;
+				Max = std::max(Max, V);
+				const u32 O = H::Uni_ProbeOctant(K);
+				Oct[O] = std::max(Oct[O], V);
+			}
+			return CountFromHlsl(H::Uni_TaskCount(HT, Ev, Sum, Max, H::float4(Oct[0], Oct[1], Oct[2], Oct[3]), H::float4(Oct[4], Oct[5], Oct[6], Oct[7])));
 		}
 
 		/** Place phase on the CPU: the GPU's PASS 1 for one task, candidates in index order (the
@@ -630,6 +674,8 @@ namespace UniCore
 		void RunPlace(const FGenTaskGPU& T, const FTaskCountGPU& C, std::vector<FObjectGPU>& OutRecords, FTaskStats& St) const
 		{
 			const H::FUniGenTask HT = ToHlsl(T);
+			const H::FUniTaskEval Ev = H::Uni_TaskEvalOf(HT);
+			const H::FUniTaskCount HC = ToHlsl(C);
 			const H::FUniSlice S = SliceHlsl(T.SliceIndex);
 			const std::vector<float>& L = Model.GpuLut();
 			const H::StructuredBuffer<float> Lut(L.data(), u32(L.size()));
@@ -637,14 +683,14 @@ namespace UniCore
 			u32 Accepted = 0;
 			for (u32 J = 0; Accepted < T.PoolCapacity && J < C.CandidateBudget; ++J)
 			{
-				H::uint3 Off; float Dens;
-				const bool bAcc = H::Uni_TaskCandidate(HT, C.Envelope, J, Off, Dens);
+				H::uint3 Off; float Dens, Env;
+				const bool bAcc = H::Uni_TaskCandidate(HT, Ev, HC, J, Off, Dens, Env);
 				++St.Candidates;
-				if (double(Dens) > double(C.Envelope)) { ++St.Clipped; }
+				if (double(Dens) > double(Env)) { ++St.Clipped; }
 				if (!bAcc) { continue; }
 				const u32 Local = Accepted++;
 				if (H::Uni_TaskSuppressed(HT, Off)) { continue; }          // masked: index consumed, slot stays blank
-				OutRecords[Local] = FromHlsl(H::Uni_TaskMakeObject(HT, S, Lut, Local, Off));
+				OutRecords[Local] = FromHlsl(H::Uni_TaskMakeObject(HT, Ev, S, Lut, Local, Off));
 				++St.Emitted;
 			}
 			St.Accepted = Accepted;
@@ -666,6 +712,9 @@ namespace UniCore
 				Out.ContributorSet.push_back(C->Id);
 				FGenTaskGPU T;
 				if (!BuildTask(*C, K, T)) { continue; }
+				// D-214: the reference resolves maps at once (its cache bakes synchronously); a
+				// cache that cannot (no host) leaves the galaxy on its field here.
+				if (!ResolveMap(T, *C)) { T.BoxSpan[3] = 0u; }
 				FTaskStats St;
 				St.ContributorId = C->Id;
 				const FTaskCountGPU Cnt = RunProbe(T);
@@ -1243,6 +1292,7 @@ namespace UniCore
 		 *  levels is an M2 measurement (UE). */
 		void Update(const FCoord& Coord, const FVec3f& Frac)
 		{
+			if (Gen.Maps) { Gen.Maps->Tick(); }   // D-214: the reference owns the tick of its maps
 			double Moved = 0.0;
 			if (bHasCamera) { Moved = Length(ToDouble(Sub(Coord, Camera))); }
 			Camera = Coord; CameraFrac = Frac; bHasCamera = true;

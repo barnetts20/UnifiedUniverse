@@ -6,9 +6,17 @@
 //   ALLOCATION    (CPU, between passes): per cell, IndexBase = prefix sum of n over the cell's
 //                 tasks in contributor order (truncated at 2^15, lowest indices kept), and a
 //                 pool range of n records per task.
-//   PLACE PHASE   (UniGen.usf, PASS 1): candidates in index order; the first n accepted are
+//   PLACE PHASE   (UniGen.usf): candidates in index order; the first n accepted are
 //                 written at PoolBase + local index. Slots of the range not written (budget
-//                 shortfall) are blanked with a hidden record (lesson #27).
+//                 shortfall) are blanked with a hidden record (lesson #27). D-214: the GPU splits
+//                 a task's candidates into chunks over many groups (EVAL, SCAN, WRITE), the
+//                 first Uni_PlanCandidates evaluated up front; the result is the same set.
+//
+// D-214, galaxy fields (the stars of a galaxy): the density is the galaxy's map
+// (Uni_GalaxyMapLight, the light the volume draws) when the task names its slot, and the
+// envelope is one per octant of the sampling box (16 probes each): a candidate picks its octant
+// in proportion to the octants' envelopes, so a cell with a steep gradient (a disc a few scale
+// heights thick, an arm's edge) wastes far fewer candidates. Other fields are unchanged.
 //
 // The CPU reference (UniGenRef.h) runs these same functions in the same order, so Tier 2
 // verifies the GPU algorithm offline; only the parallel orchestration in UniGen.usf (group
@@ -41,7 +49,7 @@ struct FUniGenTask
 	uint IndexBase;
 	float4 Suppress;          // suppressor centre in cell units relative to the cell origin, radius in cell units (w <= 0: none)
 	uint4 BoxLo;              // D-153: sampling box in cell offsets (xyz; w: D-207 the cell's ordinal in a one-trip batch). Probes and candidates
-	uint4 BoxSpan;            //        lie in [Lo, Lo + Span) per axis; Span 0 = the whole axis (identity)
+	uint4 BoxSpan;            //        lie in [Lo, Lo + Span) per axis; Span 0 = the whole axis (identity). w: D-214 the galaxy map's slot + 1 (0: the field)
 };
 
 /** D-153: an in-cell offset (2^-32 cell units) mapped into the task's sampling box. Span 0 is
@@ -80,24 +88,97 @@ struct FUniSlice
 	float FaintM;
 };
 
-/** Probe-phase result per task, read back to the CPU. 16 bytes. */
+/** Probe-phase result per task, read back to the CPU. 48 bytes (D-214: the octant envelopes).
+ *  GPU-MIRROR: UniCore::FTaskCountGPU. */
 struct FUniTaskCount
 {
 	uint Count;               // Poisson n (before truncation)
 	uint CandidateBudget;
 	float Mean;
-	float Envelope;
+	float Envelope;           // the largest envelope (D-214: of the octants, galaxy fields)
+	float4 OctLo;             // D-214: octants 0..3's envelopes (galaxy fields; others: Envelope each)
+	float4 OctHi;             //        octants 4..7
 };
 
-UNI_FN float Uni_TaskProbe(FUniGenTask InT, uint InK)
+static const float UNI_OCTANT_PAD = 1.75f;   // D-214: an octant's envelope over its 16 probes' max (1.5: 3.0 candidates a star, 0.55% over it; 1.75: 3.5, 0.36%; 2.0: 4.0, 0.24%; one envelope: 6.2, 0.19%)
+static const uint UNI_GEN_CHUNK = 256u;     // D-214: candidates per group of the split place pass
+
+/** D-214: what a task's samples need, computed once per task (not per sample): the galaxy's
+ *  constants and its map's slot. */
+struct FUniTaskEval
+{
+	FUniGalaxyConst K;
+	uint MapSlot;
+	uint bMap;                // a galaxy field with a map: its density is the map's light
+	uint bOctants;            // a galaxy field: one envelope per octant
+	uint Pad;
+};
+
+UNI_FN FUniTaskEval Uni_TaskEvalOf(FUniGenTask InT)
+{
+	FUniTaskEval E;
+	E.K = Uni_GalaxyConstOf(InT.Params);
+	E.bOctants = InT.FieldId == UNI_FIELD_GALAXY ? 1u : 0u;
+	E.bMap = (InT.FieldId == UNI_FIELD_GALAXY && InT.BoxSpan.w != 0u) ? 1u : 0u;
+	E.MapSlot = E.bMap != 0u ? InT.BoxSpan.w - 1u : 0u;
+	E.Pad = 0u;
+	return E;
+}
+
+/** The density placement samples at box-unit position InU: the galaxy's map where it has one
+ *  (D-214), the field otherwise. */
+UNI_FN float Uni_TaskDensity(FUniGenTask InT, FUniTaskEval InE, float3 InU)
+{
+	const float3 P = Uni_FieldFramePoint(InT.Frame, InU);
+	if (InE.bMap != 0u)
+	{
+		float4 Comp = float4(0.0f, 0.0f, 0.0f, 0.0f);
+		return Uni_GalaxyMapLight(P, InT.Params, InE.K, InE.MapSlot, Comp);
+	}
+	return Uni_FieldSample(InT.FieldId, P, InT.Params);
+}
+
+/** D-214: probe K's octant of the sampling box (its stratum: 2 x 2 x 2 strata of the 4 x 4 x 4
+ *  per octant, so 16 probes each over the two rounds). Bit 0 x, bit 1 y, bit 2 z. */
+UNI_FN uint Uni_ProbeOctant(uint InK)
+{
+	const uint S = InK & 63u;
+	return ((S & 3u) >= 2u ? 1u : 0u) | (((S >> 2u) & 3u) >= 2u ? 2u : 0u) | ((S >> 4u) >= 2u ? 4u : 0u);
+}
+
+UNI_FN float Uni_F4At(float4 InV, uint InI)
+{
+	return InI == 0u ? InV.x : (InI == 1u ? InV.y : (InI == 2u ? InV.z : InV.w));
+}
+
+/** D-214: octant InO's envelope. */
+UNI_FN float Uni_CountOctant(FUniTaskCount InC, uint InO)
+{
+	return InO < 4u ? Uni_F4At(InC.OctLo, InO) : Uni_F4At(InC.OctHi, InO - 4u);
+}
+
+/** The expected acceptance of a candidate: the mean over the mean envelope (D-214: the octants'
+ *  mean, which is what a candidate meets on average). */
+UNI_FN float Uni_CountAccept(FUniTaskCount InC)
+{
+	if (!(InC.Envelope > 0.0f)) { return 1.0f; }
+	// One envelope (every field but the galaxy): exactly the pre-D-214 acceptance, bit for bit.
+	const bool bOne = InC.OctLo.x == InC.Envelope && InC.OctLo.y == InC.Envelope && InC.OctLo.z == InC.Envelope && InC.OctLo.w == InC.Envelope
+		&& InC.OctHi.x == InC.Envelope && InC.OctHi.y == InC.Envelope && InC.OctHi.z == InC.Envelope && InC.OctHi.w == InC.Envelope;
+	const float EnvMean = bOne ? InC.Envelope : (InC.OctLo.x + InC.OctLo.y + InC.OctLo.z + InC.OctLo.w + InC.OctHi.x + InC.OctHi.y + InC.OctHi.z + InC.OctHi.w) * 0.125f;
+	return max(InC.Mean / EnvMean, 1.0e-4f);
+}
+
+UNI_FN float Uni_TaskProbe(FUniGenTask InT, FUniTaskEval InE, uint InK)
 {
 	const float3 V = Uni_ProbeUnit(InT.CellSeed, InK);
 	const float3 U = float3(Uni_BoxUnit(V.x, InT.BoxLo.x, InT.BoxSpan.x), Uni_BoxUnit(V.y, InT.BoxLo.y, InT.BoxSpan.y), Uni_BoxUnit(V.z, InT.BoxLo.z, InT.BoxSpan.z));
-	return Uni_FieldSample(InT.FieldId, Uni_FieldFramePoint(InT.Frame, U), InT.Params);
+	return Uni_TaskDensity(InT, InE, U);
 }
 
-/** Probe reduction -> count. Sum and max are over all UNI_PROBES_PER_CELL probes. */
-UNI_FN FUniTaskCount Uni_TaskCount(FUniGenTask InT, float InProbeSum, float InProbeMax)
+/** Probe reduction -> count. Sum and max are over all UNI_PROBES_PER_CELL probes; InOctLo / Hi
+ *  the max of each octant's 16 (Uni_ProbeOctant; used for galaxy fields only). */
+UNI_FN FUniTaskCount Uni_TaskCount(FUniGenTask InT, FUniTaskEval InE, float InProbeSum, float InProbeMax, float4 InOctLo, float4 InOctHi)
 {
 	FUniTaskCount C;
 	C.Mean = InProbeSum / (float)UNI_PROBES_PER_CELL;
@@ -138,20 +219,78 @@ UNI_FN FUniTaskCount Uni_TaskCount(FUniGenTask InT, float InProbeSum, float InPr
 			C.Mean = UniField_WebTex(Centre, InT.Params, log2(Texels));
 		}
 	}
+	// D-214: a galaxy's envelope per octant (no field bound: the galaxy has none). The largest is
+	// the task's envelope; an octant with no light gets no candidates.
+	if (InE.bOctants != 0u)
+	{
+		C.OctLo = float4(InOctLo.x * UNI_OCTANT_PAD, InOctLo.y * UNI_OCTANT_PAD, InOctLo.z * UNI_OCTANT_PAD, InOctLo.w * UNI_OCTANT_PAD);
+		C.OctHi = float4(InOctHi.x * UNI_OCTANT_PAD, InOctHi.y * UNI_OCTANT_PAD, InOctHi.z * UNI_OCTANT_PAD, InOctHi.w * UNI_OCTANT_PAD);
+		C.Envelope = max(max(max(C.OctLo.x, C.OctLo.y), max(C.OctLo.z, C.OctLo.w)), max(max(C.OctHi.x, C.OctHi.y), max(C.OctHi.z, C.OctHi.w)));
+	}
+	else
+	{
+		C.OctLo = float4(C.Envelope, C.Envelope, C.Envelope, C.Envelope);
+		C.OctHi = C.OctLo;
+	}
 	const float Lambda = InT.LambdaScale * C.Mean;
 	C.Count = (C.Envelope > 0.0f) ? Uni_PoissonCount(Lambda, InT.CellSeed) : 0u;
 	// D-114: budget follows the expected acceptance with 4x headroom.
-	const float Accept = (C.Envelope > 0.0f) ? max(C.Mean / C.Envelope, 1.0e-4f) : 1.0f;
-	C.CandidateBudget = (uint)min(256.0f + 4.0f * (float)C.Count / Accept, 4.0e9f);
+	C.CandidateBudget = (uint)min(256.0f + 4.0f * (float)C.Count / Uni_CountAccept(C), 4.0e9f);
 	return C;
 }
 
-/** Candidate J: its offset, and whether it passes rejection. */
-UNI_FN bool Uni_TaskCandidate(FUniGenTask InT, float InEnvelope, uint InJ, UNI_OUT(uint3) OutOffset, UNI_OUT(float) OutDensity)
+/** Candidate J's in-cell offset and the envelope it is tested against. D-214, galaxy fields: an
+ *  octant drawn in proportion to the octants' envelopes (channel OCTANT), the candidate's offset
+ *  halved into it (its top bit per axis set by the octant), so the candidates' density is the
+ *  octants' envelope, piecewise. Others: the offset as drawn, the one envelope. */
+UNI_FN uint3 Uni_TaskCandidateOffset(FUniGenTask InT, FUniTaskEval InE, FUniTaskCount InC, uint InJ, UNI_OUT(float) OutEnvelope)
 {
-	OutOffset = Uni_BoxOffset(InT, Uni_CandidateOffset(InT.CellSeed, InJ));
-	OutDensity = Uni_FieldSample(InT.FieldId, Uni_FieldFramePoint(InT.Frame, Uni_OffsetUnit(OutOffset)), InT.Params);
-	return Uni_Accept(InT.CellSeed, InJ, OutDensity, InEnvelope);
+	uint3 O = Uni_CandidateOffset(InT.CellSeed, InJ);
+	OutEnvelope = InC.Envelope;
+	if (InE.bOctants != 0u)
+	{
+		float Total = 0.0f;
+		for (uint K = 0u; K < 8u; ++K) { Total += Uni_CountOctant(InC, K); }
+		const float X = Uni_DrawUnit(InT.CellSeed, UNI_CH_OCTANT, InJ) * Total;
+		uint Oc = 8u;
+		uint Last = 0u;
+		float Acc = 0.0f;
+		for (uint K2 = 0u; K2 < 8u; ++K2)
+		{
+			const float Ek = Uni_CountOctant(InC, K2);
+			if (Ek > 0.0f) { Last = K2; }
+			Acc += Ek;
+			if (Oc == 8u && Ek > 0.0f && X < Acc) { Oc = K2; }
+		}
+		if (Oc == 8u) { Oc = Last; }   // rounding at the top of the sum
+		O = uint3((O.x >> 1u) | ((Oc & 1u) << 31u), (O.y >> 1u) | (((Oc >> 1u) & 1u) << 31u), (O.z >> 1u) | (((Oc >> 2u) & 1u) << 31u));
+		OutEnvelope = Uni_CountOctant(InC, Oc);
+	}
+	return Uni_BoxOffset(InT, O);
+}
+
+/** Candidate J: its offset, its density, the envelope it met, and whether it passes rejection. */
+UNI_FN bool Uni_TaskCandidate(FUniGenTask InT, FUniTaskEval InE, FUniTaskCount InC, uint InJ, UNI_OUT(uint3) OutOffset, UNI_OUT(float) OutDensity, UNI_OUT(float) OutEnvelope)
+{
+	OutOffset = Uni_TaskCandidateOffset(InT, InE, InC, InJ, OutEnvelope);
+	OutDensity = Uni_TaskDensity(InT, InE, Uni_OffsetUnit(OutOffset));
+	return Uni_Accept(InT.CellSeed, InJ, OutDensity, OutEnvelope);
+}
+
+/** D-214: candidates the split place pass evaluates up front for a task of capacity InCap: the
+ *  expected number that fills it with a 3 sigma margin, never more than the budget. Candidates
+ *  past it are evaluated only when these fall short (rare: the WRITE pass's serial tail). */
+UNI_FN uint Uni_PlanCandidates(uint InCap, FUniTaskCount InC)
+{
+	if (InCap == 0u) { return 0u; }
+	const float N = (float)InCap;
+	const float E = (N + 3.0f * sqrt(N) + 8.0f) / Uni_CountAccept(InC) + 64.0f;
+	return (uint)min(E, (float)InC.CandidateBudget);
+}
+
+UNI_FN uint Uni_PlanChunks(uint InCandidates)
+{
+	return (InCandidates + UNI_GEN_CHUNK - 1u) / UNI_GEN_CHUNK;
 }
 
 /** Inside the task's suppressor? Masked, not relocated: the index is still consumed. */
@@ -183,7 +322,7 @@ UNI_FN bool Uni_TaskEarlyType(FUniGenTask InT, uint InObjSeed, uint3 InOffset)
 }
 
 /** The record for the object with acceptance rank InLocal. */
-UNI_FN FUniObject Uni_TaskMakeObject(FUniGenTask InT, FUniSlice InS, StructuredBuffer<float> InLut, uint InLocal, uint3 InOffset)
+UNI_FN FUniObject Uni_TaskMakeObject(FUniGenTask InT, FUniTaskEval InE, FUniSlice InS, StructuredBuffer<float> InLut, uint InLocal, uint3 InOffset)
 {
 	const uint ObjSeed = Uni_ObjectSeed(InT.CellSeed, InLocal);
 	const float M = Uni_DrawAbsMag(ObjSeed, 0.0f, 1.0f, InS.BrightM, InS.FaintM, InLut, InS.LutBase, InS.LutCount);
@@ -200,7 +339,9 @@ UNI_FN FUniObject Uni_TaskMakeObject(FUniGenTask InT, FUniSlice InS, StructuredB
 	if (InT.FieldId == UNI_FIELD_GALAXY && InT.Params.F.w > 0.0f)
 	{
 		float4 Comp = float4(0.0f, 0.0f, 0.0f, 0.0f);
-		UniField_GalaxyFilteredC(Uni_FieldFramePoint(InT.Frame, Uni_OffsetUnit(InOffset)), InT.Params, 0.0f, Comp);
+		const float3 Pc = Uni_FieldFramePoint(InT.Frame, Uni_OffsetUnit(InOffset));
+		if (InE.bMap != 0u) { Uni_GalaxyMapLight(Pc, InT.Params, InE.K, InE.MapSlot, Comp); }   // D-214: the components the map gives
+		else { UniField_GalaxyFilteredCK(Pc, InT.Params, InE.K, 0.0f, Comp); }
 		Rgb = Uni_TintRecordColour(Rgb, Uni_GalaxyTint(Uni_GalaxyPalette((uint)InT.Params.F.w), Comp, 0.0f));
 	}
 	const float SB = ((InS.ChildFlags & UNI_OBJ_FLAG_EXTENDED) != 0u) ? Uni_SurfaceBrightness(M, RL2) : 0.0f;

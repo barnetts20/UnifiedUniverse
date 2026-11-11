@@ -4,14 +4,18 @@
 // vertical centre, the light's arm part). The march evaluates the camera's own galaxy from it
 // (Uni_GalaxyMapEval). The CPU bake here is the reference's; the engine bakes the same texels on
 // the GPU (MapBakeCS / MapDownCS, spread over frames). Engine-agnostic (no UE includes).
+// D-214: placement reads the maps too (Uni_GalaxyMapLight), one per galaxy it places stars in,
+// in the slots of a texture array (UniGalaxyMapCache.h); the shim has one view per slot.
 
 #pragma once
 
+#include "UniGalaxyMapCache.h"
 #include "UniVolume.h"
 #include "UniWebTexture.h"
 
 #include <algorithm>
 #include <cstring>
+#include <memory>
 #include <thread>
 #include <vector>
 
@@ -26,15 +30,15 @@ namespace UniCore
 		bool IsValid() const { return Size > 0u && !Mips.empty(); }
 		size_t Bytes() const { size_t B = 0; for (const auto& M : Mips) { B += M.size() / 4u * 8u; } return B; }
 
-		/** Bakes the carrier's map (InSize a power of two) on InThreads threads. */
-		void Bake(const FCarrierGPU& Ca, const std::vector<FFieldParamsGPU>& Params, u32 InSize, int InThreads = 1)
+		/** Bakes R's map (InSize a power of two) on InThreads threads. */
+		void Bake(const FGalaxyMapRequest& R, u32 InSize, int InThreads = 1)
 		{
 			Size = InSize;
 			HV::FUniFieldParams Par, Dust;
-			std::memcpy(static_cast<void*>(&Par), &Params[Ca.ParamIndex], sizeof(Par));
+			std::memcpy(static_cast<void*>(&Par), &R.Par, sizeof(Par));
 			Dust = Par;
-			const bool bDust = (Ca.Flags & HV::UNI_CARRIER_DUST) != 0u;
-			if (bDust) { std::memcpy(static_cast<void*>(&Dust), &Params[Ca.DustParamIndex], sizeof(Dust)); }
+			const bool bDust = R.bDust;
+			if (bDust) { std::memcpy(static_cast<void*>(&Dust), &R.Dust, sizeof(Dust)); }
 			const HV::FUniGalaxyConst K = HV::Uni_GalaxyConstOf(Par);
 			Mips.clear();
 			Mips.emplace_back(size_t(Size) * Size * 4u, 0.0f);
@@ -84,11 +88,28 @@ namespace UniCore
 			}
 			for (auto& M : Mips) { for (float& V : M) { V = UniHlsl::UniHalfToFloat(FloatToHalf(V)); } }   // as the GPU stores them
 		}
+
+		/** Bakes the carrier's map (D-212's form). */
+		void Bake(const FCarrierGPU& Ca, const std::vector<FFieldParamsGPU>& Params, u32 InSize, int InThreads = 1)
+		{
+			Bake(GalaxyMapRequestOf(Ca, Params), InSize, InThreads);
+		}
+
+		/** A volume carrier's map request: its light parameters and, if it is dusty, its dust's. */
+		static FGalaxyMapRequest GalaxyMapRequestOf(const FCarrierGPU& Ca, const std::vector<FFieldParamsGPU>& Params)
+		{
+			FGalaxyMapRequest R;
+			R.Par = Params[Ca.ParamIndex];
+			R.bDust = (Ca.Flags & HV::UNI_CARRIER_DUST) != 0u;
+			if (R.bDust) { R.Dust = Params[Ca.DustParamIndex]; }
+			return R;
+		}
 	};
 
-	/** Binds (or, with null, unbinds) a map to the shim's sampler. */
-	inline void BindGalaxyMap(const FGalaxyMap* M)
+	/** Binds (or, with null, unbinds) a map to the shim's slot InSlot. */
+	inline void BindGalaxyMap(u32 InSlot, const FGalaxyMap* M)
 	{
+		if (InSlot >= u32(UniHlsl::UNI_GAL_MAP_SLOTS_MAX)) { return; }
 		UniHlsl::FGalMapView V;
 		if (M && M->IsValid())
 		{
@@ -98,14 +119,46 @@ namespace UniCore
 			V.Size = int(M->Size);
 			V.NumMips = int(M->Mips.size());
 		}
-		UniHlsl::UniGalMapView = V;
+		UniHlsl::UniGalMapViews[InSlot] = V;
 	}
 
-	/** The view's map fields for the scene's home carrier (local index; 0: none). */
-	inline void PublishGalaxyMap(FVolumeViewGPU& View, int InCarrier, u32 InSize)
+	/** The view's map fields for the scene's home carrier (local index; 0: none) in slot InSlot. */
+	inline void PublishGalaxyMap(FVolumeViewGPU& View, int InCarrier, u32 InSize, u32 InSlot = 0u)
 	{
 		View.MapCarrier = InCarrier >= 0 && InSize > 0u ? u32(InCarrier) + 1u : 0u;
 		View.MapSize = InSize;
-		View.MapPad0 = 0u; View.MapPad1 = 0u;
+		View.MapSlot = InSlot;
+		View.MapPad1 = 0u;
 	}
+
+	/** D-214: the offline host of a map cache: bakes a slot the moment it is requested (the
+	 *  cache's SyncBake) and binds it to the shim. Install() it on a cache before generating. */
+	class FCpuGalaxyMaps
+	{
+	public:
+		FCpuGalaxyMaps(FGalaxyMapCache& InCache, u32 InSlots = 8u, u32 InSize = 256u, int InThreads = 4) : Cache(InCache), Threads(InThreads)
+		{
+			Cache.Configure(std::min(InSlots, u32(UniHlsl::UNI_GAL_MAP_SLOTS_MAX)), InSize);
+			Cache.Reset();   // nothing baked by an earlier host is bound here
+			Maps.resize(Cache.NumSlots());
+			for (auto& M : Maps) { M = std::make_unique<FGalaxyMap>(); }
+			Cache.SyncBake = [this](uint32_t Slot, const FGalaxyMapCache::FEntry& E)
+			{
+				Maps[Slot]->Bake(E.Req, Cache.MapSize(), Threads);
+				BindGalaxyMap(Slot, Maps[Slot].get());
+				++Baked;
+			};
+		}
+		~FCpuGalaxyMaps()
+		{
+			Cache.SyncBake = nullptr;
+			for (u32 S = 0; S < Maps.size(); ++S) { BindGalaxyMap(S, nullptr); }
+		}
+		const FGalaxyMap& Map(u32 Slot) const { return *Maps[Slot]; }
+		u64 Baked = 0;
+	private:
+		FGalaxyMapCache& Cache;
+		int Threads = 4;
+		std::vector<std::unique_ptr<FGalaxyMap>> Maps;
+	};
 }

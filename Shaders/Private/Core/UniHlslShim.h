@@ -364,14 +364,16 @@ namespace UniHlsl
 
 	/** D-212: the galaxy map (UniGalaxyMap.h), bound by UniCore::BindGalaxyMap: float4 texels per
 	 *  mip (already rounded to half floats), Size >> m a side, x fastest; filtered like the GPU's
-	 *  trilinear sampler (bilinear in a mip, linear between mips), wrapping. Unbound: NaN. */
+	 *  trilinear sampler (bilinear in a mip, linear between mips), wrapping. Unbound: NaN.
+	 *  D-214: one view per slot of the GPU's map array. */
 	struct FGalMapView
 	{
 		const float* const* Mips = nullptr;
 		int Size = 0;
 		int NumMips = 0;
 	};
-	inline FGalMapView UniGalMapView;
+	static constexpr int UNI_GAL_MAP_SLOTS_MAX = 16;
+	inline FGalMapView UniGalMapViews[UNI_GAL_MAP_SLOTS_MAX];
 
 	inline float4 UniGalMapBilinear(const float* D, int S, const float2& UV)
 	{
@@ -385,9 +387,10 @@ namespace UniHlsl
 		return Lerp4(Lerp4(At(X0, Y0), At(X1, Y0), Ax), Lerp4(At(X0, Y1), At(X1, Y1), Ax), Ay);
 	}
 
-	inline float4 UniGalMapSample(const float2& UV, float Mip)
+	inline float4 UniGalMapSample(const float2& UV, uint Slot, float Mip)
 	{
-		const FGalMapView& V = UniGalMapView;
+		if (Slot >= uint(UNI_GAL_MAP_SLOTS_MAX)) { const float N = std::nanf(""); return float4(N, N, N, N); }
+		const FGalMapView& V = UniGalMapViews[Slot];
 		if (!V.Mips || V.NumMips == 0) { const float N = std::nanf(""); return float4(N, N, N, N); }
 		const float M = clamp(Mip, 0.0f, float(V.NumMips - 1));
 		const int M0 = int(M);
@@ -400,8 +403,22 @@ namespace UniHlsl
 
 } // namespace UniHlsl
 
-#define UNI_GAL_MAP(UV, Mip) UniGalMapSample(UV, Mip)
+#define UNI_GAL_MAP(UV, Slot, Mip) UniGalMapSample(UV, uint(Slot), Mip)
 #define UNI_WEB_TEX_SAMPLE(P, Mip) UniWebTexSample(P, Mip)
+namespace UniHlsl
+{
+	// D-220: the disc warp's structural mip floor and the fine band's frequency (x the warp's),
+	// vertical stretch and gain: UniFields.ush's constants, as globals so the galwarp tool can vary
+	// them (T2.galaxy.warp_band checks these defaults equal the shaders' values).
+	inline float GKnobWarpMipFloor = 2.0f;
+	inline float GKnobFineFreq = 3.3f;
+	inline float GKnobFineZ = 4.0f;
+	inline float GKnobFineGain = 15.2f;
+}
+#define UNI_GAL_WARP_MIP_FLOOR (::UniHlsl::GKnobWarpMipFloor)
+#define UNI_GAL_FINE_FREQ (::UniHlsl::GKnobFineFreq)
+#define UNI_GAL_FINE_Z (::UniHlsl::GKnobFineZ)
+#define UNI_GAL_FINE_GAIN (::UniHlsl::GKnobFineGain)
 #define UNI_GAL_WARP_FINE(P, Mip) UniGalaxyTexSample(0, P, Mip)
 #define UNI_GAL_WARP_LARGE(P, Mip) UniGalaxyTexSample(1, P, Mip)
 #define UNI_GAL_DETAIL(P, Mip) UniGalaxyTexSample(2, P, Mip)

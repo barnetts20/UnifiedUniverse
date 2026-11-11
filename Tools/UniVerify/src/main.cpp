@@ -4,6 +4,8 @@
 //   univerify fuzzdump N FILE                                coordinate cases for the Python oracle
 //   univerify seeddump                                       seed values for the Python oracle
 //   univerify gen --scene NAME                               run a scene's reference pipeline, print stats
+//   univerify galslices [--out DIR] [--quick]                the sliced galaxy-map prototype's measurements
+//   univerify galwarp [--out DIR] [--quick] [--only N]       D-220: the disc warp's aliasing and look, by variant
 //   univerify list                                           list tests
 //
 // Every command is run from the plugin root (verify_all does this), so relative paths in
@@ -18,6 +20,8 @@
 int UniFuzzDump(int N, const char* Path);   // fuzzdump.cpp
 int UniSeedDump();                          // seeddump.cpp
 int UniGenCommand(int Argc, char** Argv);   // gencmd.cpp
+int UniGalSlicesCommand(int Argc, char** Argv);   // galslices.cpp
+int UniGalWarpCommand(int Argc, char** Argv);     // galwarp.cpp
 
 namespace
 {
@@ -83,6 +87,8 @@ int main(int Argc, char** Argv)
 	if (Cmd == "fuzzdump" && Argc >= 4) { return UniFuzzDump(std::atoi(Argv[2]), Argv[3]); }
 	if (Cmd == "seeddump") { return UniSeedDump(); }
 	if (Cmd == "gen") { return UniGenCommand(Argc, Argv); }
+	if (Cmd == "galslices") { return UniGalSlicesCommand(Argc, Argv); }
+	if (Cmd == "galwarp") { return UniGalWarpCommand(Argc, Argv); }
 	std::fprintf(stderr, "unknown command %s\n", Cmd.c_str());
 	return 2;
 }

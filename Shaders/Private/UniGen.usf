@@ -1,30 +1,36 @@
 // UniGen.usf
-// GPU generation: one thread group of 64 per task (cell, contributor, emitter). Orchestration
-// only; every decision is in the shared cores (Core/UniGenTask.ush), which the CPU reference
-// runs in the same order (UniGenRef.h, verified offline by Tier 2).
+// GPU generation. Orchestration only; every decision is in the shared cores
+// (Core/UniGenTask.ush), which the CPU reference runs in the same order (UniGenRef.h, verified
+// offline by Tier 2).
 //
-//   UNI_GEN_PASS 0  PROBE: 128 probes (2 per thread), group reduction to sum and max,
-//                   Uni_TaskCount -> OutCounts[task]. Read back; the CPU allocates pool ranges.
-//   UNI_GEN_PASS 1  PLACE: candidates in chunks of 64; a group-wide inclusive scan of the
-//                   accept flags gives each accepted candidate its rank, so ranks follow
-//                   candidate index exactly as the CPU's sequential loop does. The first
-//                   PoolCapacity accepted are written; the rest of the range is blanked
-//                   (lesson #27). OutAccepted[task] = filled count.
-//   UNI_GEN_PASS 2  SCATTER: authored records (anchors) written at CPU-chosen pool indices.
+//   UNI_GEN_PASS 0  PROBE: one group of 64 per task: 128 probes (2 per thread), group reduction
+//                   to sum, max and (D-214) each octant's max, Uni_TaskCount -> OutCounts[task].
+//                   Two-trip batches read it back; the CPU allocates pool ranges.
 //   UNI_GEN_PASS 3  ALLOC (D-207, one-trip batches): one thread walks the batch's cells in order
-//                   and gives every task its pool range inside the arena the CPU reserved,
-//                   exactly as FuseAllocate (UniStreamer.h). PLACE then reads the ranges from
-//                   InAlloc (UseAlloc 1) instead of the task, so probe, allocation and place run
-//                   back to back and only the counts are read back.
+//                   and gives every task its pool range inside the arena the CPU reserved, and
+//                   (D-214) its plan: candidates evaluated up front, its chunks, under the batch's
+//                   candidate cap, exactly as FuseAllocate (UniStreamer.h).
+//   UNI_GEN_PASS 1  EVAL (D-214): one group per chunk of UNI_GEN_CHUNK candidates of one task
+//                   (a dense task spreads over hundreds of groups instead of looping in one):
+//                   each candidate's rejection test, written as a 256-bit accept mask and its
+//                   count per chunk.
+//   UNI_GEN_PASS 4  SCAN (D-214): one thread per task: each chunk's accepted count before it.
+//   UNI_GEN_PASS 5  WRITE (D-214): one group per chunk: an accepted candidate's rank is its
+//                   chunk's prefix plus the mask bits below it, so ranks follow candidate index
+//                   exactly as the CPU's sequential loop does; the first PoolCapacity are written.
+//                   A task's last chunk, if its planned candidates fell short, goes on serially
+//                   from its plan to its budget (the pre-D-214 loop: rare), blanks the rest of its
+//                   range (lesson #27) and writes OutAccepted[task].
+//   UNI_GEN_PASS 2  SCATTER: authored records (anchors) written at CPU-chosen pool indices.
 //
-// Dispatch is wrapped into 2D (lesson #23): task = GroupId.y * DispatchGroupsX + GroupId.x.
-// Padding groups (TaskIndex >= NumTasks) do NOT return early: every thread of every group
+// Dispatch is wrapped into 2D (lesson #23): index = GroupId.y * DispatchGroupsX + GroupId.x.
+// Padding groups (index past the work) do NOT return early: every thread of every group
 // reaches every barrier, with the work counts forced to zero and the writes masked (UE review
 // S1: FXC rejects barriers after a return, and some drivers hang on them). Loops that contain
-// barriers have a trip count read from the task, which is group-uniform, and are bounded.
+// barriers have a trip count read from group-uniform values, and are bounded.
 // Parity note (D-105): the probe sum is a tree reduction here and a sequential sum on the CPU,
 // so mean and lambda differ in the last bits and a Poisson count can differ in rare boundary
-// cases. Integer parts (seeds, offsets, ranks) are bit-identical.
+// cases. Integer parts (seeds, offsets, ranks) are bit-identical; maxima are exact.
 
 #include "/Engine/Public/Platform.ush"
 #include "UniWebTexture.ush"   // D-164: before any core (UniFields.ush samples it)
@@ -45,6 +51,7 @@ uint DispatchGroupsX;
 RWStructuredBuffer<FUniTaskCount> OutCounts;
 groupshared float GsSum[UNI_GEN_THREADS];
 groupshared float GsMax[UNI_GEN_THREADS];
+groupshared float GsOct[8][UNI_GEN_THREADS];
 
 [numthreads(UNI_GEN_THREADS, 1, 1)]
 void MainCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
@@ -52,18 +59,23 @@ void MainCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
 	const uint TaskIndex = GroupId.y * DispatchGroupsX + GroupId.x;
 	const bool bValid = TaskIndex < NumTasks;   // group-uniform
 	const FUniGenTask T = InTasks[min(TaskIndex, NumTasks - 1)];
+	const FUniTaskEval Ev = Uni_TaskEvalOf(T);
 	const uint NumProbes = bValid ? UNI_PROBES_PER_CELL : 0u;
 
 	float Sum = 0.0f;
 	float Max = 0.0f;
+	float Oct[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
 	for (uint K = GroupIndex; K < NumProbes; K += UNI_GEN_THREADS)
 	{
-		const float V = Uni_TaskProbe(T, K);
+		const float V = Uni_TaskProbe(T, Ev, K);
 		Sum += V;
 		Max = max(Max, V);
+		const uint O = Uni_ProbeOctant(K);
+		[unroll] for (uint Q = 0u; Q < 8u; ++Q) { if (Q == O) { Oct[Q] = max(Oct[Q], V); } }
 	}
 	GsSum[GroupIndex] = Sum;
 	GsMax[GroupIndex] = Max;
+	[unroll] for (uint Q0 = 0u; Q0 < 8u; ++Q0) { GsOct[Q0][GroupIndex] = Oct[Q0]; }
 	GroupMemoryBarrierWithGroupSync();
 	for (uint Stride = UNI_GEN_THREADS / 2; Stride > 0; Stride >>= 1)
 	{
@@ -71,63 +83,269 @@ void MainCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
 		{
 			GsSum[GroupIndex] += GsSum[GroupIndex + Stride];
 			GsMax[GroupIndex] = max(GsMax[GroupIndex], GsMax[GroupIndex + Stride]);
+			[unroll] for (uint Q1 = 0u; Q1 < 8u; ++Q1) { GsOct[Q1][GroupIndex] = max(GsOct[Q1][GroupIndex], GsOct[Q1][GroupIndex + Stride]); }
 		}
 		GroupMemoryBarrierWithGroupSync();
 	}
 	if (bValid && GroupIndex == 0)
 	{
-		OutCounts[TaskIndex] = Uni_TaskCount(T, GsSum[0], GsMax[0]);
+		OutCounts[TaskIndex] = Uni_TaskCount(T, Ev, GsSum[0], GsMax[0], float4(GsOct[0][0], GsOct[1][0], GsOct[2][0], GsOct[3][0]), float4(GsOct[4][0], GsOct[5][0], GsOct[6][0], GsOct[7][0]));
 	}
 }
 
-#elif UNI_GEN_PASS == 1
+#elif UNI_GEN_PASS == 3
 
 StructuredBuffer<FUniTaskCount> InCounts;
+RWStructuredBuffer<uint4> OutAlloc;   // (pool base, capacity, index base, fits | deferred << 1)
+RWStructuredBuffer<uint4> OutPlan;    // D-214: (chunk base, chunks, planned candidates, 0)
+RWStructuredBuffer<uint> OutPlanTotal;   // D-214: [0] chunks in use
+uint ArenaBase;
+uint ArenaCap;
+uint MaxPerCell;
+uint CandidateCap;   // D-214: 0: none
+uint ChunkCap;
+
+/** D-207 / D-214: FuseAllocate (UniStreamer.h), line for line. Cells are runs of tasks with the
+ *  same ordinal (BoxLo.w), in order. A task's capacity is its count truncated so its cell holds
+ *  at most MaxPerCell; its index base the running sum before it in the cell. A cell whose total
+ *  fits in the arena's remaining room, and whose plan fits in the chunks left, is packed at the
+ *  cursors unless the batch's planned candidates are past the cap (deferred: the first cell
+ *  always goes); otherwise its tasks get capacity 0 and the next cells still try. One thread: a
+ *  batch is at most a few thousand tasks. */
+[numthreads(1, 1, 1)]
+void AllocCS()
+{
+	uint Cursor = 0u;
+	uint ChunkCursor = 0u;
+	uint Planned = 0u;
+	uint I = 0u;
+	[loop]
+	while (I < NumTasks)
+	{
+		const uint Cell = InTasks[I].BoxLo.w;
+		uint J = I;
+		uint Index = 0u;
+		uint CellPlan = 0u;
+		uint CellChunks = 0u;
+		[loop]
+		for (; J < NumTasks; ++J)
+		{
+			if (InTasks[J].BoxLo.w != Cell) { break; }
+			const uint Room = Index < MaxPerCell ? MaxPerCell - Index : 0u;
+			const uint Cap = min(InCounts[J].Count, Room);
+			Index += Cap;
+			const uint Pl = Uni_PlanCandidates(Cap, InCounts[J]);
+			CellPlan += Pl;
+			CellChunks += Uni_PlanChunks(Pl);
+		}
+		const bool bFits = Index <= ArenaCap - Cursor && CellChunks <= ChunkCap - ChunkCursor;
+		const bool bDeferred = bFits && CandidateCap > 0u && Planned > 0u && Planned + CellPlan > CandidateCap;
+		const bool bPack = bFits && !bDeferred;
+		uint Idx = 0u;
+		uint Ch = ChunkCursor;
+		[loop]
+		for (uint K = I; K < J; ++K)
+		{
+			const uint Room = Idx < MaxPerCell ? MaxPerCell - Idx : 0u;
+			const uint Cap = min(InCounts[K].Count, Room);
+			const uint Flags = (bFits ? 1u : 0u) | (bDeferred ? 2u : 0u);
+			if (bPack) { OutAlloc[K] = uint4(ArenaBase + Cursor + Idx, Cap, Idx, Flags); }
+			else { OutAlloc[K] = uint4(ArenaBase, 0u, Idx, Flags); }
+			const uint Pl = bPack ? Uni_PlanCandidates(Cap, InCounts[K]) : 0u;
+			const uint Chunks = Uni_PlanChunks(Pl);
+			OutPlan[K] = uint4(Ch, Chunks, Pl, 0u);
+			Ch += Chunks;
+			Idx += Cap;
+		}
+		if (bPack) { Cursor += Index; ChunkCursor = Ch; Planned += CellPlan; }
+		I = J;
+	}
+	OutPlanTotal[0] = ChunkCursor;
+}
+
+#elif UNI_GEN_PASS == 1 || UNI_GEN_PASS == 4 || UNI_GEN_PASS == 5
+
+StructuredBuffer<FUniTaskCount> InCounts;
+StructuredBuffer<uint4> InPlan;        // D-214: (chunk base, chunks, planned candidates, 0) per task
+StructuredBuffer<uint> InPlanTotal;    // [0] chunks in use
+StructuredBuffer<uint4> InAlloc;       // D-207: (pool base, capacity, index base, flags) per task, with UseAlloc
+uint UseAlloc;
+
+/** The task whose chunks hold global chunk InC: the last task whose chunk base is <= InC (a task
+ *  with no chunks shares its base with the next, so the last such is the one with chunks). */
+uint Uni_ChunkTask(uint InC)
+{
+	uint Lo = 0u, Hi = NumTasks;   // answer in [Lo, Hi)
+	[loop]
+	for (uint It = 0u; It < 32u && Hi - Lo > 1u; ++It)
+	{
+		const uint Mid = (Lo + Hi) >> 1u;
+		if (InPlan[Mid].x <= InC) { Lo = Mid; } else { Hi = Mid; }
+	}
+	return Lo;
+}
+
+/** The task as placement sees it: its pool range from ALLOC in a one-trip batch. */
+FUniGenTask Uni_LoadTask(uint InI)
+{
+	FUniGenTask T = InTasks[InI];
+	if (UseAlloc != 0u)
+	{
+		const uint4 Al = InAlloc[InI];
+		T.PoolBase = Al.x;
+		T.PoolCapacity = Al.y;
+		T.IndexBase = Al.z;
+	}
+	return T;
+}
+
+#if UNI_GEN_PASS == 1
+
+RWStructuredBuffer<uint> OutChunkMask;    // 8 words per chunk: bit b = candidate ChunkBase * 256 + b accepted
+RWStructuredBuffer<uint> OutChunkCount;   // accepted per chunk
+
+groupshared uint GsMask[8];
+
+[numthreads(UNI_GEN_THREADS, 1, 1)]
+void EvalCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint C = GroupId.y * DispatchGroupsX + GroupId.x;
+	const bool bValid = NumTasks > 0u && C < InPlanTotal[0];   // group-uniform
+	const uint TI = bValid ? Uni_ChunkTask(C) : 0u;
+	const FUniGenTask T = Uni_LoadTask(min(TI, max(NumTasks, 1u) - 1u));
+	const FUniTaskCount Cn = InCounts[min(TI, max(NumTasks, 1u) - 1u)];
+	const uint4 Pl = InPlan[min(TI, max(NumTasks, 1u) - 1u)];
+	const FUniTaskEval Ev = Uni_TaskEvalOf(T);
+	if (GroupIndex < 8u) { GsMask[GroupIndex] = 0u; }
+	GroupMemoryBarrierWithGroupSync();
+	if (bValid)
+	{
+		const uint K = C - Pl.x;
+		[unroll]
+		for (uint R = 0u; R < UNI_GEN_CHUNK / UNI_GEN_THREADS; ++R)
+		{
+			const uint B = R * UNI_GEN_THREADS + GroupIndex;
+			const uint J = K * UNI_GEN_CHUNK + B;
+			if (J < Pl.z)
+			{
+				uint3 Offset;
+				float Density, Env;
+				if (Uni_TaskCandidate(T, Ev, Cn, J, Offset, Density, Env))
+				{
+					InterlockedOr(GsMask[B >> 5u], 1u << (B & 31u));
+				}
+			}
+		}
+	}
+	GroupMemoryBarrierWithGroupSync();
+	if (bValid && GroupIndex < 8u)
+	{
+		OutChunkMask[C * 8u + GroupIndex] = GsMask[GroupIndex];
+	}
+	if (bValid && GroupIndex == 0u)
+	{
+		uint N = 0u;
+		[unroll] for (uint W = 0u; W < 8u; ++W) { N += countbits(GsMask[W]); }
+		OutChunkCount[C] = N;
+	}
+}
+
+#elif UNI_GEN_PASS == 4
+
+StructuredBuffer<uint> InChunkCount;
+RWStructuredBuffer<uint> OutChunkPrefix;
+RWStructuredBuffer<uint> OutAccepted;
+
+[numthreads(64, 1, 1)]
+void ScanCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+	const uint I = ThreadId.x;
+	if (I >= NumTasks) { return; }   // no barriers in this pass
+	const uint4 Pl = InPlan[I];
+	uint Sum = 0u;
+	for (uint K = 0u; K < Pl.y; ++K)
+	{
+		OutChunkPrefix[Pl.x + K] = Sum;
+		Sum += InChunkCount[Pl.x + K];
+	}
+	if (Pl.y == 0u) { OutAccepted[I] = 0u; }   // nothing placed (capacity 0); otherwise its last chunk writes it
+}
+
+#else // UNI_GEN_PASS == 5
+
 StructuredBuffer<FUniSlice> InSlices;
 StructuredBuffer<float> InLut;
+StructuredBuffer<uint> InChunkMask;
+StructuredBuffer<uint> InChunkCount;
+StructuredBuffer<uint> InChunkPrefix;
 RWStructuredBuffer<FUniObject> OutPool;
 RWStructuredBuffer<uint> OutAccepted;
-StructuredBuffer<uint4> InAlloc;   // D-207: (pool base, capacity, index base, fits) per task, with UseAlloc
-uint UseAlloc;
 
 groupshared uint GsScan[UNI_GEN_THREADS];
 groupshared uint GsBase;
 
 [numthreads(UNI_GEN_THREADS, 1, 1)]
-void MainCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+void WriteCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
 {
-	const uint TaskIndex = GroupId.y * DispatchGroupsX + GroupId.x;
-	const bool bValid = TaskIndex < NumTasks;   // group-uniform
-	const uint TaskRead = min(TaskIndex, NumTasks - 1);
-	FUniGenTask T = InTasks[TaskRead];
-	if (UseAlloc != 0u)
-	{
-		// D-207: the range ALLOC gave this task on the GPU (a one-trip batch).
-		const uint4 Al = InAlloc[TaskRead];
-		T.PoolBase = Al.x;
-		T.PoolCapacity = Al.y;
-		T.IndexBase = Al.z;
-	}
-	const FUniTaskCount C = InCounts[TaskRead];
+	const uint C = GroupId.y * DispatchGroupsX + GroupId.x;
+	const bool bValid = NumTasks > 0u && C < InPlanTotal[0];   // group-uniform
+	const uint TI = bValid ? Uni_ChunkTask(C) : 0u;
+	const uint TR = min(TI, max(NumTasks, 1u) - 1u);
+	const FUniGenTask T = Uni_LoadTask(TR);
+	const FUniTaskCount Cn = InCounts[TR];
+	const uint4 Pl = InPlan[TR];
+	const FUniTaskEval Ev = Uni_TaskEvalOf(T);
 	const FUniSlice S = InSlices[T.SliceIndex];
 	const uint Capacity = bValid ? T.PoolCapacity : 0u;
-	// At least one chunk whenever there is capacity, as the CPU loop's first iteration.
-	const uint MaxChunks = (Capacity > 0u) ? max(1u, (C.CandidateBudget + UNI_GEN_THREADS - 1u) / UNI_GEN_THREADS) : 0u;
+	const uint K = bValid ? C - Pl.x : 0u;
+	const uint Prefix = bValid ? InChunkPrefix[C] : 0u;
+	const uint Count = bValid ? InChunkCount[C] : 0u;
+	uint Mask[8];
+	[unroll] for (uint W = 0u; W < 8u; ++W) { Mask[W] = bValid ? InChunkMask[C * 8u + W] : 0u; }
 
-	if (GroupIndex == 0) { GsBase = 0; }
-	GroupMemoryBarrierWithGroupSync();
-
-	[loop]
-	for (uint Chunk = 0; Chunk < MaxChunks; ++Chunk)
+	// This chunk's accepted candidates, at their ranks.
+	if (bValid && Prefix < Capacity)
 	{
-		const uint J = Chunk * UNI_GEN_THREADS + GroupIndex;
-		uint3 Offset = uint3(0, 0, 0);
-		float Density = 0.0f;
-		bool bAccepted = false;
-		if (J < C.CandidateBudget)
+		[unroll]
+		for (uint R = 0u; R < UNI_GEN_CHUNK / UNI_GEN_THREADS; ++R)
 		{
-			bAccepted = Uni_TaskCandidate(T, C.Envelope, J, Offset, Density);
+			const uint B = R * UNI_GEN_THREADS + GroupIndex;
+			const uint Wd = B >> 5u;
+			const uint Bit = 1u << (B & 31u);
+			uint Below = 0u;
+			[unroll] for (uint W2 = 0u; W2 < 8u; ++W2) { if (W2 < Wd) { Below += countbits(Mask[W2]); } }
+			uint Mw = 0u;
+			[unroll] for (uint W3 = 0u; W3 < 8u; ++W3) { if (W3 == Wd) { Mw = Mask[W3]; } }
+			Below += countbits(Mw & (Bit - 1u));
+			const uint Rank = Prefix + Below;
+			if ((Mw & Bit) != 0u && Rank < Capacity)
+			{
+				const uint J = K * UNI_GEN_CHUNK + B;
+				float Env;
+				const uint3 Offset = Uni_TaskCandidateOffset(T, Ev, Cn, J, Env);
+				// if/else, not ?: (HLSL 2021 / DXC: the conditional operator takes numeric types only).
+				if (Uni_TaskSuppressed(T, Offset)) { OutPool[T.PoolBase + Rank] = Uni_BlankObject(); }
+				else { OutPool[T.PoolBase + Rank] = Uni_TaskMakeObject(T, Ev, S, InLut, Rank, Offset); }
+			}
 		}
+	}
+
+	// The task's last chunk: the serial tail if the plan fell short, the blanks, the count.
+	const bool bLast = bValid && Pl.y > 0u && K + 1u == Pl.y;   // group-uniform
+	uint Filled = min(Prefix + Count, Capacity);
+	const uint TailStart = Pl.z;
+	const uint TailEnd = (bLast && Filled < Capacity && Pl.z < Cn.CandidateBudget) ? Cn.CandidateBudget : TailStart;
+	const uint MaxChunks = (TailEnd - TailStart + UNI_GEN_THREADS - 1u) / UNI_GEN_THREADS;
+	if (GroupIndex == 0) { GsBase = Filled; }
+	GroupMemoryBarrierWithGroupSync();
+	[loop]
+	for (uint Ck = 0; Ck < MaxChunks; ++Ck)
+	{
+		const uint J = TailStart + Ck * UNI_GEN_THREADS + GroupIndex;
+		uint3 Offset = uint3(0, 0, 0);
+		float Density = 0.0f, Env = 0.0f;
+		bool bAccepted = false;
+		if (J < TailEnd) { bAccepted = Uni_TaskCandidate(T, Ev, Cn, J, Offset, Density, Env); }
 		// Inclusive scan of accept flags (Hillis-Steele): rank = acceptance order.
 		GsScan[GroupIndex] = bAccepted ? 1u : 0u;
 		GroupMemoryBarrierWithGroupSync();
@@ -143,75 +361,25 @@ void MainCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
 		const uint Rank = Base + GsScan[GroupIndex] - (bAccepted ? 1u : 0u);
 		if (bAccepted && Rank < Capacity)
 		{
-			// if/else, not ?: (HLSL 2021 / DXC: the conditional operator takes numeric types only).
 			if (Uni_TaskSuppressed(T, Offset)) { OutPool[T.PoolBase + Rank] = Uni_BlankObject(); }
-			else { OutPool[T.PoolBase + Rank] = Uni_TaskMakeObject(T, S, InLut, Rank, Offset); }
+			else { OutPool[T.PoolBase + Rank] = Uni_TaskMakeObject(T, Ev, S, InLut, Rank, Offset); }
 		}
 		const uint ChunkTotal = GsScan[UNI_GEN_THREADS - 1];
 		GroupMemoryBarrierWithGroupSync();
 		if (GroupIndex == 0) { GsBase = Base + ChunkTotal; }
 		GroupMemoryBarrierWithGroupSync();
-		// Early out once the range is full. Every thread reads the same GsBase after the
-		// barrier, so the break is group-uniform; if a compiler still rejects it (X4026 on FXC),
-		// delete this line: the rank test above already stops the writes, at the cost of
-		// evaluating the rest of the budget.
+		// Early out once the range is full (GsBase is the same for every thread after the barrier).
 		if (GsBase >= Capacity) { break; }
 	}
-
-	const uint Filled = min(GsBase, Capacity);
-	for (uint I = Filled + GroupIndex; I < Capacity; I += UNI_GEN_THREADS)
+	Filled = min(GsBase, Capacity);
+	if (bLast)
 	{
-		OutPool[T.PoolBase + I] = Uni_BlankObject();
-	}
-	if (bValid && GroupIndex == 0) { OutAccepted[TaskIndex] = Filled; }
-}
-
-#elif UNI_GEN_PASS == 3
-
-StructuredBuffer<FUniTaskCount> InCounts;
-RWStructuredBuffer<uint4> OutAlloc;
-uint ArenaBase;
-uint ArenaCap;
-uint MaxPerCell;
-
-/** D-207: FuseAllocate (UniStreamer.h), line for line. Cells are runs of tasks with the same
- *  ordinal (BoxLo.w), in order. A task's capacity is its count truncated so its cell holds at
- *  most MaxPerCell; its index base the running sum before it in the cell. A cell whose total fits
- *  in the arena's remaining room is packed at the cursor; otherwise its tasks get capacity 0 and
- *  the next cells still try. One thread: a batch is at most a few thousand tasks. */
-[numthreads(1, 1, 1)]
-void AllocCS()
-{
-	uint Cursor = 0u;
-	uint I = 0u;
-	[loop]
-	while (I < NumTasks)
-	{
-		const uint Cell = InTasks[I].BoxLo.w;
-		uint J = I;
-		uint Index = 0u;
-		[loop]
-		for (; J < NumTasks; ++J)
-		{
-			if (InTasks[J].BoxLo.w != Cell) { break; }
-			const uint Room = Index < MaxPerCell ? MaxPerCell - Index : 0u;
-			Index += min(InCounts[J].Count, Room);
-		}
-		const bool bFits = Index <= ArenaCap - Cursor;
-		uint Idx = 0u;
-		[loop]
-		for (uint K = I; K < J; ++K)
-		{
-			const uint Room = Idx < MaxPerCell ? MaxPerCell - Idx : 0u;
-			const uint Cap = min(InCounts[K].Count, Room);
-			if (bFits) { OutAlloc[K] = uint4(ArenaBase + Cursor + Idx, Cap, Idx, 1u); }
-			else { OutAlloc[K] = uint4(ArenaBase, 0u, Idx, 0u); }
-			Idx += Cap;
-		}
-		if (bFits) { Cursor += Index; }
-		I = J;
+		for (uint Bk = Filled + GroupIndex; Bk < Capacity; Bk += UNI_GEN_THREADS) { OutPool[T.PoolBase + Bk] = Uni_BlankObject(); }
+		if (GroupIndex == 0) { OutAccepted[TR] = Filled; }
 	}
 }
+
+#endif
 
 #else // UNI_GEN_PASS == 2: scatter authored records (anchors) into the pool
 

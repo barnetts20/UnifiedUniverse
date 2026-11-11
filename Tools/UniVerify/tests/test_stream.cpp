@@ -81,6 +81,27 @@ UNI_TEST(stream, parity)
 				Cells, Objects, Mismatch, Detail.c_str(), Batches, MaxLatency, PoolUsed, Failures));
 }
 
+UNI_TEST(stream, phase_names)
+{
+	// The HUD, uu.Perf and the logs print the phases' short names (StreamPhaseShortName): every
+	// name must carry the "Uni.Stream." prefix (Insights shows the full name) and the short names
+	// must be distinct and non-empty, or two phases read as one.
+	int Bad = 0;
+	std::string Detail;
+	std::map<std::string, int> Seen;
+	for (int P = 0; P < int(EStreamPhase::Count); ++P)
+	{
+		const std::string Full = StreamPhaseName(EStreamPhase(P));
+		const std::string Short = StreamPhaseShortName(EStreamPhase(P));
+		const bool Ok = Full.rfind("Uni.Stream.", 0) == 0 && !Short.empty() && Short != "?" && Full == "Uni.Stream." + Short && Seen.count(Short) == 0;
+		Seen[Short] = P;
+		if (!Ok) { ++Bad; Detail += Uni::Fmt("%s%d '%s'", Detail.empty() ? "" : ", ", P, Full.c_str()); }
+	}
+	Uni::Check(2, "T2.stream.phase_names", "Every streamer phase name carries the Uni.Stream. prefix and its short name (HUD, uu.Perf) is distinct")
+		.Metric("phases", double(int(EStreamPhase::Count))).Metric("bad", double(Bad))
+		.Pass(Bad == 0, Bad == 0 ? Uni::Fmt("%d phases, all prefixed, short names distinct", int(EStreamPhase::Count)) : Uni::Fmt("bad: %s", Detail.c_str()));
+}
+
 UNI_TEST(stream, sensitivity_resize)
 {
 	// A sensitivity change resizes windows. The streamer must keep the cells still inside
@@ -347,7 +368,7 @@ UNI_TEST(stream, responsive)
 		WorstMs = std::max(WorstMs, Ms);
 		// D-157/D-161: the worst frame and where it went (the CPU backend's generation is in Batches/Submit).
 		std::string Worst;
-		for (int Ph = 0; Ph < int(EStreamPhase::Count); ++Ph) { if (WorstProf.Ms[Ph] >= 0.5) { Worst += Uni::Fmt("%s%s %.1f", Worst.empty() ? "" : " ", StreamPhaseName(EStreamPhase(Ph)) + 11, WorstProf.Ms[Ph]); } }
+		for (int Ph = 0; Ph < int(EStreamPhase::Count); ++Ph) { if (WorstProf.Ms[Ph] >= 0.5) { Worst += Uni::Fmt("%s%s %.1f", Worst.empty() ? "" : " ", StreamPhaseShortName(EStreamPhase(Ph)), WorstProf.Ms[Ph]); } }
 		Detail += Uni::Fmt("%s%s: latency <= %zu frames (measured %.1f), visible cells all Ready on %.1f%% of frames, widest window N = %d, %.1f levels suspended per frame, Update %.2f ms (worst %.1f: %s; %llu overlap tests), pool peak %zu, alloc failures %zu",
 			Detail.empty() ? "" : "; ", R.Name, S.Stats().MaxLatencyFrames, S.LatencyFrames(), 100.0 * Vis, MaxN, double(Suspended) / Frames, Ms, MaxMs, Worst.c_str(), (unsigned long long)WorstProf.OverlapTests, PoolPeak, S.Stats().AllocFailures);
 		WorstPool = std::max(WorstPool, PoolPeak);

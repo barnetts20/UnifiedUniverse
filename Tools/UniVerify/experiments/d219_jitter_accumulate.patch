@@ -1,0 +1,739 @@
+diff --git a/Shaders/Private/Core/UniHlslShim.h b/Shaders/Private/Core/UniHlslShim.h
+index a985b82..41a19f4 100644
+--- a/Shaders/Private/Core/UniHlslShim.h
++++ b/Shaders/Private/Core/UniHlslShim.h
+@@ -125,6 +125,13 @@ namespace UniHlsl
+ 		uint4(uint InX, uint InY, uint InZ, uint InW) : x(InX), y(InY), z(InZ), w(InW) {}
+ 	};
+ 
++	struct int2   // D-219: the resolve's fresh-lattice cell
++	{
++		int x, y;
++		int2() : x(0), y(0) {}
++		int2(int InX, int InY) : x(InX), y(InY) {}
++	};
++
+ 	struct int3
+ 	{
+ 		int x, y, z;
+diff --git a/Shaders/Private/Core/UniVolume.ush b/Shaders/Private/Core/UniVolume.ush
+index 04b50bd..b65e6c5 100644
+--- a/Shaders/Private/Core/UniVolume.ush
++++ b/Shaders/Private/Core/UniVolume.ush
+@@ -107,7 +107,7 @@ struct FUniVolumeView
+ 	uint MapCarrier;        // the mapped carrier's index + 1 (0: none)
+ 	uint MapSize;           // texels a side of its mip 0
+ 	uint MapSlot;           // D-214: its slot in the map array
+-	uint MapPad1;
++	uint JitterFrame;       // D-219: 0: samples at step midpoints (deterministic); else this frame's index + 1: each step's sample jittered within it and each ray's first step by a phase (Uni_MarchNoise), for the temporal accumulation
+ };
+ 
+ struct FUniVolumeResult
+@@ -311,7 +311,34 @@ UNI_FN float Uni_CarrierStepLimit(FUniCarrier InCa, FUniFieldParams InPar, float
+ 	return Loose * H / InCa.InvRadius;
+ }
+ 
+-UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
++// ------------------------------------------------------------------------------------------
++// D-219 (owner: "slice sliding" in motion; CloudAtmosphere's render reference). Samples at fixed
++// step midpoints sit on the same shells about the camera every frame, so the march's error is a
++// set of bands fixed to the camera, and moving drags the field through them. With JitterFrame
++// set, each step's sample is drawn uniformly within the step (unbiased for the step's integral)
++// and each ray's first step (and its first after a gap) is shortened by a phase, so the shells
++// move every frame and between neighbouring pixels; the temporal resolve accumulates the noise
++// away (Uni_TemporalResolve*). The draws: interleaved gradient noise at the pixel, its lookup moved
++// per draw index by the R2 sequence (CloudAtmosphere's pitfall: moving the value instead gives
++// every step one pattern and rings about the view), shifted per frame by the golden ratio.
++// ------------------------------------------------------------------------------------------
++
++/** A draw in [0, 1) for pixel InPx, draw index InIndex, frame InFrame (D-219). */
++UNI_FN float Uni_MarchNoise(uint2 InPx, uint InIndex, uint InFrame)
++{
++	const float Ox = (float)InIndex * 0.75487766f, Oy = (float)InIndex * 0.56984029f;
++	const float Px = (float)InPx.x + floor((Ox - floor(Ox)) * 4096.0f);
++	const float Py = (float)InPx.y + floor((Oy - floor(Oy)) * 4096.0f);
++	const float G = Px * 0.06711056f + Py * 0.00583715f;
++	const float Ign = 52.9829189f * (G - floor(G));
++	const float Shift = (float)((InFrame * 2654435769u) >> 8u) * (1.0f / 16777216.0f);
++	const float V = Ign + Shift;
++	return V - floor(V);
++}
++
++/** The march of one ray. InNoisePx: the pixel the draws are keyed to (with JitterFrame; any value
++ *  otherwise). Uni_VolumeMarch: the same with JitterFrame cleared (midpoints). */
++UNI_FN FUniVolumeResult Uni_VolumeMarchPx(float3 InDir, float InTScene, uint2 InNoisePx,
+ 	StructuredBuffer<FUniCarrier> InCarriers, StructuredBuffer<FUniFieldParams> InParams,
+ 	StructuredBuffer<float4> InLut, FUniVolumeView InView)
+ {
+@@ -434,6 +461,11 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
+ 	float3 B = float3(0.0f, 0.0f, 0.0f);
+ 	float DepthW = 0.0f, DepthWL = 0.0f;   // D-184
+ 	bool bDone = false;
++	// D-219: jittered samples, a phase on a ray's first step; the checks' fine reference
++	// (MarchFlags bit 1: every step an eighth).
++	const bool bJit = InView.JitterFrame != 0u;
++	const float RefDiv = (InView.MarchFlags & 2u) != 0u ? 0.125f : 1.0f;
++	bool bLead = bJit;
+ 	UNI_LOOP
+ 	for (uint Step = 0u; Step < InView.MaxSteps; ++Step)
+ 	{
+@@ -465,11 +497,18 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
+ 		{
+ 			if (Next >= TMax) { bDone = true; break; }
+ 			T = Next;   // a gap between intervals: nothing to integrate
++			bLead = bJit;   // D-219: the next interval starts at its own phase
+ 			continue;
+ 		}
+-		float S = min(max(Ratio * T, InView.MinStepCm), Hint);
++		float S = min(max(Ratio * T, InView.MinStepCm), Hint) * RefDiv;
++		if (bLead)
++		{
++			// D-219: the first step a fraction (0, 1] of itself: every later step's shell moves with it.
++			S = S * (1.0f - 0.999f * Uni_MarchNoise(InNoisePx, 7919u + Step, InView.JitterFrame));
++			bLead = false;
++		}
+ 		S = max(min(S, Next - T), 1.0e-6f * T);
+-		const float Tm = T + 0.5f * S;
++		const float Tm = T + S * (bJit ? Uni_MarchNoise(InNoisePx, Step, InView.JitterFrame) : 0.5f);
+ 
+ 		float3 E = float3(0.0f, 0.0f, 0.0f);      // emission over this step
+ 		float3 Tau = float3(0.0f, 0.0f, 0.0f);    // optical depth over this step
+@@ -645,6 +684,15 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
+ 	return Res;
+ }
+ 
++UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
++	StructuredBuffer<FUniCarrier> InCarriers, StructuredBuffer<FUniFieldParams> InParams,
++	StructuredBuffer<float4> InLut, FUniVolumeView InView)
++{
++	FUniVolumeView V = InView;
++	V.JitterFrame = 0u;
++	return Uni_VolumeMarchPx(InDir, InTScene, uint2(0u, 0u), InCarriers, InParams, InLut, V);
++}
++
+ // ------------------------------------------------------------------------------------------
+ // D-184: temporal slicing. Each frame marches one pixel of every 2 x 2 block of the march grid
+ // (the phase cycles through the four in a Bayer order), so a pixel is fresh every fourth frame.
+@@ -902,6 +950,107 @@ UNI_FN float4 Uni_TemporalHistW(float4 InWb, float InLnTp, float4 InLnSceneH)
+ 		InWb.z * Uni_TemporalDepthWeight(InLnTp, InLnSceneH.z), InWb.w * Uni_TemporalDepthWeight(InLnTp, InLnSceneH.w));
+ }
+ 
++// ------------------------------------------------------------------------------------------
++// D-219: the accumulating resolve (CloudAtmosphere's MainResolveCS, our grids). D-184/D-194's
++// reconstruct took a marched pixel's sample as it was and an unmarched pixel's reprojected
++// history as it was, so it could not average jittered samples, and in motion a pixel held its
++// history resampled N^2 times. Here every pixel keeps an age (samples accumulated, and its own
++// samples alone; capped at 1 / FreshWeight):
++//  - a marched pixel blends its sample into its reprojected history at max(1 / (age + 1), FreshWeight);
++//  - the others blend in the fill (the 4 x 4 fresh samples about them, bilinear, depth-guided) at a
++//    share of 0.1 at rest (fading once the pixel holds a sample of its own) rising to 0.5 in motion;
++//  - the history is clamped to the fresh neighbourhood's mean +- gamma sigma (moments over a tent two
++//    cells wide, in radiance compressed by its brightest channel against 4 x the fill's luminance),
++//    gamma 4 at rest falling to 1 at TightPx of motion; what the clamp moves loses its age;
++//  - no usable history: the fill (a marched pixel: its own sample).
++// Pitfalls kept from CloudAtmosphere: moments about the nearest fresh sample are constant across a
++// cell and stamp the grid into the image in motion (the tent moves with the pixel); one non-finite
++// sample spreads through the moments (the march's output is finite by construction).
++// ------------------------------------------------------------------------------------------
++#define UNI_TEMPORAL_GAMMA_REST 4.0f
++#define UNI_TEMPORAL_GAMMA_MOTION 1.0f
++#define UNI_TEMPORAL_FILL_REST 0.1f
++#define UNI_TEMPORAL_FILL_MOTION 0.5f
++
++/** A pixel's place among the fresh samples: the fresh-lattice cell at or before it (-1 before the
++ *  first fresh column or row), the fraction across the cell, and whether it is this frame's. */
++UNI_FN void Uni_ResolveCell(uint2 InPx, uint InPhase, UNI_OUT(int2) OutBase, UNI_OUT(float2) OutFrac, UNI_OUT(uint) OutFresh)
++{
++	const int N = (int)Uni_TemporalN(InPhase);
++	const uint2 O = Uni_TemporalOffset(InPhase);
++	const int Rx = (int)InPx.x - (int)O.x, Ry = (int)InPx.y - (int)O.y;
++	const int Bx = (Rx + N) / N - 1, By = (Ry + N) / N - 1;
++	const int Mx = Rx - Bx * N, My = Ry - By * N;
++	OutBase = int2(Bx, By);
++	OutFrac = float2((float)Mx / (float)N, (float)My / (float)N);
++	OutFresh = Mx == 0 && My == 0 ? 1u : 0u;
++}
++
++/** Tap InTap (0..15, x fastest) of the 4 x 4 fresh samples about a cell: its march pixel (clamped
++ *  onto the grid), its fill weight (bilinear over the inner four) and moment weight (a tent two cells
++ *  wide), both 0 off the grid. Tap 5 is the cell's own sample. */
++UNI_FN uint2 Uni_ResolveTap(int2 InBase, float2 InFrac, uint InTap, uint InPhase, uint2 InSize, UNI_OUT(float) OutFillW, UNI_OUT(float) OutMomentW)
++{
++	const int N = (int)Uni_TemporalN(InPhase);
++	const uint2 O = Uni_TemporalOffset(InPhase);
++	const int Ox = (int)(InTap & 3u) - 1, Oy = (int)(InTap >> 2u) - 1;
++	const int Px = (InBase.x + Ox) * N + (int)O.x, Py = (InBase.y + Oy) * N + (int)O.y;
++	const bool bOn = InBase.x + Ox >= 0 && InBase.y + Oy >= 0 && Px < (int)InSize.x && Py < (int)InSize.y;
++	const float Dx = abs((float)Ox - InFrac.x), Dy = abs((float)Oy - InFrac.y);
++	OutFillW = bOn ? saturate(1.0f - Dx) * saturate(1.0f - Dy) : 0.0f;
++	OutMomentW = bOn ? saturate(1.0f - 0.5f * Dx) * saturate(1.0f - 0.5f * Dy) : 0.0f;
++	return uint2((uint)clamp(Px, 0, (int)InSize.x - 1), (uint)clamp(Py, 0, (int)InSize.y - 1));
++}
++
++/** Radiance compressed by its brightest channel against InKnee (4 x the fill's luminance: scale
++ *  free), so one bright sample cannot widen the moments to everything; transmittance as is. */
++UNI_FN float4 Uni_ResolveCompress(float4 InC, float InKnee)
++{
++	const float K = 1.0f / max(InKnee, 1.0e-30f);
++	const float Ex = InC.x * K, Ey = InC.y * K, Ez = InC.z * K;
++	const float D = 1.0f / (1.0f + max(Ex, max(Ey, Ez)));
++	return float4(Ex * D, Ey * D, Ez * D, InC.w);
++}
++
++UNI_FN float4 Uni_ResolveExpand(float4 InC, float InKnee)
++{
++	const float D = max(InKnee, 1.0e-30f) / max(1.0f - max(InC.x, max(InC.y, InC.z)), 1.0e-4f);
++	return float4(InC.x * D, InC.y * D, InC.z * D, InC.w);
++}
++
++/** The motion response (0 at rest, 1 from InTightPx march pixels of reprojection on). */
++UNI_FN float Uni_ResolveMotion(float InMotionPx, float InTightPx)
++{
++	return saturate(InMotionPx / max(InTightPx, 1.0e-3f));
++}
++
++/** The history clamped to the moments' mean +- gamma sigma (compressed space), and how far the
++ *  clamp moved it relative to the box's half width (0..1: the share of its age it loses). */
++UNI_FN float4 Uni_ResolveClamp(float4 InHistC, float4 InMean, float4 InSigma, float InMotion, UNI_OUT(float) OutReject)
++{
++	const float G = lerp(UNI_TEMPORAL_GAMMA_REST, UNI_TEMPORAL_GAMMA_MOTION, InMotion);
++	const float4 Lo = float4(InMean.x - G * InSigma.x, InMean.y - G * InSigma.y, InMean.z - G * InSigma.z, InMean.w - G * InSigma.w);
++	const float4 Hi = float4(InMean.x + G * InSigma.x, InMean.y + G * InSigma.y, InMean.z + G * InSigma.z, InMean.w + G * InSigma.w);
++	const float4 C = float4(clamp(InHistC.x, Lo.x, Hi.x), clamp(InHistC.y, Lo.y, Hi.y), clamp(InHistC.z, Lo.z, Hi.z), clamp(InHistC.w, Lo.w, Hi.w));
++	const float Rx = abs(InHistC.x - C.x) / (G * InSigma.x + 0.01f), Ry = abs(InHistC.y - C.y) / (G * InSigma.y + 0.01f);
++	const float Rz = abs(InHistC.z - C.z) / (G * InSigma.z + 0.01f), Rw = abs(InHistC.w - C.w) / (G * InSigma.w + 0.01f);
++	OutReject = saturate(max(max(Rx, Ry), max(Rz, Rw)));
++	return C;
++}
++
++/** A marched pixel's weight for its own sample: 1 / (samples + 1), at least InFreshWeight. */
++UNI_FN float Uni_ResolveAlpha(float InAge, float InFreshWeight)
++{
++	return max(1.0f / (InAge + 1.0f), InFreshWeight);
++}
++
++/** An unmarched pixel's share of the fill: 0.1 at rest while it holds no sample of its own (so the
++ *  history converges to its own samples), 0.5 in motion. */
++UNI_FN float Uni_ResolveShare(float InOwnAge, float InMotion)
++{
++	return lerp(UNI_TEMPORAL_FILL_REST * saturate(1.0f - InOwnAge), UNI_TEMPORAL_FILL_MOTION, InMotion);
++}
++
+ // ------------------------------------------------------------------------------------------
+ // D-169: web debug views (uu.WebDebug). Render-only false colour of the textured web, to check
+ // its shape directly instead of from where galaxies land. The ray is marched front to back
+diff --git a/Shaders/Private/UniVolume.usf b/Shaders/Private/UniVolume.usf
+index 52028b0..34eefbd 100644
+--- a/Shaders/Private/UniVolume.usf
++++ b/Shaders/Private/UniVolume.usf
+@@ -18,6 +18,8 @@
+ //                   pixel of every 2 x 2 block (SliceOffset); this pass fills the others from
+ //                   the previous frame's output, reprojected (Catmull-Rom where it can), or from
+ //                   the fresh neighbours. Its output is the frame's volume and next frame's history.
++//                   D-219: by default it accumulates (every pixel an age; jittered samples
++//                   averaged; CloudAtmosphere's resolve); TemporalClamp.w 0 keeps D-194's rule.
+ //
+ // DEBUG VIEWS (uu.VolumeDebug, lesson #37; exposure-independent false colour, no background):
+ //   1 steps         mean steps per ray / MaxSteps as a heat ramp; truncated rays magenta
+@@ -163,7 +165,9 @@ void MarchCS(uint3 DispatchId : SV_DispatchThreadID)
+ 		for (uint I = 0u; I < SS; ++I)
+ 		{
+ 			const float2 Sub = float2((float)Id.x + ((float)I + 0.5f) / (float)SS, (float)Id.y + ((float)J + 0.5f) / (float)SS);
+-			const FUniVolumeResult R = Uni_VolumeMarch(SS == 1u ? Dir : TrueDir(PixelDir(Sub, Size)), TScene, InCarriers, InParams, InLut, V);
++			// D-219: the draws keyed to the pixel (a sub-ray to its own: x 8 plus its place).
++			const uint2 NoisePx = SS == 1u ? Id.xy : uint2(Id.x * 8u + I, Id.y * 8u + J);
++			const FUniVolumeResult R = Uni_VolumeMarchPx(SS == 1u ? Dir : TrueDir(PixelDir(Sub, Size)), TScene, NoisePx, InCarriers, InParams, InLut, V);
+ 			B += R.Radiance;
+ 			T += R.Transmittance;
+ 			StepSum += R.Steps;
+@@ -266,7 +270,7 @@ uint TemporalPhase;
+ float3 CamStep;             // camera now minus then, cm
+ uint bHistory;
+ float4 PrevWarpVelBeta;     // D-190: the previous frame's warp optics
+-float4 TemporalClamp;       // D-194: x 1: clamp the history into the fresh range (0: the D-184 band); y the motion (px) at which it is tight; z beyond which history is not used
++float4 TemporalClamp;       // D-194: x 1: clamp the history into the fresh range (0: the D-184 band); y the motion (px) at which it is tight; z beyond which history is not used; D-219: w FreshWeight (0: the D-194 replace rule; else the accumulating resolve)
+ Texture2D<float4> FreshVolume;
+ Texture2DArray<float> FreshSlices;
+ Texture2D<float2> FreshDepth;
+@@ -276,14 +280,210 @@ Texture2D<float2> HistDepth;
+ RWTexture2D<float4> OutVolume;
+ RWTexture2DArray<float> OutSlices;
+ RWTexture2D<float2> OutDepth;
++Texture2D<float2> HistAge;   // D-219: samples accumulated, own samples
++RWTexture2D<float2> OutAge;
+ 
+ float LumOf(float4 InV) { return Uni_Luminance(InV.rgb); }
+ 
++FUniTemporalView TemporalViewOf()
++{
++	FUniTemporalView TV;
++	TV.PrevForward = PrevForward; TV.PrevTanX = PrevTanX;
++	TV.PrevRight = PrevRight; TV.PrevTanY = PrevTanY;
++	TV.PrevUp = PrevUp; TV.Phase = TemporalPhase;
++	TV.CamStep = CamStep; TV.bHistory = bHistory;
++	TV.PrevVel = PrevWarpVelBeta.xyz; TV.PrevBeta = PrevWarpVelBeta.w;
++	return TV;
++}
++
++/** D-219: the accumulating resolve (Core/UniVolume.ush, Uni_Resolve*; the CPU reference's
++ *  FTemporalVolume::ResolveAccumulate is the same, line for line). */
++void ResolveAccumulate(uint2 Px)
++{
++	const FUniTemporalView TV = TemporalViewOf();
++	const float2 Size = float2((float)MarchSize.x, (float)MarchSize.y);
++	const float2 Pc = float2((float)Px.x + 0.5f, (float)Px.y + 0.5f);
++	const float3 ApDir = PixelDir(Pc, Size);
++	const float LnTp = log(max(SceneDistanceAtUV(Pc * MarchToDepthUV.xy + MarchToDepthUV.zw, dot(ApDir, ViewForward)), 1.0f));
++	const float3 Dir = TrueDir(ApDir);
++	int2 Base;
++	float2 Frac;
++	uint bFresh;
++	Uni_ResolveCell(Px, TemporalPhase, Base, Frac, bFresh);
++
++	// The fill and the moments from the 4 x 4 fresh samples about the pixel.
++	float4 Cs[16];
++	float Gm[16];
++	float4 Fill = float4(0.0f, 0.0f, 0.0f, 0.0f);
++	float FillW = 0.0f;
++	float FillS[UNI_VOL_SLICES];
++	float OwnS[UNI_VOL_SLICES];
++	UNI_UNROLL
++	for (uint K0 = 0u; K0 < UNI_VOL_SLICES; ++K0) { FillS[K0] = 0.0f; OwnS[K0] = 1.0f; }
++	float4 Own = float4(0.0f, 0.0f, 0.0f, 1.0f);
++	float2 OwnDepth = float2(UNI_VOL_LN_DEPTH_NONE, LnTp);
++	float4 W4 = float4(0.0f, 0.0f, 0.0f, 0.0f), D4 = float4(UNI_VOL_LN_DEPTH_NONE, UNI_VOL_LN_DEPTH_NONE, UNI_VOL_LN_DEPTH_NONE, UNI_VOL_LN_DEPTH_NONE);
++	UNI_UNROLL
++	for (uint Tap = 0u; Tap < 16u; ++Tap)
++	{
++		float Fw, Mw;
++		const uint2 Q = Uni_ResolveTap(Base, Frac, Tap, TemporalPhase, MarchSize, Fw, Mw);
++		const float2 Dq = FreshDepth.Load(int3(int2(Q), 0));
++		const float G = Mw > 0.0f || Fw > 0.0f ? Uni_TemporalDepthWeight(LnTp, Dq.y) + 1.0e-3f : 0.0f;
++		const float4 C = FreshVolume.Load(int3(int2(Q), 0));
++		Cs[Tap] = C;
++		Gm[Tap] = Mw * G;
++		const float Gf = Fw * G;
++		Fill += C * Gf;
++		FillW += Gf;
++		if (Gf > 0.0f)
++		{
++			UNI_UNROLL
++			for (uint K1 = 0u; K1 < UNI_VOL_SLICES; ++K1) { FillS[K1] += FreshSlices.Load(int4(int2(Q), (int)K1, 0)) * Gf; }
++		}
++		if (Tap == 5u)
++		{
++			Own = C; OwnDepth = Dq; W4.x = Gf; D4.x = Dq.x;
++			UNI_UNROLL
++			for (uint K2 = 0u; K2 < UNI_VOL_SLICES; ++K2) { OwnS[K2] = FreshSlices.Load(int4(int2(Q), (int)K2, 0)); }
++		}
++		if (Tap == 6u) { W4.y = Gf; D4.y = Dq.x; }
++		if (Tap == 9u) { W4.z = Gf; D4.z = Dq.x; }
++		if (Tap == 10u) { W4.w = Gf; D4.w = Dq.x; }
++	}
++	const float InvFill = 1.0f / max(FillW, 1.0e-6f);
++	Fill *= InvFill;
++	UNI_UNROLL
++	for (uint K3 = 0u; K3 < UNI_VOL_SLICES; ++K3) { FillS[K3] *= InvFill; }
++	const float Knee = 4.0f * max(LumOf(Fill), 1.0e-30f);
++	float4 M1 = float4(0.0f, 0.0f, 0.0f, 0.0f), M2 = float4(0.0f, 0.0f, 0.0f, 0.0f);
++	float MW = 0.0f;
++	UNI_UNROLL
++	for (uint Tm = 0u; Tm < 16u; ++Tm)
++	{
++		const float4 Cc = Uni_ResolveCompress(Cs[Tm], Knee);
++		M1 += Cc * Gm[Tm];
++		M2 += Cc * Cc * Gm[Tm];
++		MW += Gm[Tm];
++	}
++	M1 /= max(MW, 1.0e-6f);
++	const float4 Sigma = sqrt(max(M2 / max(MW, 1.0e-6f) - M1 * M1, float4(0.0f, 0.0f, 0.0f, 0.0f)));
++	const float LnD = bFresh != 0u ? OwnDepth.x : Uni_TemporalLightLnDepth(W4, D4);
++
++	// The history, reprojected (D-184 / D-215 rules), its age, the clamp.
++	bool bValid = false;
++	float4 Hist = float4(0.0f, 0.0f, 0.0f, 1.0f);
++	float HistS[UNI_VOL_SLICES];
++	UNI_UNROLL
++	for (uint K4 = 0u; K4 < UNI_VOL_SLICES; ++K4) { HistS[K4] = 1.0f; }
++	float HDep = UNI_VOL_LN_DEPTH_NONE;
++	float Age = 0.0f, OwnAge = 0.0f, Motion = 0.0f;
++	const float2 HSize = float2((float)HistSize.x, (float)HistSize.y);
++	float2 Pp = float2(0.0f, 0.0f);
++	if (bHistory != 0u && Uni_TemporalPrevPixel(Dir, LnD, TV, HSize, Pp))
++	{
++		const FUniTemporalTaps Ht = Uni_TemporalHistTaps(Pp, HistSize);
++		const float2 H0 = HistDepth.Load(int3(int2(Ht.Q0), 0)), H1 = HistDepth.Load(int3(int2(Ht.Q1), 0)), H2 = HistDepth.Load(int3(int2(Ht.Q2), 0)), H3 = HistDepth.Load(int3(int2(Ht.Q3), 0));
++		const float4 Wh = Uni_TemporalHistW(Ht.W, LnTp, float4(H0.y, H1.y, H2.y, H3.y));
++		const float Shw = Wh.x + Wh.y + Wh.z + Wh.w;
++		const float Mo = Uni_TemporalMotionPx(Uni_TemporalToGrid(Pp, HSize, Size), Px);
++		if (Shw >= 0.5f && Mo <= TemporalClamp.z)
++		{
++			const float4 Wn = Wh / Shw;
++			float4 Hv = HistVolume.Load(int3(int2(Ht.Q0), 0)) * Wn.x + HistVolume.Load(int3(int2(Ht.Q1), 0)) * Wn.y + HistVolume.Load(int3(int2(Ht.Q2), 0)) * Wn.z + HistVolume.Load(int3(int2(Ht.Q3), 0)) * Wn.w;
++			HDep = H0.x * Wn.x + H1.x * Wn.y + H2.x * Wn.z + H3.x * Wn.w;
++			UNI_UNROLL
++			for (uint K5 = 0u; K5 < UNI_VOL_SLICES; ++K5)
++			{
++				HistS[K5] = HistSlices.Load(int4(int2(Ht.Q0), (int)K5, 0)) * Wn.x + HistSlices.Load(int4(int2(Ht.Q1), (int)K5, 0)) * Wn.y
++					+ HistSlices.Load(int4(int2(Ht.Q2), (int)K5, 0)) * Wn.z + HistSlices.Load(int4(int2(Ht.Q3), (int)K5, 0)) * Wn.w;
++			}
++			// Catmull-Rom where all 16 texels are on the grid and on this pixel's surface (D-184).
++			const float Fx = Pp.x - 0.5f, Fy = Pp.y - 0.5f;
++			const int X0 = (int)floor(Fx), Y0 = (int)floor(Fy);
++			if (X0 - 1 >= 0 && Y0 - 1 >= 0 && X0 + 2 < (int)HistSize.x && Y0 + 2 < (int)HistSize.y)
++			{
++				const float4 Cx = Uni_CatmullRomWeights(Fx - (float)X0);
++				const float4 Cy = Uni_CatmullRomWeights(Fy - (float)Y0);
++				float4 Cr = float4(0.0f, 0.0f, 0.0f, 0.0f);
++				bool bSame = true;
++				UNI_UNROLL
++				for (int J = 0; J < 4; ++J)
++				{
++					const float Wy = J == 0 ? Cy.x : (J == 1 ? Cy.y : (J == 2 ? Cy.z : Cy.w));
++					UNI_UNROLL
++					for (int K = 0; K < 4; ++K)
++					{
++						const float Wx = K == 0 ? Cx.x : (K == 1 ? Cx.y : (K == 2 ? Cx.z : Cx.w));
++						const int3 Qc = int3(X0 - 1 + K, Y0 - 1 + J, 0);
++						bSame = bSame && Uni_TemporalDepthWeight(LnTp, HistDepth.Load(Qc).y) > 0.9f;
++						Cr += HistVolume.Load(Qc) * (Wx * Wy);
++					}
++				}
++				if (bSame) { Hv = float4(max(Cr.xyz, float3(0.0f, 0.0f, 0.0f)), saturate(Cr.w)); }
++			}
++			// The age of the texels the colour blends, at their least: a texel from across a
++			// disocclusion does not lend its count.
++			const float2 A0 = HistAge.Load(int3(int2(Ht.Q0), 0)), A1 = HistAge.Load(int3(int2(Ht.Q1), 0)), A2 = HistAge.Load(int3(int2(Ht.Q2), 0)), A3 = HistAge.Load(int3(int2(Ht.Q3), 0));
++			float2 Am = float2(1.0e30f, 1.0e30f);
++			if (Wn.x > 0.0f) { Am = min(Am, A0); }
++			if (Wn.y > 0.0f) { Am = min(Am, A1); }
++			if (Wn.z > 0.0f) { Am = min(Am, A2); }
++			if (Wn.w > 0.0f) { Am = min(Am, A3); }
++			Motion = Uni_ResolveMotion(Mo, TemporalClamp.y);
++			float Reject = 0.0f;
++			const float4 Hc = Uni_ResolveCompress(Hv, Knee);
++			const float4 Cl = Uni_ResolveClamp(Hc, M1, Sigma, Motion, Reject);
++			Hist = Reject > 0.0f ? Uni_ResolveExpand(Cl, Knee) : Hv;
++			Age = Am.x * (1.0f - Reject);
++			OwnAge = Am.y * (1.0f - Reject);
++			bValid = true;
++		}
++	}
++
++	const float Cap = 1.0f / max(TemporalClamp.w, 1.0e-3f);
++	float4 Res;
++	float Share;
++	float2 NewAge;
++	float OutLn;
++	if (bFresh != 0u)
++	{
++		Share = bValid ? Uni_ResolveAlpha(Age, TemporalClamp.w) : 1.0f;
++		Res = lerp(Hist, Own, Share);
++		UNI_UNROLL
++		for (uint K6 = 0u; K6 < UNI_VOL_SLICES; ++K6) { OutSlices[uint3(Px, K6)] = lerp(HistS[K6], OwnS[K6], Share); }
++		NewAge = float2(min(Age + 1.0f, Cap), min(OwnAge + 1.0f, Cap));
++		OutLn = OwnDepth.x;
++	}
++	else if (bValid)
++	{
++		Share = Uni_ResolveShare(OwnAge, Motion);
++		Res = lerp(Hist, Fill, Share);
++		UNI_UNROLL
++		for (uint K7 = 0u; K7 < UNI_VOL_SLICES; ++K7) { OutSlices[uint3(Px, K7)] = lerp(HistS[K7], FillS[K7], Share); }
++		NewAge = float2(min(Age + Share, Cap), OwnAge);
++		OutLn = HDep;
++	}
++	else
++	{
++		Res = Fill;
++		UNI_UNROLL
++		for (uint K8 = 0u; K8 < UNI_VOL_SLICES; ++K8) { OutSlices[uint3(Px, K8)] = FillS[K8]; }
++		NewAge = float2(0.0f, 0.0f);
++		OutLn = LnD;
++	}
++	OutVolume[Px] = float4(max(Res.xyz, float3(0.0f, 0.0f, 0.0f)), saturate(Res.w));
++	OutDepth[Px] = float2(OutLn, LnTp);
++	OutAge[Px] = NewAge;
++}
++
+ [numthreads(8, 8, 1)]
+ void ReconstructCS(uint3 Id : SV_DispatchThreadID)
+ {
+ 	if (Id.x >= MarchSize.x || Id.y >= MarchSize.y) { return; }
+ 	const uint2 Px = Id.xy;
++	if (TemporalClamp.w > 0.0f) { ResolveAccumulate(Px); return; }   // D-219
++	OutAge[Px] = float2(0.0f, 0.0f);
+ 	if (Uni_TemporalFresh(Px, TemporalPhase))
+ 	{
+ 		OutVolume[Px] = FreshVolume.Load(int3(int2(Px), 0));
+@@ -291,12 +491,7 @@ void ReconstructCS(uint3 Id : SV_DispatchThreadID)
+ 		for (uint K0 = 0u; K0 < UNI_VOL_SLICES; ++K0) { OutSlices[uint3(Px, K0)] = FreshSlices.Load(int4(int2(Px), (int)K0, 0)); }
+ 		return;
+ 	}
+-	FUniTemporalView TV;
+-	TV.PrevForward = PrevForward; TV.PrevTanX = PrevTanX;
+-	TV.PrevRight = PrevRight; TV.PrevTanY = PrevTanY;
+-	TV.PrevUp = PrevUp; TV.Phase = TemporalPhase;
+-	TV.CamStep = CamStep; TV.bHistory = bHistory;
+-	TV.PrevVel = PrevWarpVelBeta.xyz; TV.PrevBeta = PrevWarpVelBeta.w;
++	const FUniTemporalView TV = TemporalViewOf();
+ 	const float2 Size = float2((float)MarchSize.x, (float)MarchSize.y);
+ 	const float2 Pc = float2((float)Px.x + 0.5f, (float)Px.y + 0.5f);
+ 	const float3 ApDir = PixelDir(Pc, Size);
+diff --git a/Source/UniCore/UniGalaxyMap.h b/Source/UniCore/UniGalaxyMap.h
+index 86aa235..d1dd45b 100644
+--- a/Source/UniCore/UniGalaxyMap.h
++++ b/Source/UniCore/UniGalaxyMap.h
+@@ -128,7 +128,6 @@ namespace UniCore
+ 		View.MapCarrier = InCarrier >= 0 && InSize > 0u ? u32(InCarrier) + 1u : 0u;
+ 		View.MapSize = InSize;
+ 		View.MapSlot = InSlot;
+-		View.MapPad1 = 0u;
+ 	}
+ 
+ 	/** D-214: the offline host of a map cache: bakes a slot the moment it is requested (the
+diff --git a/Source/UniCore/UniVolume.h b/Source/UniCore/UniVolume.h
+index 28d1061..deed7fa 100644
+--- a/Source/UniCore/UniVolume.h
++++ b/Source/UniCore/UniVolume.h
+@@ -85,7 +85,7 @@ namespace UniCore
+ 		u32 MapCarrier;         // D-212: the mapped carrier's index + 1 (0: none)
+ 		u32 MapSize;            // texels a side of the map's mip 0
+ 		u32 MapSlot;            // D-214: its slot in the map array
+-		u32 MapPad1;
++		u32 JitterFrame;        // D-219: 0: step midpoints; else the frame's index + 1: jittered samples and first-step phase (temporal accumulation)
+ 	};
+ 	static_assert(sizeof(FVolumeViewGPU) == 112, "FVolumeViewGPU must match FUniVolumeView (UniVolume.ush)");
+ 	static_assert(sizeof(HV::FUniVolumeView) == 112, "shim FUniVolumeView layout");
+diff --git a/Tools/UniVerify/src/UniVolumeRef.h b/Tools/UniVerify/src/UniVolumeRef.h
+index f70a019..53a1f4d 100644
+--- a/Tools/UniVerify/src/UniVolumeRef.h
++++ b/Tools/UniVerify/src/UniVolumeRef.h
+@@ -105,7 +105,7 @@ namespace UniRender
+ 		H::FUniVolumeResult R;
+ 		if (SS == 1u)
+ 		{
+-			R = H::Uni_VolumeMarch(Dc, TScene, Cb, Pb, Lb, V);
++			R = H::Uni_VolumeMarchPx(Dc, TScene, H::uint2(u32(X), u32(Y)), Cb, Pb, Lb, V);   // D-219: draws keyed to the pixel
+ 		}
+ 		else
+ 		{
+@@ -116,7 +116,7 @@ namespace UniRender
+ 			for (u32 J = 0; J < SS; ++J) for (u32 I = 0; I < SS; ++I)
+ 			{
+ 				const FV3 Ds = PixelDir(Cam, Wd, Ht, X + (I + 0.5) / SS, Y + (J + 0.5) / SS);
+-				const H::FUniVolumeResult Rs = H::Uni_VolumeMarch(H::float3(float(Ds.X), float(Ds.Y), float(Ds.Z)), TScene, Cb, Pb, Lb, V);
++				const H::FUniVolumeResult Rs = H::Uni_VolumeMarchPx(H::float3(float(Ds.X), float(Ds.Y), float(Ds.Z)), TScene, H::uint2(u32(X) * 8u + I, u32(Y) * 8u + J), Cb, Pb, Lb, V);
+ 				Acc += Rs.Radiance; AccT += Rs.Transmittance; Steps += Rs.Steps; Tr += Rs.Truncated; Act = std::max(Act, Rs.Active);
+ 				Dw += Rs.DepthWeight; if (Rs.LnDepth < H::UNI_VOL_LN_DEPTH_NONE - 1.0f) { Dwl += Rs.DepthWeight * H::Uni_LightInvDepth(Rs.LnDepth); }   // D-194: harmonic
+ 				for (u32 K = 0; K < H::UNI_VOL_SLICES; ++K) { AccS[K] = (I == 0 && J == 0) ? Rs.SliceT[K] : AccS[K] + Rs.SliceT[K]; }
+@@ -213,8 +213,164 @@ namespace UniRender
+ 		size_t TooFast = 0;
+ 		// D-208: the slicing's block (2: D-184's 2 x 2); set before each Step to vary it.
+ 		u32 Interleave = 2;
++		// D-219: the accumulating resolve (UniVolume.usf ResolveAccumulate) with jittered marches;
++		// false: D-194's replace rule, midpoint samples. Age: samples accumulated, own samples.
++		bool bAccumulate = true;
++		bool bJitter = true;              // with bAccumulate: the march's draws (false: midpoints, for comparisons)
++		float FreshWeight = 0.15f;
++		float FillScale = 1.0f;           // exploration knob (the unmarched pixels' fill share x this)
++		const std::vector<H::float2>* OracleDepth = nullptr;   // exploration: the reprojection's light depth from a full march (D-194 path)
++		std::vector<H::float2> Age;
++		u32 JitterCount = 0;
++		/** Optional per-frame reference march view tweak (the checks' fine reference): unused here. */
+ 
+ 		static float Lum(const H::float4& V) { return H::Uni_Luminance(H::float3(V.x, V.y, V.z)); }
++		static H::float4 Lerp4(const H::float4& A, const H::float4& B, float T) { return H::float4(A.x + (B.x - A.x) * T, A.y + (B.y - A.y) * T, A.z + (B.z - A.z) * T, A.w + (B.w - A.w) * T); }
++		static H::float4 Mul4(const H::float4& A, const H::float4& B) { return H::float4(A.x * B.x, A.y * B.y, A.z * B.z, A.w * B.w); }
++
++		/** D-219: UniVolume.usf's ResolveAccumulate for pixel (X, Y), line for line. */
++		void ResolveAccumulate(const FCamera& Cam, const H::FUniTemporalView& TV, u32 Phase, float LnTp, const std::vector<H::float4>& FVol, const std::vector<float>& FSl, const std::vector<H::float2>& FDep,
++			int X, int Y, std::vector<H::float4>& OVol, std::vector<float>& OSl, std::vector<H::float2>& ODep, std::vector<H::float2>& OAge) const
++		{
++			const u32 NS = H::UNI_VOL_SLICES;
++			const H::uint2 Px = H::uint2(u32(X), u32(Y));
++			const H::uint2 Size = H::uint2(u32(W), u32(Ht));
++			const H::float2 SizeF = H::float2(float(W), float(Ht));
++			const size_t I = size_t(Y) * W + X;
++			H::int2 Base;
++			H::float2 Frac;
++			u32 bFresh = 0u;
++			H::Uni_ResolveCell(Px, Phase, Base, Frac, bFresh);
++			H::float4 Cs[16];
++			float Gm[16];
++			H::float4 Fill(0, 0, 0, 0);
++			float FillW = 0.0f;
++			std::vector<float> FillS(NS, 0.0f), OwnS(NS, 1.0f), HistS(NS, 1.0f);
++			H::float4 Own(0, 0, 0, 1);
++			H::float2 OwnDepth(H::UNI_VOL_LN_DEPTH_NONE, LnTp);
++			float W4a[4] = { 0, 0, 0, 0 }, D4a[4] = { H::UNI_VOL_LN_DEPTH_NONE, H::UNI_VOL_LN_DEPTH_NONE, H::UNI_VOL_LN_DEPTH_NONE, H::UNI_VOL_LN_DEPTH_NONE };
++			for (u32 Tap = 0; Tap < 16u; ++Tap)
++			{
++				float Fw = 0.0f, Mw = 0.0f;
++				const H::uint2 Q = H::Uni_ResolveTap(Base, Frac, Tap, Phase, Size, Fw, Mw);
++				const size_t Qi = size_t(Q.y) * W + Q.x;
++				const H::float2 Dq = FDep[Qi];
++				const float G = Mw > 0.0f || Fw > 0.0f ? H::Uni_TemporalDepthWeight(LnTp, Dq.y) + 1.0e-3f : 0.0f;
++				const H::float4 C = FVol[Qi];
++				Cs[Tap] = C;
++				Gm[Tap] = Mw * G;
++				const float Gf = Fw * G;
++				Fill = Fill + C * Gf;
++				FillW += Gf;
++				if (Gf > 0.0f) { for (u32 K = 0; K < NS; ++K) { FillS[K] += FSl[Qi * NS + K] * Gf; } }
++				if (Tap == 5u) { Own = C; OwnDepth = Dq; W4a[0] = Gf; D4a[0] = Dq.x; for (u32 K = 0; K < NS; ++K) { OwnS[K] = FSl[Qi * NS + K]; } }
++				if (Tap == 6u) { W4a[1] = Gf; D4a[1] = Dq.x; }
++				if (Tap == 9u) { W4a[2] = Gf; D4a[2] = Dq.x; }
++				if (Tap == 10u) { W4a[3] = Gf; D4a[3] = Dq.x; }
++			}
++			const float InvFill = 1.0f / std::max(FillW, 1.0e-6f);
++			Fill = Fill * InvFill;
++			for (u32 K = 0; K < NS; ++K) { FillS[K] *= InvFill; }
++			const float Knee = 4.0f * std::max(Lum(Fill), 1.0e-30f);
++			H::float4 M1(0, 0, 0, 0), M2(0, 0, 0, 0);
++			float MW = 0.0f;
++			for (u32 T = 0; T < 16u; ++T)
++			{
++				const H::float4 Cc = H::Uni_ResolveCompress(Cs[T], Knee);
++				M1 = M1 + Cc * Gm[T];
++				M2 = M2 + Mul4(Cc, Cc) * Gm[T];
++				MW += Gm[T];
++			}
++			M1 = M1 * (1.0f / std::max(MW, 1.0e-6f));
++			const float Iw = 1.0f / std::max(MW, 1.0e-6f);
++			const H::float4 Sigma(std::sqrt(std::max(M2.x * Iw - M1.x * M1.x, 0.0f)), std::sqrt(std::max(M2.y * Iw - M1.y * M1.y, 0.0f)),
++				std::sqrt(std::max(M2.z * Iw - M1.z * M1.z, 0.0f)), std::sqrt(std::max(M2.w * Iw - M1.w * M1.w, 0.0f)));
++			const float LnD = bFresh != 0u ? OwnDepth.x : H::Uni_TemporalLightLnDepth(H::float4(W4a[0], W4a[1], W4a[2], W4a[3]), H::float4(D4a[0], D4a[1], D4a[2], D4a[3]));
++
++			bool bValid = false;
++			H::float4 Hist(0, 0, 0, 1);
++			float HDep = H::UNI_VOL_LN_DEPTH_NONE;
++			float AgeV = 0.0f, OwnAge = 0.0f, Motion = 0.0f;
++			const H::uint2 HSize = H::uint2(u32(HW), u32(HH));
++			const H::float2 HSizeF = H::float2(float(HW), float(HH));
++			H::float2 Pp(0, 0);
++			const FV3 Dd = PixelDir(Cam, W, Ht, X + 0.5, Y + 0.5);
++			if (TV.bHistory != 0u && H::Uni_TemporalPrevPixel(H::float3(float(Dd.X), float(Dd.Y), float(Dd.Z)), LnD, TV, HSizeF, Pp))
++			{
++				const H::FUniTemporalTaps Ht4 = H::Uni_TemporalHistTaps(Pp, HSize);
++				const size_t Qh[4] = { size_t(Ht4.Q0.y) * HW + Ht4.Q0.x, size_t(Ht4.Q1.y) * HW + Ht4.Q1.x, size_t(Ht4.Q2.y) * HW + Ht4.Q2.x, size_t(Ht4.Q3.y) * HW + Ht4.Q3.x };
++				const H::float4 Wh = H::Uni_TemporalHistW(Ht4.W, LnTp, H::float4(Depth[Qh[0]].y, Depth[Qh[1]].y, Depth[Qh[2]].y, Depth[Qh[3]].y));
++				const float Shw = Wh.x + Wh.y + Wh.z + Wh.w;
++				const float Mo = H::Uni_TemporalMotionPx(H::Uni_TemporalToGrid(Pp, HSizeF, SizeF), Px);
++				if (Shw >= 0.5f && Mo <= MaxMotionPx)
++				{
++					const float Wn[4] = { Wh.x / Shw, Wh.y / Shw, Wh.z / Shw, Wh.w / Shw };
++					H::float4 Hv(0, 0, 0, 0);
++					HDep = 0.0f;
++					for (u32 K = 0; K < NS; ++K) { HistS[K] = 0.0f; }
++					for (int K = 0; K < 4; ++K)
++					{
++						Hv = Hv + Vol[Qh[K]] * Wn[K];
++						HDep += Depth[Qh[K]].x * Wn[K];
++						for (u32 S = 0; S < NS; ++S) { HistS[S] += Slices[Qh[K] * NS + S] * Wn[K]; }
++					}
++					const float Fx = Pp.x - 0.5f, Fy = Pp.y - 0.5f;
++					const int X0 = int(std::floor(Fx)), Y0 = int(std::floor(Fy));
++					if (X0 - 1 >= 0 && Y0 - 1 >= 0 && X0 + 2 < HW && Y0 + 2 < HH)
++					{
++						const H::float4 Cx = H::Uni_CatmullRomWeights(Fx - float(X0)), Cy = H::Uni_CatmullRomWeights(Fy - float(Y0));
++						const float Cxa[4] = { Cx.x, Cx.y, Cx.z, Cx.w }, Cya[4] = { Cy.x, Cy.y, Cy.z, Cy.w };
++						H::float4 Cr(0, 0, 0, 0);
++						bool bSame = true;
++						for (int J = 0; J < 4; ++J) for (int K = 0; K < 4; ++K)
++						{
++							const size_t Qc = size_t(Y0 - 1 + J) * HW + size_t(X0 - 1 + K);
++							bSame = bSame && H::Uni_TemporalDepthWeight(LnTp, Depth[Qc].y) > 0.9f;
++							Cr = Cr + Vol[Qc] * (Cxa[K] * Cya[J]);
++						}
++						if (bSame) { Hv = H::float4(std::max(Cr.x, 0.0f), std::max(Cr.y, 0.0f), std::max(Cr.z, 0.0f), std::min(std::max(Cr.w, 0.0f), 1.0f)); }
++					}
++					H::float2 Am(1.0e30f, 1.0e30f);
++					for (int K = 0; K < 4; ++K) { if (Wn[K] > 0.0f) { Am = H::float2(std::min(Am.x, Age[Qh[K]].x), std::min(Am.y, Age[Qh[K]].y)); } }
++					Motion = H::Uni_ResolveMotion(Mo, ClampTightPx);
++					float Reject = 0.0f;
++					const H::float4 Hc = H::Uni_ResolveCompress(Hv, Knee);
++					const H::float4 Cl = H::Uni_ResolveClamp(Hc, M1, Sigma, Motion, Reject);
++					Hist = Reject > 0.0f ? H::Uni_ResolveExpand(Cl, Knee) : Hv;
++					AgeV = Am.x * (1.0f - Reject);
++					OwnAge = Am.y * (1.0f - Reject);
++					bValid = true;
++				}
++			}
++			const float Cap = 1.0f / std::max(FreshWeight, 1.0e-3f);
++			H::float4 Res;
++			float OutLn;
++			if (bFresh != 0u)
++			{
++				const float Share = bValid ? H::Uni_ResolveAlpha(AgeV, FreshWeight) : 1.0f;
++				Res = Lerp4(Hist, Own, Share);
++				for (u32 K = 0; K < NS; ++K) { OSl[I * NS + K] = HistS[K] + (OwnS[K] - HistS[K]) * Share; }
++				OAge[I] = H::float2(std::min(AgeV + 1.0f, Cap), std::min(OwnAge + 1.0f, Cap));
++				OutLn = OwnDepth.x;
++			}
++			else if (bValid)
++			{
++				const float Share = H::Uni_ResolveShare(OwnAge, Motion) * FillScale;
++				Res = Lerp4(Hist, Fill, Share);
++				for (u32 K = 0; K < NS; ++K) { OSl[I * NS + K] = HistS[K] + (FillS[K] - HistS[K]) * Share; }
++				OAge[I] = H::float2(std::min(AgeV + Share, Cap), OwnAge);
++				OutLn = HDep;
++			}
++			else
++			{
++				Res = Fill;
++				for (u32 K = 0; K < NS; ++K) { OSl[I * NS + K] = FillS[K]; }
++				OAge[I] = H::float2(0.0f, 0.0f);
++				OutLn = LnD;
++			}
++			OVol[I] = H::float4(std::max(Res.x, 0.0f), std::max(Res.y, 0.0f), std::max(Res.z, 0.0f), std::min(std::max(Res.w, 0.0f), 1.0f));
++			ODep[I] = H::float2(OutLn, LnTp);
++		}
+ 
+ 		void Step(const FVolumeScene& Sc, const FCamera& Cam, const FV3& CamStepCm, bool bStepValid, bool bTemporal, int Threads = 2)
+ 		{
+@@ -240,7 +396,8 @@ namespace UniRender
+ 			// Without usable history (first frame, a jump, a new size) every pixel is marched, as the
+ 			// renderer does.
+ 			const bool bSlice = bTemporal && TV.bHistory != 0u;
+-			const H::FUniVolumeView V = ToHlsl(Sc.View);
++			H::FUniVolumeView V = ToHlsl(Sc.View);
++			V.JitterFrame = bTemporal && bAccumulate && bJitter ? ++JitterCount : 0u;   // D-219 (the renderer: while temporal is on)
+ 			const auto Cb = Sc.CarrierBuf(); const auto Pb = Sc.ParamBuf(); const auto Lb = Sc.LutBuf();
+ 			const float TScene = 3.0e38f, LnTp = std::log(TScene);
+ 			// Pass 0: the fresh pixels (all of them without slicing).
+@@ -275,7 +432,15 @@ namespace UniRender
+ 			std::vector<H::float4> OVol = FVol;
+ 			std::vector<float> OSl = FSl;
+ 			std::vector<H::float2> ODep = FDep;
+-			if (bSlice)
++			std::vector<H::float2> OAge(N, bAccumulate ? H::float2(1.0f, 1.0f) : H::float2(0.0f, 0.0f));   // D-219: a full march is one sample of each pixel's own
++			if (bSlice && bAccumulate)
++			{
++				for (int Y = 0; Y < Ht; ++Y) for (int X = 0; X < W; ++X)
++				{
++					ResolveAccumulate(Cam, TV, Phase, LnTp, FVol, FSl, FDep, X, Y, OVol, OSl, ODep, OAge);
++				}
++			}
++			else if (bSlice)
+ 			{
+ 				const H::uint2 Size = H::uint2(u32(W), u32(Ht));
+ 				const H::float2 SizeF = H::float2(float(W), float(Ht));
+@@ -306,7 +471,7 @@ namespace UniRender
+ 							Hi4 = H::float4(std::max(Hi4.x, Fv.x), std::max(Hi4.y, Fv.y), std::max(Hi4.z, Fv.z), std::max(Hi4.w, Fv.w));
+ 						}
+ 					}
+-					const float LnD = H::Uni_TemporalLightLnDepth(Ws, H::float4(FDep[Q[0]].x, FDep[Q[1]].x, FDep[Q[2]].x, FDep[Q[3]].x));
++					const float LnD = OracleDepth ? (*OracleDepth)[I].x : H::Uni_TemporalLightLnDepth(Ws, H::float4(FDep[Q[0]].x, FDep[Q[1]].x, FDep[Q[2]].x, FDep[Q[3]].x));
+ 					bool bHist = false;
+ 					H::float4 Hv(0, 0, 0, 0);
+ 					float Hsl[H::UNI_VOL_SLICES] = {};
+@@ -381,7 +546,7 @@ namespace UniRender
+ 					}
+ 				}
+ 			}
+-			Vol.swap(OVol); Slices.swap(OSl); Depth.swap(ODep);
++			Vol.swap(OVol); Slices.swap(OSl); Depth.swap(ODep); Age.swap(OAge);
+ 			HW = W; HH = Ht;
+ 			Prev = Cam;
+ 			bHave = true;

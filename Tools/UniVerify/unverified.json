@@ -190,5 +190,25 @@
   {
     "id": "UE-50",
     "what": "D-213 cleanup: the engine builds and shaders compile after the removals (clipmap, window stretch, travel sensitivity, uu.VolumeGalaxyConst); look and fps unchanged (REVIEW_TONIGHT \u00a747)."
+  },
+  {
+    "id": "UE-51",
+    "what": "D-214 generation load: UniGen.usf's PROBE / ALLOC / EVAL / SCAN / WRITE compile and give the CPU's records (UniGpuParityTest), galaxy stars placed from the slotted galaxy-map array (stars appear in every galaxy entered), uu.GenFrameCandidates caps a frame's work, in-view cells first; the dense-region stutter at speed gone at uu.Star.Keep 0.35 (REVIEW_TONIGHT \u00a748)."
+  },
+  {
+    "id": "UE-52",
+    "what": "D-215: the volume reconstruct reprojects the history across a march resize (HistSize): uu.Perf shows no 'march size changed' unsliced frames while the auto budget changes level, no 100 ms volume frames while streaming, no smear after a level change (REVIEW_TONIGHT \u00a749)."
+  },
+  {
+    "id": "UE-53",
+    "what": "D-216: Play begins in the flythrough universe in free flight (uu.AutoStart, uu.AutoFly); the sky light swaps its cube every 2 s without per-frame blend recaptures: uu.Perf's light-rig peak small, no sky-light hitch (REVIEW_TONIGHT \u00a750)."
+  },
+  {
+    "id": "UE-54",
+    "what": "D-218: the bulge's warp_large read only inside 8 effective radii (shader-only; Uni_GalaxyTexTerms): galaxies look unchanged (the field moves 0.07% per point offline); a slight gain in uu.Perf's volume time inside a galaxy's inner disc (REVIEW_TONIGHT \u00a752)."
+  },
+  {
+    "id": "UE-55",
+    "what": "D-220: galaxy discs warped at a structural level (warp_fine mip >= 2) with the fine band as a bounded multiplier (shader only; UniFields.ush): the rings flying top-down toward a galaxy's centre and the arcs inside one mostly gone; the look close to before (slightly grainier arms); stars in textured galaxies reroll (REVIEW_TONIGHT section 54)."
   }
 ]

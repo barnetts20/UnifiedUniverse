@@ -53,12 +53,13 @@ namespace
 		double Ms = 0.0, MsFull = 0.0;
 		int Frames = 0;
 		double MeanN = 0.0;           // D-208: the interleave, averaged over the compared frames
+		double WorstMarched = 0.0;    // D-215: the largest share of a frame's pixels marched
 	};
 
 	/** Fly a path: per frame the camera moves by Step (cm) and turns by Turn (rad) about Axis;
 	 *  the volume is rebuilt for every frame's camera (as the engine does). Frames from the
 	 *  fifth on are compared (the first four fill the history). */
-	FPathStats FlyPath(const FUniverseDef& D, FCoord Cam0, FV3 Look, FV3 StepCm, FV3 Axis, double Turn, int Frames, int W, int Ht, bool bClamp = true, u32 MaxN = 2)
+	FPathStats FlyPath(const FUniverseDef& D, FCoord Cam0, FV3 Look, FV3 StepCm, FV3 Axis, double Turn, int Frames, int W, int Ht, bool bClamp = true, u32 MaxN = 2, int ResizeEvery = 0, bool bKeepAcrossResize = true)
 	{
 		FUniverseModel M(D);
 		FRefGenerator G(M);
@@ -67,12 +68,17 @@ namespace
 		P.bVelocityLod = false;
 		FTemporalVolume Tv;
 		Tv.bClamp = bClamp;   // D-194
+		Tv.bKeepAcrossResize = bKeepAcrossResize;   // D-215
 		FPathStats St;
 		FCoord Cam = Cam0;
 		FV3 Fwd = Norm(Look);
 		size_t Recon = 0, Hist = 0;
 		for (int F = 0; F < Frames; ++F)
 		{
+			// D-215: the auto budget's levels (x1, x0.92, x0.84 a side), changing every ResizeEvery frames.
+			static const double LevelScale[3] = { 1.0, 0.92, 0.84 };
+			const double Ls = ResizeEvery > 0 ? LevelScale[(F / ResizeEvery) % 3] : 1.0;
+			const int Wf = std::max(8, int(std::lround(W * Ls))), Hf = std::max(8, int(std::lround(Ht * Ls)));
 			if (F > 0)
 			{
 				FVec3f Fr{};
@@ -80,13 +86,13 @@ namespace
 				Fwd = Rotate(Fwd, Axis, Turn);
 			}
 			P.Update(Cam, FVec3f{});
-			FCamera Cm; Cm.Coord = Cam; Cm.Width = W; Cm.Height = Ht; Cm.DeltaMag = 0.0;
+			FCamera Cm; Cm.Coord = Cam; Cm.Width = Wf; Cm.Height = Hf; Cm.DeltaMag = 0.0;
 			Cm.LookAlong(Fwd);
 			const FVolumeScene Sc = VB.Build(P, Cam, FVec3f{}, Cm.View()).Subset(false);
 			// D-208: the renderer's interleave rule (its motion estimate: the turn, plus the step over
 			// the nearest marched structure).
 			{
-				const double ThetaPix = 2.0 * Cm.TanX() / double(W);
+				const double ThetaPix = 2.0 * Cm.TanX() / double(Wf);
 				const double StepLen = std::sqrt(Dot(StepCm, StepCm));
 				const double Move = F > 0 && StepLen > 0.0 ? (Sc.NearCm > 0.0 ? StepLen / Sc.NearCm : 1.0e9) : 0.0;
 				const double MotionPx = ((F > 0 ? std::abs(Turn) : 0.0) + Move) / ThetaPix;
@@ -103,12 +109,13 @@ namespace
 			St.Ms += std::chrono::duration<double, std::milli>(T1 - T0).count();
 			St.MsFull += std::chrono::duration<double, std::milli>(T2 - T1).count();
 			Hist += Tv.FromHistory - H0; Recon += Tv.FromHistory + Tv.FromFresh - R0;
-			St.MarchedShare += double(Tv.Marched - M0) / double(size_t(W) * Ht);
+			St.MarchedShare += double(Tv.Marched - M0) / double(size_t(Wf) * Hf);
+			St.WorstMarched = std::max(St.WorstMarched, double(Tv.Marched - M0) / double(size_t(Wf) * Hf));   // D-215: the frame's spike
 			double Sa = 0, Sb = 0;
 			std::vector<double> La(Ref.size()), Lb(Ref.size());
 			for (size_t I = 0; I < Ref.size(); ++I)
 			{
-				const double Om = PixelSolidAngle(Cm, W, Ht, double(I % W) + 0.5, double(I / W) + 0.5);
+				const double Om = PixelSolidAngle(Cm, Wf, Hf, double(I % Wf) + 0.5, double(I / Wf) + 0.5);
 				La[I] = double(H::Uni_Luminance(H::float3(Tv.Vol[I].x, Tv.Vol[I].y, Tv.Vol[I].z))) * Om;
 				Lb[I] = double(H::Uni_Luminance(H::float3(Ref[I].x, Ref[I].y, Ref[I].z))) * Om;
 				Sa += La[I]; Sb += Lb[I];
@@ -130,10 +137,10 @@ namespace
 			if (!Rel.empty()) { std::sort(Rel.begin(), Rel.end()); P95 = Rel[std::min(Rel.size() - 1, size_t(0.95 * double(Rel.size())))]; }
 			St.MeanP95 += P95;
 			St.WorstP95 = std::max(St.WorstP95, P95);
-			for (int By = 0; By + 8 <= Ht; By += 8) for (int Bx = 0; Bx + 8 <= W; Bx += 8)
+			for (int By = 0; By + 8 <= Hf; By += 8) for (int Bx = 0; Bx + 8 <= Wf; Bx += 8)
 			{
 				double A = 0, B = 0;
-				for (int Y = By; Y < By + 8; ++Y) for (int X = Bx; X < Bx + 8; ++X) { A += La[size_t(Y) * W + X]; B += Lb[size_t(Y) * W + X]; }
+				for (int Y = By; Y < By + 8; ++Y) for (int X = Bx; X < Bx + 8; ++X) { A += La[size_t(Y) * Wf + X]; B += Lb[size_t(Y) * Wf + X]; }
 				if (B > 64.0 * 0.05 * Mean) { St.WorstBlock = std::max(St.WorstBlock, std::abs(A - B) / B); }
 			}
 			++St.Frames;
@@ -301,5 +308,30 @@ UNI_TEST(volume, interleave)
 	Uni::Check(2, "T2.vol.interleave", "D-208 the slicing's block grows with stillness (3 x 3 under 1.5 march px a frame, 4 x 4 under 0.5): over still and slow paths inside and outside a galaxy, the light within 1% of a full march and the per-pixel p95 within 2% of the 2 x 2's; 2 x 2 kept when moving")
 		.Metric("marched_2x2", MarchedA / 6.0).Metric("marched_adaptive", MarchedB / 6.0)
 		.Pass(bPass, Detail);
+}
+
+UNI_TEST(volume, temporal_resize)
+{
+	// D-215 (owner: frame drops to 30-40 fps while a dense region streams in; trace: the volume
+	// march up to 115 ms in a frame, uu.Perf: 225 frames "not sliced: march size changed" for 225
+	// auto-budget level changes). A new march size dropped the history, so that frame marched every
+	// pixel: 16x the rays at 1/16. The history is now kept across a resize (within 2x), reprojected
+	// at its own size. Inside the Milky Way, moving and turning, 1/16 slicing, the size changing
+	// level every 4 frames (x1, x0.92, x0.84 a side): no frame marches more than a sliced frame's
+	// share (the slicing follows the motion), and the light stays within the fixed-size run's error.
+	const FUniverseDef D = UniScenes::GalaxyToStar();
+	const FCoord Cam = UniScenes::SolarCamera();
+	const FV3 Look{ 1.0, 0.3, -0.1 }, Step{ 20.0 * Units::Pc, 5.0 * Units::Pc, 0.0 }, Axis{ 0.2, 0.1, 1.0 };
+	const double Turn = 0.002;
+	const FPathStats Fixed = FlyPath(D, Cam, Look, Step, Axis, Turn, 20, 192, 120, true, 4, 0, true);
+	const FPathStats Old = FlyPath(D, Cam, Look, Step, Axis, Turn, 20, 192, 120, true, 4, 4, false);
+	const FPathStats Kept = FlyPath(D, Cam, Look, Step, Axis, Turn, 20, 192, 120, true, 4, 4, true);
+	Uni::Check(2, "T2.vol.temporal_resize", "D-215 the march resized every 4 frames (the auto budget's levels) keeps its history: no frame marches more than the fixed-size run's sliced share (dropping it marched every pixel: the spike), light within the fixed-size run's error plus 1%, pixel p95 within 1.5x of it")
+		.Metric("worst_marched_old", Old.WorstMarched).Metric("worst_marched_kept", Kept.WorstMarched).Metric("worst_marched_fixed", Fixed.WorstMarched)
+		.Metric("light_fixed", Fixed.WorstLightPath).Metric("light_kept", Kept.WorstLightPath).Metric("p95_fixed", Fixed.MeanP95).Metric("p95_kept", Kept.MeanP95)
+		.Pass(Old.WorstMarched > 0.9 && Kept.WorstMarched <= Fixed.WorstMarched + 0.01 && Kept.WorstLightPath < Fixed.WorstLightPath + 0.01 && Kept.MeanP95 < 1.5 * Fixed.MeanP95 + 0.01,
+			Uni::Fmt("most of a frame marched: dropping the history at a resize %.0f%%, keeping it %.0f%% (fixed size %.0f%%); light over the path's mean, worst frame: fixed %.2f%%, resized and kept %.2f%% (dropped %.2f%%); pixel p95: fixed %.1f%%, kept %.1f%%, dropped %.1f%%; %.0f%% of reconstructed pixels from history (fixed %.0f%%)",
+				100.0 * Old.WorstMarched, 100.0 * Kept.WorstMarched, 100.0 * Fixed.WorstMarched, 100.0 * Fixed.WorstLightPath, 100.0 * Kept.WorstLightPath, 100.0 * Old.WorstLightPath,
+				100.0 * Fixed.MeanP95, 100.0 * Kept.MeanP95, 100.0 * Old.MeanP95, 100.0 * Kept.HistoryShare, 100.0 * Fixed.HistoryShare));
 }
 

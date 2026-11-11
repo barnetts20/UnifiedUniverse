@@ -104,9 +104,12 @@ static TAutoConsoleVariable<int32> CVarUniSubmitDefer(TEXT("uu.SubmitDeferPerLev
 // D-203: cell glow, a fixed build budget and windows that keep their rest size at speed.
 static TAutoConsoleVariable<float> CVarUniTravelExposure(TEXT("uu.TravelExposure"), 1.5f, TEXT("D-205: magnitudes everything is brightened by at full travel speed (render only: sprites, glow and background; windows and what is generated unchanged), lerped by the travel curve (100 kpc/s to 10 Mpc/s). Brings back the visibility travel sensitivity gave nearby clusters at speed without widening windows. 0: off."));
 static TAutoConsoleVariable<int32> CVarUniGenOneTrip(TEXT("uu.GenOneTrip"), 1, TEXT("D-207: cells whose objects never come back (stars) are generated in one GPU round trip (probe, allocation and place in one graph) instead of two (~6 -> ~3 frames). 0: two trips for every cell."));
-static TAutoConsoleVariable<int32> CVarUniGalaxyMap(TEXT("uu.GalaxyMap"), 1, TEXT("D-212: the galaxy the camera is in is marched from its baked 2D map (in-plane light, dust, disc centre, arm part; baked once per galaxy on a worker) with the vertical profile, bulge, warp and detail read per sample. 0: its field at every step (A/B)."));
+static TAutoConsoleVariable<int32> CVarUniGalaxyMap(TEXT("uu.GalaxyMap"), 1, TEXT("D-212: the galaxy the camera is in is marched from its baked 2D map (in-plane light, dust, disc centre, arm part; baked once per galaxy on the GPU) with the vertical profile, bulge, warp and detail read per sample. 0: its field at every step (A/B). D-214: placement always reads the maps (a galaxy's stars come from its map); this toggles the volume only."));
 static TAutoConsoleVariable<int32> CVarUniGalaxyMapSize(TEXT("uu.GalaxyMap.Size"), 1024, TEXT("D-212: the galaxy map's texels a side (a power of two, 256..4096): 1024 ~11 MB with mips, baked in one frame (p95 1% against the field; the owner sees no difference from 2048), 2048 ~43 MB (0.3%). Changing it rebakes."));
-static TAutoConsoleVariable<int32> CVarUniGalaxyMapBudget(TEXT("uu.GalaxyMap.Budget"), 1048576, TEXT("D-212: texels of the galaxy map the GPU bakes a frame (rows of the map): 1M bakes 1024^2 in one frame, 2048^2 in 4. The glow uses the field until the map is done."));
+static TAutoConsoleVariable<int32> CVarUniGalaxyMapBudget(TEXT("uu.GalaxyMap.Budget"), 1048576, TEXT("D-212: texels of the galaxy maps the GPU bakes a frame (rows of a map): 1M bakes a 1024^2 map in one frame, 2048^2 in 4. The glow uses the field until the camera's galaxy's map is done; D-214: a galaxy's stars wait for theirs."));
+static TAutoConsoleVariable<int32> CVarUniGalaxyMapSlots(TEXT("uu.GalaxyMap.Slots"), 4, TEXT("D-214: galaxy maps kept on the GPU at once (1..16; ~11 MB each at 1024^2): every galaxy stars are placed in, and the camera's own. A galaxy beyond them waits (glow) until a slot frees (unused for 64 frames). Changing it rebakes."));
+static TAutoConsoleVariable<int32> CVarUniGenFrameCandidates(TEXT("uu.GenFrameCandidates"), 1000000, TEXT("D-214: the most candidate positions a frame's one-trip generation batch evaluates up front (a galaxy star takes ~3, a dense core cell thousands); cells past it wait a frame as glow, the most needed first. The hard cap on a frame's generation work. 0: no cap."));
+static TAutoConsoleVariable<int32> CVarUniGenViewPriority(TEXT("uu.GenViewPriority"), 1, TEXT("D-214: cells in view are built before cells out of view (after the cells finer levels wait on). 0: by distance alone (D-203)."));
 static TAutoConsoleVariable<int32> CVarUniCellGlow(TEXT("uu.CellGlow"), 1, TEXT("D-203: a cell still loading is drawn as glow (the volume adds its children's expected light from the field) and its sprites fade in once it is Ready, instead of a hole that pops. 0: before D-203."));
 static TAutoConsoleVariable<int32> CVarUniStreamBuildBudget(TEXT("uu.StreamBuildBudget"), 96, TEXT("D-203: at most this many cells built per frame over every level, those needed soonest first; the rest wait as glow. 0: D-173's per-level rule (uu.SubmitDeferPerLevel)."));
 static TAutoConsoleVariable<float> CVarUniCellFadeFrames(TEXT("uu.CellFadeFrames"), 8.0f, TEXT("D-203: frames over which a cell's sprites fade in (and its glow out) once it is Ready."));
@@ -174,6 +177,20 @@ void UUniSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	GLastSubsystem = this;
 }
 
+// D-216: start-up without console commands.
+static TAutoConsoleVariable<FString> CVarUniAutoStart(TEXT("uu.AutoStart"), TEXT("flythrough"), TEXT("D-216: the scene enabled when play begins (galaxy, web or flythrough, as uu.Enable); none: wait for uu.Enable. Set in DefaultEngine.ini [ConsoleVariables] to change it."));
+static TAutoConsoleVariable<int32> CVarUniAutoFly(TEXT("uu.AutoFly"), 1, TEXT("D-216: with uu.AutoStart, begin in free flight (as uu.Fly) once the player's pawn exists. 0: Local mode."));
+
+void UUniSubsystem::OnWorldBeginPlay(UWorld& InWorld)
+{
+	Super::OnWorldBeginPlay(InWorld);
+	const FString Scene = CVarUniAutoStart.GetValueOnGameThread().TrimStartAndEnd();
+	if (Scene.IsEmpty() || Scene.Equals(TEXT("none"), ESearchCase::IgnoreCase)) { return; }
+	EnableUniverse(Scene);
+	// The pawn is usually possessed after the world's begin play: free flight waits for it (Tick).
+	bAutoFlyPending = bEnabled && CVarUniAutoFly.GetValueOnGameThread() != 0;
+}
+
 void UUniSubsystem::Deinitialize()
 {
 	DisableUniverse();
@@ -214,6 +231,8 @@ void UUniSubsystem::EnableUniverse(const FString& Scene)
 		UE_LOG(LogUnifiedUniverse, Warning, TEXT("UnifiedUniverse: archetype validation: %s"), UTF8_TO_TCHAR(Problem.c_str()));
 	}
 	Generator = MakeUnique<UniCore::FRefGenerator>(*Model);
+	GalaxyMaps.Reset();
+	Generator->Maps = &GalaxyMaps;   // D-214: galaxies place their stars from their maps
 	Backend = MakeUnique<FUniGpuGenBackend>();
 	Streamer = MakeUnique<UniCore::FUniStreamer>(*Generator, *Backend);
 	VolumeBuilder = MakeUnique<UniCore::FVolumeBuilder>(*Model, *Generator);
@@ -596,6 +615,11 @@ void UUniSubsystem::StartFlythrough(float Seconds)
 void UUniSubsystem::Tick(float DeltaTime)
 {
 	if (!bEnabled || !Streamer) { return; }
+	if (bAutoFlyPending)   // D-216
+	{
+		const APlayerController* PC = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr;
+		if (PC && PC->GetPawn()) { bAutoFlyPending = false; SetFreeFly(true); }
+	}
 	TRACE_CPUPROFILER_EVENT_SCOPE(Uni_Tick);
 	for (double& M : PerfMs) { M = 0.0; }
 	{
@@ -701,6 +725,7 @@ void UUniSubsystem::Tick(float DeltaTime)
 		const double Dt = FMath::Max(double(DeltaTime), 1.0e-4);
 		const UniCore::FVec3d Step = UniCore::ToDouble(UniCore::Sub(C, PrevCamera.ToCore()));
 		const double Speed = bCameraJumped ? 0.0 : UniCore::Length(Step) / Dt;
+		CameraSpeedCmPerS = Speed;   // D-216
 		// D-184: the volume's temporal reprojection needs the camera's move (not across a jump).
 		CameraStepCm = bCameraJumped ? FVector3d::ZeroVector : FVector3d(Step.X, Step.Y, Step.Z);
 		bCameraStepValid = !bCameraJumped;
@@ -728,6 +753,36 @@ void UUniSubsystem::Tick(float DeltaTime)
 	Streamer->bOneTrip = CVarUniGenOneTrip.GetValueOnGameThread() != 0;           // D-207
 	Streamer->CellFadeFrames = FMath::Clamp(double(CVarUniCellFadeFrames.GetValueOnGameThread()), 0.0, 120.0);
 	Streamer->BuildBudget = FMath::Max(CVarUniStreamBuildBudget.GetValueOnGameThread(), 0);
+	{
+		// D-214: the frame's generation cap, the split place pass's chunk grid (the cap's chunks
+		// plus one partial chunk per task), and the view the build order prefers.
+		const int32 Cap = FMath::Max(CVarUniGenFrameCandidates.GetValueOnGameThread(), 0);
+		Streamer->FrameCandidateCap = UniCore::u64(Cap);
+		Streamer->GenChunkCap = Cap > 0 ? uint32(Cap) / UniHlsl::UNI_GEN_CHUNK + 8192u : 65536u;
+		Streamer->bViewPriority = CVarUniGenViewPriority.GetValueOnGameThread() != 0;
+		const FVector Fw = ViewRot.Vector();
+		Streamer->ViewDir = UniCore::FVec3d{ Fw.X, Fw.Y, Fw.Z };
+		float FovDeg = 90.0f;
+		if (UWorld* World = GetWorld()) { if (APlayerController* PC = World->GetFirstPlayerController()) { if (PC->PlayerCameraManager) { FovDeg = PC->PlayerCameraManager->GetFOVAngle(); } } }
+		// The diagonal's half angle (aspect up to ~2:1), plus 10 degrees for turning.
+		const double HalfX = FMath::DegreesToRadians(double(FMath::Clamp(FovDeg, 1.0f, 170.0f)) * 0.5);
+		const double Half = FMath::Atan(FMath::Tan(HalfX) * 1.12) + FMath::DegreesToRadians(10.0);
+		Streamer->ViewCos = Half >= UE_DOUBLE_PI ? -2.0 : FMath::Cos(Half);
+	}
+	{
+		// D-214: the galaxy maps: their slots, a tick, and the bakes the GPU finished.
+		const uint32 Slots = uint32(FMath::Clamp(CVarUniGalaxyMapSlots.GetValueOnGameThread(), 1, FUniRenderStats::MaxGalMapSlots));
+		const uint32 Size = FMath::RoundUpToPowerOfTwo(uint32(FMath::Clamp(CVarUniGalaxyMapSize.GetValueOnGameThread(), 256, 4096)));
+		GalaxyMaps.Configure(Slots, Size);
+		GalaxyMaps.Tick();
+		for (uint32 S = 0; S < GalaxyMaps.NumSlots(); ++S)
+		{
+			const uint32 E = FUniRenderer::Get().Stats.GalMapBaked[S].load();
+			if (E != 0u && E != GalaxyMapEpochSeen[S] && GalaxyMaps.Entry(S).Epoch == E) { ++GalaxyMapBakesSeen; }
+			GalaxyMapEpochSeen[S] = E;
+			GalaxyMaps.MarkBaked(S, E);
+		}
+	}
 	{
 		// D-168: contributors the volume builder will ask for (above its reject angle) stay awake:
 		// half that angle, from last frame's pixel size (as the builder uses).
@@ -779,8 +834,8 @@ FString UUniSubsystem::StreamBreakdown(const UniCore::FStreamProfile& P) const
 	for (int32 I = 0; I < int32(UniCore::EStreamPhase::Count); ++I)
 	{
 		if (P.Ms[I] < 0.05) { continue; }
-		const char* Name = UniCore::StreamPhaseName(UniCore::EStreamPhase(I));
-		S += FString::Printf(TEXT("%s%s %.1f"), S.IsEmpty() ? TEXT("") : TEXT(", "), UTF8_TO_TCHAR(Name + 11), P.Ms[I]);   // drop "Uni.Stream."
+		const char* Name = UniCore::StreamPhaseShortName(UniCore::EStreamPhase(I));
+		S += FString::Printf(TEXT("%s%s %.1f"), S.IsEmpty() ? TEXT("") : TEXT(", "), UTF8_TO_TCHAR(Name), P.Ms[I]);
 	}
 	S += FString::Printf(TEXT(" | cells submitted %llu (tasks %llu), overlap tests %llu, growth checks %llu, read back %llu objects, contributors +%llu -%llu (awake %llu, asleep %llu; woke %llu, slept %llu), cells deferred %llu, gathered %llu, batch-cell scans %llu, cell table %llu"),
 		P.CellsSubmitted, P.TasksSubmitted, P.OverlapTests, P.GrowthChecks, P.ObjectsReadBack, P.ContributorsAdded, P.ContributorsRemoved, P.Awake, P.Asleep, P.Woken, P.Slept, P.CellsDeferred, P.Gathered, P.BatchCellScans, P.CellTableEntries);
@@ -820,7 +875,7 @@ void UUniSubsystem::DrawPerfHud() const
 	for (int32 I = 0; I < int32(UniCore::EStreamPhase::Count); ++I)
 	{
 		if (StreamAvg[I] < 0.05) { continue; }
-		L2 += FString::Printf(TEXT("  %s %.1f"), UTF8_TO_TCHAR(UniCore::StreamPhaseName(UniCore::EStreamPhase(I)) + 11), StreamAvg[I]);
+		L2 += FString::Printf(TEXT("  %s %.1f"), UTF8_TO_TCHAR(UniCore::StreamPhaseShortName(UniCore::EStreamPhase(I))), StreamAvg[I]);
 	}
 	const UniCore::FStreamProfile& P = StreamLast;
 	const FString L3 = FString::Printf(TEXT("UU work: sprites %u, cells drawn %u, carriers %u, contributors %llu | this frame: submitted %llu cells / %llu tasks, %llu overlap tests, read back %llu, +%llu -%llu contributors | hitches %llu"),
@@ -838,7 +893,7 @@ void UUniSubsystem::LogPerf()
 	UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse perf over %llu frames (game thread, ms; avg ~20 frames / peak since the last uu.Perf), %llu hitches over uu.PerfHitchMs:"), PerfFrames, PerfHitches);
 	for (int32 I = 0; I < PerfCount; ++I) { UE_LOG(LogUnifiedUniverse, Log, TEXT("  %-14s %7.2f / %7.2f"), PerfPhaseName(I), PerfAvg[I], PerfPeak[I]); }
 	FString Avg;
-	for (int32 I = 0; I < int32(UniCore::EStreamPhase::Count); ++I) { Avg += FString::Printf(TEXT("%s%s %.2f"), Avg.IsEmpty() ? TEXT("") : TEXT(", "), UTF8_TO_TCHAR(UniCore::StreamPhaseName(UniCore::EStreamPhase(I)) + 11), StreamAvg[I]); }
+	for (int32 I = 0; I < int32(UniCore::EStreamPhase::Count); ++I) { Avg += FString::Printf(TEXT("%s%s %.2f"), Avg.IsEmpty() ? TEXT("") : TEXT(", "), UTF8_TO_TCHAR(UniCore::StreamPhaseShortName(UniCore::EStreamPhase(I))), StreamAvg[I]); }
 	UE_LOG(LogUnifiedUniverse, Log, TEXT("  streamer avg: %s"), *Avg);
 	UE_LOG(LogUnifiedUniverse, Log, TEXT("  worst frame (%.1f ms) streamer: %s"), StreamWorstTickMs, *StreamBreakdown(StreamWorst));
 	UE_LOG(LogUnifiedUniverse, Log, TEXT("  last frame streamer: %s"), *StreamBreakdown(StreamLast));
@@ -863,9 +918,19 @@ void UUniSubsystem::LogPerf()
 	for (int32 I = 0; I < FUniRenderStats::NumSliceCounts; ++I) { Sl[I] = FUniRenderer::Get().Stats.VolumeSliceCounts[I].exchange(0u); }   // R is const
 	UE_LOG(LogUnifiedUniverse, Log, TEXT("  volume slicing since the last uu.Perf: 1/16 %u, 1/9 %u, 1/4 %u frames; not sliced %u (temporal off or a debug view %u, no history %u, march size changed %u, camera jump %u, same frame rendered again %u, frames skipped %u)"),
 		Sl[4], Sl[3], Sl[2], Sl[5] + Sl[6] + Sl[7] + Sl[8] + Sl[9] + Sl[10], Sl[5], Sl[6], Sl[7], Sl[8], Sl[9], Sl[10]);
-	UE_LOG(LogUnifiedUniverse, Log, TEXT("  galaxy map (uu.GalaxyMap): %s, %u^2 (%.1f MB with mips); last bake %u frames on the GPU (%.0f ms from request to use); %llu bakes"),
-		GalaxyMapEpoch == 0u ? TEXT("none") : (R.GalMapReadyEpoch.load() == GalaxyMapEpoch ? TEXT("ready") : TEXT("baking")), GalaxyMapSize, double(GalaxyMapSize) * GalaxyMapSize * 8.0 * 4.0 / 3.0 / 1048576.0,
-		R.GalMapBakeFrames.load(), GalaxyMapBakeMs, (unsigned long long)GalaxyMapBakes);
+	{
+		uint32 Used = 0, Baking = 0;
+		for (uint32 S = 0; S < GalaxyMaps.NumSlots(); ++S) { if (GalaxyMaps.Entry(S).Key != 0ull) { ++Used; if (!GalaxyMaps.Entry(S).bReady) { ++Baking; } } }
+		UE_LOG(LogUnifiedUniverse, Log, TEXT("  galaxy maps (uu.GalaxyMap.*): %u of %u slots used (%u baking), %u^2 (%.1f MB with mips); the camera's galaxy %s; %llu maps baked in %u GPU frames, %llu requests, %llu evictions, %llu waits"),
+			Used, GalaxyMaps.NumSlots(), Baking, GalaxyMaps.MapSize(), double(GalaxyMaps.NumSlots()) * double(GalaxyMaps.MapSize()) * GalaxyMaps.MapSize() * 8.0 * 4.0 / 3.0 / 1048576.0,
+			GalaxyMapVolumeSlot >= 0 ? TEXT("from its map") : TEXT("from the field (no map yet, or uu.GalaxyMap 0)"),
+			(unsigned long long)GalaxyMapBakesSeen, R.GalMapBakeFrames.load(), (unsigned long long)GalaxyMaps.Requests, (unsigned long long)GalaxyMaps.Evictions, (unsigned long long)GalaxyMaps.Waits);
+		UE_LOG(LogUnifiedUniverse, Log, TEXT("  generation (uu.GenFrameCandidates %llu): %llu cells deferred by the cap, %llu waited for a galaxy map; since the last uu.Perf %llu one-trip batches, candidates planned %.0f a batch on average, %llu at most (GPU: the Uni.Gen.* scopes in ProfileGPU / Insights)"),
+			(unsigned long long)(Streamer ? Streamer->FrameCandidateCap : 0ull), (unsigned long long)(Streamer ? Streamer->FusedDeferred : 0ull), (unsigned long long)(Streamer ? Streamer->MapWaits : 0ull),
+			(unsigned long long)(Streamer ? Streamer->FusedPlannedBatches : 0ull), Streamer && Streamer->FusedPlannedBatches ? double(Streamer->FusedPlannedSum) / double(Streamer->FusedPlannedBatches) : 0.0,
+			(unsigned long long)(Streamer ? Streamer->FusedPlannedMax : 0ull));
+		if (Streamer) { Streamer->ResetGenStats(); }
+	}
 	UE_LOG(LogUnifiedUniverse, Log, TEXT("  background map re-marched since the last uu.Perf: %u (camera moved %u, LUT layout %u, its LUT changed %u, sky web %u)"),
 		BgDirtyCounts[0] + BgDirtyCounts[1] + BgDirtyCounts[2] + BgDirtyCounts[3], BgDirtyCounts[0], BgDirtyCounts[1], BgDirtyCounts[2], BgDirtyCounts[3]);
 	for (uint32& C : BgDirtyCounts) { C = 0u; }
@@ -981,41 +1046,21 @@ void UUniSubsystem::PushFrame()
 		F.VolumeLut.Reserve(int32(Sc.Lut.size()));
 		for (const UniHlsl::float4& L : Sc.Lut) { F.VolumeLut.Add(FVector4f(L.x, L.y, L.z, L.w)); }
 		F.VolumeView = Sc.View;
-		// D-212: the galaxy map: the GPU bakes it over a few frames when the camera's galaxy (or the
-		// size) changes; published once the renderer reports this request baked.
+		// D-212 / D-214: the camera's galaxy's map (its whole map, dust too) from the cache; published
+		// once baked. The cache's pending bakes (generation's too) ride every frame until done.
 		{
 			const bool bMap = CVarUniGalaxyMap.GetValueOnGameThread() != 0;
-			const uint32 WantSize = FMath::RoundUpToPowerOfTwo(uint32(FMath::Clamp(CVarUniGalaxyMapSize.GetValueOnGameThread(), 256, 4096)));
 			const UniCore::FCarrierGPU* Home = UniCore::HomeCarrierOf(Sc);
+			GalaxyMapVolumeSlot = -1;
 			if (bMap && Home)
 			{
-				if (!(GalaxyMapEpoch != 0u && GalaxyMapId == Sc.Home.Parent && GalaxyMapSize == WantSize))
+				const int Slot = GalaxyMaps.AcquireFull(UniCore::FGalaxyMap::GalaxyMapRequestOf(*Home, Sc.Params));
+				if (Slot >= 0)
 				{
-					++GalaxyMapSerial;
-					GalaxyMapEpoch = GalaxyMapSerial;
-					GalaxyMapId = Sc.Home.Parent;
-					GalaxyMapSize = WantSize;
-					GalaxyMapParams[0] = Sc.Params[Home->ParamIndex];
-					GalaxyMapParams[1] = (Home->Flags & UniHlsl::UNI_CARRIER_DUST) != 0u ? Sc.Params[Home->DustParamIndex] : Sc.Params[Home->ParamIndex];
-					bGalaxyMapDust = (Home->Flags & UniHlsl::UNI_CARRIER_DUST) != 0u;
-					GalaxyMapStart = FPlatformTime::Seconds();
-					GalaxyMapBakeMs = -1.0;
+					GalaxyMapVolumeSlot = Slot;
+					UniCore::PublishGalaxyMap(F.VolumeView, Sc.Home.Carrier, GalaxyMaps.MapSize(), uint32(Slot));
+					F.GalMapVolumeEpoch = GalaxyMaps.Entry(uint32(Slot)).Epoch;
 				}
-			}
-			else if (!bMap) { GalaxyMapEpoch = 0u; }
-			// The request rides every frame (the renderer starts it once per epoch); away from any galaxy
-			// the last map is kept for coming back.
-			F.GalMapEpoch = GalaxyMapEpoch;
-			F.GalMapSize = GalaxyMapSize;
-			F.GalMapBudget = uint32(FMath::Clamp(CVarUniGalaxyMapBudget.GetValueOnGameThread(), 4096, 1 << 24));
-			F.bGalMapDust = bGalaxyMapDust ? 1u : 0u;
-			F.GalMapParams[0] = GalaxyMapParams[0];
-			F.GalMapParams[1] = GalaxyMapParams[1];
-			const bool bReady = GalaxyMapEpoch != 0u && FUniRenderer::Get().Stats.GalMapReadyEpoch.load() == GalaxyMapEpoch;
-			if (bReady && GalaxyMapBakeMs < 0.0) { GalaxyMapBakeMs = (FPlatformTime::Seconds() - GalaxyMapStart) * 1000.0; ++GalaxyMapBakes; }
-			if (bMap && Home && bReady && GalaxyMapId == Sc.Home.Parent)
-			{
-				UniCore::PublishGalaxyMap(F.VolumeView, Sc.Home.Carrier, GalaxyMapSize);
 			}
 		}
 		F.VolumeNearCm = float(Sc.NearCm);   // D-208
@@ -1074,6 +1119,22 @@ void UUniSubsystem::PushFrame()
 		F.BackgroundVersion = BackgroundVersion;
 	}
 	FillApiRequests(F);   // D-193
+	// D-214: the galaxy map array and the bakes the cache waits on (every frame, whatever renders:
+	// generation waits on them too).
+	F.GalMapSlots = GalaxyMaps.NumSlots();
+	F.GalMapSize = GalaxyMaps.MapSize();
+	F.GalMapConfig = GalaxyMaps.ConfigGeneration();
+	F.GalMapBudget = uint32(FMath::Clamp(CVarUniGalaxyMapBudget.GetValueOnGameThread(), 4096, 1 << 24));
+	for (const uint32 Slot : GalaxyMaps.PendingBakes())
+	{
+		const UniCore::FGalaxyMapCache::FEntry& E = GalaxyMaps.Entry(Slot);
+		FUniFrameData::FGalMapBake& Bk = F.GalMapBakes.AddDefaulted_GetRef();
+		Bk.Slot = Slot;
+		Bk.Epoch = E.Epoch;
+		Bk.bDust = E.Req.bDust ? 1u : 0u;
+		Bk.Params[0] = E.Req.Par;
+		Bk.Params[1] = E.Req.bDust ? E.Req.Dust : E.Req.Par;
+	}
 	FUniRenderer::Get().SetFrame_GameThread(MoveTemp(F));
 }
 
@@ -1686,13 +1747,16 @@ void UUniSubsystem::UpdateLightRig()
 
 static TAutoConsoleVariable<int32> CVarUniSkyLight(TEXT("uu.SkyLight"), 1, TEXT("D-186: a movable sky light lit by the backdrop (the galaxy's glow and the web around the camera), refreshed on a worker thread. 0: none."));
 static TAutoConsoleVariable<int32> CVarUniSkyLightSize(TEXT("uu.SkyLightSize"), 16, TEXT("D-186: sky light cube texels per face (each the mean of 2 x 2 rays)."));
-static TAutoConsoleVariable<float> CVarUniSkyLightInterval(TEXT("uu.SkyLightInterval"), 1.0f, TEXT("D-186: seconds between sky light refreshes (a refresh starts only when the last one has finished)."));
-static TAutoConsoleVariable<float> CVarUniSkyLightBlend(TEXT("uu.SkyLightBlend"), 1.0f, TEXT("D-186: seconds over which a new sky light cube blends in."));
+static TAutoConsoleVariable<float> CVarUniSkyLightInterval(TEXT("uu.SkyLightInterval"), 2.0f, TEXT("D-186: seconds between sky light refreshes (a refresh starts only when the last one has finished). D-216: 1 -> 2 (each refresh is a sky light recapture, which waits on the GPU)."));
+static TAutoConsoleVariable<float> CVarUniSkyLightBlend(TEXT("uu.SkyLightBlend"), 0.0f, TEXT("D-186: seconds over which a new sky light cube blends in. D-216: 1 -> 0: every blend step recaptured the sky light (a GPU wait: 20-60 ms hitches under load, uu.Perf's light rig peak); 0 swaps the cube in one step."));
 static TAutoConsoleVariable<float> CVarUniSkyLightIntensity(TEXT("uu.SkyLightIntensity"), 1.0f, TEXT("D-186: sky light intensity; 1: the cube holds what a screen pixel of that sky shows."));
+static TAutoConsoleVariable<float> CVarUniSkyLightMaxSpeed(TEXT("uu.SkyLightMaxSpeed"), 3.0857e18f, TEXT("D-216: the sky light refreshes only while the camera moves slower than this (cm/s; default 1 pc/s): faster, the sky changes every frame and nothing is lit by it (bodies are promoted near rest), and each refresh recaptures the sky light (a GPU wait). 0: always."));
 
 void UUniSubsystem::StartSkyJob(const UniCore::FVolumeScene& Sc)
 {
 	if (CVarUniSkyLight.GetValueOnGameThread() == 0 || bSkyJob) { return; }
+	const double MaxSpeed = double(CVarUniSkyLightMaxSpeed.GetValueOnGameThread());
+	if (MaxSpeed > 0.0 && CameraSpeedCmPerS > MaxSpeed) { return; }   // D-216: not while travelling
 	const double Now = FPlatformTime::Seconds();
 	if (Now - SkyLastStart < double(FMath::Max(CVarUniSkyLightInterval.GetValueOnGameThread(), 0.05f))) { return; }
 	SkyLastStart = Now;

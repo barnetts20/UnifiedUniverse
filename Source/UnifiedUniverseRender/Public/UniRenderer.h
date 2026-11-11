@@ -49,14 +49,24 @@ struct FUniFrameData
 	float SpeedAmount = 0.0f;  // D-198: the travel curve itself (not x uu.Warp): the volume march's budget falls with it
 	float VolumeBudgetScale = 1.0f;   // D-200: the auto budget's scale of the march pixel budget (1: off)
 	float VolumeNearCm = 0.0f;        // D-208: the nearest marched structure's distance (FVolumeScene::NearCm; 0: unknown)
-	// D-212: the galaxy map's bake request (the camera's own galaxy): an epoch that changes per
-	// galaxy or size (0: no map), its size, the light's and dust's parameters, and the texels the
-	// GPU may bake a frame. The renderer bakes it over frames and reports the epoch when done.
-	uint32 GalMapEpoch = 0;
+	// D-212 / D-214: the galaxy map array (UniCore::FGalaxyMapCache): its slots and texels a side
+	// (a change of either, or of Config, recreates it), the bakes the cache waits on (a slot, the
+	// epoch its contents belong to, the light's and dust's parameters), the texels the GPU may
+	// bake a frame, and the epoch the volume's map slot must hold (VolumeView.MapSlot; 0: none).
+	// The renderer bakes them over frames and reports each slot's epoch when done.
+	struct FGalMapBake
+	{
+		uint32 Slot = 0;
+		uint32 Epoch = 0;
+		uint32 bDust = 0;
+		UniCore::FFieldParamsGPU Params[2] = {};
+	};
+	uint32 GalMapSlots = 0;
 	uint32 GalMapSize = 0;
+	uint32 GalMapConfig = 0;
 	uint32 GalMapBudget = 0;
-	uint32 bGalMapDust = 0;
-	UniCore::FFieldParamsGPU GalMapParams[2] = {};
+	uint32 GalMapVolumeEpoch = 0;
+	TArray<FGalMapBake> GalMapBakes;
 	// D-192: warp ambience motes (UniCore::MoteLattice): per lattice slot the camera's cell (w: the
 	// level) and its fraction in it (w: the slot's weight, 0: none); cell sizes (cm) and the
 	// motes' flux (exposure units) in MoteScale (x, y, z).
@@ -156,8 +166,10 @@ struct FUniRenderStats
 	 *  size changed, [8] camera jump, [9] the same frame rendered again, [10] frames skipped. */
 	static constexpr int32 NumSliceCounts = 11;
 	std::atomic<uint32> VolumeSliceCounts[NumSliceCounts] = {};
-	std::atomic<uint32> GalMapReadyEpoch{ 0 };       // D-212: the galaxy map baked for this request
-	std::atomic<uint32> GalMapBakeFrames{ 0 };       // frames the last bake took
+	/** D-214: per slot of the galaxy map array, the epoch whose bake is done (0: none). */
+	static constexpr int32 MaxGalMapSlots = 16;
+	std::atomic<uint32> GalMapBaked[MaxGalMapSlots] = {};
+	std::atomic<uint32> GalMapBakeFrames{ 0 };       // frames the GPU spent baking maps (total)
 	std::atomic<uint32> ActivationsLastReadback{ 0 };
 	/** The last rendered view's angular pixel size (rad): the game thread builds the next
 	 *  frame's carriers with it (one frame late, harmless: it only sets handoff weights). */
@@ -215,7 +227,7 @@ public:
 	/** Render thread (D-179): galaxy texture Slot registered into a graph (uploaded on first use
 	 *  after SetGalaxyTexture), or the NaN dummy. */
 	FRDGTextureRef RegisterGalaxyTexture_RenderThread(FRDGBuilder& GraphBuilder, int32 Slot);
-	FRDGTextureRef RegisterGalaxyMap_RenderThread(FRDGBuilder& GraphBuilder);   // D-212: bakes a chunk while one is due; a 1x1 zero dummy without one
+	FRDGTextureRef RegisterGalaxyMap_RenderThread(FRDGBuilder& GraphBuilder);   // D-212 / D-214: the map array (a 1x1x1 zero dummy without one)
 
 	/** Render thread: draws the backdrop additively into Output (a render-targetable copy of
 	 *  scene colour, made by the view extension). Called from the view extension. */
@@ -256,12 +268,25 @@ private:
 	TArray<TArray<FUintVector2>> GalMipsRT[GalaxyTextureSlots];
 	uint32 GalSizeRT[GalaxyTextureSlots] = { 0, 0, 0 };
 	bool bGalDirty[GalaxyTextureSlots] = { false, false, false };
-	// D-212: the galaxy map (render thread): the request being baked, rows done, whether complete.
+	// D-212 / D-214: the galaxy map array (render thread): per slot the bake under way (its epoch,
+	// rows done, whether complete).
+	struct FGalMapSlotRT
+	{
+		uint32 Epoch = 0;
+		uint32 RowsDone = 0;
+		bool bComplete = false;
+		bool bDust = false;
+		TArray<UniCore::FFieldParamsGPU> Params;
+	};
 	TRefCountPtr<IPooledRenderTarget> GalMapTexture, GalMapDummy;
-	uint32 GalMapEpochRT = 0, GalMapSizeRT = 0, GalMapBudgetRT = 0, GalMapRowsDone = 0;
-	bool bGalMapDustRT = false, bGalMapComplete = false;
-	TArray<UniCore::FFieldParamsGPU> GalMapParamsRT;
+	uint32 GalMapSlotsRT = 0, GalMapSizeRT = 0, GalMapConfigRT = 0, GalMapBudgetRT = 0;
+	TArray<FGalMapSlotRT> GalMapSlotRT;
 	void QueueGalaxyMap_RenderThread(const FUniFrameData& F);
+	/** D-214: bakes the queued slots' rows (the frame's texel budget), in their own graph, every
+	 *  frame whatever renders: generation waits on them. */
+	void BakeGalaxyMaps_RenderThread(FRHICommandListImmediate& RHICmdList);
+	/** D-214: is Slot's bake of Epoch complete? */
+	bool GalaxyMapComplete_RenderThread(uint32 Slot, uint32 Epoch) const { return int32(Slot) < GalMapSlotRT.Num() && GalMapSlotRT[Slot].bComplete && GalMapSlotRT[Slot].Epoch == Epoch && Epoch != 0u; }
 	TRefCountPtr<IPooledRenderTarget> GalTexture[GalaxyTextureSlots];
 
 	/** The 1^3 NaN dummy any unbound field texture reads (fail closed). */

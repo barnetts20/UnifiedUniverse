@@ -210,8 +210,9 @@ uint MapSize;
 uint MapRow0;
 uint MapRows;
 uint bMapDust;
-RWTexture2D<float4> OutMap;
-Texture2D<float4> InMapMip;
+uint MapSlot;   // D-214: the slot of the map array baked
+RWTexture2DArray<float4> OutMap;
+Texture2DArray<float4> InMapMip;
 
 [numthreads(8, 8, 1)]
 void MapBakeCS(uint3 Id : SV_DispatchThreadID)
@@ -222,15 +223,16 @@ void MapBakeCS(uint3 Id : SV_DispatchThreadID)
 	const FUniFieldParams Dust = InMapParams[1];
 	const float Fx = ((float)Id.x + 0.5f) / (float)MapSize * 2.0f - 1.0f;
 	const float Fy = ((float)Y + 0.5f) / (float)MapSize * 2.0f - 1.0f;
-	OutMap[uint2(Id.x, Y)] = Uni_GalaxyMapTexel(Fx, Fy, Par, Dust, Uni_GalaxyConstOf(Par), bMapDust != 0u);
+	OutMap[uint3(Id.x, Y, MapSlot)] = Uni_GalaxyMapTexel(Fx, Fy, Par, Dust, Uni_GalaxyConstOf(Par), bMapDust != 0u);
 }
 
 [numthreads(8, 8, 1)]
 void MapDownCS(uint3 Id : SV_DispatchThreadID)
 {
 	if (Id.x >= MapSize || Id.y >= MapSize) { return; }   // MapSize: the output mip's side
-	const uint2 B = Id.xy * 2u;
-	OutMap[Id.xy] = 0.25f * (InMapMip.Load(int3(B, 0)) + InMapMip.Load(int3(B + uint2(1u, 0u), 0)) + InMapMip.Load(int3(B + uint2(0u, 1u), 0)) + InMapMip.Load(int3(B + uint2(1u, 1u), 0)));
+	const int2 B = int2(Id.xy * 2u);
+	const int Sl = (int)MapSlot;
+	OutMap[uint3(Id.xy, MapSlot)] = 0.25f * (InMapMip.Load(int4(B, Sl, 0)) + InMapMip.Load(int4(B + int2(1, 0), Sl, 0)) + InMapMip.Load(int4(B + int2(0, 1), Sl, 0)) + InMapMip.Load(int4(B + int2(1, 1), Sl, 0)));
 }
 
 #elif UNI_VOL_PASS == 1
@@ -254,6 +256,7 @@ void BackgroundCS(uint3 Id : SV_DispatchThreadID)
 #elif UNI_VOL_PASS == 3
 
 uint2 MarchSize;
+uint2 HistSize;             // D-215: the history's size (the march may have been resized since: the auto budget)
 float3 PrevForward;
 float PrevTanX;
 float3 PrevRight;
@@ -322,9 +325,10 @@ void ReconstructCS(uint3 Id : SV_DispatchThreadID)
 	FUniTemporalTaps Ht = Tp;
 	float4 Wn = float4(0.0f, 0.0f, 0.0f, 0.0f);
 	float2 Pp = float2(0.0f, 0.0f);
-	if (bHistory != 0u && Uni_TemporalPrevPixel(Dir, LnD, TV, Size, Pp))
+	const float2 HSize = float2((float)HistSize.x, (float)HistSize.y);
+	if (bHistory != 0u && Uni_TemporalPrevPixel(Dir, LnD, TV, HSize, Pp))
 	{
-		Ht = Uni_TemporalHistTaps(Pp, MarchSize);
+		Ht = Uni_TemporalHistTaps(Pp, HistSize);
 		const float2 H0 = HistDepth.Load(int3(int2(Ht.Q0), 0)), H1 = HistDepth.Load(int3(int2(Ht.Q1), 0)), H2 = HistDepth.Load(int3(int2(Ht.Q2), 0)), H3 = HistDepth.Load(int3(int2(Ht.Q3), 0));
 		const float4 Wh = Uni_TemporalHistW(Ht.W, LnTp, float4(H0.y, H1.y, H2.y, H3.y));
 		const float Shw = Wh.x + Wh.y + Wh.z + Wh.w;
@@ -336,7 +340,7 @@ void ReconstructCS(uint3 Id : SV_DispatchThreadID)
 			// Catmull-Rom where all 16 texels are on the grid and on this pixel's surface.
 			const float Fx = Pp.x - 0.5f, Fy = Pp.y - 0.5f;
 			const int X0 = (int)floor(Fx), Y0 = (int)floor(Fy);
-			if (X0 - 1 >= 0 && Y0 - 1 >= 0 && X0 + 2 < (int)MarchSize.x && Y0 + 2 < (int)MarchSize.y)
+			if (X0 - 1 >= 0 && Y0 - 1 >= 0 && X0 + 2 < (int)HistSize.x && Y0 + 2 < (int)HistSize.y)
 			{
 				const float4 Cx = Uni_CatmullRomWeights(Fx - (float)X0);
 				const float4 Cy = Uni_CatmullRomWeights(Fy - (float)Y0);
@@ -360,7 +364,7 @@ void ReconstructCS(uint3 Id : SV_DispatchThreadID)
 			if (TemporalClamp.x != 0.0f)
 			{
 				// D-194: clamp into the fresh range (tight once moving); moving too fast: not used.
-				const float Mo = Uni_TemporalMotionPx(Pp, Px);
+				const float Mo = Uni_TemporalMotionPx(Uni_TemporalToGrid(Pp, HSize, Size), Px);   // D-215: in this frame's pixels
 				if (Mo <= TemporalClamp.z) { Hv = Uni_TemporalClamp(Hv, Lo4, Hi4, Uni_TemporalClampK(Mo, TemporalClamp.y)); bHist = true; }
 			}
 			else { bHist = Uni_TemporalAccept(LumOf(Hv), Lo, Hi); }

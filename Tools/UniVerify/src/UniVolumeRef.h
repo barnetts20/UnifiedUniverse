@@ -193,6 +193,11 @@ namespace UniRender
 	struct FTemporalVolume
 	{
 		int W = 0, Ht = 0;
+		int HW = 0, HH = 0;              // D-215: the history's size (the last frame's; may differ from this frame's)
+		/** D-215: a new size (the volume's auto budget) keeps the history, reprojected at its own
+		 *  size, when within 2x either way; false: every pixel marched (pre-D-215). */
+		bool bKeepAcrossResize = true;
+		size_t Resizes = 0, ResizesKept = 0;
 		std::vector<H::float4> Vol;      // radiance rgb (exposure units per sr), luminance transmittance a
 		std::vector<float> Slices;       // luminance transmittance at the slice boundaries
 		std::vector<H::float2> Depth;    // ln depth of the light, ln scene distance
@@ -213,7 +218,14 @@ namespace UniRender
 
 		void Step(const FVolumeScene& Sc, const FCamera& Cam, const FV3& CamStepCm, bool bStepValid, bool bTemporal, int Threads = 2)
 		{
-			if (Cam.Width != W || Cam.Height != Ht) { W = Cam.Width; Ht = Cam.Height; bHave = false; }
+			if (Cam.Width != W || Cam.Height != Ht)
+			{
+				const bool bNear = bHave && W > 0 && Ht > 0 && Cam.Width * 2 >= W && Cam.Width <= 2 * W && Cam.Height * 2 >= Ht && Cam.Height <= 2 * Ht;
+				if (bHave) { ++Resizes; }
+				if (bKeepAcrossResize && bNear) { ++ResizesKept; } else { bHave = false; }
+				W = Cam.Width; Ht = Cam.Height;
+			}
+			if (!bHave) { HW = W; HH = Ht; }
 			const size_t N = size_t(W) * Ht;
 			const u32 Phase = H::Uni_TemporalPack(Frame, Interleave);   // D-208 (2: Frame & 3, as before)
 			H::FUniTemporalView TV;
@@ -267,6 +279,8 @@ namespace UniRender
 			{
 				const H::uint2 Size = H::uint2(u32(W), u32(Ht));
 				const H::float2 SizeF = H::float2(float(W), float(Ht));
+				const H::uint2 HSize = H::uint2(u32(HW), u32(HH));   // D-215
+				const H::float2 HSizeF = H::float2(float(HW), float(HH));
 				for (int Y = 0; Y < Ht; ++Y) for (int X = 0; X < W; ++X)
 				{
 					const H::uint2 Px = H::uint2(u32(X), u32(Y));
@@ -301,10 +315,10 @@ namespace UniRender
 					{
 						const FV3 Dd = PixelDir(Cam, W, Ht, X + 0.5, Y + 0.5);
 						H::float2 Pp(0, 0);
-						if (H::Uni_TemporalPrevPixel(H::float3(float(Dd.X), float(Dd.Y), float(Dd.Z)), LnD, TV, SizeF, Pp))
+						if (H::Uni_TemporalPrevPixel(H::float3(float(Dd.X), float(Dd.Y), float(Dd.Z)), LnD, TV, HSizeF, Pp))
 						{
-							const H::FUniTemporalTaps Ht4 = H::Uni_TemporalHistTaps(Pp, Size);
-							const size_t Qh[4] = { size_t(Ht4.Q0.y) * W + Ht4.Q0.x, size_t(Ht4.Q1.y) * W + Ht4.Q1.x, size_t(Ht4.Q2.y) * W + Ht4.Q2.x, size_t(Ht4.Q3.y) * W + Ht4.Q3.x };
+							const H::FUniTemporalTaps Ht4 = H::Uni_TemporalHistTaps(Pp, HSize);
+							const size_t Qh[4] = { size_t(Ht4.Q0.y) * HW + Ht4.Q0.x, size_t(Ht4.Q1.y) * HW + Ht4.Q1.x, size_t(Ht4.Q2.y) * HW + Ht4.Q2.x, size_t(Ht4.Q3.y) * HW + Ht4.Q3.x };
 							const H::float4 Wh = H::Uni_TemporalHistW(Ht4.W, LnTp, H::float4(Depth[Qh[0]].y, Depth[Qh[1]].y, Depth[Qh[2]].y, Depth[Qh[3]].y));
 							const float Wha[4] = { Wh.x, Wh.y, Wh.z, Wh.w };
 							const float Shw = Wh.x + Wh.y + Wh.z + Wh.w;
@@ -321,7 +335,7 @@ namespace UniRender
 								// on this pixel's surface (the shader's rule: Uni_CatmullRomWeights).
 								const float Fx = Pp.x - 0.5f, Fy = Pp.y - 0.5f;
 								const int X0 = int(std::floor(Fx)), Y0 = int(std::floor(Fy));
-								if (X0 - 1 >= 0 && Y0 - 1 >= 0 && X0 + 2 < W && Y0 + 2 < Ht)
+								if (X0 - 1 >= 0 && Y0 - 1 >= 0 && X0 + 2 < HW && Y0 + 2 < HH)
 								{
 									const H::float4 Cx = H::Uni_CatmullRomWeights(Fx - float(X0)), Cy = H::Uni_CatmullRomWeights(Fy - float(Y0));
 									const float Cxa[4] = { Cx.x, Cx.y, Cx.z, Cx.w }, Cya[4] = { Cy.x, Cy.y, Cy.z, Cy.w };
@@ -329,7 +343,7 @@ namespace UniRender
 									bool bSame = true;
 									for (int J = 0; J < 4; ++J) for (int K = 0; K < 4; ++K)
 									{
-										const size_t Qc = size_t(Y0 - 1 + J) * W + size_t(X0 - 1 + K);
+										const size_t Qc = size_t(Y0 - 1 + J) * HW + size_t(X0 - 1 + K);
 										bSame = bSame && H::Uni_TemporalDepthWeight(LnTp, Depth[Qc].y) > 0.9f;
 										Cr = Cr + Vol[Qc] * (Cxa[K] * Cya[J]);
 									}
@@ -338,7 +352,7 @@ namespace UniRender
 								if (bClamp)
 								{
 									// D-194: clamp into the fresh range (tight once moving); too fast: not used.
-									const float Mo = H::Uni_TemporalMotionPx(Pp, Px);
+									const float Mo = H::Uni_TemporalMotionPx(H::Uni_TemporalToGrid(Pp, HSizeF, SizeF), Px);   // D-215: in this frame's pixels
 									if (Mo <= MaxMotionPx) { Hv = H::Uni_TemporalClamp(Hv, Lo4, Hi4, H::Uni_TemporalClampK(Mo, ClampTightPx)); bHist = true; }
 									else { ++TooFast; }
 								}
@@ -368,6 +382,7 @@ namespace UniRender
 				}
 			}
 			Vol.swap(OVol); Slices.swap(OSl); Depth.swap(ODep);
+			HW = W; HH = Ht;
 			Prev = Cam;
 			bHave = true;
 			++Frame;

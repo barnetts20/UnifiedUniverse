@@ -14,7 +14,9 @@ bool UniShadersEnabled()
 }
 
 IMPLEMENT_GLOBAL_SHADER(FUniGenProbeCS, "/Plugin/UnifiedUniverse/Private/UniGen.usf", "MainCS", SF_Compute);
-IMPLEMENT_GLOBAL_SHADER(FUniGenPlaceCS, "/Plugin/UnifiedUniverse/Private/UniGen.usf", "MainCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FUniGenEvalCS, "/Plugin/UnifiedUniverse/Private/UniGen.usf", "EvalCS", SF_Compute);     // D-214
+IMPLEMENT_GLOBAL_SHADER(FUniGenScanCS, "/Plugin/UnifiedUniverse/Private/UniGen.usf", "ScanCS", SF_Compute);     // D-214
+IMPLEMENT_GLOBAL_SHADER(FUniGenWriteCS, "/Plugin/UnifiedUniverse/Private/UniGen.usf", "WriteCS", SF_Compute);   // D-214
 IMPLEMENT_GLOBAL_SHADER(FUniScatterCS, "/Plugin/UnifiedUniverse/Private/UniGen.usf", "ScatterCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FUniGenAllocCS, "/Plugin/UnifiedUniverse/Private/UniGen.usf", "AllocCS", SF_Compute);   // D-207
 IMPLEMENT_GLOBAL_SHADER(FUniProjectCS, "/Plugin/UnifiedUniverse/Private/UniProject.usf", "MainCS", SF_Compute);
