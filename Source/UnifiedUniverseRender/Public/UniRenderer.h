@@ -303,6 +303,10 @@ private:
 	// D-184: temporal slicing of the march. The previous frame's reconstructed output (radiance +
 	// transmittance, slices, light depth + scene depth) and its view, for the reprojection.
 	TRefCountPtr<IPooledRenderTarget> TemporalVolume, TemporalSlices, TemporalDepth;
+	// D-223 amendment: the splat path's deposit buffers and tile marks persist (zeroed where each
+	// frame wrote them, SplatZeroCS), recreated cleared when the buffers' size changes.
+	TRefCountPtr<FRDGPooledBuffer> SplatLumBuffer, SplatColBuffer, SplatTileBuffer;
+	FUintVector2 SplatBufferSize = FUintVector2(0u, 0u);
 	FIntPoint TemporalSize = FIntPoint(0, 0);
 	FVector3f TemporalPrevForward = FVector3f::ZeroVector, TemporalPrevRight = FVector3f::ZeroVector, TemporalPrevUp = FVector3f::ZeroVector;
 	float TemporalPrevTanX = 1.0f, TemporalPrevTanY = 1.0f;

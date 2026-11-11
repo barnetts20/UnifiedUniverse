@@ -512,6 +512,98 @@ UNI_FN float Uni_SpriteProfileStreak(float InX, float InY, float InSigmaPx, floa
 	return W;
 }
 
+// ---------------------------------------------------------------------------------------------
+// D-223: the splat path. A plain point sprite (the core alone: no halo, no disc, round, no streak,
+// at the core sigma) is not drawn as a quad. Its light goes into fixed-point buffers with atomic
+// adds, and one shared pass shapes it into the core's Gaussian:
+//  - luminance into a 2x supersampled grid, bilinearly (4 adds): the 2x grid's tent adds a
+//    variance of 1/24 px^2, so the gather's Gaussian is narrower by that (Uni_SplatBlurSigma) and
+//    the result is the core's sigma. At 1 px the shape is within ~2% of the quad's peak and its
+//    sub-pixel swing (twinkle in motion) is the quad's; a 1x bilinear deposit was 20% / 2.3x
+//    (Docs/DECISIONS.md D-223);
+//  - colour into a 1x grid at the nearest texel (3 adds), blurred at the core sigma: only the
+//    ratio colour / its luminance is used, times the luminance's shape (an isolated star keeps
+//    its colour exactly; neighbours within ~2 px share theirs, luminance-weighted).
+// Integer adds are order-independent: the result is the same bit for bit in any thread order.
+// ---------------------------------------------------------------------------------------------
+static const float UNI_SPLAT_SCALE = 1048576.0f;      // fixed-point units per scene-colour unit (2^20)
+static const float UNI_SPLAT_ADD_MAX = 67108864.0f;   // one add's cap in units (2^26: 64 scene colour)
+static const int UNI_SPLAT_PAD = 6;                   // the buffers' margin, output px: a star just off screen still blurs in
+static const int UNI_SPLAT_TAPS = 7;                  // the gather's widest reach, output px (< a tile: see below)
+// D-223 amendment (owner: option 2, tile skipping). The buffers are split into tiles of
+// UNI_SPLAT_TILE output px a side. The deposit marks each tile it writes; a tile within one tile
+// of a marked one is gathered and resolved (level 2), one within two has its gathered rows
+// written as zeros (level 1: a level-2 pixel's columns read them; nothing can reach them, since
+// the gather reaches at most UNI_SPLAT_TAPS + 0.75 < UNI_SPLAT_TILE px), and the rest is skipped.
+// The deposit buffers persist; after the gather, the level-2 tiles are zeroed and the marks reset,
+// so a frame touches the screen only around its stars.
+static const int UNI_SPLAT_TILE = 8;
+
+/** D-223: true for a sprite the splat path draws exactly: the core alone (no halo, core weight 1,
+ *  no resolved disc), round (Q = 1), at the core sigma (the sprite pass's sigma, max(radius px,
+ *  0.5), within 1% of InCorePx's), and no warp (streaks are drawn by the quad path). Everything
+ *  else stays a quad. */
+UNI_FN bool Uni_SpriteSplattable(FUniSprite InS, float InPixelsPerRadian, float InCorePx, float InWarp)
+{
+	if (InWarp > 0.0f) { return false; }
+	if (InS.HaloRatio > 0.0f) { return false; }
+	if (!(Uni_SpriteCoreWeight(InS) > 0.0f)) { return false; }
+	if (Uni_SpriteDiscFrac(InS, InPixelsPerRadian) > 0.0f) { return false; }
+	const float Sigma = max(InS.AngularRadius * InPixelsPerRadian, 0.5f);
+	if (Uni_SpriteEllipseQ(InS, Sigma) < 1.0f) { return false; }
+	const float Core = max(InCorePx, 0.5f);
+	return abs(Sigma - Core) <= 0.01f * Core;
+}
+
+/** D-223: the gather's Gaussian sigma (output px) for a core sigma: the 2x grid's bilinear
+ *  deposit is a tent of half a pixel, variance 1/24 px^2, taken out so the total is the core's. */
+UNI_FN float Uni_SplatBlurSigma(float InSigmaPx)
+{
+	return sqrt(max(InSigmaPx * InSigmaPx - 1.0f / 24.0f, 0.0225f));
+}
+
+/** D-223: the gather's reach (output px) for a sigma: 3.5 sigmas (1e-3 of the peak), at most
+ *  UNI_SPLAT_TAPS. */
+UNI_FN int Uni_SplatReach(float InSigmaB)
+{
+	return min((int)ceil(3.5f * InSigmaB), UNI_SPLAT_TAPS);
+}
+
+/** D-223: an unnormalised Gaussian tap at InD output pixels. */
+UNI_FN float Uni_SplatTap(float InD, float InSigmaB)
+{
+	return exp(-0.5f * InD * InD / (InSigmaB * InSigmaB));
+}
+
+/** D-223: the 2x gather's normaliser: a subtexel sits a quarter pixel off an output pixel's
+ *  centre, and the output pixels within the gather's reach (|d| <= R + 0.75) take it with taps at
+ *  k + 0.25, k = -R-1..R. Dividing by their sum hands each subtexel's light out whole. */
+UNI_FN float Uni_SplatNorm2x(float InSigmaB, int InReach)
+{
+	float S = 0.0f;
+	for (int K = -InReach - 1; K <= InReach; ++K) { S += Uni_SplatTap((float)K + 0.25f, InSigmaB); }
+	return S;
+}
+
+/** D-223: the 1x gather's normaliser (taps at k = -R..R). */
+UNI_FN float Uni_SplatNorm1x(float InSigmaB, int InReach)
+{
+	float S = 0.0f;
+	for (int K = -InReach; K <= InReach; ++K) { S += Uni_SplatTap((float)K, InSigmaB); }
+	return S;
+}
+
+/** D-223: scene colour to fixed point (rounded, capped per add) and back. */
+UNI_FN uint Uni_SplatEncode(float InV)
+{
+	return (uint)(min(max(InV, 0.0f) * UNI_SPLAT_SCALE, UNI_SPLAT_ADD_MAX) + 0.5f);
+}
+
+UNI_FN float Uni_SplatDecode(uint InU)
+{
+	return (float)InU * (1.0f / UNI_SPLAT_SCALE);
+}
+
 /** D-187: a sprite's settled share from its cell's age: 0 on the frame its cell first became
  *  Ready, 1 after InFrames frames. */
 UNI_FN float Uni_SpriteArrival(uint InAgeFrames, float InFrames)

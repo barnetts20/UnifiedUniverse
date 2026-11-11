@@ -1,0 +1,67 @@
+// exploration (D-225 prototype): supersampling scaled by a carrier's weight, at the owner's spot.
+#include "../src/UniTest.h"
+#include "../src/UniRenderRef.h"
+#include "../src/UniVolumeRef.h"
+#include "../scenes/UniScenes.h"
+#include <algorithm>
+#include <cmath>
+#include <vector>
+using namespace UniCore;
+using namespace UniRender;
+namespace H = UniHlsl;
+namespace
+{
+	struct FImg { std::vector<double> L; double Steps = 0; u32 Max = 0; double Super = 0; };
+	FImg Render(const FVolumeScene& Sc, const FCamera& Cam)
+	{
+		const auto Cb = Sc.CarrierBuf(); const auto Pb = Sc.ParamBuf(); const auto Lb = Sc.LutBuf();
+		const H::FUniVolumeView V = ToHlsl(Sc.View);
+		FImg O; O.L.resize(size_t(Cam.Width) * Cam.Height);
+		for (int Y = 0; Y < Cam.Height; ++Y) for (int X = 0; X < Cam.Width; ++X)
+		{
+			bool bS = false;
+			const H::FUniVolumeResult R = MarchPixel(Cb, Pb, Lb, V, Cam, Cam.Width, Cam.Height, X, Y, 3.0e38f, bS);
+			O.L[size_t(Y) * Cam.Width + X] = H::Uni_Luminance(R.Radiance);
+			O.Steps += R.Steps; O.Max = std::max(O.Max, R.Steps); O.Super += bS ? 1 : 0;
+		}
+		O.Steps /= double(O.L.size()); O.Super /= double(O.L.size());
+		return O;
+	}
+}
+UNI_TEST(explore, super)
+{
+	FUniverseModel M(UniScenes::Flythrough());
+	FRefGenerator G(M);
+	FVolumeBuilder VB(M, G);
+	const double Kpc = Units::Kpc, Deg = 3.14159265358979 / 180.0;
+	for (double Az : { 60.0, 90.0 }) for (int Wd : { 93, 186 })
+	{
+		const double X = 8 * Kpc * std::cos(Az * Deg), Y = 8 * Kpc * std::sin(Az * Deg), Z = -8 * Kpc * std::tan(20 * Deg);
+		FCoord Cam = FCoord::Origin(); FVec3f Fr{}; AddDisplacement(Cam, Fr, FVec3d{ X, Y, Z });
+		FRefPipeline P(G); P.bVelocityLod = false; P.Update(Cam, FVec3f{});
+		FCamera Cm; Cm.Coord = Cam; Cm.Width = Wd; Cm.Height = Wd * 2 / 3; Cm.DeltaMag = 0.0; Cm.LookAlong(FV3{ -X, -Y, -Z });
+		const FVolumeSettings S;
+		const FVolumeScene Base = VB.Build(P, Cam, FVec3f{}, Cm.View(), S).Subset(false);
+		const FImg A = Render(Base, Cm);
+		double Tot = 0; for (double v : A.L) Tot += v;
+		for (int Rule = 1; Rule <= 3; ++Rule)
+		{
+			FVolumeScene Sc = Base;
+			for (auto& C : Sc.Carriers)
+			{
+				const double W = std::clamp(double(C.Weight), 0.0, 1.0);
+				if (Rule == 1 && W < 0.25) { C.ResolveScale = 0.0f; }                       // no supersampling below a quarter
+				if (Rule == 2 && C.ResolveScale > 0.0f) { C.ResolveScale = float(C.ResolveScale / std::max(W, 1e-6)); }        // rays per axis x weight
+				if (Rule == 3 && C.ResolveScale > 0.0f) { C.ResolveScale = float(C.ResolveScale / std::sqrt(std::max(W, 1e-6))); }   // x sqrt(weight)
+			}
+			const FImg B = Render(Sc, Cm);
+			double D = 0, Mx = 0, Lt = 0; std::vector<double> Rel;
+			const double Mean = Tot / A.L.size();
+			for (size_t I = 0; I < A.L.size(); ++I) { const double d = std::abs(B.L[I] - A.L[I]); D += d; Lt += B.L[I]; if (A.L[I] > 0.01 * Mean) Rel.push_back(d / A.L[I]); Mx = std::max(Mx, d / std::max(A.L[I], 1e-30)); }
+			std::sort(Rel.begin(), Rel.end());
+			std::printf("az %3.0f %3d px rule %d: steps %.1f -> %.1f/px (max %u -> %u), super %.2f%% -> %.2f%%; light %+.4f%%, L1 %.4f%%, p99.9 %.3f%%, max %.2f%%\n", Az, Wd, Rule, A.Steps, B.Steps, A.Max, B.Max, 100 * A.Super, 100 * B.Super,
+				100 * (Lt / Tot - 1), 100 * D / Tot, 100 * Rel[size_t(0.999 * (Rel.size() - 1))], 100 * Mx);
+		}
+	}
+	Uni::Check(9, "X.explore.super", "exploration").Pass(true, "printed");
+}

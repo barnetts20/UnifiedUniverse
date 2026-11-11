@@ -1022,7 +1022,14 @@ UNI_FN uint Uni_CarrierSubsamples(FUniCarrier InC, float InThetaPixel)
 	if ((InC.Flags & UNI_CARRIER_PERIODIC) != 0u || !(InC.ResolveScale > 0.0f)) { return 1u; }
 	const float Dist = max(sqrt(dot(InC.CamLocal, InC.CamLocal)), 1.0e-6f);   // field units
 	const float FeaturePx = InC.ResolveScale / Dist / InThetaPixel;
-	return (uint)clamp(ceil(0.5f / max(FeaturePx, 1.0e-6f)), 1.0f, 8.0f);
+	// D-225: rays per axis scale with the square root of the light the carrier draws (its Weight:
+	// the handoff share x visibility x level fade). A carrier still mostly drawn as sprites (a
+	// distant cluster's glow at weight 0.03-0.05) was supersampled 3x3 to 8x8 for a few percent of
+	// its light: every pixel it covered cost up to 64 rays (the owner's hitch at some angles, where
+	// two such clusters sat behind the galaxy's core). Unsupersampled, those pixels change by at most
+	// 1.4% (T2.vol.super_weight). A carrier at full weight is supersampled as before.
+	const float W = sqrt(saturate(InC.Weight));
+	return (uint)clamp(ceil(0.5f * W / max(FeaturePx, 1.0e-6f)), 1.0f, 8.0f);
 }
 
 /** D-160/D-163: rays per pixel axis for one ray through this carrier. A prefiltered galaxy needs

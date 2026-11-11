@@ -1,0 +1,91 @@
+// test_zz_shells_explore.cpp — exploration only (paradigm review, 2026-11-10; archived after the run).
+// How the march's steps and light divide by distance from inside the Milky Way: each view
+// marched to R (TScene = R) and from R (every carrier's TStart raised to R), at the defaults.
+// If most light sits beyond a distance whose parallax is small per frame, that part can be cached
+// in world-aligned direction maps (as the background is) and refreshed by a parallax budget.
+
+#include "../src/UniTest.h"
+#include "../src/UniRenderRef.h"
+#include "../src/UniVolumeRef.h"
+#include "../scenes/UniScenes.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <string>
+#include <thread>
+#include <vector>
+
+using namespace UniCore;
+using namespace UniRender;
+namespace H = UniHlsl;
+
+namespace
+{
+	struct FRun { double Lum = 0.0; double Steps = 0.0; };
+
+	FRun Run(const FVolumeScene& Sc, const FCamera& Cam, float TScene)
+	{
+		const auto Cb = Sc.CarrierBuf(); const auto Pb = Sc.ParamBuf(); const auto Lb = Sc.LutBuf();
+		const H::FUniVolumeView V = ToHlsl(Sc.View);
+		const int W = Cam.Width, Ht = Cam.Height, Threads = 4;
+		std::vector<double> L(Threads, 0.0), S(Threads, 0.0);
+		std::atomic<int> Next{ 0 };
+		auto Work = [&](int T)
+		{
+			for (int Y = Next++; Y < Ht; Y = Next++)
+			{
+				for (int X = 0; X < W; ++X)
+				{
+					bool bSuper = false;
+					const H::FUniVolumeResult R = MarchPixel(Cb, Pb, Lb, V, Cam, W, Ht, X, Y, TScene, bSuper);
+					L[T] += H::Uni_Luminance(R.Radiance) * PixelSolidAngle(Cam, W, Ht, X + 0.5, Y + 0.5);
+					S[T] += R.Steps;
+				}
+			}
+		};
+		std::vector<std::thread> Ts;
+		for (int T = 1; T < Threads; ++T) { Ts.emplace_back(Work, T); }
+		Work(0);
+		for (auto& T : Ts) { T.join(); }
+		FRun O;
+		for (int T = 0; T < Threads; ++T) { O.Lum += L[T]; O.Steps += S[T]; }
+		O.Steps /= double(W) * Ht;
+		return O;
+	}
+}
+
+UNI_TEST(explore, shells)
+{
+	FUniverseModel M(UniScenes::Flythrough());
+	FRefGenerator G(M);
+	FVolumeBuilder VB(M, G);
+	FRefPipeline P(G);
+	P.bVelocityLod = false;
+	const FCoord Cam = UniScenes::SolarCamera();
+	P.Update(Cam, FVec3f{});
+	const double Pc = 3.0856775814913673e18;
+	struct FView { const char* Name; FV3 Look; };
+	const FView Views[] = { { "toward the centre", { -1.0, 0.05, 0.02 } }, { "along the disc", { 0.05, 1.0, 0.02 } }, { "out of the plane", { 0.3, 0.2, 1.0 } } };
+	const double Rs[] = { 30.0, 100.0, 300.0, 1000.0, 3000.0 };
+	for (const FView& Vw : Views)
+	{
+		FCamera Cm; Cm.Coord = Cam; Cm.Width = 192; Cm.Height = 108; Cm.DeltaMag = 0.0;
+		Cm.LookAlong(Vw.Look);
+		const FVolumeSettings S;
+		const FVolumeScene Sc = VB.Build(P, Cam, FVec3f{}, Cm.View(), S).Subset(false);
+		const FRun Full = Run(Sc, Cm, 3.0e38f);
+		std::printf("%-18s full: %.1f steps/px\n", Vw.Name, Full.Steps);
+		for (double R : Rs)
+		{
+			const float Rcm = float(R * Pc);
+			const FRun Near = Run(Sc, Cm, Rcm);
+			FVolumeScene Far = Sc;
+			for (auto& C : Far.Carriers) { C.TStart = std::max(C.TStart, Rcm); }
+			const FRun Fr = Run(Far, Cm, 3.0e38f);
+			std::printf("   split at %6.0f pc: near %5.1f steps/px, light %5.1f%% | far %5.1f steps/px, light (unattenuated) %5.1f%%\n",
+				R, Near.Steps, 100.0 * Near.Lum / Full.Lum, Fr.Steps, 100.0 * Fr.Lum / Full.Lum);
+		}
+	}
+	Uni::Check(9, "X.explore.shells", "exploration").Pass(true, "printed");
+}

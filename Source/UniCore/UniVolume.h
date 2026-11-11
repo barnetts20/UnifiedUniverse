@@ -496,6 +496,23 @@ namespace UniCore
 		HV::StructuredBuffer<HV::FUniFieldParams> ParamBuf() const { return HV::StructuredBuffer<HV::FUniFieldParams>(reinterpret_cast<const HV::FUniFieldParams*>(Params.data()), HV::uint(Params.size())); }
 		HV::StructuredBuffer<HV::float4> LutBuf() const { return HV::StructuredBuffer<HV::float4>(Lut.data(), HV::uint(Lut.size())); }
 	};
+	/** D-224: true when the camera is inside a local (non-periodic) carrier's sphere: in a galaxy,
+	 *  or a cluster's or group's glow. The renderer then keeps the background on its direction map
+	 *  instead of marching it per pixel while travelling (uu.BackgroundMode 2): per pixel, every
+	 *  marched ray inside a galaxy also crosses the web, 7-10x the march's cost (explore.hitch), while
+	 *  the map's refresh is a fixed two faces a frame, cross-faded. */
+	inline bool CameraInsideLocalCarrier(const FCarrierGPU* InCarriers, size_t InCount)
+	{
+		for (size_t I = 0; I < InCount; ++I)
+		{
+			const FCarrierGPU& C = InCarriers[I];
+			if ((C.Flags & HV::UNI_CARRIER_PERIODIC) != 0u) { continue; }
+			const float D2 = C.CamLocal[0] * C.CamLocal[0] + C.CamLocal[1] * C.CamLocal[1] + C.CamLocal[2] * C.CamLocal[2];
+			if (D2 < 1.0f) { return true; }
+		}
+		return false;
+	}
+
 	static_assert(sizeof(HV::FUniFieldParams) == sizeof(FFieldParamsGPU), "field params layout");
 
 	/** What the builder reads from the streaming side: the reference pipeline (univerify) or the

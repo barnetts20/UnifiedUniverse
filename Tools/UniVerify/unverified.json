@@ -210,5 +210,17 @@
   {
     "id": "UE-55",
     "what": "D-220: galaxy discs warped at a structural level (warp_fine mip >= 2) with the fine band as a bounded multiplier (shader only; UniFields.ush): the rings flying top-down toward a galaxy's centre and the arcs inside one mostly gone; the look close to before (slightly grainier arms); stars in textured galaxies reroll (REVIEW_TONIGHT section 54)."
+  },
+  {
+    "id": "UE-56",
+    "what": "D-223: plain point sprites drawn by the splat path (uu.Sprite.Splat 1: atomic adds into fixed-point buffers, one shared gather; the rest stay quads): the new shaders compile (SplatCS, SplatGatherCS, SplatResolveVS/PS, the project pass's lists); stars look as with uu.Sprite.Splat 0 (shape, twinkle in motion, colour, nothing on a near body's edge); ProfileGPU Uni.Sprites vs Uni.Sprites.Splat against uu.Sprite.Splat 0 in a dense core (REVIEW_TONIGHT section 57). D-223 amendment: tile skipping (Uni.Sprites.Splat.Tiles / .Zero, persistent buffers); expect ~0.1-0.15 ms."
+  },
+  {
+    "id": "UE-57",
+    "what": "D-224: travelling inside a galaxy the background stays on its direction map (uu.BackgroundPerPixelInside 0) and the per-pixel decision no longer follows the auto budget: no frame drop at the owner's angles (mid-disc, 20 degrees below the plane, orbiting, moving in and out at speed); uu.Perf shows no per-pixel background frames inside the galaxy (REVIEW_TONIGHT section 58)."
+  },
+  {
+    "id": "UE-58",
+    "what": "D-225: supersampling scales with sqrt(carrier weight) (UniVolume.ush): no hitch at the owner's angles with uu.VolumeMaxSubsamples 8 (default); the image as with uu.VolumeMaxSubsamples 1; cluster glows not blocky up close (REVIEW_TONIGHT section 59)."
   }
 ]

@@ -187,7 +187,8 @@ The march's cost is rays x steps per ray x cost per step. These are the console 
 | `uu.VolumeTargetFps` | 60 | the pixel budget steps down (7 levels, to x0.35) while the GPU frame is over this frame rate, and back up with headroom; `uu.VolumeAutoHold` (20) frames between changes. 0: off | D-200 |
 | `uu.VolumeTemporal` | 1 | march one pixel of every 2 x 2 a frame and reconstruct the rest | D-184, D-194 |
 | `uu.BackgroundMode` | 2 | the background from its direction map, marched per pixel only while travelling fast | D-166 |
-| `uu.BackgroundPerPixelInterval` | 0 (automatic) | how often the background must change to be marched per pixel | D-196 |
+| `uu.BackgroundPerPixelInterval` | 0 (automatic) | how often the background must change to be marched per pixel (D-224: judged on the march's pixels before the auto budget) | D-196, D-224 |
+| `uu.BackgroundPerPixelInside` | 0 | inside a galaxy (a local carrier) the background stays on its map while travelling; 1: per pixel there too (before D-224; ~8x the march) | D-224 |
 
 **Steps per ray.**
 | Setting | Default | What it does | Decision |
@@ -206,6 +207,7 @@ The march's cost is rays x steps per ray x cost per step. These are the console 
 |---|---|---|---|
 | `uu.Star.Keep` | 0.35 | share of every galaxy's stars generated and drawn | D-197, D-198, D-205 |
 | `uu.Cluster.MemberKeep` | 0.5 | share of cluster members and group dwarfs generated and drawn | D-197, D-198 |
+| `uu.Sprite.Splat` | 1 | plain point sprites (the core alone: nearly every star) drawn by atomic adds and one shared gather instead of a quad each; haloed, resolved, elliptical and streaked sprites stay quads. 0: every sprite a quad | D-223 |
 
 **Loading and speed** (D-203: work per frame no longer grows with speed; what has not loaded is glow).
 | Setting | Default | What it does | Decision |

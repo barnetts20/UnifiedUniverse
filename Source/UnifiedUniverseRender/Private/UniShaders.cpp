@@ -22,6 +22,12 @@ IMPLEMENT_GLOBAL_SHADER(FUniGenAllocCS, "/Plugin/UnifiedUniverse/Private/UniGen.
 IMPLEMENT_GLOBAL_SHADER(FUniProjectCS, "/Plugin/UnifiedUniverse/Private/UniProject.usf", "MainCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FUniSpriteVS, "/Plugin/UnifiedUniverse/Private/UniSprite.usf", "MainVS", SF_Vertex);
 IMPLEMENT_GLOBAL_SHADER(FUniSpritePS, "/Plugin/UnifiedUniverse/Private/UniSprite.usf", "MainPS", SF_Pixel);
+IMPLEMENT_GLOBAL_SHADER(FUniSplatCS, "/Plugin/UnifiedUniverse/Private/UniSprite.usf", "SplatCS", SF_Compute);             // D-223
+IMPLEMENT_GLOBAL_SHADER(FUniSplatGatherCS, "/Plugin/UnifiedUniverse/Private/UniSprite.usf", "SplatGatherCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FUniSplatTilesCS, "/Plugin/UnifiedUniverse/Private/UniSprite.usf", "SplatTilesCS", SF_Compute);   // D-223 amendment
+IMPLEMENT_GLOBAL_SHADER(FUniSplatZeroCS, "/Plugin/UnifiedUniverse/Private/UniSprite.usf", "SplatZeroCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FUniSplatResolveVS, "/Plugin/UnifiedUniverse/Private/UniSprite.usf", "SplatResolveVS", SF_Vertex);
+IMPLEMENT_GLOBAL_SHADER(FUniSplatResolvePS, "/Plugin/UnifiedUniverse/Private/UniSprite.usf", "SplatResolvePS", SF_Pixel);
 IMPLEMENT_GLOBAL_SHADER(FUniVolumeMarchCS, "/Plugin/UnifiedUniverse/Private/UniVolume.usf", "MarchCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FUniGalMapBakeCS, "/Plugin/UnifiedUniverse/Private/UniVolume.usf", "MapBakeCS", SF_Compute);   // D-212
 IMPLEMENT_GLOBAL_SHADER(FUniGalMapDownCS, "/Plugin/UnifiedUniverse/Private/UniVolume.usf", "MapDownCS", SF_Compute);

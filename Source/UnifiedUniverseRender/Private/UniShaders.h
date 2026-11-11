@@ -273,6 +273,11 @@ public:
 		SHADER_PARAMETER(uint32, WriteSpriteSource)      // D-193
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint4>, InHandoffs)   // D-196
 		SHADER_PARAMETER(uint32, NumHandoffs)
+		SHADER_PARAMETER(uint32, SplatMode)                                       // D-223
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutQuadIndex)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutQuadArgs)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutSplatIndex)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutSplatCount)
 		SHADER_PARAMETER(FVector3f, ViewForward)
 		SHADER_PARAMETER(float, TanHalfFovX)
 		SHADER_PARAMETER(FVector3f, ViewRight)
@@ -610,6 +615,8 @@ BEGIN_SHADER_PARAMETER_STRUCT(FUniSpriteParameters, )
 	SHADER_PARAMETER(float, SliceLnTHi)
 	SHADER_PARAMETER(FVector4f, OutToMarch)
 	SHADER_PARAMETER(FUintVector2, MarchSize)
+	SHADER_PARAMETER(uint32, bQuadIndex)                                    // D-223: instance i draws InQuadIndex[i]
+	SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InQuadIndex)
 END_SHADER_PARAMETER_STRUCT()
 
 class FUniSpriteVS : public FGlobalShader
@@ -633,6 +640,140 @@ public:
 BEGIN_SHADER_PARAMETER_STRUCT(FUniSpritePassParameters, )
 	SHADER_PARAMETER_STRUCT_INCLUDE(FUniSpriteParameters, Sprite)
 	RDG_BUFFER_ACCESS(DrawArgs, ERHIAccess::IndirectArgs)
+	RENDER_TARGET_BINDING_SLOTS()
+END_SHADER_PARAMETER_STRUCT()
+
+/** D-223: the splat path's deposit (UniSprite.usf SplatCS): each plain point sprite's light into
+ *  the fixed-point buffers, after its scene-depth test and the dust at its centre. */
+class FUniSplatCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FUniSplatCS);
+	SHADER_USE_PARAMETER_STRUCT(FUniSplatCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FUniSprite>, InSprites)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InSplatIndex)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, InSplatCount)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutSplatLum)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutSplatCol)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutSplatTiles)   // D-223 amendment: the tiles written
+		SHADER_PARAMETER(FUintVector2, SplatTiles)
+		SHADER_PARAMETER(uint32, MaxSprites)
+		SHADER_PARAMETER(FUintVector2, SplatSize)
+		SHADER_PARAMETER(FVector4f, OutRectMinSize)
+		SHADER_PARAMETER(uint32, SplatThreads)
+		SHADER_PARAMETER(FVector3f, ViewForward)
+		SHADER_PARAMETER(FVector3f, SceneColourScale)
+		SHADER_PARAMETER(FVector4f, InvDeviceZToWorldZTransform)
+		SHADER_PARAMETER(FVector4f, DepthUVScaleBias)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneDepthTexture)
+		SHADER_PARAMETER_SAMPLER(SamplerState, SceneDepthSampler)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float>, VolumeSlices)
+		SHADER_PARAMETER(uint32, bVolume)
+		SHADER_PARAMETER(float, SliceLnTLo)
+		SHADER_PARAMETER(float, SliceLnTHi)
+		SHADER_PARAMETER(FVector4f, OutToMarch)
+		SHADER_PARAMETER(FUintVector2, MarchSize)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
+};
+
+/** D-223: the splat path's rows (UniSprite.usf SplatGatherCS): the 2x luminance gathered to 1x
+ *  columns, the colour's rows blurred at 1x. */
+class FUniSplatGatherCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FUniSplatGatherCS);
+	SHADER_USE_PARAMETER_STRUCT(FUniSplatGatherCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, InSplatLum)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, InSplatCol)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float>, OutGatherLum)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutGatherCol)
+		SHADER_PARAMETER(FUintVector2, SplatSize)
+		SHADER_PARAMETER(float, SplatCorePx)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, InTileLevel)   // D-223 amendment
+		SHADER_PARAMETER(FUintVector2, SplatTiles)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
+};
+
+/** D-223 amendment: each tile's level from the tiles the deposit marked (UniSprite.usf SplatTilesCS). */
+class FUniSplatTilesCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FUniSplatTilesCS);
+	SHADER_USE_PARAMETER_STRUCT(FUniSplatTilesCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, InSplatTiles)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutTileLevel)
+		SHADER_PARAMETER(FUintVector2, SplatTiles)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
+};
+
+/** D-223 amendment: the persistent deposit buffers zeroed where this frame wrote them, the marks
+ *  reset (UniSprite.usf SplatZeroCS). */
+class FUniSplatZeroCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FUniSplatZeroCS);
+	SHADER_USE_PARAMETER_STRUCT(FUniSplatZeroCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, InTileLevel)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutSplatLum)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutSplatCol)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutSplatTiles)
+		SHADER_PARAMETER(FUintVector2, SplatSize)
+		SHADER_PARAMETER(FUintVector2, SplatTiles)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
+};
+
+/** D-223: the splat path's columns and composite (UniSprite.usf SplatResolveVS / PS). */
+BEGIN_SHADER_PARAMETER_STRUCT(FUniSplatResolveParameters, )
+	SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float>, InGatherLum)
+	SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float4>, InGatherCol)
+	SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, InTileLevel)   // D-223 amendment
+	SHADER_PARAMETER(FUintVector2, SplatTiles)
+	SHADER_PARAMETER(FUintVector2, SplatSize)
+	SHADER_PARAMETER(FVector4f, OutRectMinSize)
+	SHADER_PARAMETER(float, SplatCorePx)
+	SHADER_PARAMETER(FVector2f, TanHalfFov)
+	SHADER_PARAMETER(FVector4f, InvDeviceZToWorldZTransform)
+	SHADER_PARAMETER(FVector4f, DepthUVScaleBias)
+	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneDepthTexture)
+	SHADER_PARAMETER_SAMPLER(SamplerState, SceneDepthSampler)
+END_SHADER_PARAMETER_STRUCT()
+
+class FUniSplatResolveVS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FUniSplatResolveVS);
+	SHADER_USE_PARAMETER_STRUCT(FUniSplatResolveVS, FGlobalShader);
+	using FParameters = FUniSplatResolveParameters;
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
+};
+
+class FUniSplatResolvePS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FUniSplatResolvePS);
+	SHADER_USE_PARAMETER_STRUCT(FUniSplatResolvePS, FGlobalShader);
+	using FParameters = FUniSplatResolveParameters;
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
+};
+
+BEGIN_SHADER_PARAMETER_STRUCT(FUniSplatResolvePassParameters, )
+	SHADER_PARAMETER_STRUCT_INCLUDE(FUniSplatResolveParameters, Resolve)
 	RENDER_TARGET_BINDING_SLOTS()
 END_SHADER_PARAMETER_STRUCT()
 

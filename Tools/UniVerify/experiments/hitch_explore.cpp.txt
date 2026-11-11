@@ -1,0 +1,93 @@
+// test_zz_hitch_explore.cpp — exploration only (owner's hitch at some approach angles, 2026-11-11;
+// archived after the run). The volume march's steps per pixel from cameras around the Milky Way
+// looking at its centre, by elevation over the disc and azimuth: the local carriers alone (the
+// background from its map) and with the background marched per pixel (uu.BackgroundMode 2 while
+// travelling). Defaults, 192 x 108.
+
+#include "../src/UniTest.h"
+#include "../src/UniRenderRef.h"
+#include "../src/UniVolumeRef.h"
+#include "../scenes/UniScenes.h"
+
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <thread>
+#include <vector>
+
+using namespace UniCore;
+using namespace UniRender;
+namespace H = UniHlsl;
+
+namespace
+{
+	struct FRun { double Steps = 0.0; u32 Max = 0; u64 Trunc = 0; double Super = 0.0; double Ms = 0.0; double Active = 0.0; };
+
+	FRun Run(const FVolumeScene& Sc, const FCamera& Cam)
+	{
+		const auto Cb = Sc.CarrierBuf(); const auto Pb = Sc.ParamBuf(); const auto Lb = Sc.LutBuf();
+		const H::FUniVolumeView V = ToHlsl(Sc.View);
+		const int W = Cam.Width, Ht = Cam.Height, Threads = 4;
+		std::vector<double> S(Threads, 0.0), Su(Threads, 0.0), Ac(Threads, 0.0);
+		std::vector<u32> Mx(Threads, 0u);
+		std::vector<u64> Tr(Threads, 0u);
+		std::atomic<int> Next{ 0 };
+		const auto T0 = std::chrono::steady_clock::now();
+		auto Work = [&](int T)
+		{
+			for (int Y = Next++; Y < Ht; Y = Next++)
+			{
+				for (int X = 0; X < W; ++X)
+				{
+					bool bSuper = false;
+					const H::FUniVolumeResult R = MarchPixel(Cb, Pb, Lb, V, Cam, W, Ht, X, Y, 3.0e38f, bSuper);
+					S[T] += R.Steps; Ac[T] += R.Active; Su[T] += bSuper ? 1.0 : 0.0; Mx[T] = std::max(Mx[T], R.Steps); Tr[T] += R.Truncated;
+				}
+			}
+		};
+		std::vector<std::thread> Ts;
+		for (int T = 1; T < Threads; ++T) { Ts.emplace_back(Work, T); }
+		Work(0);
+		for (auto& T : Ts) { T.join(); }
+		FRun O;
+		O.Ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - T0).count();
+		for (int T = 0; T < Threads; ++T) { O.Steps += S[T]; O.Active += Ac[T]; O.Super += Su[T]; O.Max = std::max(O.Max, Mx[T]); O.Trunc += Tr[T]; }
+		O.Steps /= double(W) * Ht; O.Super /= double(W) * Ht; O.Active /= double(W) * Ht;
+		return O;
+	}
+}
+
+UNI_TEST(explore, hitch)
+{
+	FUniverseModel M(UniScenes::Flythrough());
+	FRefGenerator G(M);
+	FVolumeBuilder VB(M, G);
+	const double Kpc = Units::Kpc;
+	const double Deg = 3.14159265358979 / 180.0;
+	// The owner's path: mid-disc, below the plane looking up at the core ~20 degrees, orbiting.
+	for (double R : { 8.0, 11.0 })
+	{
+		for (double Az = 0.0; Az < 359.0; Az += 15.0)
+		{
+			const double El = -20.0;
+			FCoord Cam = FCoord::Origin();
+			FVec3f Fr{};
+			const double X = R * Kpc * std::cos(Az * Deg), Y = R * Kpc * std::sin(Az * Deg), Z = R * Kpc * std::tan(El * Deg);
+			AddDisplacement(Cam, Fr, FVec3d{ X, Y, Z });
+			FRefPipeline P(G);
+			P.bVelocityLod = false;
+			P.Update(Cam, FVec3f{});
+			FCamera Cm; Cm.Coord = Cam; Cm.Width = 192; Cm.Height = 108; Cm.DeltaMag = 0.0;
+			Cm.LookAlong(FV3{ -X, -Y, -Z });
+			const FVolumeSettings S;
+			const FVolumeScene Full = VB.Build(P, Cam, FVec3f{}, Cm.View(), S);
+			const FVolumeScene Local = Full.Subset(false);
+			const FRun A = Run(Local, Cm);
+			const FRun B = Run(Full, Cm);
+			std::printf("r %4.1f kpc az %3.0f (z %.1f kpc): %2u local carriers: %6.1f steps/px (max %4u, trunc %llu, active %.2f, super %4.1f%%, %5.0f ms) | +background %6.1f steps/px (max %4u, trunc %llu, %5.0f ms) x%.2f\n",
+				R, Az, Z / Kpc, ToHlsl(Local.View).NumCarriers, A.Steps, A.Max, (unsigned long long)A.Trunc, A.Active, 100.0 * A.Super, A.Ms, B.Steps, B.Max, (unsigned long long)B.Trunc, B.Ms, B.Ms / std::max(A.Ms, 1e-9));
+			std::fflush(stdout);
+		}
+	}
+	Uni::Check(9, "X.explore.hitch", "exploration").Pass(true, "printed");
+}

@@ -1801,3 +1801,66 @@ Owner, 2026-11-10: away from home; polish, review and miscellaneous fixes (offli
 - Engine-only code read through (the generation backend's submit, poll and timeout paths, RenderVolume, RenderBackdrop and its readback rings, auto start and auto fly, the sky light, uu.Perf): nothing wrong found. Three small edge cases noted in BACKLOG B-027 and left unchanged (untestable while the owner is away, and none seen).
 Reroll impact: none.
 Status: Done offline (the gate); the only engine-side change is the uu.Perf / HUD / hitch-log phase names (UniSubsystem.cpp), checked at the next build (REVIEW_TONIGHT §55).
+
+D-222 — Paradigm review: assumptions audited, two prototypes proposed, galslices brought up to D-220
+Owner, 2026-11-10: the 2D galaxy map came from breaking a design assumption; inspect the project and look for other paradigm shifts we may have missed. Written up in Docs/PARADIGMS.md (project doc claude/PARADIGMS.md).
+Measured:
+- explore.shells (archived, Tools/UniVerify/experiments/paradigm_shells_explore.cpp.txt): the solar camera at the defaults, each view marched to R and from R. Beyond 300 pc: toward the centre 99.8% of the light in 40.5 of 52.7 steps/px, along the disc 97.2% in 27.4 of 41.5, out of the plane 77.1% in 18.4 of 30.7. Within 300 pc 13 steps/px everywhere.
+- galslices updated to D-220 (the rebuilt field applies the fine band and the warp's mip floor; it matches UniField_Galaxy to 7.4e-6, from 5.3). Sliced map: home 8 slices 3.9% per point (D-217: 13.7%), thick disc 25.5%. B-025 stays parked.
+Proposed (owner to choose; nothing in the engine changed):
+- Galaxies seen from outside as impostors drawn from their 2D map (B-022, raised: D-219's worst sliding is that case).
+- The march split by distance, the far part in world-aligned direction maps refreshed on a parallax budget (B-028).
+- Compute splatting of sub-pixel stars, after a ProfileGPU of the sprite pass (B-029).
+Not recommended now, with reasons in PARADIGMS.md §4: work graphs (generation is 0.2 ms; plugin access in UE 5.7 unconfirmed), particle or Gaussian galaxies, stateless stars, a screen-space layered history (D-219: depth is not the error).
+Reroll impact: none.
+Status: Done (analysis). Prototypes wait for the owner's choice.
+
+D-223 — Plain point sprites by a splat path (scatter + quads)
+Owner, 2026-11-11: after PARADIGMS.md §3 and the follow-up on a unified pipeline: "lets give the scatter + quads approach a try".
+Decision: a sprite that is the core alone (no halo, core weight 1, no resolved disc, round, at the core sigma, no warp: Uni_SpriteSplattable) is not drawn as a quad. The project pass sorts each visible sprite's slot into a quad list (draw arguments {6, n, 0, 0}) or a splat list (OutSprites, OutDrawArgs, pick and uu.Perf unchanged). After the volume pass:
+- SplatCS: one thread per listed sprite (strided). The scene-depth test and the dust's transmittance at its centre pixel (the quad tests every pixel of a footprint a few pixels wide). Its luminance is added bilinearly into a 2x supersampled uint buffer, and its colour at the nearest 1x texel (fixed point 2^20 units per scene-colour unit, 2^26 cap per add: the floor 2e-4 is 210 units).
+- SplatGatherCS: the 2x rows gathered to 1x columns by a Gaussian of sigma sqrt(core^2 - 1/24) (the 2x tent's variance taken out), normalised so each subtexel's light is handed out whole; colour rows blurred at the core sigma.
+- SplatResolveVS/PS: the columns, then colour / its luminance x the luminance's shape, additive into scene colour. Light is kept off scene surfaces nearer than r0 (no sprite can be there), so the gather's tails do not touch a near body's edge.
+Why this shape (measured, one star at 11 x 11 sub-pixel phases, against the quad's per-pixel Gaussian at a 1 px core):
+- bilinear at 1x + blur: within 20% of the peak, its peak swinging 67% over phases (the quad's 28%: more twinkle in motion);
+- Lagrange 3x3 at 1x: 15%; Catmull-Rom 4x4 at 1x: 5.6% but 36% swing;
+- the exact 5x5 renormalised: 5%, but 75 atomics a star;
+- 2x supersampled bilinear: 2.2%, swing 27.6% (adopted for luminance; 4x: 0.5%).
+Full RGB on the 2x grid would be ~100 MB at 1880 x 1120. Luminance there and colour at 1x is 7 atomics a star and ~60 MB of transient buffers (RDG pooled), with an isolated star's colour exact.
+Offline (T2.sprite.splat, new; UniSplatRef.h mirrors the passes with the shared core, and the engine quad's VS/PS for a round core):
+- One star: core 1 px within 2.24% of the quad's peak, swing 27.6% vs 28.4%, light 1.0026x (the quad cuts its edge); 0.75 px 4.21%; 1.5 px 0.96%.
+- The solar star field, three views: 98.9-99.9% of the sprites splatted, carrying 81-99% of the light (the rest are haloed stars). Light +0.24..+0.27%, per-pixel L1 1.33-1.51%, colour 0.01-0.07%.
+- The buffers are bit-identical in reverse order; no overflow.
+T4.static.shader_params: the four new shaders and the changed project and sprite passes bound, 25 shaders clean.
+Engine: uu.Sprite.Splat (1; 0 is the quads as before). RDG scope Uni.Sprites.Splat (Deposit, Gather, Resolve). Not compiled here (DXC not runnable): UE-56.
+Reroll impact: none (render only).
+Status: Provisional (UE-56: shaders compile; the look against uu.Sprite.Splat 0; ProfileGPU in a dense core).
+
+D-223 amendment (2026-11-11) — The splat path skips the screen away from its stars
+Owner's engine profile of D-223: compiles, looks the same or slightly crisper. The quads cost 0.02-0.06 ms at today's density (in motion too, volume off); the splat path cost ~0.43 ms, almost all fixed: buffer clears 0.09, gather 0.22-0.26, resolve 0.10-0.13, deposit 0.006-0.011. Owner chose to keep it and cut the fixed cost (headroom for more stars).
+Decision: tiles of 8 px (UNI_SPLAT_TILE). SplatCS marks the tiles it writes. SplatTilesCS gives each tile a level from the marks within two tiles: 2 (within one: gathered and resolved), 1 (within two: its gathered rows written as zeros, since a level-2 pixel's columns read them), 0 (skipped). The gather reaches at most UNI_SPLAT_TAPS + 0.75 px, so UNI_SPLAT_TAPS is 7, below a tile. The deposit buffers and marks persist between frames. SplatZeroCS zeroes the level-2 tiles after the gather and resets the marks, so the full-screen clears are gone. They are created cleared, and again when the view's size changes. SplatResolvePS returns at once outside level 2.
+Offline (T2.sprite.splat, extended; UniSplatRef.h mirrors the passes): at 1920 x 1080 the tiled image equals the untiled one bit for bit (rows the gather skips hold NaN in the reference, so a read of one would show), and every buffer is zero after the zero pass. The solar star field's three views: 10-28% of the tiles gathered and resolved, 16-24% zero rows, 1-5% marked. Expected engine cost in views like the owner's: ~0.1-0.15 ms (from ~0.43).
+Reroll impact: none. Status: Provisional (UE-56).
+
+D-224 — Inside a galaxy the background stays on its direction map while travelling (the hitch at some angles)
+Owner, 2026-11-11: travelling through the galaxy, some view and approach angles drop the frame rate. Mid-disc, below the plane looking up at the core ~20 degrees, orbiting: at some azimuths it drops, and moving in and out at speed it chugs. Captures: frames of 35-55 ms, all in one pass, Uni.Volume.March+Background, 31-51 ms. In the owner's static profile Uni.Volume.March alone was ~4 ms.
+Measured:
+- uu.Perf (default settings): the background was marched per pixel in 7909 of 39689 frames. Its map was re-marched 2044 times, 2035 because the camera moved. The auto budget was at its lowest level (373 x 245) with the GPU at 22.4 ms smoothed.
+- With uu.BackgroundPerPixelInterval 2 for 31 s of the same flying: no per-pixel frame in 1635, the map re-marched every ~6 frames, GPU 4.4 ms smoothed.
+- explore.hitch (archived, Tools/UniVerify/experiments/hitch_explore.cpp.txt): the owner's geometry, 8 and 11 kpc out, 2.9 and 4.0 kpc below the plane, looking at the core, every 15 degrees of azimuth. The local carriers alone take 45-50 steps/px; with the background per pixel 114-119 steps/px and 6.3-10.1x the time (web steps are far dearer than the galaxy's, which reads its 2D map). At azimuths 45-105 degrees some rays take 2-3x the steps of the others: max 206 vs ~100 locally, 470 vs ~170 with the background, the mean barely moving. A GPU wave runs as long as its longest ray, so this is a candidate for the angle dependence on top (B-030).
+- The trigger: uu.BackgroundMode 2 marches the background per pixel when its map would be re-marched at least every Interval frames, with Interval = map rays / (march pixels / 4). The march's pixels were taken after the auto budget (D-200) had shrunk them. A slow GPU shrank the march, which raised Interval (6 -> 17 frames), which put the background per pixel, which slowed the GPU further: a feedback loop. Moving in and out at speed re-marks the map every few frames.
+Decision:
+- While the camera is inside a local carrier (UniCore::CameraInsideLocalCarrier: in a galaxy, or a cluster's or group's glow), the background is never marched per pixel. Its map refreshes (two faces a frame, cross-faded) as at rest. uu.BackgroundPerPixelInside 1 restores the old behaviour.
+- The per-pixel interval is computed from the march's pixels before the auto budget (the travel scale only), so the auto budget no longer feeds into it.
+- Outside any carrier (intergalactic travel, what D-166 made per-pixel background for) nothing changes.
+T2.vol.bg_per_pixel_inside (new): the rule holds at the solar camera and at the owner's spot, and not at 60 kpc or in a void; per pixel at the owner's spot costs 8.7x the march.
+Cost: the map lags the camera by up to a refresh (3 frames at two faces a frame, then a cross-fade). Inside a galaxy the web is the faint, distant part of the view.
+Reroll impact: none (render only). Status: Provisional (UE-57).
+
+D-225 — Supersampling scales with the light a carrier draws (the rest of the hitch)
+Owner, 2026-11-11: the hitch at some angles remained after D-224. Capture: Uni.Volume.March alone ~16 ms with the auto budget at its smallest march (373 x 245, 5828 rays, 1/16 sliced): ~2.7 us a ray against ~0.25 us in a normal frame. uu.Perf: the background per pixel in 33 of 5489 frames (D-224 working). uu.VolumeMaxSubsamples 1 removed the hitch.
+Measured (explore.hitch2, archived): from the owner's spot (8 kpc out, 20 degrees below the plane looking at the core) at azimuths 60-120 degrees, two distant clusters' glows (field 5, ~1 Mpc radius, 16-18 Mpc away, weight 0.03-0.05: the rest of their light still sprites) sit behind the core. Not prefiltered (D-160 is galaxies), each pixel they cover was supersampled 3x3 to 8x8 (Uni_CarrierSubsamples: their cores sub-pixel). 0.7% of the pixels at up to ~600 steps against ~100. On the GPU a wave runs as long as its longest ray, and with 1/16 slicing a wave spans ~1000 pixels. The auto budget's smaller march makes the cores smaller in pixels, so more rays: another feedback.
+Decision: rays per axis x sqrt(saturate(Weight)) in Uni_CarrierSubsamples. The sampling error of a sub-pixel feature scales with the light it carries, so a carrier drawing a few percent of its light is not supersampled; one at full weight is supersampled exactly as before. (Rules tried: none below weight 0.25, x weight, x sqrt(weight). All three gave the same here.)
+T2.vol.super_weight (new): at azimuths 60 and 90 (93 px wide, the smallest march scaled), against the old rule: supersampled pixels 0.73% -> 0, the longest ray 596-611 -> 101-102 steps, steps/px 51 -> 48. The image changes by at most 1.37% in a pixel, 0.0000% overall. At full weight 0 of 12 cases differ from the old rule.
+Render only; the CPU reference and the shader share Uni_CarrierSubsamples.
+Reroll impact: none. Status: Provisional (UE-58: no hitch at the owner's angles with uu.VolumeMaxSubsamples back at 8).

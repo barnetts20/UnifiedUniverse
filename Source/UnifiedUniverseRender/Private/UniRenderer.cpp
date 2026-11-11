@@ -24,6 +24,7 @@
 
 static TAutoConsoleVariable<float> CVarUniSpriteExtent(TEXT("uu.SpriteExtent"), 3.0f, TEXT("Sprite quad half size in Gaussian sigmas."), ECVF_RenderThreadSafe);
 // D-156 sprite style: a pinpoint core plus a faint, capped halo (replaces uu.GlareGain).
+static TAutoConsoleVariable<int32> CVarUniSpriteSplat(TEXT("uu.Sprite.Splat"), 1, TEXT("D-223: 1: plain point sprites (no halo, round, at the core size: nearly every star) are drawn by atomic adds into fixed-point buffers and one shared gather; the rest stay quads. 0: every sprite a quad (before D-223)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<float> CVarUniSpriteCorePx(TEXT("uu.Sprite.CorePx"), UniHlsl::UNI_SPRITE_CORE_PX, TEXT("Core size of an unresolved sprite (Gaussian sigma, pixels). Brightness no longer enlarges it (D-156)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<float> CVarUniSpriteSaturation(TEXT("uu.Sprite.Saturation"), UniHlsl::UNI_SPRITE_CORE_SAT, TEXT("Intensity (exposure units: 1 = a star at the exposure magnitude) where a sprite's core stops brightening. 0: physical (all light in the core, no halo; the engine's bloom does the glare)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<float> CVarUniSpriteHaloGain(TEXT("uu.Sprite.HaloGain"), UniHlsl::UNI_SPRITE_HALO_GAIN, TEXT("Halo light per doubling of brightness over saturation, in units of the saturation level (0: no halo)."), ECVF_RenderThreadSafe);
@@ -70,6 +71,7 @@ static TAutoConsoleVariable<float> CVarUniWebDebugDepth(TEXT("uu.WebDebugDepth")
 static TAutoConsoleVariable<float> CVarUniWebDebugThreshold(TEXT("uu.WebDebugThreshold"), 2.0f, TEXT("D-169: uu.WebDebug shows density above this multiple of the mean (full strength 100x above it)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<float> CVarUniWebDebugOpacity(TEXT("uu.WebDebugOpacity"), 0.3f, TEXT("D-169: uu.WebDebug opacity per texel at full strength (higher: only the nearest structure shows)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniBackgroundMode(TEXT("uu.BackgroundMode"), 2, TEXT("D-166: how the background (the periodic web) is marched. 0: into the direction map (D-136/D-159), a few faces per frame. 1: per pixel with the local volume, every frame. 2: per pixel while the background is changing (travel), the map once it has been still for uu.BackgroundStillFrames."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<int32> CVarUniBackgroundPerPixelInside(TEXT("uu.BackgroundPerPixelInside"), 0, TEXT("D-224: 0: while the camera is inside a galaxy (or a cluster's or group's glow), the background stays on its direction map when travelling (per pixel it cost 7-10x the march: the hitch at some angles). 1: as before D-224 (per pixel there too)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniBackgroundPerPixelInterval(TEXT("uu.BackgroundPerPixelInterval"), 0, TEXT("D-196: uu.BackgroundMode 2 marches the background per pixel only while it changes at least this often (frames between changes): fast travel. Slower changes refresh the direction map (cross-faded). 0: automatic, where a map refresh per change costs more than marching it per pixel."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniBackgroundStillFrames(TEXT("uu.BackgroundStillFrames"), 30, TEXT("D-166: uu.BackgroundMode 2 switches to the direction map after this many frames without a background change."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniBackgroundFaces(TEXT("uu.BackgroundFacesPerFrame"), 2, TEXT("Background map faces marched per frame during a refresh (1..6; D-159: a refresh is always all six faces from one snapshot, cross-faded in)."), ECVF_RenderThreadSafe);
@@ -791,11 +793,18 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		// the background has been still for StillFrames frames, as before (hysteresis).
 		const int32 Cs = FMath::Clamp(CVarUniBackgroundSize.GetValueOnRenderThread(), 16, 1024);
 		const double MapRays = 6.0 * double(Cs) * double(Cs);
-		const double PixelRays = FMath::Max(double(MarchSize.X) * double(MarchSize.Y) * 0.25, 1.0);
+		// D-224: the march's pixels before the auto budget (D-200) took them down. Measured on the
+		// shrunk march, a slow GPU made per-pixel background look cheaper, which made the GPU slower.
+		int32 RefX = 1, RefY = 1;
+		UniCore::VolumeMarchSize(OutRect.Width(), OutRect.Height(), Div, double(FMath::Max(CVarUniVolumeMaxMarchPixels.GetValueOnRenderThread(), 0)) * TravelScale, RefX, RefY);
+		const double PixelRays = FMath::Max(double(RefX) * double(RefY) * 0.25, 1.0);
+		// D-224: inside a galaxy the background stays on its map (UniCore::CameraInsideLocalCarrier).
+		const bool bInsideLocal = CVarUniBackgroundPerPixelInside.GetValueOnRenderThread() == 0
+			&& UniCore::CameraInsideLocalCarrier(F.VolumeCarriers.GetData(), size_t(F.VolumeCarriers.Num()));
 		const int32 Want = CVarUniBackgroundPerPixelInterval.GetValueOnRenderThread();
 		const int32 Interval = Want > 0 ? Want : FMath::Clamp(int32(FMath::CeilToDouble(MapRays / PixelRays)), 2, 120);
 		const int32 Still = FMath::Max(CVarUniBackgroundStillFrames.GetValueOnRenderThread(), 1);
-		if (BgMode != 2) { bBgPerPixel = false; }
+		if (BgMode != 2 || bInsideLocal) { bBgPerPixel = false; }
 		else if (!bBgPerPixel) { bBgPerPixel = BgStillFrames == 0 && BgDirtyInterval <= Interval; }
 		else if (BgStillFrames >= Still) { bBgPerPixel = false; }
 	}
@@ -1138,6 +1147,24 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 	FRDGBufferRef SpriteSourceBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(FUintVector2), bPick ? UniGpuLayout::MaxSprites : 1u), TEXT("UniSpriteSource"));
 	if (!bPick) { AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(SpriteSourceBuf), 0u); }   // bound, never written
 
+	// D-223: the project pass sorts the sprites into the quads' list (their draw arguments) and
+	// the splat path's list (its count). Off: 1-element lists, bound and cleared, never written.
+	const bool bSplat = CVarUniSpriteSplat.GetValueOnRenderThread() != 0;
+	const uint32 SplatSlots = bSplat ? UniGpuLayout::MaxSprites : 1u;
+	FRDGBufferRef QuadIndexBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), SplatSlots), TEXT("UniQuadIndex"));
+	FRDGBufferRef SplatIndexBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), SplatSlots), TEXT("UniSplatIndex"));
+	FRDGBufferRef QuadArgsBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateIndirectDesc<FRHIDrawIndirectParameters>(1), TEXT("UniQuadArgs"));
+	FRDGBufferRef SplatCountBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), 1), TEXT("UniSplatCount"));
+	FRDGBufferUAVRef QuadArgsUAV = GraphBuilder.CreateUAV(QuadArgsBuf, PF_R32_UINT);
+	FRDGBufferUAVRef SplatCountUAV = GraphBuilder.CreateUAV(SplatCountBuf, PF_R32_UINT);
+	AddClearUAVPass(GraphBuilder, QuadArgsUAV, 0u);
+	AddClearUAVPass(GraphBuilder, SplatCountUAV, 0u);
+	if (!bSplat)
+	{
+		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(QuadIndexBuf), 0u);
+		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(SplatIndexBuf), 0u);
+	}
+
 	// Planet records (D-143) into the reserved pool tail, before the project pass reads them.
 	if (F.DynamicRecords.Num() > 0)
 	{
@@ -1185,6 +1212,11 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 		P->WriteSpriteSource = bPick ? 1u : 0u;
 		P->InHandoffs = GraphBuilder.CreateSRV(UploadStructured(GraphBuilder, TEXT("UniCarrierHandoffs"), F.CarrierHandoffs));   // D-196
 		P->NumHandoffs = uint32(F.CarrierHandoffs.Num());
+		P->SplatMode = bSplat ? 1u : 0u;   // D-223
+		P->OutQuadIndex = GraphBuilder.CreateUAV(QuadIndexBuf);
+		P->OutQuadArgs = QuadArgsUAV;
+		P->OutSplatIndex = GraphBuilder.CreateUAV(SplatIndexBuf);
+		P->OutSplatCount = SplatCountUAV;
 		P->NumCells = uint32(F.Cells.Num());
 		P->MaxSprites = UniGpuLayout::MaxSprites;
 		P->MaxPromote = UniGpuLayout::MaxPromote;
@@ -1396,7 +1428,9 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 		P->Sprite.OutToMarch = FVector4f(float(MarchSize.X) / float(FMath::Max(OutRect.Width(), 1)), float(MarchSize.Y) / float(FMath::Max(OutRect.Height(), 1)),
 			-float(OutRect.Min.X) * float(MarchSize.X) / float(FMath::Max(OutRect.Width(), 1)), -float(OutRect.Min.Y) * float(MarchSize.Y) / float(FMath::Max(OutRect.Height(), 1)));
 		P->Sprite.MarchSize = FUintVector2(uint32(MarchSize.X), uint32(MarchSize.Y));
-		P->DrawArgs = ArgsBuf;
+		P->Sprite.bQuadIndex = bSplat ? 1u : 0u;   // D-223: the quads' list (the splat path draws the rest, below)
+		P->Sprite.InQuadIndex = GraphBuilder.CreateSRV(QuadIndexBuf);
+		P->DrawArgs = bSplat ? QuadArgsBuf : ArgsBuf;
 		P->RenderTargets[0] = FRenderTargetBinding(SceneColor.Texture, ERenderTargetLoadAction::ELoad);   // a render-targetable copy (R1)
 
 		TShaderMapRef<FUniSpriteVS> VS(GetGlobalShaderMap(View.GetFeatureLevel()));
@@ -1444,6 +1478,150 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 					SetShaderParameters(RHICmdList, PS, PS.GetPixelShader(), Pm->Sprite);
 					RHICmdList.DrawPrimitive(0, 2, UniHlsl::UNI_MOTE_COUNT);
 				});
+		}
+
+		// D-223: the splat path. Deposits into fixed-point buffers (luminance on a 2x grid, colour
+		// at 1x, the view plus a margin), the rows gathered, then the columns gathered and
+		// composited additively, as the quads are.
+		if (bSplat)
+		{
+			RDG_EVENT_SCOPE(GraphBuilder, "Uni.Sprites.Splat");
+			const int32 Pad = UniHlsl::UNI_SPLAT_PAD;
+			const FUintVector2 SplatSize(uint32(OutRect.Width() + 2 * Pad), uint32(OutRect.Height() + 2 * Pad));
+			const uint32 SplatTexels = SplatSize.X * SplatSize.Y;
+			const int32 Tile = UniHlsl::UNI_SPLAT_TILE;
+			const FUintVector2 SplatTiles(uint32(FMath::DivideAndRoundUp(int32(SplatSize.X), Tile)), uint32(FMath::DivideAndRoundUp(int32(SplatSize.Y), Tile)));
+			// D-223 amendment: persistent deposit buffers and tile marks, zeroed where each frame
+			// wrote them (SplatZeroCS below); created cleared, and again when the size changes.
+			FRDGBufferRef LumBuf, ColBuf, TileBuf;
+			if (!SplatLumBuffer.IsValid() || !SplatColBuffer.IsValid() || !SplatTileBuffer.IsValid() || SplatBufferSize != SplatSize)
+			{
+				LumBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), 4u * SplatTexels), TEXT("UniSplatLum"));
+				ColBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), 3u * SplatTexels), TEXT("UniSplatCol"));
+				TileBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), SplatTiles.X * SplatTiles.Y), TEXT("UniSplatTiles"));
+				AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(LumBuf, PF_R32_UINT), 0u);
+				AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(ColBuf, PF_R32_UINT), 0u);
+				AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(TileBuf, PF_R32_UINT), 0u);
+				SplatLumBuffer = GraphBuilder.ConvertToExternalBuffer(LumBuf);
+				SplatColBuffer = GraphBuilder.ConvertToExternalBuffer(ColBuf);
+				SplatTileBuffer = GraphBuilder.ConvertToExternalBuffer(TileBuf);
+				SplatBufferSize = SplatSize;
+			}
+			else
+			{
+				LumBuf = GraphBuilder.RegisterExternalBuffer(SplatLumBuffer);
+				ColBuf = GraphBuilder.RegisterExternalBuffer(SplatColBuffer);
+				TileBuf = GraphBuilder.RegisterExternalBuffer(SplatTileBuffer);
+			}
+			FRDGBufferUAVRef LumUAV = GraphBuilder.CreateUAV(LumBuf, PF_R32_UINT);
+			FRDGBufferUAVRef ColUAV = GraphBuilder.CreateUAV(ColBuf, PF_R32_UINT);
+			FRDGBufferUAVRef TileUAV = GraphBuilder.CreateUAV(TileBuf, PF_R32_UINT);
+			FRDGBufferRef LevelBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), SplatTiles.X * SplatTiles.Y), TEXT("UniSplatTileLevel"));
+			FRDGBufferSRVRef LevelSRV = GraphBuilder.CreateSRV(LevelBuf, PF_R32_UINT);
+			const float SplatCore = FMath::Clamp(CVarUniSpriteCorePx.GetValueOnRenderThread(), 0.25f, 16.0f);   // as the project pass takes it
+			const FVector4f RectMinSize(float(OutRect.Min.X), float(OutRect.Min.Y), float(OutRect.Width()), float(OutRect.Height()));
+			{
+				FUniSplatCS::FParameters* Sp = GraphBuilder.AllocParameters<FUniSplatCS::FParameters>();
+				Sp->InSprites = GraphBuilder.CreateSRV(SpriteBuf);
+				Sp->InSplatIndex = GraphBuilder.CreateSRV(SplatIndexBuf);
+				Sp->InSplatCount = GraphBuilder.CreateSRV(SplatCountBuf, PF_R32_UINT);
+				Sp->OutSplatLum = LumUAV;
+				Sp->OutSplatCol = ColUAV;
+				Sp->OutSplatTiles = TileUAV;
+				Sp->SplatTiles = SplatTiles;
+				Sp->MaxSprites = UniGpuLayout::MaxSprites;
+				Sp->SplatSize = SplatSize;
+				Sp->OutRectMinSize = RectMinSize;
+				const uint32 Groups = FMath::Min(FMath::DivideAndRoundUp(UniGpuLayout::MaxSprites, 64u), 2048u);   // each thread strides over the list
+				Sp->SplatThreads = Groups * 64u;
+				Sp->ViewForward = Forward;
+				Sp->SceneColourScale = P->Sprite.SceneColourScale;
+				Sp->InvDeviceZToWorldZTransform = P->Sprite.InvDeviceZToWorldZTransform;
+				Sp->DepthUVScaleBias = P->Sprite.DepthUVScaleBias;
+				Sp->SceneDepthTexture = SceneDepth;
+				Sp->SceneDepthSampler = P->Sprite.SceneDepthSampler;
+				Sp->VolumeSlices = VolumeSlices;
+				Sp->bVolume = P->Sprite.bVolume;
+				Sp->SliceLnTLo = P->Sprite.SliceLnTLo;
+				Sp->SliceLnTHi = P->Sprite.SliceLnTHi;
+				Sp->OutToMarch = P->Sprite.OutToMarch;
+				Sp->MarchSize = P->Sprite.MarchSize;
+				TShaderMapRef<FUniSplatCS> CS(GetGlobalShaderMap(View.GetFeatureLevel()));
+				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Sprites.Splat.Deposit"), CS, Sp, FIntVector(int32(Groups), 1, 1));
+			}
+			{
+				FUniSplatTilesCS::FParameters* Tp = GraphBuilder.AllocParameters<FUniSplatTilesCS::FParameters>();
+				Tp->InSplatTiles = GraphBuilder.CreateSRV(TileBuf, PF_R32_UINT);
+				Tp->OutTileLevel = GraphBuilder.CreateUAV(LevelBuf, PF_R32_UINT);
+				Tp->SplatTiles = SplatTiles;
+				TShaderMapRef<FUniSplatTilesCS> CS(GetGlobalShaderMap(View.GetFeatureLevel()));
+				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Sprites.Splat.Tiles"), CS, Tp,
+					FIntVector(FMath::DivideAndRoundUp(int32(SplatTiles.X), 8), FMath::DivideAndRoundUp(int32(SplatTiles.Y), 8), 1));
+			}
+			FRDGTextureRef GatherLum = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(FIntPoint(int32(SplatSize.X), int32(2u * SplatSize.Y)), PF_R16F, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV), TEXT("UniSplatGatherLum"));
+			FRDGTextureRef GatherCol = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(FIntPoint(int32(SplatSize.X), int32(SplatSize.Y)), PF_FloatRGBA, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV), TEXT("UniSplatGatherCol"));
+			{
+				FUniSplatGatherCS::FParameters* Gp = GraphBuilder.AllocParameters<FUniSplatGatherCS::FParameters>();
+				Gp->InSplatLum = GraphBuilder.CreateSRV(LumBuf, PF_R32_UINT);
+				Gp->InSplatCol = GraphBuilder.CreateSRV(ColBuf, PF_R32_UINT);
+				Gp->OutGatherLum = GraphBuilder.CreateUAV(GatherLum);
+				Gp->OutGatherCol = GraphBuilder.CreateUAV(GatherCol);
+				Gp->SplatSize = SplatSize;
+				Gp->SplatCorePx = SplatCore;
+				Gp->InTileLevel = LevelSRV;
+				Gp->SplatTiles = SplatTiles;
+				TShaderMapRef<FUniSplatGatherCS> CS(GetGlobalShaderMap(View.GetFeatureLevel()));
+				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Sprites.Splat.Gather"), CS, Gp,
+					FIntVector(FMath::DivideAndRoundUp(int32(SplatSize.X), 8), FMath::DivideAndRoundUp(int32(2u * SplatSize.Y), 8), 1));
+			}
+			{
+				FUniSplatZeroCS::FParameters* Zp = GraphBuilder.AllocParameters<FUniSplatZeroCS::FParameters>();
+				Zp->InTileLevel = LevelSRV;
+				Zp->OutSplatLum = LumUAV;
+				Zp->OutSplatCol = ColUAV;
+				Zp->OutSplatTiles = TileUAV;
+				Zp->SplatSize = SplatSize;
+				Zp->SplatTiles = SplatTiles;
+				TShaderMapRef<FUniSplatZeroCS> CS(GetGlobalShaderMap(View.GetFeatureLevel()));
+				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Sprites.Splat.Zero"), CS, Zp,
+					FIntVector(FMath::DivideAndRoundUp(int32(SplatSize.X), 8), FMath::DivideAndRoundUp(int32(SplatSize.Y), 8), 1));
+			}
+			{
+				FUniSplatResolvePassParameters* Rp = GraphBuilder.AllocParameters<FUniSplatResolvePassParameters>();
+				Rp->Resolve.InGatherLum = GatherLum;
+				Rp->Resolve.InGatherCol = GatherCol;
+				Rp->Resolve.InTileLevel = LevelSRV;
+				Rp->Resolve.SplatTiles = SplatTiles;
+				Rp->Resolve.SplatSize = SplatSize;
+				Rp->Resolve.OutRectMinSize = RectMinSize;
+				Rp->Resolve.SplatCorePx = SplatCore;
+				Rp->Resolve.TanHalfFov = FVector2f(TanX, TanY);
+				Rp->Resolve.InvDeviceZToWorldZTransform = P->Sprite.InvDeviceZToWorldZTransform;
+				Rp->Resolve.DepthUVScaleBias = P->Sprite.DepthUVScaleBias;
+				Rp->Resolve.SceneDepthTexture = SceneDepth;
+				Rp->Resolve.SceneDepthSampler = P->Sprite.SceneDepthSampler;
+				Rp->RenderTargets[0] = FRenderTargetBinding(SceneColor.Texture, ERenderTargetLoadAction::ELoad);
+				TShaderMapRef<FUniSplatResolveVS> RVS(GetGlobalShaderMap(View.GetFeatureLevel()));
+				TShaderMapRef<FUniSplatResolvePS> RPS(GetGlobalShaderMap(View.GetFeatureLevel()));
+				GraphBuilder.AddPass(RDG_EVENT_NAME("Uni.Sprites.Splat.Resolve"), Rp, ERDGPassFlags::Raster,
+					[Rp, RVS, RPS, OutRect](FRHICommandList& RHICmdList)
+					{
+						RHICmdList.SetViewport(float(OutRect.Min.X), float(OutRect.Min.Y), 0.0f, float(OutRect.Max.X), float(OutRect.Max.Y), 1.0f);
+						FGraphicsPipelineStateInitializer Pso;
+						RHICmdList.ApplyCachedRenderTargets(Pso);
+						Pso.BlendState = TStaticBlendState<CW_RGB, BO_Add, BF_One, BF_One>::GetRHI();
+						Pso.RasterizerState = TStaticRasterizerState<FM_Solid, CM_None>::GetRHI();
+						Pso.DepthStencilState = TStaticDepthStencilState<false, CF_Always>::GetRHI();
+						Pso.BoundShaderState.VertexDeclarationRHI = GEmptyVertexDeclaration.VertexDeclarationRHI;
+						Pso.BoundShaderState.VertexShaderRHI = RVS.GetVertexShader();
+						Pso.BoundShaderState.PixelShaderRHI = RPS.GetPixelShader();
+						Pso.PrimitiveType = PT_TriangleList;
+						SetGraphicsPipelineState(RHICmdList, Pso, 0);
+						SetShaderParameters(RHICmdList, RVS, RVS.GetVertexShader(), Rp->Resolve);
+						SetShaderParameters(RHICmdList, RPS, RPS.GetPixelShader(), Rp->Resolve);
+						RHICmdList.DrawPrimitive(0, 1, 1);
+					});
+			}
 		}
 	}
 	Stats.CellsLastFrame = uint32(F.Cells.Num());

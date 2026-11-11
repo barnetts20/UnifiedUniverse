@@ -9,6 +9,12 @@
 // transmittance of the dust between the camera and the sprite, read from the volume's
 // transmittance slices at the sprite's true distance (piecewise linear in ln t, as
 // Uni_SliceTransmittance). Without it, the slice texture is a 1 x 1 dummy and bVolume = 0.
+//
+// D-223: with uu.Sprite.Splat on, the project pass sorts the sprites into two index lists. Plain
+// point sprites (Uni_SpriteSplattable: the core alone, round, at the core sigma) are drawn by
+// SplatCS (atomic adds of their light into fixed-point buffers: luminance on a 2x grid, colour at
+// 1x), SplatGatherCS (rows) and SplatResolveVS / PS (columns, additive into scene colour); the
+// rest are quads (MainVS reads InQuadIndex). The CPU reference is Tools/UniVerify/src/UniSplatRef.h.
 
 #include "/Engine/Public/Platform.ush"
 #include "UniWebTexture.ush"   // D-164: before any core (UniFields.ush samples it)
@@ -50,6 +56,38 @@ float SliceLnTHi;
 float4 OutToMarch;                  // output pixel -> slice texel: m = p * xy + zw
 uint2 MarchSize;
 
+uint bQuadIndex;                    // D-223: 1: instance i draws sprite InQuadIndex[i] (the splat path has the rest)
+StructuredBuffer<uint> InQuadIndex;
+
+// D-223: the splat path's passes.
+StructuredBuffer<uint> InSplatIndex;    // SplatCS: the sprites it draws (slots in InSprites) ..
+Buffer<uint> InSplatCount;              // .. and how many
+RWBuffer<uint> OutSplatLum;             // fixed point: luminance on the 2x grid, (2 SplatSize.y) rows of (2 SplatSize.x)
+RWBuffer<uint> OutSplatCol;             // fixed point: colour at 1x, SplatSize.y rows of SplatSize.x, x 3
+uint2 SplatSize;                        // the buffers' 1x size: the view plus UNI_SPLAT_PAD each side
+float4 OutRectMinSize;                  // the output view rect: min (xy), size (zw), pixels
+uint SplatThreads;                      // SplatCS: threads dispatched (each strides by this)
+float SplatCorePx;                      // the core sigma, px (uu.Sprite.CorePx)
+Buffer<uint> InSplatLum;                // SplatGatherCS reads the deposits ..
+Buffer<uint> InSplatCol;
+RWTexture2D<float> OutGatherLum;        // .. and writes the rows gathered: luminance (SplatSize.x, 2 SplatSize.y) ..
+RWTexture2D<float4> OutGatherCol;       // .. and colour (SplatSize)
+Texture2D<float> InGatherLum;           // SplatResolvePS reads them
+Texture2D<float4> InGatherCol;
+float2 TanHalfFov;                      // SplatResolvePS: the view's half-angle tangents (a pixel's ray for its scene depth)
+// D-223 amendment: tiles of UNI_SPLAT_TILE px (UniProject.ush).
+uint2 SplatTiles;                       // tiles across and down the buffers
+RWBuffer<uint> OutSplatTiles;           // SplatCS marks the tiles it writes; SplatZeroCS resets them
+Buffer<uint> InSplatTiles;              // SplatTilesCS reads the marks ..
+RWBuffer<uint> OutTileLevel;            // .. and writes each tile's level: 2 gather and resolve, 1 zero rows, 0 skip
+Buffer<uint> InTileLevel;               // SplatGatherCS, SplatZeroCS, SplatResolvePS read the levels
+
+/** D-223: the tile holding padded 1x pixel (X, Y). */
+uint SplatTileIndex(int X, int Y)
+{
+	return (uint)(Y / UNI_SPLAT_TILE) * SplatTiles.x + (uint)(X / UNI_SPLAT_TILE);
+}
+
 struct FSpriteVSOut
 {
 	float4 Position : SV_POSITION;
@@ -83,7 +121,9 @@ void MainVS(uint VertexId : SV_VertexID, uint InstanceId : SV_InstanceID, out FS
 	else
 	{
 		if (InstanceId >= MaxSprites) { Out.Position = float4(0, 0, -1, 1); return; }   // past the cap: degenerate
-		S = InSprites[InstanceId];
+		uint Slot = InstanceId;
+		if (bQuadIndex != 0u) { Slot = InQuadIndex[InstanceId]; }   // D-223: the quads' list (HLSL's ?: reads both sides)
+		S = InSprites[Slot];
 	}
 	// Two triangles: (-1,-1) (1,-1) (1,1) / (-1,-1) (1,1) (-1,1).
 	const float2 Corners[6] = { float2(-1, -1), float2(1, -1), float2(1, 1), float2(-1, -1), float2(1, 1), float2(-1, 1) };
@@ -151,6 +191,28 @@ float SceneDistance(float2 PixelPos, float CosToForward)
 	return ViewZ / CosToForward;   // view depth to distance along the ray
 }
 
+/** The dust's luminance transmittance at an output pixel to a true distance: the volume's slices,
+ *  piecewise linear in ln t (Uni_SliceTransmittance); 1 without the volume. D-223: shared by the
+ *  quad's pixels and the splat path's centres. */
+float SpriteTransmittance(float2 PixelPos, float TrueDistance)
+{
+	float T = 1.0f;
+	if (bVolume != 0u)
+	{
+		const int2 M = clamp(int2(PixelPos * OutToMarch.xy + OutToMarch.zw), int2(0, 0), int2(MarchSize) - 1);
+		const float X = (log(max(TrueDistance, 1.0f)) - SliceLnTLo) * (float)UNI_VOL_SLICES / max(SliceLnTHi - SliceLnTLo, 1.0e-3f);
+		if (X >= (float)UNI_VOL_SLICES) { T = VolumeSlices.Load(int4(M, UNI_VOL_SLICES - 1, 0)); }
+		else if (X > 0.0f)
+		{
+			const uint I = (uint)X;
+			const float Lo = (I == 0u) ? 1.0f : VolumeSlices.Load(int4(M, I - 1u, 0));
+			const float Hi = VolumeSlices.Load(int4(M, I, 0));
+			T = Lo + (Hi - Lo) * (X - (float)I);
+		}
+	}
+	return T;
+}
+
 void MainPS(in FSpriteVSOut In, out float4 OutColor : SV_Target0)
 {
 	if (!Uni_SceneDepthKeep(In.TrueDistance, SceneDistance(In.Position.xy, In.CosToForward))) { discard; }
@@ -180,19 +242,200 @@ void MainPS(in FSpriteVSOut In, out float4 OutColor : SV_Target0)
 		Wall = Uni_SpriteProfileEllipse(Xp, Yp, In.SigmaPx, In.DiscFrac, In.HaloPx, In.HaloRatio, In.CoreWeight, In.EllipseAngle, In.EllipseQ) * Edge;
 		Wglare = In.HaloRatio > 0.0f ? Uni_SpriteProfileHalo(Rp, In.SigmaPx, In.DiscFrac, In.HaloPx, In.HaloRatio, 0.0f) * Edge : 0.0f;
 	}
-	float T = 1.0f;
-	if (bVolume != 0u)
+	const float T = SpriteTransmittance(In.Position.xy, In.TrueDistance);
+	OutColor = float4((In.Radiance * max(Wall - Wglare, 0.0f) + In.HaloRadiance * Wglare) * T, 0.0f);
+}
+
+// =============================================================================================
+// D-223: the splat path.
+// =============================================================================================
+
+[numthreads(64, 1, 1)]
+void SplatCS(uint3 DispatchId : SV_DispatchThreadID)
+{
+	const uint N = min(InSplatCount[0], MaxSprites);
+	const uint Wp = SplatSize.x, Hp = SplatSize.y;
+	UNI_LOOP
+	for (uint I = DispatchId.x; I < N; I += SplatThreads)
 	{
-		const int2 M = clamp(int2(In.Position.xy * OutToMarch.xy + OutToMarch.zw), int2(0, 0), int2(MarchSize) - 1);
-		const float X = (log(max(In.TrueDistance, 1.0f)) - SliceLnTLo) * (float)UNI_VOL_SLICES / max(SliceLnTHi - SliceLnTLo, 1.0e-3f);
-		if (X >= (float)UNI_VOL_SLICES) { T = VolumeSlices.Load(int4(M, UNI_VOL_SLICES - 1, 0)); }
-		else if (X > 0.0f)
+		const FUniSprite S = InSprites[InSplatIndex[I]];
+		// The centre in view pixels (x right, y down), then in the padded buffers.
+		const float Lx = (S.NdcX * 0.5f + 0.5f) * OutRectMinSize.z;
+		const float Ly = (0.5f - S.NdcY * 0.5f) * OutRectMinSize.w;
+		const float X = Lx + (float)UNI_SPLAT_PAD, Y = Ly + (float)UNI_SPLAT_PAD;
+		if (!(X >= 0.0f && Y >= 0.0f && X < (float)Wp && Y < (float)Hp)) { continue; }
+		// The scene-depth test and the dust at the centre pixel (the quad tests every pixel of a
+		// footprint a few pixels wide; SplatResolvePS keeps light off anything nearer than r0).
+		const float2 Pix = OutRectMinSize.xy + clamp(floor(float2(Lx, Ly)) + 0.5f, float2(0.5f, 0.5f), OutRectMinSize.zw - 0.5f);
+		const float R = length(S.RenderPos);
+		const float3 Dir = S.RenderPos / max(R, 1.0f);
+		if (!Uni_SceneDepthKeep(S.TrueDistance, SceneDistance(Pix, max(dot(Dir, ViewForward), 1.0e-3f)))) { continue; }
+		const float3 Rad = S.Radiance * SceneColourScale * SpriteTransmittance(Pix, S.TrueDistance);
+		const float L = Uni_Luminance(Rad);
+		if (!(L > 0.0f)) { continue; }
+		// Luminance: bilinear into the 2x grid (subtexel centres at (i + 0.5) / 2).
+		const float Qx = 2.0f * X - 0.5f, Qy = 2.0f * Y - 0.5f;
+		const float Fx0 = floor(Qx), Fy0 = floor(Qy);
+		const int I0 = (int)Fx0, J0 = (int)Fy0;
+		const float Ax = Qx - Fx0, Ay = Qy - Fy0;
+		UNI_UNROLL
+		for (int Dj = 0; Dj < 2; ++Dj)
 		{
-			const uint I = (uint)X;
-			const float Lo = (I == 0u) ? 1.0f : VolumeSlices.Load(int4(M, I - 1u, 0));
-			const float Hi = VolumeSlices.Load(int4(M, I, 0));
-			T = Lo + (Hi - Lo) * (X - (float)I);
+			UNI_UNROLL
+			for (int Di = 0; Di < 2; ++Di)
+			{
+				const int Ii = I0 + Di, Jj = J0 + Dj;
+				if (Ii < 0 || Jj < 0 || Ii >= (int)(2u * Wp) || Jj >= (int)(2u * Hp)) { continue; }
+				const float Wt = (Di != 0 ? Ax : 1.0f - Ax) * (Dj != 0 ? Ay : 1.0f - Ay);
+				const uint U = Uni_SplatEncode(L * Wt);
+				if (U != 0u)
+				{
+					InterlockedAdd(OutSplatLum[(uint)Jj * (2u * Wp) + (uint)Ii], U);
+					OutSplatTiles[SplatTileIndex(Ii / 2, Jj / 2)] = 1u;
+				}
+			}
+		}
+		// Colour: the nearest 1x texel.
+		const uint Cx = min((uint)X, Wp - 1u), Cy = min((uint)Y, Hp - 1u);
+		const uint C = (Cy * Wp + Cx) * 3u;
+		OutSplatTiles[SplatTileIndex((int)Cx, (int)Cy)] = 1u;
+		InterlockedAdd(OutSplatCol[C + 0u], Uni_SplatEncode(Rad.x));
+		InterlockedAdd(OutSplatCol[C + 1u], Uni_SplatEncode(Rad.y));
+		InterlockedAdd(OutSplatCol[C + 2u], Uni_SplatEncode(Rad.z));
+	}
+}
+
+/** One thread per (column x, 2x row j): the luminance row j gathered to 1x column x; threads with
+ *  j < SplatSize.y also gather the colour row j at 1x. */
+[numthreads(8, 8, 1)]
+void SplatGatherCS(uint3 DispatchId : SV_DispatchThreadID)
+{
+	const uint Wp = SplatSize.x, Hp = SplatSize.y;
+	const int X = (int)DispatchId.x, J = (int)DispatchId.y;
+	if (X >= (int)Wp || J >= (int)(2u * Hp)) { return; }
+	const float Core = max(SplatCorePx, 0.5f);
+	// D-223 amendment: the tile's level (level 0 is never read; level 1 rows are zero).
+	const uint Lj = InTileLevel[SplatTileIndex(X, J / 2)];
+	if (Lj == 1u) { OutGatherLum[uint2((uint)X, (uint)J)] = 0.0f; }
+	else if (Lj == 2u)
+	{
+		const float Sb = Uni_SplatBlurSigma(Core);
+		const int Rb = Uni_SplatReach(Sb);
+		const float N2 = Uni_SplatNorm2x(Sb, Rb);
+		float A = 0.0f;
+		UNI_LOOP
+		for (int I = 2 * X - 2 * Rb - 1; I <= 2 * X + 2 * Rb + 2; ++I)
+		{
+			if (I < 0 || I >= (int)(2u * Wp)) { continue; }
+			const uint U = InSplatLum[(uint)J * (2u * Wp) + (uint)I];
+			if (U == 0u) { continue; }
+			A += Uni_SplatDecode(U) * Uni_SplatTap((float)X + 0.5f - ((float)I + 0.5f) * 0.5f, Sb);
+		}
+		OutGatherLum[uint2((uint)X, (uint)J)] = A / N2;
+	}
+	if (J >= (int)Hp) { return; }
+	const uint Lc = InTileLevel[SplatTileIndex(X, J)];
+	if (Lc == 0u) { return; }
+	if (Lc == 1u) { OutGatherCol[uint2((uint)X, (uint)J)] = float4(0.0f, 0.0f, 0.0f, 0.0f); return; }
+	const int Rc = Uni_SplatReach(Core);
+	const float N1 = Uni_SplatNorm1x(Core, Rc);
+	float3 Cs = float3(0.0f, 0.0f, 0.0f);
+	UNI_LOOP
+	for (int I = X - Rc; I <= X + Rc; ++I)
+	{
+		if (I < 0 || I >= (int)Wp) { continue; }
+		const uint B = ((uint)J * Wp + (uint)I) * 3u;
+		const uint3 U = uint3(InSplatCol[B + 0u], InSplatCol[B + 1u], InSplatCol[B + 2u]);
+		if ((U.x | U.y | U.z) == 0u) { continue; }
+		Cs += float3(Uni_SplatDecode(U.x), Uni_SplatDecode(U.y), Uni_SplatDecode(U.z)) * Uni_SplatTap((float)(X - I), Core);
+	}
+	OutGatherCol[uint2((uint)X, (uint)J)] = float4(Cs / N1, 0.0f);
+}
+
+/** D-223 amendment: each tile's level from the marked tiles within two (Chebyshev). */
+[numthreads(8, 8, 1)]
+void SplatTilesCS(uint3 DispatchId : SV_DispatchThreadID)
+{
+	const int Tx = (int)DispatchId.x, Ty = (int)DispatchId.y;
+	if (Tx >= (int)SplatTiles.x || Ty >= (int)SplatTiles.y) { return; }
+	int D = 3;
+	UNI_UNROLL
+	for (int Dy = -2; Dy <= 2; ++Dy)
+	{
+		UNI_UNROLL
+		for (int Dx = -2; Dx <= 2; ++Dx)
+		{
+			const int X = Tx + Dx, Y = Ty + Dy;
+			if (X < 0 || Y < 0 || X >= (int)SplatTiles.x || Y >= (int)SplatTiles.y) { continue; }
+			if (InSplatTiles[(uint)Y * SplatTiles.x + (uint)X] != 0u) { D = min(D, max(abs(Dx), abs(Dy))); }
 		}
 	}
-	OutColor = float4((In.Radiance * max(Wall - Wglare, 0.0f) + In.HaloRadiance * Wglare) * T, 0.0f);
+	OutTileLevel[(uint)Ty * SplatTiles.x + (uint)Tx] = D <= 1 ? 2u : (D == 2 ? 1u : 0u);
+}
+
+/** D-223 amendment: after the gather, the level-2 tiles' deposits are zeroed (every marked tile
+ *  is level 2) and every tile's mark reset, so the persistent buffers start the next frame clean. */
+[numthreads(8, 8, 1)]
+void SplatZeroCS(uint3 DispatchId : SV_DispatchThreadID)
+{
+	const uint Wp = SplatSize.x, Hp = SplatSize.y;
+	const int X = (int)DispatchId.x, Y = (int)DispatchId.y;
+	if (X >= (int)Wp || Y >= (int)Hp) { return; }
+	const uint T = SplatTileIndex(X, Y);
+	if ((X % UNI_SPLAT_TILE) == 0 && (Y % UNI_SPLAT_TILE) == 0) { OutSplatTiles[T] = 0u; }
+	if (InTileLevel[T] != 2u) { return; }
+	const uint C = ((uint)Y * Wp + (uint)X) * 3u;
+	OutSplatCol[C + 0u] = 0u;
+	OutSplatCol[C + 1u] = 0u;
+	OutSplatCol[C + 2u] = 0u;
+	const uint L0 = (2u * (uint)Y) * (2u * Wp) + 2u * (uint)X;
+	OutSplatLum[L0] = 0u;
+	OutSplatLum[L0 + 1u] = 0u;
+	OutSplatLum[L0 + 2u * Wp] = 0u;
+	OutSplatLum[L0 + 2u * Wp + 1u] = 0u;
+}
+
+void SplatResolveVS(uint VertexId : SV_VertexID, out float4 OutPosition : SV_POSITION)
+{
+	// One full-screen triangle; the viewport is the output view rect.
+	const float2 Uv = float2((float)((VertexId << 1u) & 2u), (float)(VertexId & 2u));
+	OutPosition = float4(Uv * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), 0.0f, 1.0f);
+}
+
+/** The columns gathered, the colour ratio times the luminance's shape, additive. Light is kept
+ *  off scene surfaces nearer than r0, where no sprite can be (the quad path tests each pixel
+ *  against its own sprite; this keeps the gather's 1-3 px tails off a near body's edge). */
+void SplatResolvePS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	OutColor = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	const float2 Lp = SvPosition.xy - OutRectMinSize.xy;   // view pixel centre
+	const int X = (int)Lp.x + UNI_SPLAT_PAD, Y = (int)Lp.y + UNI_SPLAT_PAD;
+	if (InTileLevel[SplatTileIndex(X, Y)] != 2u) { return; }   // D-223 amendment: no star within a tile
+	const uint Hp = SplatSize.y;
+	const float Core = max(SplatCorePx, 0.5f);
+	const float Sb = Uni_SplatBlurSigma(Core);
+	const int Rb = Uni_SplatReach(Sb);
+	float L = 0.0f;
+	UNI_LOOP
+	for (int J = 2 * Y - 2 * Rb - 1; J <= 2 * Y + 2 * Rb + 2; ++J)
+	{
+		if (J < 0 || J >= (int)(2u * Hp)) { continue; }
+		L += InGatherLum.Load(int3(X, J, 0)) * Uni_SplatTap((float)Y + 0.5f - ((float)J + 0.5f) * 0.5f, Sb);
+	}
+	L /= Uni_SplatNorm2x(Sb, Rb);
+	if (!(L > 0.0f)) { return; }
+	const float2 Ndc = Lp / OutRectMinSize.zw * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f);
+	const float CosF = rsqrt(1.0f + dot(Ndc * TanHalfFov, Ndc * TanHalfFov));
+	if (!Uni_SceneDepthKeep(UNI_R0_CM, SceneDistance(SvPosition.xy, CosF))) { return; }
+	const int Rc = Uni_SplatReach(Core);
+	float3 C = float3(0.0f, 0.0f, 0.0f);
+	UNI_LOOP
+	for (int J = Y - Rc; J <= Y + Rc; ++J)
+	{
+		if (J < 0 || J >= (int)Hp) { continue; }
+		C += InGatherCol.Load(int3(X, J, 0)).rgb * Uni_SplatTap((float)(Y - J), Core);
+	}
+	C /= Uni_SplatNorm1x(Core, Rc);
+	const float Lc = Uni_Luminance(C);
+	OutColor = float4(Lc > 0.0f ? C * (L / Lc) : float3(L, L, L), 0.0f);
 }

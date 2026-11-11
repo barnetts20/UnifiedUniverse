@@ -83,8 +83,9 @@ namespace
 		H::FUniGalaxyConst K;
 		float Slab = 0.0f;
 		// A changed warp (the reference is then that field, FieldOf): warp_fine read at mip WarpMip
-		// (a smoother warp), or with its frame's height stretched ZStretch times (Fr.z = 2 z / ZStretch:
-		// the same in-plane warp, varying ZStretch times slower with height).
+		// (a smoother warp; never finer than D-220's UNI_GAL_WARP_MIP_FLOOR), or with its frame's
+		// height stretched ZStretch times (Fr.z = 2 z / ZStretch: the same in-plane warp, varying
+		// ZStretch times slower with height). D-220's fine band is unchanged by either.
 		float WarpMip = 0.0f;
 		float ZStretch = 1.0f;
 		bool Changed() const { return WarpMip > 0.0f || ZStretch != 1.0f; }
@@ -127,13 +128,25 @@ namespace
 		const float St = std::sin(Tw), Ct = std::cos(Tw);
 		const float3 Fr = float3(P.x * Ct - P.y * St, P.x * St + P.y * Ct, 2.0f * P.z / G.ZStretch);
 		if (Par.G.x == 0.0f || std::abs(P.z) > G.Slab) { return P; }
-		const float4 W = H::UniGalaxyTexSample(0, float3(Fr.x * Par.G.z + Off.x, Fr.y * Par.G.z + Off.y, Fr.z * Par.G.z + Off.z), G.WarpMip);
+		const float4 W = H::UniGalaxyTexSample(0, float3(Fr.x * Par.G.z + Off.x, Fr.y * Par.G.z + Off.y, Fr.z * Par.G.z + Off.z), std::max(G.WarpMip, float(UNI_GAL_WARP_MIP_FLOOR)));
 		const float A = Par.G.x * H::Uni_GalaxyWarpInner(R0, Par);
 		return float3(P.x + W.x * A, P.y + W.y * A, P.z + W.z * A);
 	}
 
+	/** D-220's fine band at P (footprint 0): Uni_GalaxyTexTerms' OutFineN with the galaxy's own
+	 *  parameters (the band does not depend on the warp's mip or height stretch). */
+	float FineNAt(const FGalaxy& G, const float3& P)
+	{
+		float3 Pd, Pb;
+		float4 Dt;
+		uint32_t bDt = 0u;
+		float FineN = 0.0f;
+		H::Uni_GalaxyTexTerms(P, G.Par, G.K, 0.0f, G.Slab, true, false, Pd, Pb, Dt, bDt, FineN);
+		return FineN;
+	}
+
 	/** The galaxy's field; with a changed warp, Uni_GalaxySharedK's state rebuilt at that warp's
-	 *  point (detail and bulge as the field reads them). */
+	 *  point (detail, bulge and D-220's fine band as the field reads them). */
 	float FieldOf(const FGalaxy& G, const float3& P)
 	{
 		if (!G.Changed()) { return H::UniField_Galaxy(P, G.Par); }
@@ -146,6 +159,7 @@ namespace
 		S.Pb = S0.Pb;
 		S.Dt = S0.Dt;
 		S.bDetail = S0.bDetail;
+		S.FineN = FineNAt(G, P);
 		return H::Uni_GalaxyFromShared(S, P, G.Par, 0.0f);
 	}
 
@@ -279,7 +293,8 @@ namespace
 	};
 
 	/** A galaxy's light at InP from its sliced map (footprint 0): Uni_GalaxyMapEval's light with
-	 *  the map read moved from (warped x, y) to (x, y, slice) and no warp_fine read. */
+	 *  the map read moved from (warped x, y) to (x, y, slice): no structural warp read. D-220's
+	 *  fine band stays a per-sample read (a 3D multiplier the slices cannot hold). */
 	float EvalSliced(const FGalaxy& G, const FCfg& C, const FSliceMap& M, const float3& P)
 	{
 		const H::FUniFieldParams& Par = G.Par;
@@ -308,7 +323,7 @@ namespace
 			const float V = std::exp(-Z / Hs);
 			const float Fd = Par.H.x != 0.0f ? std::max(1.0f + Par.H.x * DetailN, 0.0f) : 1.0f;
 			const float Wk = Par.H.y != 0.0f ? std::max(1.0f + Par.H.y * Knot, 0.0f) : 1.0f;
-			Disc = V * Fd * (std::max(T.x, 0.0f) + std::max(T.w, 0.0f) * (Wk - 1.0f));
+			Disc = V * Fd * H::Uni_GalaxyFineMul(FineNAt(G, P), Par) * (std::max(T.x, 0.0f) + std::max(T.w, 0.0f) * (Wk - 1.0f));
 		}
 		const float Bulge = H::Uni_GalaxyBulgeAt(Pb, Par, 0.0f);
 		const float R = std::sqrt(R2);
@@ -539,8 +554,7 @@ int UniGalSlicesCommand(int Argc, char** Argv)
 	}
 	if (!bQuick)
 	{
-		Gals.push_back(MakeGalaxy("home, warp at mip 1", Home, 1.0f));
-		Gals.push_back(MakeGalaxy("home, warp at mip 2", Home, 2.0f));
+		Gals.push_back(MakeGalaxy("home, warp at mip 3", Home, 3.0f));
 		Gals.push_back(MakeGalaxy("home, warp 4x slower in height", Home, 0.0f, 4.0f));
 		Gals.push_back(MakeGalaxy("home, warp 8x slower in height", Home, 0.0f, 8.0f));
 	}

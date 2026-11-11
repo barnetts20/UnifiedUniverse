@@ -8,6 +8,9 @@
 // frame with a pick request, each sprite's (cell index, slot) beside it (UniQuery.usf).
 // D-196: an object with a volume carrier draws only the share its carrier did not take this
 // frame (InHandoffs, from the volume builder); one with no carrier keeps its whole sprite.
+// D-223: with SplatMode on, each sprite's slot also goes to one of two lists: plain point sprites
+// (Uni_SpriteSplattable) to the splat path's, the rest to the quads' (their draw arguments
+// {6, quads, 0, 0} in OutQuadArgs). OutSprites and OutDrawArgs are unchanged (pick, uu.Perf).
 //
 // The view is passed as raw floats and rebuilt here (lesson #2: no derived struct mirrored as a
 // constant buffer). The cell table carries exact 128-bit deltas (D-104).
@@ -54,6 +57,11 @@ uint4 FixedDiscSeeds;                            // D-183: seeds of fixed-orient
 uint WriteSpriteSource;                          // D-193: 1 on a frame with a pick request
 StructuredBuffer<uint4> InHandoffs;              // D-196: (cell index, slot, carrier share bits, 0), sorted by (cell index, slot)
 uint NumHandoffs;
+uint SplatMode;                                  // D-223: 1: sort the sprites into the splat and quad lists
+RWStructuredBuffer<uint> OutQuadIndex;           // D-223: slots drawn as quads ..
+RWBuffer<uint> OutQuadArgs;                      // .. their draw arguments {6, count, 0, 0}
+RWStructuredBuffer<uint> OutSplatIndex;          // D-223: slots drawn by the splat path ..
+RWBuffer<uint> OutSplatCount;                    // .. and their count
 
 /** D-196: the share of an object's light its volume carrier takes this frame (0: none). */
 float CarrierShareOf(uint InCellIndex, uint InSlot)
@@ -91,7 +99,11 @@ float SpriteHaloMaxPx;
 void MainCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
 {
 	const uint CellIndex = GroupId.y * DispatchGroupsX + GroupId.x;
-	if (CellIndex == 0 && GroupIndex == 0) { OutDrawArgs[0] = 6; }   // two triangles per sprite
+	if (CellIndex == 0 && GroupIndex == 0)
+	{
+		OutDrawArgs[0] = 6;   // two triangles per sprite
+		if (SplatMode != 0u) { OutQuadArgs[0] = 6; }
+	}
 	if (CellIndex >= NumCells) { return; }
 	const FUniCellGPU Cell = InCells[CellIndex];
 
@@ -162,6 +174,20 @@ void MainCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
 			{
 				OutSprites[Slot] = S;
 				if (WriteSpriteSource != 0u) { OutSpriteSource[Slot] = uint2(CellIndex, I); }
+				if (SplatMode != 0u)   // D-223
+				{
+					uint K;
+					if (Uni_SpriteSplattable(S, 1.0f / max(ThetaPixel, 1.0e-30f), SpriteCorePx, WarpAmount))
+					{
+						InterlockedAdd(OutSplatCount[0], 1u, K);
+						OutSplatIndex[K] = Slot;
+					}
+					else
+					{
+						InterlockedAdd(OutQuadArgs[1], 1u, K);
+						OutQuadIndex[K] = Slot;
+					}
+				}
 			}
 		}
 	}
