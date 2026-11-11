@@ -427,6 +427,18 @@ public:
 	}
 };
 
+/** D-228: the far cache's map, read by the march (slices), the reconstruct (the history at a
+ *  switch) and the composite (UniVolume.usf; UniCore/UniFarCache.h). */
+BEGIN_SHADER_PARAMETER_STRUCT(FUniVolumeFarParameters, )
+	SHADER_PARAMETER(uint32, bFar)
+	SHADER_PARAMETER(uint32, FarSize)
+	SHADER_PARAMETER(uint32, FarLayerBits)
+	SHADER_PARAMETER(float, FarStartCm)
+	SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float4>, FarTexture)
+	SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float>, FarSlices)
+	SHADER_PARAMETER_SAMPLER(SamplerState, FarSampler)
+END_SHADER_PARAMETER_STRUCT()
+
 class FUniVolumeMarchCS : public FGlobalShader
 {
 public:
@@ -448,6 +460,7 @@ public:
 		SHADER_PARAMETER(float, WebDebugOpacity)
 		SHADER_PARAMETER(uint32, bSliceMarch)         // D-184
 		SHADER_PARAMETER(FUintVector2, SliceOffset)
+		SHADER_PARAMETER_STRUCT_INCLUDE(FUniVolumeFarParameters, Far)   // D-228
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutVolume)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float>, OutSlices)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float2>, OutDepth)
@@ -486,6 +499,8 @@ public:
 		SHADER_PARAMETER(uint32, bHistory)
 		SHADER_PARAMETER(FVector4f, PrevWarpVelBeta)   // D-190
 		SHADER_PARAMETER(FVector4f, TemporalClamp)     // D-194: (on, tight px, max motion px, 0)
+		SHADER_PARAMETER(int32, HistFarSign)           // D-228
+		SHADER_PARAMETER_STRUCT_INCLUDE(FUniVolumeFarParameters, Far)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float4>, FreshVolume)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float>, FreshSlices)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float2>, FreshDepth)
@@ -526,6 +541,33 @@ public:
 	}
 };
 
+/** D-228: rows of one face of the far cache's map (UNI_VOL_PASS 1, FarCS). */
+class FUniVolumeFarCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FUniVolumeFarCS);
+	SHADER_USE_PARAMETER_STRUCT(FUniVolumeFarCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_STRUCT_INCLUDE(FUniVolumeCommonParameters, Common)
+		SHADER_PARAMETER(uint32, FarCubeSize)
+		SHADER_PARAMETER(uint32, FarFace)
+		SHADER_PARAMETER(uint32, FarLayer)
+		SHADER_PARAMETER(uint32, FarRow0)
+		SHADER_PARAMETER(uint32, FarRows)
+		SHADER_PARAMETER(float, FarSplitCm)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float4>, OutFar)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float>, OutFarSlices)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& P, FShaderCompilerEnvironment& Env)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(P, Env);
+		Env.SetDefine(TEXT("UNI_VOL_PASS"), 1);
+	}
+};
+
 BEGIN_SHADER_PARAMETER_STRUCT(FUniVolumeCompositeParameters, )
 	SHADER_PARAMETER_STRUCT_INCLUDE(FUniVolumeCommonParameters, Common)
 	SHADER_PARAMETER(FVector4f, InvDeviceZToWorldZTransform)
@@ -547,6 +589,7 @@ BEGIN_SHADER_PARAMETER_STRUCT(FUniVolumeCompositeParameters, )
 	SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float4>, CubeTexture)
 	SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float4>, CubePrevTexture)
 	SHADER_PARAMETER_SAMPLER(SamplerState, LinearClampSampler)
+	SHADER_PARAMETER_STRUCT_INCLUDE(FUniVolumeFarParameters, Far)   // D-228
 END_SHADER_PARAMETER_STRUCT()
 
 class FUniVolumeCompositeVS : public FGlobalShader

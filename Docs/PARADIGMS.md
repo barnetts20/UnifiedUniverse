@@ -9,7 +9,7 @@ The method: list the assumptions each part of the pipeline still rests on, ask w
 | # | Assumption today | Alternative | Evidence | Verdict |
 |---|---|---|---|---|
 | 1 | A galaxy seen from outside is marched like one seen from inside | Draw it from its 2D map as an impostor: the map projected with its analytic thickness, no march | D-219: the worst sliding (1.5-4%) is outside a galaxy (60 kpc), where the march resamples a sharp disc frame after frame | **Prototype next** (B-022, raised) |
-| 2 | The march is split by carrier (background map vs per pixel) | Split it by distance: near marched every frame, far cached in world-aligned direction maps refreshed on a parallax budget | Measured (below): 77-100% of the light from inside the disc is beyond 300 pc and costs 60-77% of the steps | **Prototype after 1** (B-028) |
+| 2 | The march is split by carrier (background map vs per pixel) | Split it by distance: near marched every frame, far cached in world-aligned direction maps refreshed on a parallax budget | Measured (below): 77-100% of the light from inside the disc is beyond 300 pc and costs 60-77% of the steps | **Built, slow only** (B-028, D-228) |
 | 3 | Stars are instanced quads through the raster pipeline | Compute splatting of sub-pixel stars (atomic adds into a light buffer); quads only for stars with halos | Schütz et al. rasterise 1-2 billion points a frame in compute | **Built (D-223, scatter + quads; UE-56)** |
 | 4 | Generation is a CPU-orchestrated GPU round trip | GPU work graphs (cell → emitter → stars on the GPU) | Generation is 0.2 ms a frame; Ready latency is hidden by cell glow (D-203); UE 5.7 work graph access for plugins unconfirmed | Not now |
 | 5 | Galaxies are continuous fields | Particle/sprite galaxies (SpaceEngine, Gaia Sky), or splatted Gaussians | Those engines draw galaxies as many soft sprites; Gaussian splatting needs a sort or moment OIT for dust | Not recommended |
@@ -26,6 +26,11 @@ The method: list the assumptions each part of the pipeline still rests on, ask w
 **What it costs:** a map per galaxy drawn this way. B-022 suggested 128²-512² maps (0.1-2 MB) baked at the size the galaxy covers on screen, from the same bake shader. The handoff becomes sprite → impostor → marched carrier (when the camera enters, or the galaxy is large on screen), and conservation still holds if the impostor's light is the carrier's light: the handoff table (D-196) already does this between the sprite and the carrier.
 
 **To measure offline first:** the impostor against the march, for inclinations 0-85° and distances 20-200 kpc. Measure light error, per-pixel p95 and the edge-on failure angle. Then measure T2.vol.slide's 60 kpc flight with the impostor in place of the carrier (its sliding should go to the raster's, near 0).
+
+**Measured (D-226, 2026-11-11):**
+- A single map read at the disc crossing loses light with inclination (-3.4% at 50°, -11% at 75°): the radial profile is convex across the ray's path through the slab.
+- K = 8 reads a side, through the slab: light within 0.6% and L1 2.5-2.6% up to 65°; 75° -1.4% (p90 23%); it breaks down past ~75°.
+- At about 20-25 evaluations a pixel, an every-frame impostor costs more than the sliced march. So the proposal is cached billboards per galaxy, re-rendered on a view-angle and distance budget and drawn each frame by the camera's 2D transform. That is no sliding, a cost that follows refreshes, and the machinery #2 needs.
 
 ## 2. Split the march by distance, not by carrier (B-028)
 
@@ -55,6 +60,17 @@ The method: list the assumptions each part of the pipeline still rests on, ask w
 - Cell glow in the far map: kept out of the background map today because it changes while cells load (VOLUMETRICS §13). The far map would need the same per-pixel exception, or a refresh when a level's load state changes.
 
 **To measure offline first:** T2.vol.slide's flights with the far part from a cached direction map refreshed on a parallax budget. Measure error and crawl against the fine reference, compared with today's slicing, and the steps per frame.
+
+**Measured (D-227, 2026-11-11):**
+- Slow (0.3 pc a frame) the far cache from 1 kpc costs 4.2 steps/px a frame against today's 12.7, with the same crawl.
+- At 15 pc a frame it removes the slicing's sliding (crawl 0.91% -> 0.01-0.09%) but must be re-marched every frame: 35-42 steps/px, ~3x today.
+- A quality/cost trade, switched by speed if wanted.
+
+**Built (D-228, 2026-11-11), slow only:**
+- Costed at engine resolution first. With the cube as fine as the march, refreshes must be per face and in view only; refreshing the whole cube costs more than today as soon as one happens. A face's re-march costs ~3x a frame's march.
+- Break-even is ~0.06 texels of parallax at R a frame. Steps against today's at R 2 kpc: 0.38x at rest, 0.52x at 0.3 pc/frame (192-texel faces), 0.92x at 1, 1.74x at 3.
+- So it's a parked/drifting win; the quality-at-speed case (no sliding, ~3x the march) was not built.
+- The rules, fills and history conversion are in UniCore/UniFarCache.h and VOLUMETRICS' controls table.
 
 ## 3. Stars by compute splatting (B-029)
 

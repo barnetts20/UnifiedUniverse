@@ -1101,4 +1101,42 @@ UNI_FN float3 Uni_SliceTransmittance(float3 InSliceT[UNI_VOL_SLICES], float InT,
 	return Lo + (Hi - Lo) * F;
 }
 
+// =============================================================================================
+// D-228: the far cache (UniCore/UniFarCache.h). The march stops at R (the local carriers' TEnd);
+// a six-face map holds the light from R on (their TStart) as (radiance rgb, luminance
+// transmittance), and transmittance at the view's slice boundaries. Volume values are
+// (radiance rgb, luminance transmittance), as the march writes them.
+// =============================================================================================
+
+/** The near part and the far map's texel composited: radiance near + T_near far, transmittance
+ *  T_near T_far. The far map's slices combine with the march's the same way (a product: past R
+ *  the near slices hold T_near). */
+UNI_FN float4 Uni_FarComposite(float4 InNear, float4 InFar)
+{
+	return float4(InNear.x + InNear.w * InFar.x, InNear.y + InNear.w * InFar.y, InNear.z + InNear.w * InFar.z, InNear.w * InFar.w);
+}
+
+/** The far map's slice K: 1 where the slice's boundary is at or before R (nothing of the far part
+ *  is there; the march records a slice after the step that crosses it, which for the far march is
+ *  its first step, from R), else the far march's. */
+UNI_FN float Uni_FarSliceT(uint InK, float InSliceT, float InStartCm, FUniVolumeView InView)
+{
+	const float Boundary = InView.SliceLnTLo + (float)(InK + 1u) * (InView.SliceLnTHi - InView.SliceLnTLo) / (float)UNI_VOL_SLICES;
+	return Boundary <= log(max(InStartCm, 1.0f)) ? 1.0f : InSliceT;
+}
+
+/** A history texel converted at a switch, once (the reconstruct): InSign +1, it holds the near part
+ *  (the far cache was on) and becomes the whole; -1, the reverse. Where the far part is opaque the
+ *  near transmittance cannot be recovered and is taken as 1 (the subtraction is clamped at 0). */
+UNI_FN float4 Uni_FarHistoryConvert(float4 InHist, float4 InFar, float InSign)
+{
+	if (InSign > 0.0f) { return Uni_FarComposite(InHist, InFar); }
+	if (InSign < 0.0f)
+	{
+		const float Tn = InFar.w > 1.0e-3f ? saturate(InHist.w / InFar.w) : 1.0f;
+		return float4(max(InHist.x - InFar.x * Tn, 0.0f), max(InHist.y - InFar.y * Tn, 0.0f), max(InHist.z - InFar.z * Tn, 0.0f), Tn);
+	}
+	return InHist;
+}
+
 #endif // UNI_VOLUME_USH

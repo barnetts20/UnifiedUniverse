@@ -10,6 +10,7 @@
 #include "UniVolume.h"
 
 #include <atomic>
+#include <functional>
 #include <thread>
 #include <unordered_map>
 
@@ -213,6 +214,13 @@ namespace UniRender
 		size_t TooFast = 0;
 		// D-208: the slicing's block (2: D-184's 2 x 2); set before each Step to vary it.
 		u32 Interleave = 2;
+		// D-228: the far cache (UniFarRef.h sets these per frame, as the renderer's passes do).
+		// FarSlice: the far map's transmittance at slice K in a direction, multiplied into each
+		// fresh pixel's slices (MarchCS). HistFarSign / HistFar: the history converted once at a
+		// switch (ReconstructCS: Uni_FarHistoryConvert with the far map's texel at the pixel).
+		std::function<float(const FV3&, u32)> FarSlice;
+		int HistFarSign = 0;
+		std::function<H::float4(const FV3&)> HistFar;
 
 		static float Lum(const H::float4& V) { return H::Uni_Luminance(H::float3(V.x, V.y, V.z)); }
 
@@ -261,6 +269,11 @@ namespace UniRender
 						const size_t I = size_t(Y) * W + X;
 						FVol[I] = H::float4(R.Radiance.x, R.Radiance.y, R.Radiance.z, H::Uni_Luminance(R.Transmittance));
 						for (u32 K = 0; K < H::UNI_VOL_SLICES; ++K) { FSl[I * H::UNI_VOL_SLICES + K] = H::Uni_Luminance(R.SliceT[K]); }
+						if (FarSlice)
+						{
+							const FV3 Dd = PixelDir(Cam, W, Ht, X + 0.5, Y + 0.5);
+							for (u32 K = 0; K < H::UNI_VOL_SLICES; ++K) { FSl[I * H::UNI_VOL_SLICES + K] *= FarSlice(Dd, K); }
+						}
 						FDep[I] = H::float2(R.LnDepth, LnTp);
 						++MarchedA; StepsA += R.Steps;
 					}
@@ -349,6 +362,7 @@ namespace UniRender
 									}
 									if (bSame) { Hv = H::float4(std::max(Cr.x, 0.0f), std::max(Cr.y, 0.0f), std::max(Cr.z, 0.0f), std::min(std::max(Cr.w, 0.0f), 1.0f)); }
 								}
+								if (HistFarSign != 0 && HistFar) { Hv = H::Uni_FarHistoryConvert(Hv, HistFar(Dd), float(HistFarSign)); }   // D-228
 								if (bClamp)
 								{
 									// D-194: clamp into the fresh range (tight once moving); too fast: not used.

@@ -71,6 +71,15 @@ static TAutoConsoleVariable<float> CVarUniWebDebugDepth(TEXT("uu.WebDebugDepth")
 static TAutoConsoleVariable<float> CVarUniWebDebugThreshold(TEXT("uu.WebDebugThreshold"), 2.0f, TEXT("D-169: uu.WebDebug shows density above this multiple of the mean (full strength 100x above it)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<float> CVarUniWebDebugOpacity(TEXT("uu.WebDebugOpacity"), 0.3f, TEXT("D-169: uu.WebDebug opacity per texel at full strength (higher: only the nearest structure shows)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniBackgroundMode(TEXT("uu.BackgroundMode"), 2, TEXT("D-166: how the background (the periodic web) is marched. 0: into the direction map (D-136/D-159), a few faces per frame. 1: per pixel with the local volume, every frame. 2: per pixel while the background is changing (travel), the map once it has been still for uu.BackgroundStillFrames."), ECVF_RenderThreadSafe);
+// D-228: the far cache (UniCore/UniFarCache.h, Docs/VOLUMETRICS.md).
+static TAutoConsoleVariable<int32> CVarUniVolumeFar(TEXT("uu.VolumeFar"), 1, TEXT("D-228: the far cache. While the camera is inside a galaxy and nearly still, the march stops at uu.VolumeFarStartPc and the light from there on comes from a six-face map refreshed face by face as the camera drifts (~0.4x the march at rest). 0: off (the whole march every frame, as before)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniVolumeFarStartPc(TEXT("uu.VolumeFarStartPc"), 2000.0f, TEXT("D-228: the far cache's split (pc): the march stops here, the map holds the rest. Farther: cheaper refreshes (the map lasts longer) but a costlier near march."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<int32> CVarUniVolumeFarSize(TEXT("uu.VolumeFarSize"), 0, TEXT("D-228: the far map's face size (texels). 0: as fine as the march at the view's centre (its pixels before the auto budget over tan(fov/2), in 64s, 128..1024)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<int32> CVarUniVolumeFarFillFrames(TEXT("uu.VolumeFarFillFrames"), 8, TEXT("D-228: frames one face's re-march is spread over (one face in one frame costs ~3x the march: a spike)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<int32> CVarUniVolumeFarOnFrames(TEXT("uu.VolumeFarOnFrames"), 30, TEXT("D-228: frames the camera must stay slow before the far cache is used."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniVolumeFarOnMotion(TEXT("uu.VolumeFarOnMotion"), 0.02f, TEXT("D-228: the far cache comes on below this much parallax a frame at the split (map texels), held uu.VolumeFarOnFrames frames."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniVolumeFarOffMotion(TEXT("uu.VolumeFarOffMotion"), 0.04f, TEXT("D-228: the far cache goes off above this much parallax a frame at the split (map texels): past ~0.06 its face refreshes cost more than they save."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniVolumeFarDueTexels(TEXT("uu.VolumeFarDueTexels"), 0.3f, TEXT("D-228: a face in view is re-marched once the camera has moved this much parallax at the split (map texels) since it was marched."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniBackgroundPerPixelInside(TEXT("uu.BackgroundPerPixelInside"), 0, TEXT("D-224: 0: while the camera is inside a galaxy (or a cluster's or group's glow), the background stays on its direction map when travelling (per pixel it cost 7-10x the march: the hitch at some angles). 1: as before D-224 (per pixel there too)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniBackgroundPerPixelInterval(TEXT("uu.BackgroundPerPixelInterval"), 0, TEXT("D-196: uu.BackgroundMode 2 marches the background per pixel only while it changes at least this often (frames between changes): fast travel. Slower changes refresh the direction map (cross-faded). 0: automatic, where a map refresh per change costs more than marching it per pixel."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniBackgroundStillFrames(TEXT("uu.BackgroundStillFrames"), 30, TEXT("D-166: uu.BackgroundMode 2 switches to the direction map after this many frames without a background change."), ECVF_RenderThreadSafe);
@@ -682,6 +691,9 @@ void FUniRenderer::Release_RenderThread()
 		QueriesReady.Reset();
 	}
 	for (TRefCountPtr<IPooledRenderTarget>& M : BackgroundMaps) { M.SafeRelease(); }
+	FarMapTexture.SafeRelease(); FarMapSlices.SafeRelease(); FarMapSize = 0;   // D-228
+	FarCtl = UniCore::FFarCacheControl();
+	bFarHaveKey = false;
 	TemporalVolume.SafeRelease(); TemporalSlices.SafeRelease(); TemporalDepth.SafeRelease();   // D-184
 	bTemporalHave = false;
 	bBgHaveCur = bBgFilling = false;
@@ -916,10 +928,169 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		CubePrev = Cube;
 	}
 
-	// 2. March the local carriers at reduced resolution (D-166: with the background's, per pixel).
+	// D-228: the far cache (UniCore/UniFarCache.h). While the camera is inside a galaxy and nearly
+	// still, the march stops at R and the light from R on comes from a six-face map; each face is
+	// re-marched (a few rows a frame, from a snapshot, into its spare layer) as the camera drifts.
+	UniCore::FFarCacheSettings FarS;
+	FarS.bEnabled = CVarUniVolumeFar.GetValueOnRenderThread() != 0;
+	FarS.StartCm = double(FMath::Max(CVarUniVolumeFarStartPc.GetValueOnRenderThread(), 1.0f)) * 3.0856775814913673e18;
+	{
+		// A face spans 90 degrees: as fine as the march at the view's centre (its size before the
+		// auto budget, D-200, so the map is not re-created whenever the budget changes level).
+		int32 Fx = 1, Fy = 1;
+		UniCore::VolumeMarchSize(OutRect.Width(), OutRect.Height(), Div, double(FMath::Max(CVarUniVolumeMaxMarchPixels.GetValueOnRenderThread(), 0)), Fx, Fy);
+		const int32 Want = CVarUniVolumeFarSize.GetValueOnRenderThread();
+		FarS.FaceSize = Want > 0 ? FMath::Clamp(Want, 32, 2048) : FMath::Clamp(FMath::DivideAndRoundUp(int32(FMath::CeilToFloat(float(Fx) / FMath::Max(TanX, 0.05f))), 64) * 64, 128, 1024);
+	}
+	FarS.OnMotion = FMath::Max(double(CVarUniVolumeFarOnMotion.GetValueOnRenderThread()), 0.0);
+	FarS.OffMotion = FMath::Max(double(CVarUniVolumeFarOffMotion.GetValueOnRenderThread()), FarS.OnMotion);
+	FarS.OnFrames = FMath::Max(CVarUniVolumeFarOnFrames.GetValueOnRenderThread(), 1);
+	FarS.DueTexels = FMath::Max(double(CVarUniVolumeFarDueTexels.GetValueOnRenderThread()), 0.01);
+	FarS.FillFrames = FMath::Clamp(CVarUniVolumeFarFillFrames.GetValueOnRenderThread(), 1, 64);
+	FRDGTextureRef FarTex = nullptr, FarSl = nullptr;
+	bool bFarReset = false;
+	if (!FarS.bEnabled)
+	{
+		if (FarMapTexture.IsValid()) { FarMapTexture.SafeRelease(); FarMapSlices.SafeRelease(); FarMapSize = 0; }
+	}
+	else if (!FarMapTexture.IsValid() || !FarMapSlices.IsValid() || FarMapSize != FarS.FaceSize)
+	{
+		const FIntPoint Fsz(FarS.FaceSize, FarS.FaceSize);
+		FarTex = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(Fsz, PF_A32B32G32R32F, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV, 12), TEXT("UniFarMap"));
+		FarSl = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(Fsz, PF_R16F, FClearValueBinding::White, TexCreate_ShaderResource | TexCreate_UAV, 12 * UniGpuLayout::VolumeSlices), TEXT("UniFarMapSlices"));
+		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FarTex), FLinearColor(0.0f, 0.0f, 0.0f, 1.0f));
+		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FarSl), FLinearColor(1.0f, 1.0f, 1.0f, 1.0f));
+		FarMapTexture = GraphBuilder.ConvertToExternalTexture(FarTex);
+		FarMapSlices = GraphBuilder.ConvertToExternalTexture(FarSl);
+		FarMapSize = FarS.FaceSize;
+		bFarReset = true;
+	}
+	else
+	{
+		FarTex = GraphBuilder.RegisterExternalTexture(FarMapTexture, TEXT("UniFarMap"));
+		FarSl = GraphBuilder.RegisterExternalTexture(FarMapSlices, TEXT("UniFarMapSlices"));
+	}
+	UniCore::FFarCacheDecision FarD;
+	if (F.FrameNumber == FarLastFrame)
+	{
+		// The same game frame rendered again: as last time, without its fill or history conversion.
+		FarD.bUse = FarLast.bUse && FarTex != nullptr && !bFarReset && !bPerPixelBackground && VolDebugMode == 0u;
+		FarD.LayerBits = FarLast.LayerBits;
+		FarD.Reason = FarLast.Reason;
+		bFarResetPending = bFarResetPending || bFarReset;
+	}
+	else
+	{
+		UniCore::FFarCacheFrame FarFr;
+		FarFr.bEligible = FarTex != nullptr && VolDebugMode == 0u && !bPerPixelBackground
+			&& UniCore::CameraInsideLocalCarrier(F.VolumeCarriers.GetData(), size_t(F.VolumeCarriers.Num()));
+		FarFr.bLoading = VV.GlowLevels != 0u;
+		FarFr.bStepValid = F.bCameraStepValid;
+		FarFr.Step[0] = double(F.CameraStepCm.X); FarFr.Step[1] = double(F.CameraStepCm.Y); FarFr.Step[2] = double(F.CameraStepCm.Z);
+		{
+			const FVector Fw = View.GetViewDirection(), Rt = View.GetViewRight(), Up = View.GetViewUp();
+			const double Fa[3] = { Fw.X, Fw.Y, Fw.Z }, Ra[3] = { Rt.X, Rt.Y, Rt.Z }, Ua[3] = { Up.X, Up.Y, Up.Z };
+			FarFr.FacesInView = UniCore::CubeFacesInView(Fa, Ra, Ua, double(TanX), double(TanY));
+		}
+		if (FarFr.bEligible)
+		{
+			// What the map's light depends on besides the camera's position (more than 1%: re-march).
+			UniCore::FFarSceneKey Key = UniCore::FFarSceneKey::Build(F.VolumeCarriers.GetData(), size_t(F.VolumeCarriers.Num()),
+				reinterpret_cast<const float*>(F.VolumeParams.GetData()), size_t(F.VolumeParams.Num()) * (sizeof(UniCore::FFieldParamsGPU) / sizeof(float)),
+				reinterpret_cast<const float*>(F.VolumeLut.GetData()), size_t(F.VolumeLut.Num()) * 4u);
+			FarFr.bSceneChanged = bFarHaveKey && UniCore::FFarSceneKey::Changed(FarKey, Key);
+			FarKey = MoveTemp(Key);
+			bFarHaveKey = true;
+		}
+		else { bFarHaveKey = false; }
+		// Game frames skipped: their steps are lost, so every face is re-marched (still used meanwhile).
+		if (FarLastFrame != ~0ull && F.FrameNumber != FarLastFrame + 1) { FarFr.bSceneChanged = true; }
+		if (FarFr.bSceneChanged) { Stats.FarSceneChanges++; }
+		FarFr.bReset = bFarReset || bFarResetPending;
+		bFarResetPending = false;
+		FarD = FarCtl.Update(FarS, FarFr);
+		FarLastFrame = F.FrameNumber;
+		FarLast = FarD;
+		if (FarD.bSnapshot)
+		{
+			FarSnapCarriers = F.VolumeCarriers;
+			for (UniCore::FCarrierGPU& C : FarSnapCarriers) { C.TStart = FMath::Max(C.TStart, float(FarS.StartCm)); }   // local carriers only here
+			FarSnapParams = F.VolumeParams;
+			FarSnapLut = F.VolumeLut;
+			FarSnapView = VV;
+			// No cell glow in a kept map (as the background's, D-203): the rules keep the cache off
+			// while cells load anyway.
+			FarSnapView.GlowLevels = 0u;
+			for (int32 K = 0; K < 4; ++K) { FarSnapView.GlowMask[K] = 0u; }
+			FarSnapStartCm = float(FarS.StartCm);
+		}
+		if (FarD.FillFace >= 0 && FarTex)
+		{
+			const uint32 Face = uint32(FarD.FillFace);
+			const uint32 BitsBefore = FarD.LayerBits ^ (FarD.bFillDone ? (1u << Face) : 0u);
+			const uint32 Spare = Face + (((BitsBefore >> Face) & 1u) ? 0u : 6u);
+			FRDGBufferRef SnapParamBuf = UploadStructured(GraphBuilder, TEXT("UniFarParams"), FarSnapParams);
+			FRDGBufferRef SnapLutBuf = UploadStructured(GraphBuilder, TEXT("UniFarLut"), FarSnapLut);
+			FUniVolumeFarCS::FParameters* P = GraphBuilder.AllocParameters<FUniVolumeFarCS::FParameters>();
+			FillCommonWith(P->Common, FarSnapCarriers, FarSnapView, SnapParamBuf, SnapLutBuf);
+			const uint32 Rows = uint32(FarD.RowEnd - FarD.RowBegin);
+			P->FarCubeSize = uint32(FarS.FaceSize);
+			P->FarFace = Face;
+			P->FarLayer = Spare;
+			P->FarRow0 = uint32(FarD.RowBegin);
+			P->FarRows = Rows;
+			P->FarSplitCm = FarSnapStartCm;
+			P->OutFar = GraphBuilder.CreateUAV(FarTex);
+			P->OutFarSlices = GraphBuilder.CreateUAV(FarSl);
+			TShaderMapRef<FUniVolumeFarCS> CS(GetGlobalShaderMap(View.GetFeatureLevel()));
+			RDG_EVENT_SCOPE(GraphBuilder, "Uni.Volume.FarMap");   // D-196: ProfileGPU shows scopes
+			FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Volume.Far face %u rows %d..%d", Face, FarD.RowBegin, FarD.RowEnd), CS, P,
+				FIntVector(FMath::DivideAndRoundUp(FarS.FaceSize, 8), FMath::DivideAndRoundUp(int32(Rows), 8), 1));
+		}
+		if (FarD.bDropHistory) { bTemporalHave = false; Stats.FarHistoryDrops++; }
+		Stats.FarFacesFilled = uint32(FarCtl.FacesFilled);
+		Stats.FarSwitches = uint32(FarCtl.Switches);
+		Stats.FarFramesOn = uint32(FarCtl.FramesOn);
+	}
+	if (!FarTex)
+	{
+		// uu.VolumeFar 0 while on: no map to convert the history with, so it is dropped.
+		if (FarD.HistSign != 0) { bTemporalHave = false; Stats.FarHistoryDrops++; }
+		FarD.bUse = false;
+		FarD.HistSign = 0;
+	}
+	Stats.FarReason = uint32(FarD.Reason);
+	Stats.FarMotion = float(FarD.Motion);
+	Stats.FarFaceSize = uint32(FarS.FaceSize);
+	if (!FarTex)
+	{
+		FarTex = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(FIntPoint(1, 1), PF_A32B32G32R32F, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV, 1), TEXT("UniFarDummy"));
+		FarSl = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(FIntPoint(1, 1), PF_R16F, FClearValueBinding::White, TexCreate_ShaderResource | TexCreate_UAV, 1), TEXT("UniFarSlicesDummy"));
+		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FarTex), FLinearColor(0.0f, 0.0f, 0.0f, 1.0f));
+		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FarSl), FLinearColor(1.0f, 1.0f, 1.0f, 1.0f));
+	}
+	auto FillFar = [&](FUniVolumeFarParameters& P)
+	{
+		P.bFar = FarD.bUse ? 1u : 0u;
+		P.FarSize = uint32(FMath::Max(FarMapSize, 1));
+		P.FarLayerBits = FarD.LayerBits;
+		P.FarStartCm = float(FarS.StartCm);
+		P.FarTexture = FarTex;
+		P.FarSlices = FarSl;
+		P.FarSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+	};
+
+	// 2. March the local carriers at reduced resolution (D-166: with the background's, per pixel;
+	// D-228: stopped at R while the far cache is on).
 	TArray<UniCore::FCarrierGPU> PerPixelCarriers;
 	if (bPerPixelBackground) { PerPixelCarriers = F.VolumeCarriers; PerPixelCarriers.Append(F.BackgroundCarriers); }
-	const TArray<UniCore::FCarrierGPU>& MarchCarriers = bPerPixelBackground ? PerPixelCarriers : F.VolumeCarriers;
+	TArray<UniCore::FCarrierGPU> NearCarriers;
+	if (FarD.bUse && !bPerPixelBackground)
+	{
+		NearCarriers = F.VolumeCarriers;
+		for (UniCore::FCarrierGPU& C : NearCarriers) { C.TEnd = FMath::Min(C.TEnd, float(FarS.StartCm)); }
+	}
+	const TArray<UniCore::FCarrierGPU>& MarchCarriers = bPerPixelBackground ? PerPixelCarriers : (FarD.bUse ? NearCarriers : F.VolumeCarriers);
 	FRDGTextureRef VolumeTex = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(MarchSize, PF_A32B32G32R32F, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV), TEXT("UniVolume"));   // float32: see the cube
 	FRDGTextureRef Slices = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(MarchSize, PF_R16F, FClearValueBinding::White, TexCreate_ShaderResource | TexCreate_UAV, UniGpuLayout::VolumeSlices), TEXT("UniVolumeSlices"));
 	FRDGTextureRef DepthTex = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(MarchSize, PF_G32R32F, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV), TEXT("UniVolumeDepth"));
@@ -977,6 +1148,7 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		P->WebDebugOpacity = FMath::Max(CVarUniWebDebugOpacity.GetValueOnRenderThread(), 0.0f);
 		P->bSliceMarch = bSlice ? Interleave : 0u;   // D-208: N (2..4)
 		P->SliceOffset = SliceOffset;
+		FillFar(P->Far);   // D-228
 		P->OutVolume = GraphBuilder.CreateUAV(MarchVol);
 		P->OutSlices = GraphBuilder.CreateUAV(MarchSlices);
 		P->OutDepth = GraphBuilder.CreateUAV(MarchDepth);
@@ -989,7 +1161,7 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		Stats.VolumeMarchFlags = (bPerPixelBackground ? 1u : 0u) | (bSlice ? 2u : 0u) | ((bSlice ? Interleave : 1u) << 8);
 		Stats.VolumeSliceCounts[bSlice ? int32(Interleave) : NoSlice].fetch_add(1u);
 		// D-196: ProfileGPU shows scopes (not pass names): the scope says what was marched.
-		RDG_EVENT_SCOPE(GraphBuilder, "%s", bPerPixelBackground ? TEXT("Uni.Volume.March+Background") : TEXT("Uni.Volume.March"));
+		RDG_EVENT_SCOPE(GraphBuilder, "%s", bPerPixelBackground ? TEXT("Uni.Volume.March+Background") : (FarD.bUse ? TEXT("Uni.Volume.March (near: far cache on)") : TEXT("Uni.Volume.March")));
 		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Volume.March %dx%d, %d carriers%s%s", MarchSize.X, MarchSize.Y, MarchCarriers.Num(), bPerPixelBackground ? TEXT(" (with the background)") : TEXT(""), bSlice ? (Interleave == 4u ? TEXT(", 1/16 sliced") : (Interleave == 3u ? TEXT(", 1/9 sliced") : TEXT(", 1/4 sliced"))) : TEXT("")), CS, P, FComputeShaderUtils::GetGroupCount(Grid, 8));
 	}
 	if (bSlice)
@@ -1009,6 +1181,8 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		P->PrevWarpVelBeta = TemporalPrevWarp;   // D-190
 		P->TemporalClamp = FVector4f(CVarUniVolumeTemporalClamp.GetValueOnRenderThread() != 0 ? 1.0f : 0.0f,
 			FMath::Max(CVarUniVolumeTemporalTightPx.GetValueOnRenderThread(), 0.01f), FMath::Max(CVarUniVolumeTemporalMaxPx.GetValueOnRenderThread(), 0.0f), 0.0f);   // D-194
+		P->HistFarSign = int32(FarD.HistSign);   // D-228: the history converted once at a switch
+		FillFar(P->Far);
 		P->FreshVolume = MarchVol; P->FreshSlices = MarchSlices; P->FreshDepth = MarchDepth;
 		P->HistVolume = GraphBuilder.RegisterExternalTexture(TemporalVolume, TEXT("UniVolumeHistory"));
 		P->HistSlices = GraphBuilder.RegisterExternalTexture(TemporalSlices, TEXT("UniVolumeHistorySlices"));
@@ -1066,6 +1240,7 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		C.CubeTexture = Cube;
 		C.CubePrevTexture = CubePrev;
 		C.LinearClampSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+		FillFar(C.Far);   // D-228
 		P->RenderTargets[0] = FRenderTargetBinding(Output.Texture, ERenderTargetLoadAction::ELoad);
 		TShaderMapRef<FUniVolumeCompositeVS> VS(GetGlobalShaderMap(View.GetFeatureLevel()));
 		TShaderMapRef<FUniVolumeCompositePS> PS(GetGlobalShaderMap(View.GetFeatureLevel()));

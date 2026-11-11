@@ -32,6 +32,7 @@ IMPLEMENT_GLOBAL_SHADER(FUniVolumeMarchCS, "/Plugin/UnifiedUniverse/Private/UniV
 IMPLEMENT_GLOBAL_SHADER(FUniGalMapBakeCS, "/Plugin/UnifiedUniverse/Private/UniVolume.usf", "MapBakeCS", SF_Compute);   // D-212
 IMPLEMENT_GLOBAL_SHADER(FUniGalMapDownCS, "/Plugin/UnifiedUniverse/Private/UniVolume.usf", "MapDownCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FUniVolumeBackgroundCS, "/Plugin/UnifiedUniverse/Private/UniVolume.usf", "BackgroundCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FUniVolumeFarCS, "/Plugin/UnifiedUniverse/Private/UniVolume.usf", "FarCS", SF_Compute);   // D-228
 IMPLEMENT_GLOBAL_SHADER(FUniVolumeReconstructCS, "/Plugin/UnifiedUniverse/Private/UniVolume.usf", "ReconstructCS", SF_Compute);   // D-184
 IMPLEMENT_GLOBAL_SHADER(FUniVolumeCompositeVS, "/Plugin/UnifiedUniverse/Private/UniVolume.usf", "CompositeVS", SF_Vertex);
 IMPLEMENT_GLOBAL_SHADER(FUniVolumeCompositePS, "/Plugin/UnifiedUniverse/Private/UniVolume.usf", "CompositePS", SF_Pixel);

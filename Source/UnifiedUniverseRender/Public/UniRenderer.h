@@ -22,6 +22,7 @@
 #include "UniStreamer.h"
 #include "UniQuery.h"   // D-193
 #include "UniVolume.h"
+#include "UniFarCache.h"   // D-228
 
 #include <atomic>
 #include <memory>
@@ -170,6 +171,16 @@ struct FUniRenderStats
 	static constexpr int32 MaxGalMapSlots = 16;
 	std::atomic<uint32> GalMapBaked[MaxGalMapSlots] = {};
 	std::atomic<uint32> GalMapBakeFrames{ 0 };       // frames the GPU spent baking maps (total)
+	// D-228: the far cache (uu.VolumeFar*): the last frame's state (UniCore::EFarReason) and
+	// parallax a frame (texels at R), and totals since start.
+	std::atomic<uint32> FarReason{ 1 };
+	std::atomic<float> FarMotion{ 0.0f };
+	std::atomic<uint32> FarFaceSize{ 0 };
+	std::atomic<uint32> FarFramesOn{ 0 };
+	std::atomic<uint32> FarFacesFilled{ 0 };
+	std::atomic<uint32> FarSwitches{ 0 };
+	std::atomic<uint32> FarSceneChanges{ 0 };
+	std::atomic<uint32> FarHistoryDrops{ 0 };
 	std::atomic<uint32> ActivationsLastReadback{ 0 };
 	/** The last rendered view's angular pixel size (rad): the game thread builds the next
 	 *  frame's carriers with it (one frame late, harmless: it only sets handoff weights). */
@@ -331,6 +342,23 @@ private:
 	TArray<UniCore::FFieldParamsGPU> BgSnapParams;
 	TArray<FVector4f> BgSnapLut;
 	UniCore::FVolumeViewGPU BgSnapView{};
+	// D-228: the far cache. The map (12 layers: each face's shown one and its spare, Float32 like
+	// the background's) and its slices (12 x UNI_VOL_SLICES, half), the switching and fill rules
+	// (UniCore::FFarCacheControl), what the map's light depends on (to re-march on a change), and the
+	// snapshot the face being filled is marched from.
+	TRefCountPtr<IPooledRenderTarget> FarMapTexture, FarMapSlices;
+	int32 FarMapSize = 0;
+	UniCore::FFarCacheControl FarCtl;
+	UniCore::FFarSceneKey FarKey;
+	bool bFarHaveKey = false;
+	TArray<UniCore::FCarrierGPU> FarSnapCarriers;
+	TArray<UniCore::FFieldParamsGPU> FarSnapParams;
+	TArray<FVector4f> FarSnapLut;
+	UniCore::FVolumeViewGPU FarSnapView{};
+	float FarSnapStartCm = 0.0f;
+	uint64 FarLastFrame = ~0ull;           // the game frame the rules last ran for (a frame rendered twice reuses it)
+	bool bFarResetPending = false;         // the map was re-created on a frame rendered twice: tell the rules next frame
+	UniCore::FFarCacheDecision FarLast;
 	void RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& View, const FScreenPassRenderTarget& Output,
 		FRDGTextureRef SceneDepth, const FIntRect& DepthViewRect, float PreExposure, FRDGTextureRef& OutSlices, FIntPoint& OutMarchSize);
 

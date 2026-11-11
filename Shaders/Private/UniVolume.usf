@@ -11,6 +11,8 @@
 //   UNI_VOL_PASS 1  BACKGROUND (compute): periodic carriers into a 6-layer direction map, a few
 //                   faces per frame (the background starts at 0.1 Mpc: no parallax unless the
 //                   camera moves ~0.1 Mpc x theta_texel; the CPU decides when to re-march).
+//                   D-228: FarCS, rows of one face of the far cache's map (the local carriers
+//                   from R on), from a snapshot, into the face's spare layer.
 //   UNI_VOL_PASS 2  COMPOSITE (full-screen triangle, additive): depth-aware upsample of the
 //                   march, plus T_near x background(dir), times the pixel's solid angle, into
 //                   the scene-colour copy the view extension made (before the sprites).
@@ -18,6 +20,10 @@
 //                   pixel of every 2 x 2 block (SliceOffset); this pass fills the others from
 //                   the previous frame's output, reprojected (Catmull-Rom where it can), or from
 //                   the fresh neighbours. Its output is the frame's volume and next frame's history.
+//
+// D-228 the far cache (UniCore/UniFarCache.h): while on, the local carriers stop at R (TEnd), the
+// march's slices take the far map's transmittance, the composite adds T_near x the far map, and
+// at a switch the reconstruct converts the history once (Uni_FarHistoryConvert).
 //
 // DEBUG VIEWS (uu.VolumeDebug, lesson #37; exposure-independent false colour, no background):
 //   1 steps         mean steps per ray / MaxSteps as a heat ramp; truncated rays magenta
@@ -95,6 +101,37 @@ float SceneDistanceAtUV(float2 InUV, float InCosToForward)
 	const float ViewZ = DeviceZ * InvDeviceZToWorldZTransform[0] + InvDeviceZToWorldZTransform[1]
 		+ 1.0f / (DeviceZ * InvDeviceZToWorldZTransform[2] - InvDeviceZToWorldZTransform[3]);
 	return Uni_SceneTrueDistance(ViewZ / max(InCosToForward, 1.0e-3f));   // render space -> true distance (D-146)
+}
+
+// D-228: the far cache's map (UniCore/UniFarCache.h): 12 layers of (radiance rgb, luminance
+// transmittance) from FarStartCm on, and 12 x UNI_VOL_SLICES of luminance transmittance at the
+// view's slice boundaries; face f shows layer f, or f + 6 when bit f of FarLayerBits is set.
+uint bFar;
+uint FarSize;
+uint FarLayerBits;
+float FarStartCm;
+Texture2DArray<float4> FarTexture;
+Texture2DArray<float> FarSlices;
+SamplerState FarSampler;
+
+/** The far map's texel at a true direction (bilinear within its face), radiance Doppler-shifted
+ *  as the march's is (D-190). */
+float4 FarAt(float3 InTrueDir)
+{
+	float X, Y;
+	const uint Face = Uni_CubeDirToFace(InTrueDir, (float)FarSize, X, Y);
+	const uint Layer = Face + (((FarLayerBits >> Face) & 1u) != 0u ? 6u : 0u);
+	const float4 V = FarTexture.SampleLevel(FarSampler, float3(X / (float)FarSize, Y / (float)FarSize, (float)Layer), 0);
+	return float4(DopplerOf(V.rgb, InTrueDir), V.a);
+}
+
+/** The far map's transmittance at slice K in a true direction. */
+float FarSliceAt(float3 InTrueDir, uint InK)
+{
+	float X, Y;
+	const uint Face = Uni_CubeDirToFace(InTrueDir, (float)FarSize, X, Y);
+	const uint Layer = Face + (((FarLayerBits >> Face) & 1u) != 0u ? 6u : 0u);
+	return FarSlices.SampleLevel(FarSampler, float3(X / (float)FarSize, Y / (float)FarSize, (float)(Layer * UNI_VOL_SLICES + InK)), 0);
 }
 
 #endif
@@ -197,7 +234,15 @@ void MarchCS(uint3 DispatchId : SV_DispatchThreadID)
 	}
 	OutVolume[Id.xy] = Out;
 	OutDepth[Id.xy] = float2(DepthW > 0.0f && DepthWL > 0.0f ? Uni_LightLnDepthFromInv(DepthWL / DepthW) : UNI_VOL_LN_DEPTH_NONE, LnScene);   // D-194: harmonic
-	for (uint K3 = 0u; K3 < UNI_VOL_SLICES; ++K3) { OutSlices[uint3(Id.x, Id.y, K3)] = Slice[K3] * Inv; }
+	// D-228: with the far cache the march stops at R; past it the slices take the far map's
+	// transmittance (a product: past R the near slices hold the near part's).
+	const bool bFarSlices = bFar != 0u && DebugMode == 0u && TScene > FarStartCm;
+	for (uint K3 = 0u; K3 < UNI_VOL_SLICES; ++K3)
+	{
+		float Fs = 1.0f;
+		if (bFarSlices) { Fs = FarSliceAt(Dir, K3); }   // an if: HLSL's ?: evaluates both sides
+		OutSlices[uint3(Id.x, Id.y, K3)] = Slice[K3] * Inv * Fs;
+	}
 }
 
 #elif UNI_VOL_PASS == 5
@@ -253,6 +298,33 @@ void BackgroundCS(uint3 Id : SV_DispatchThreadID)
 	OutCube[uint3(Id.x, Id.y, Face)] = float4(R.Radiance, 1.0f);
 }
 
+// D-228: rows [FarRow0, FarRow0 + FarRows) of one face of the far map, into layer FarLayer, from
+// the fill's snapshot (the local carriers from R on: their TStart).
+uint FarCubeSize;
+uint FarFace;
+uint FarLayer;
+uint FarRow0;
+uint FarRows;
+float FarSplitCm;
+RWTexture2DArray<float4> OutFar;
+RWTexture2DArray<float> OutFarSlices;
+
+[numthreads(8, 8, 1)]
+void FarCS(uint3 Id : SV_DispatchThreadID)
+{
+	const uint Y = FarRow0 + Id.y;
+	if (Id.x >= FarCubeSize || Id.y >= FarRows || Y >= FarCubeSize) { return; }
+	FUniVolumeView V = InVolumeView[0];
+	V.ThetaPixel = 2.0f / (float)FarCubeSize;
+	const float3 Dir = Uni_CubeTexelDir(FarFace, (float)Id.x + 0.5f, (float)Y + 0.5f, (float)FarCubeSize);
+	const FUniVolumeResult R = Uni_VolumeMarch(Dir, 3.0e38f, InCarriers, InParams, InLut, V);
+	OutFar[uint3(Id.x, Y, FarLayer)] = float4(R.Radiance, Uni_Luminance(R.Transmittance));
+	for (uint K = 0u; K < UNI_VOL_SLICES; ++K)
+	{
+		OutFarSlices[uint3(Id.x, Y, FarLayer * UNI_VOL_SLICES + K)] = Uni_FarSliceT(K, Uni_Luminance(R.SliceT[K]), FarSplitCm, V);
+	}
+}
+
 #elif UNI_VOL_PASS == 3
 
 uint2 MarchSize;
@@ -266,6 +338,7 @@ uint TemporalPhase;
 float3 CamStep;             // camera now minus then, cm
 uint bHistory;
 float4 PrevWarpVelBeta;     // D-190: the previous frame's warp optics
+int HistFarSign;            // D-228: the far cache switched: +1 the history is the near part (make it whole), -1 the reverse
 float4 TemporalClamp;       // D-194: x 1: clamp the history into the fresh range (0: the D-184 band); y the motion (px) at which it is tight; z beyond which history is not used
 Texture2D<float4> FreshVolume;
 Texture2DArray<float> FreshSlices;
@@ -361,6 +434,8 @@ void ReconstructCS(uint3 Id : SV_DispatchThreadID)
 				}
 				if (bSame) { Hv = float4(max(Cr.xyz, float3(0.0f, 0.0f, 0.0f)), saturate(Cr.w)); }
 			}
+			// D-228: once, at a far-cache switch, the history is made what this frame marches.
+			if (HistFarSign != 0) { Hv = Uni_FarHistoryConvert(Hv, FarAt(Dir), (float)HistFarSign); }
 			if (TemporalClamp.x != 0.0f)
 			{
 				// D-194: clamp into the fresh range (tight once moving); moving too fast: not used.
@@ -454,7 +529,9 @@ void CompositePS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Targe
 		OutColor = float4(Vol.rgb * DebugScale, 0.0f);
 		return;
 	}
-	float3 B = Vol.rgb;
+	float4 VolAll = Vol;
+	if (bFar != 0u && DPix > FarStartCm) { VolAll = Uni_FarComposite(Vol, FarAt(TrueDir(Dir))); }   // D-228: near + T_near far
+	float3 B = VolAll.rgb;
 	if (bBackground != 0u && DPix > BackgroundStartCm)
 	{
 		float X, Y;
@@ -464,7 +541,7 @@ void CompositePS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Targe
 		const float3 BgCur = CubeTexture.SampleLevel(LinearClampSampler, Uvw, 0).rgb;
 		const float3 BgPrev = CubePrevTexture.SampleLevel(LinearClampSampler, Uvw, 0).rgb;
 		const float3 Bg = lerp(BgPrev, BgCur, BackgroundBlend);   // D-159: cross-fade between whole, consistent maps
-		B += Vol.a * DopplerOf(Bg, BgDir);
+		B += VolAll.a * DopplerOf(Bg, BgDir);
 	}
 	// Solid angle of this pixel: cos^3 / f^2 (pinhole). Radiance x solid angle = the pixel's
 	// energy in the sprites' exposure units (D-128), so sprites + volume conserve light.

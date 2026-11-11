@@ -1864,3 +1864,72 @@ Decision: rays per axis x sqrt(saturate(Weight)) in Uni_CarrierSubsamples. The s
 T2.vol.super_weight (new): at azimuths 60 and 90 (93 px wide, the smallest march scaled), against the old rule: supersampled pixels 0.73% -> 0, the longest ray 596-611 -> 101-102 steps, steps/px 51 -> 48. The image changes by at most 1.37% in a pixel, 0.0000% overall. At full weight 0 of 12 cases differ from the old rule.
 Render only; the CPU reference and the shader share Uni_CarrierSubsamples.
 Reroll impact: none. Status: Provisional (UE-58: no hitch at the owner's angles with uu.VolumeMaxSubsamples back at 8).
+
+D-226 — Galaxy impostors from the 2D map: accuracy measured; build as cached billboards (proposal)
+Owner, 2026-11-11: do PARADIGMS #1 (galaxies seen from outside as impostors) and #2 (the far cache).
+Measured (explore.impostor, archived: Tools/UniVerify/experiments/impostor_explore.cpp.txt): the Milky Way from outside (40-120 kpc, azimuth 30 deg), 128 x 96, against today's march of it (its carrier alone).
+- One map read per ray at the warped midplane crossing, the disc's vertical profile analytic, dust as the slab, the bulge 3D: face-on light +0.4%, L1 5.6%. The light falls with inclination: -3.4% at 50 deg, -6% at 65, -11% at 75 (dust off: the same). The disc's light varies across the ray's path through the slab (about 2 H tan i in the plane: +-0.05 radii at 75 deg), and its radial profile is convex: the crossing's value underestimates the path's mean.
+- K map reads a side, each an equal share of the light's vertical profile at its own point on the ray (the vertical profile integrated analytically between them, light and dust apart):
+  - K = 4: light within -0.6% to 65 deg, L1 2.7-3.8%;
+  - K = 8: -0.1% at 50 deg (L1 2.5%, p50 0.7%), -0.55% at 65 (L1 2.6%), -1.4% at 75 (L1 4.0%, p90 23%). It breaks down past ~75 deg (82: -4.6%, p90 48%), where the march must take over.
+- The face-on L1 of ~5.6% stays at any K: the march from outside samples the analytic field prefiltered over the footprint (D-160), the impostor the map's mips; the sharpest pixels differ (p99 ~17%, p50 0.8%). The bulge at its warp_large point (D-218) changes nothing.
+- The march's own fine reference (MarchFlags bit 1) truncates at the step cap from outside (light 29-127% off), so it is not used here.
+Proposal (owner to choose): about 20-25 evaluations a pixel per frame, unsliced, would cost 2-8x today's sliced march. So build the impostor as a cached billboard per galaxy seen from outside. It is drawn with the K-node method (or the march, unsliced) into a texture at the galaxy's screen size, and re-rendered when the view direction or distance to it moves past a budget. Each frame it is drawn by the exact 2D transform of the current camera, resampled once (no sliding). Past ~65 deg it hands back to the march, cross-faded. It is composited against the march with its transmittance through the volume's log-distance slices, as sprites are. Cost follows the refreshes, not the frames. PARADIGMS #2 (the far cache for the camera's own galaxy) uses the same refresh-on-a-budget machinery.
+Reroll impact: none. Status: measured; proposal pending the owner.
+
+D-227 — The march split by distance (PARADIGMS #2): measured, a quality/cost trade
+Owner, 2026-11-11: #2 before #1.
+Prototype (explore.farcache, archived: Tools/UniVerify/experiments/farcache_explore.cpp.txt), in the D-219 harness (the solar camera, GalaxyToStar, 160 x 100, against the fine reference every frame):
+- The near part (carriers clipped to R) is marched every frame with today's slicing.
+- The far part (TStart raised to R) is marched into a world-aligned 160^2-a-face cube from an anchor, re-marched when the camera has moved half a texel's parallax at R.
+- Composite: B_near + T_near B_far(dir).
+- Steps per pixel a frame: near rays x steps, plus the in-view share of each refresh.
+Results (error / crawl / steps per px a frame):
+- 0.3 pc a frame: today 0.12% / 0.036% / 12.7; from 1 kpc 0.32% / 0.024% / 4.2 (no refresh in 10 frames); from 300 pc 0.30% / 0.029% / 11.0.
+- 3 pc a frame: today 0.23% / 0.17% / 12.7; from 1 kpc 0.30% / 0.11% / 19.8 (5 refreshes in 10); from 300 pc 0.30% / 0.04% / 42.2 (every frame).
+- 15 pc a frame: today 1.05% / 0.91% / 12.8 (the slicing slides); from 1 kpc 0.30% / 0.085% / 35.5; from 300 pc 0.30% / 0.013% / 42.3.
+Reading:
+- Slow, the far cache is ~3x cheaper with the same crawl. Its ~0.3% floor is the cube's resampling (one texel a pixel): a finer cube lowers it.
+- At speed, the far content's parallax is real motion. The cube must be re-marched every frame (2.8-3.3x today's steps), and a partial, rolling refresh would leave texels many texels out of place. In exchange the crawl falls 10-70x (0.9% -> 0.01-0.09%).
+- Inside the disc at modest speed today's slicing is already good (D-219).
+Options for the owner:
+- (a) The far cache only while slow: a saving, with today's quality.
+- (b) The far cache at speed too: no sliding, ~3x the march.
+- (c) Both, switched by speed.
+- (d) Leave it, and do #1 (D-226's billboards), where the outside-galaxy sliding is.
+Reroll impact: none. Status: measured; owner to choose.
+
+D-228 — The far cache, switched by speed (PARADIGMS #2, B-028): built
+Owner, 2026-11-11: "Switch by speed (Recommended)".
+Costed again first (explore.farcost, archived: Tools/UniVerify/experiments/farcost_explore.cpp.txt). D-227 had no refresh in its window, and its cube was as coarse as its view. Here the cube matches the march's angular resolution (192 x 108, N 192, 40 frames). Steps per pixel a frame against today's slicing, faces refreshed per face, in view only:
+- R 1 kpc: 0.32x at rest; 0.63x at 0.3 pc/frame; 1.24x at 1.
+- R 2 kpc: 0.38x; 0.52x; 0.92x; 1.74x at 3.
+- R 4 kpc: 0.46x; 0.46x; 0.68x; 1.01x at 3.
+- Refreshing the whole cube costs more than today once any refresh happens (2.42x at 1 pc/frame, R 1 kpc).
+- A face's re-march costs ~40 steps per view pixel, about 3x a frame's march. Break-even is ~0.06 texels of parallax at R a frame, for any R. At the engine's default march (~680 px wide, 90 degrees) and R 2 kpc that is roughly 15-20 pc/s at 60 fps.
+- Error 0.16-0.25% (today 0.10-0.20%); crawl at or under today's.
+Built:
+- UniCore/UniFarCache.h (engine-agnostic): FFarCacheControl (the rules), CubeFacesInView, FFarSceneKey.
+  - On below uu.VolumeFarOnMotion (0.02 texels of parallax at R a frame) held uu.VolumeFarOnFrames (30) frames, with every face marched and the faces in view fresh. Off above uu.VolumeFarOffMotion (0.04), and while outside a local carrier, while cells load (their glow is per frame), with the background per pixel, or in a debug view.
+  - Per-face anchors. A face in view is re-marched past uu.VolumeFarDueTexels (0.3) of parallax since its anchor; a face out of view past 1.2. The fill takes the scene's snapshot and marches uu.VolumeFarFillFrames (8) frames' rows into the face's spare layer, then swaps it in. No frame marches more than a face's share: no spike.
+  - A change of more than 1% in the local carriers, their LUT or parameter blocks, or skipped game frames: every face re-marched, in view first, the map still used meanwhile. A jump: everything invalid.
+- Shaders:
+  - UniVolume.ush: Uni_FarComposite, Uni_FarHistoryConvert, Uni_FarSliceT.
+  - UniVolume.usf:
+    - FarCS fills the map: 12 layers, (rgb, luminance T), Float32; 12 x 8 slice layers.
+    - MarchCS: past R the slices take the map's transmittance (a product).
+    - ReconstructCS: at a switch the history is converted once (HistFarSign: whole <-> near part).
+    - CompositePS: near + T_near far, then the background through both.
+- Renderer: the march's local carriers stop at R (TEnd) while on. uu.VolumeFar (1), uu.VolumeFarStartPc (2000), uu.VolumeFarSize (0: as fine as the march at the view's centre, in 64s). ProfileGPU scopes: Uni.Volume.FarMap, Uni.Volume.March (near: far cache on). uu.Perf has a far-cache line.
+- Found on the way: the march records a slice after the step that crosses it, so the far march's first step (from R) stamped every boundary nearer than R. The map's slices before R are now exactly 1 (Uni_FarSliceT); the sprites' slices went from 2.3% to 0.02% off at R 2 kpc.
+Verified offline:
+- T1.vol.far_controller: the rules on synthetic frames.
+- T2.vol.far_split: still camera, near + far = the whole march. Light 0.28-0.29%, transmittance 0.0006, slices 0.0002-0.0011 mean abs, at R 1 and 2 kpc.
+- T2.vol.far_flight: the solar camera drifting, travelling, drifting again with the renderer's rules.
+  - On 77 of 122 frames at 0.46x today's steps (march plus fills); within 0.32% of the whole march.
+  - Three switches, the light changing 0.05% at them (0.06% on other frames). Without the history conversion: 55%.
+  - At most a face's share of rows a frame; the scene key steady.
+Not verified: the engine side (UE-59).
+Reroll impact: none (render only).
+Status: built; engine test pending (UE-59).
+

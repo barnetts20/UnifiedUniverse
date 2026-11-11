@@ -1093,3 +1093,23 @@ A reviewer read the uncompiled engine code against UE 5.3–5.6 without seeing i
 - **Test steps:** shaders recompile on launch. `uu.VolumeMaxSubsamples 8` (the default) and `uu.BackgroundPerPixelInterval 0` (the default). Repeat your orbit and the in-and-out at the bad angles.
 - **Expect:** no hitch; the image as with `uu.VolumeMaxSubsamples 1`.
 - **If it's wrong:** a slowdown remains (send a ProfileGPU and `uu.Perf`), or a cluster's glow looks blocky up close (send a shot).
+
+## 60. The far cache, switched by speed (D-228, UE-59)
+*Owner: PARADIGMS #2, "Switch by speed".*
+
+- **What it does:** while you're inside a galaxy and nearly still, the volume march stops at 2 kpc. The light from there on comes from a six-face map, re-marched face by face as you drift. Each face's re-march is spread over 8 frames into a spare layer and swapped in, so there's no spike. At speed it switches off and today's slicing runs as before. When it switches either way, the temporal history is converted once, so there's no flash.
+- **What it buys (offline):** at rest about 0.4x the march's steps; with drift, up to ~0.5x. Break-even is about 0.06 texels of parallax a frame at 2 kpc: roughly 15-20 pc/s at 60 fps with the default march size. So it's a parked/looking-around win, not a travel one. Image within 0.3% of the whole march.
+- **Change:** UniCore/UniFarCache.h (new), UniVolume.ush/.usf (FarCS; the march, reconstruct and composite read the map), UniShaders.h/.cpp, UniRenderer.cpp/.h, uu.Perf. New CVars: `uu.VolumeFar` (1; 0 = off, as before), `uu.VolumeFarStartPc` (2000), `uu.VolumeFarSize` (0 = auto), `uu.VolumeFarFillFrames` (8), `uu.VolumeFarOnFrames` (30), `uu.VolumeFarOnMotion` (0.02), `uu.VolumeFarOffMotion` (0.04), `uu.VolumeFarDueTexels` (0.3).
+- **Test steps:**
+  1. Build. If FarCS fails to compile, set `uu.VolumeFar 0` and send the log line.
+  2. Park inside the Milky Way (mid-disc), let cells finish loading, and wait ~2 s. Run `uu.Perf`: the far-cache line should say `on`.
+  3. ProfileGPU: `Uni.Volume.March (near: far cache on)` plus `Uni.Volume.FarMap` (only while a face refills) against `Uni.Volume.March` with `uu.VolumeFar 0`.
+  4. Toggle `uu.VolumeFar 0` / `1` while parked: the image should not change.
+  5. Look around slowly: no seams at face edges, nothing blocky in the Milky Way band.
+  6. Drift slowly, then speed up and slow down again: no flash at the switches (`uu.Perf` counts them).
+- **Expect:** the near march at about 0.3-0.5x the full march's time when parked; a FarMap pass of a fraction of that, now and then, while drifting.
+- **If it's wrong:**
+  - It's never `on`: `uu.Perf` names the reason (outside, cells loading, moving, settling, warming).
+  - A flash at the switch, a visible edge 2 kpc out, wrong star dimming, or blocky far light: `uu.VolumeFar 0` restores today's path. Send a shot and `uu.Perf`.
+  - Far light too coarse: `uu.VolumeFarSize 1024`.
+

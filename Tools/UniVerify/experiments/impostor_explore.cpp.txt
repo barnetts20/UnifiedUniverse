@@ -1,0 +1,263 @@
+// test_zz_impostor.cpp — exploration only (PARADIGMS.md #1, B-022; archived after the run).
+// A galaxy seen from outside drawn as an impostor against today's march of it. The impostor reads
+// the galaxy's 2D map once per ray, where the ray crosses the (warped) midplane, and integrates the
+// disc's analytic vertical profile for light and dust there; the bulge stays 3D along the ray. Fine
+// nodes, so the one approximation measured is the thin disc's: the map read at one point of the
+// ray instead of along it. The Milky Way from outside, at inclinations 0-88 degrees and 40-200 kpc.
+
+#include "../src/UniTest.h"
+#include "../src/UniRenderRef.h"
+#include "../src/UniVolumeRef.h"
+#include "../scenes/UniScenes.h"
+#include "UniGalaxyMap.h"
+#include <cstring>
+
+#include <algorithm>
+#include <cmath>
+#include <thread>
+#include <vector>
+
+using namespace UniCore;
+using namespace UniRender;
+namespace H = UniHlsl;
+
+namespace
+{
+	struct FImpostorCtx
+	{
+		H::FUniCarrier C;
+		H::FUniFieldParams Par, Dust;
+		bool bDust = false;
+		H::FUniGalaxyConst K;
+		H::FUniVolumeView V;
+	};
+
+	/** The impostor's radiance for one pixel ray (world direction InDir). */
+	int KNodes = 0;
+
+	H::float3 Impostor(const FImpostorCtx& X, const FVolumeScene& Sc, const H::float3& InDir)
+	{
+		const auto Lb = Sc.LutBuf();
+		const H::FUniCarrier& C = X.C;
+		const H::float3 Ld = H::Uni_CarrierLocalDir(C, InDir);
+		float T0 = 0.0f, T1 = 0.0f;
+		if (!H::Uni_CarrierInterval(C, Ld, 3.0e38f, T0, T1)) { return H::float3(0, 0, 0); }
+		const float InvR = C.InvRadius;
+		auto Point = [&](float T) { return H::Uni_CarrierPoint(C, Ld, T); };
+		// The warped midplane crossing: z(P + warp) = the map's centre there (secant iterations).
+		auto Gap = [&](float T, H::float3& OutPd, H::float4& OutM, float& OutFine)
+		{
+			const H::float3 P = Point(T);
+			H::float3 Pd, Pb; H::float4 Dt; H::uint bDt = 0u; float Fine = 0.0f;
+			const float Foot = T * X.V.ThetaPixel * InvR;
+			H::Uni_GalaxyTexTerms(P, X.Par, X.K, Foot, H::Uni_GalaxyDiscSlab(X.Par), true, false, Pd, Pb, Dt, bDt, Fine);
+			OutPd = Pd;
+			OutM = H::UniGalMapSample(H::float2(Pd.x * 0.5f + 0.5f, Pd.y * 0.5f + 0.5f), 0u, std::log2(std::max(Foot * 1024.0f * 0.5f, 1.0f)));
+			OutFine = Fine;
+			return Pd.z - OutM.z;
+		};
+		if (std::abs(Ld.z) < 1.0e-4f) { return H::float3(0, 0, 0); }
+		float Ta = (0.0f - C.CamLocal.z) / (Ld.z * InvR);
+		Ta = std::clamp(Ta, T0, T1);
+		float Tb = Ta * 1.001f + 1.0f;
+		H::float3 Pd; H::float4 M; float Fine;
+		float Ga = Gap(Ta, Pd, M, Fine), Gb = Gap(Tb, Pd, M, Fine);
+		for (int It = 0; It < 6 && std::abs(Gb - Ga) > 0.0f; ++It)
+		{
+			const float Tn = std::clamp(Tb - Gb * (Tb - Ta) / (Gb - Ga), T0, T1);
+			Ta = Tb; Ga = Gb; Tb = Tn; Gb = Gap(Tb, Pd, M, Fine);
+		}
+		const float Ts = Tb;
+		// The disc's and the dust's midplane densities there (the map path's own evaluation).
+		const H::float3 Ps = Point(Ts);
+		const float FootS = Ts * X.V.ThetaPixel * InvR;
+		float Re = 0.0f, Rd = 0.0f; H::float4 Comp;
+		H::Uni_GalaxyMapEval(Ps, X.Par, X.Dust, X.bDust, X.K, FootS, 1024.0f, 0u, Re, Rd, Comp);
+		const float Cut = X.Par.D.x;
+		const float Rs = std::sqrt(H::dot(Ps, Ps));
+		const float FadeR = std::clamp((Cut - Rs) / (0.05f * Cut), 0.0f, 1.0f);
+		const float Disc0 = std::max(Re - Comp.x * FadeR, 0.0f);
+		// Its rebuild of the vertical profile at the crossing (the map path's He: flare, footprint).
+		const float Rn = std::clamp(std::sqrt(Pd.x * Pd.x + Pd.y * Pd.y) / std::max(Cut, 1.0e-6f), 0.0f, 1.0f);
+		const float Flare = X.Par.E.w > 0.0f ? 1.0f + X.Par.E.w * Rn : 1.0f;
+		const float Hh = std::max(X.Par.A.y, 1.0e-6f) * Flare, He = std::sqrt(Hh * Hh + 0.25f * FootS * FootS);
+		const float Hd = std::max(X.Dust.A.y, 1.0e-6f) * Flare, Hde = std::sqrt(Hd * Hd + 0.25f * FootS * FootS);
+		const float Rd0 = Rd;
+		// Disc: K segments a side, each an equal share of the light's vertical profile; one full map
+		// evaluation per segment, at its own point on the ray (K = 0: the single crossing read).
+		struct FEv { float T; H::float3 E; H::float3 Tau; };
+		std::vector<FEv> Ev;
+		const H::FUniFieldParams& DPar = X.Dust;
+		const H::float3 Sig(X.V.DustSigmaRgb.x, X.V.DustSigmaRgb.y, X.V.DustSigmaRgb.z);
+		const float Az = std::abs(Ld.z);
+		auto Seg = [&](float Za, float Zb, float Sgn, const H::float3& Pn, float Tn, float Zn)
+		{
+			// Densities at the node, scaled back to the midplane, integrated over [Za, Zb] in z'.
+			float Ren = 0.0f, Rdn = 0.0f; H::float4 Cn;
+			const float Fn = Tn * X.V.ThetaPixel * InvR;
+			H::Uni_GalaxyMapEval(Pn, X.Par, X.Dust, X.bDust, X.K, Fn, 1024.0f, 0u, Ren, Rdn, Cn);
+			const float Rr = std::sqrt(H::dot(Pn, Pn));
+			const float Fr = std::clamp((Cut - Rr) / (0.05f * Cut), 0.0f, 1.0f);
+			const float DiscN = std::max(Ren - Cn.x * Fr, 0.0f) * std::exp(Zn / He);
+			const float DustN = Rdn * std::exp(Zn / Hde);
+			const float IL = He * (std::exp(-Za / He) - std::exp(-Zb / He)) / Az;      // path integral (field units)
+			const float ID = Hde * (std::exp(-Za / Hde) - std::exp(-Zb / Hde)) / Az;
+			FEv E;
+			E.T = Tn;
+			E.E = H::Uni_VolumeLut(Lb, C.LutIndex, Tn) * (C.Amplitude * C.Weight * DiscN * IL);
+			E.Tau = X.bDust ? Sig * (DPar.D.y * DustN * ID) : H::float3(0, 0, 0);
+			(void)Sgn;
+			Ev.push_back(E);
+		};
+		const int Kn = KNodes;
+		if (Kn == 0)
+		{
+			// The single crossing read: the whole slab from the midplane densities.
+			const float IL = 2.0f * He / Az, ID = 2.0f * Hde / Az;
+			FEv E; E.T = Ts;
+			E.E = H::Uni_VolumeLut(Lb, C.LutIndex, Ts) * (C.Amplitude * C.Weight * Disc0 * IL);
+			E.Tau = X.bDust ? Sig * (DPar.D.y * Rd0 * ID) : H::float3(0, 0, 0);
+			// Split in two halves so the near half's light is not dimmed by the far half's dust.
+			FEv E1 = E, E2 = E; E1.E = E.E * 0.5f; E2.E = E.E * 0.5f; E1.Tau = E.Tau * 0.5f; E2.Tau = E.Tau * 0.5f; E1.T = Ts - 1.0f; E2.T = Ts + 1.0f;
+			Ev.push_back(E1); Ev.push_back(E2);
+		}
+		else
+		{
+			for (int Side = -1; Side <= 1; Side += 2)
+			{
+				for (int Kk = 0; Kk < Kn; ++Kk)
+				{
+					const float Ua = float(Kk) / float(Kn), Ub = float(Kk + 1) / float(Kn), Um = (float(Kk) + 0.5f) / float(Kn);
+					const float Za = -He * std::log(1.0f - Ua), Zb = Kk + 1 == Kn ? 30.0f * std::max(He, Hde) : -He * std::log(1.0f - Ub);
+					const float Zm = -He * std::log(1.0f - Um);
+					const float Tn = Ts + float(Side) * Zm / (Az * InvR);
+					if (Tn < T0 || Tn > T1) { continue; }
+					Seg(Za, Zb, float(Side), Point(Tn), Tn, Zm);
+				}
+			}
+		}
+		// Bulge: 3D along the ray (no dust of its own).
+		const float Tc = -H::dot(C.CamLocal, Ld) / InvR;
+		const float Bt = 12.0f * std::max(X.Par.A.w, 0.004f) / InvR;
+		const int Nb = 240;
+		for (int I = 0; I < Nb; ++I)
+		{
+			const float Ta2 = std::clamp(Tc - Bt + 2.0f * Bt * float(I) / Nb, T0, T1), Tb2 = std::clamp(Tc - Bt + 2.0f * Bt * float(I + 1) / Nb, T0, T1);
+			if (!(Tb2 > Ta2)) { continue; }
+			const float Tm = 0.5f * (Ta2 + Tb2);
+			const H::float3 Pm = Point(Tm);
+			const float Rm = std::sqrt(H::dot(Pm, Pm));
+			H::float3 Pdb, Pbb; H::float4 Dtb; H::uint bDtb = 0u; float Fnb = 0.0f;
+			const float Fb = Tm * X.V.ThetaPixel * InvR;
+			H::Uni_GalaxyTexTerms(Pm, X.Par, X.K, Fb, H::Uni_GalaxyDiscSlab(X.Par), true, false, Pdb, Pbb, Dtb, bDtb, Fnb);   // the bulge's warp_large point (D-218)
+			const float Bulge = H::Uni_GalaxyBulgeAt(Pbb, X.Par, Fb) * std::clamp((Cut - Rm) / (0.05f * Cut), 0.0f, 1.0f);
+			FEv E; E.T = Tm; E.E = H::Uni_VolumeLut(Lb, C.LutIndex, Tm) * (C.Amplitude * C.Weight * Bulge * (Tb2 - Ta2) * InvR); E.Tau = H::float3(0, 0, 0);
+			Ev.push_back(E);
+		}
+		std::sort(Ev.begin(), Ev.end(), [](const FEv& A, const FEv& Bb) { return A.T < Bb.T; });
+		H::float3 B(0, 0, 0), Tr(1, 1, 1);
+		for (const FEv& E : Ev)
+		{
+			const H::float3 Ex(std::exp(-E.Tau.x), std::exp(-E.Tau.y), std::exp(-E.Tau.z));
+			const H::float3 W(E.Tau.x > 1e-5f ? (1 - Ex.x) / E.Tau.x : 1 - 0.5f * E.Tau.x, E.Tau.y > 1e-5f ? (1 - Ex.y) / E.Tau.y : 1 - 0.5f * E.Tau.y, E.Tau.z > 1e-5f ? (1 - Ex.z) / E.Tau.z : 1 - 0.5f * E.Tau.z);
+			B = B + Tr * (E.E * W);
+			Tr = Tr * Ex;
+		}
+		return B;
+	}
+
+	std::vector<double> RenderMarch(const FVolumeScene& Sc, const FCamera& Cam)
+	{
+		const auto Cb = Sc.CarrierBuf(); const auto Pb = Sc.ParamBuf(); const auto Lb = Sc.LutBuf();
+		const H::FUniVolumeView V = ToHlsl(Sc.View);
+		std::vector<double> L(size_t(Cam.Width) * Cam.Height);
+		std::vector<std::thread> Ts;
+		for (int T = 0; T < 4; ++T) Ts.emplace_back([&, T]() {
+			for (int Y = T; Y < Cam.Height; Y += 4) for (int X = 0; X < Cam.Width; ++X)
+			{
+				bool bS = false;
+				L[size_t(Y) * Cam.Width + X] = H::Uni_Luminance(MarchPixel(Cb, Pb, Lb, V, Cam, Cam.Width, Cam.Height, X, Y, 3.0e38f, bS).Radiance);
+			} });
+		for (auto& T : Ts) T.join();
+		return L;
+	}
+}
+
+UNI_TEST(explore, impostor)
+{
+	FUniverseModel M(UniScenes::Flythrough());
+	FRefGenerator G(M);
+	FVolumeBuilder VB(M, G);
+	const double Kpc = Units::Kpc, Deg = 3.14159265358979 / 180.0;
+	const int NoDust = 0;
+	for (int Kv : { 8 })
+	for (double D : { 60.0 })
+	{
+		KNodes = Kv;
+		for (double Inc : { 0.0, 30.0, 50.0, 60.0, 65.0, 70.0, 75.0 })
+		{
+			const double Ph = 30.0 * Deg;
+			const double X = D * Kpc * std::sin(Inc * Deg) * std::cos(Ph), Y = D * Kpc * std::sin(Inc * Deg) * std::sin(Ph), Z = D * Kpc * std::cos(Inc * Deg);
+			FCoord Cam = FCoord::Origin(); FVec3f Fr{};
+			AddDisplacement(Cam, Fr, FVec3d{ X, Y, Z });
+			FRefPipeline P(G); P.bVelocityLod = false; P.Update(Cam, FVec3f{});
+			FCamera Cm; Cm.Coord = Cam; Cm.Width = 128; Cm.Height = 96; Cm.DeltaMag = 0.0;
+			Cm.FovX = 2.0 * std::atan(1.15 * 20.0 / D);
+			Cm.LookAlong(FV3{ -X, -Y, -Z }, (Inc < 1.0) ? FV3{ 0, 1, 0 } : FV3{ 0, 0, 1 });
+			const FVolumeSettings S;
+			const FVolumeScene All = VB.Build(P, Cam, FVec3f{}, Cm.View(), S).Subset(false);
+			// The Milky Way's carrier alone (the nearest galaxy carrier).
+			int Best = -1; float BestD = 1e30f;
+			for (size_t I = 0; I < All.Carriers.size(); ++I)
+			{
+				const auto& C = All.Carriers[I];
+				if ((C.FieldId & 0xFFFFu) != H::UNI_FIELD_GALAXY) continue;
+				const float Dd = C.CamLocal[0] * C.CamLocal[0] + C.CamLocal[1] * C.CamLocal[1] + C.CamLocal[2] * C.CamLocal[2];
+				if (Dd < BestD) { BestD = Dd; Best = int(I); }
+			}
+			if (Best < 0) { std::printf("d %.0f inc %.0f: no galaxy carrier\n", D, Inc); continue; }
+			FVolumeScene One = All;
+			One.Carriers = { All.Carriers[size_t(Best)] };
+			One.View.NumCarriers = 1u; One.View.MapCarrier = 0u;
+			if (NoDust) { One.Carriers[0].Flags &= ~H::UNI_CARRIER_DUST; }
+			FGalaxyMap Map;
+			Map.Bake(One.Carriers[0], One.Params, 1024u, 4);
+			BindGalaxyMap(0u, &Map);
+			FImpostorCtx Cx;
+			std::memcpy(static_cast<void*>(&Cx.C), &One.Carriers[0], sizeof(Cx.C));
+			std::memcpy(static_cast<void*>(&Cx.Par), &One.Params[One.Carriers[0].ParamIndex], sizeof(Cx.Par));
+			Cx.bDust = (One.Carriers[0].Flags & H::UNI_CARRIER_DUST) != 0u;
+			std::memcpy(static_cast<void*>(&Cx.Dust), &One.Params[Cx.bDust ? One.Carriers[0].DustParamIndex : One.Carriers[0].ParamIndex], sizeof(Cx.Dust));
+			Cx.K = H::Uni_GalaxyConstOf(Cx.Par);
+			Cx.V = ToHlsl(One.View);
+			const std::vector<double> Ref = RenderMarch(One, Cm);
+			FVolumeScene Fine = One; Fine.View.MarchFlags |= 2u;
+			const std::vector<double> RefF = RenderMarch(Fine, Cm);
+			double Sf = 0, L1m = 0; for (size_t I = 0; I < RefF.size(); ++I) { Sf += RefF[I]; L1m += std::abs(Ref[I] - RefF[I]); }
+			std::vector<double> Imp(Ref.size());
+			{
+				std::vector<std::thread> Ts;
+				for (int T = 0; T < 4; ++T) Ts.emplace_back([&, T]() {
+					for (int Yy = T; Yy < Cm.Height; Yy += 4) for (int Xx = 0; Xx < Cm.Width; ++Xx)
+					{
+						const FV3 Dw = PixelDir(Cm, Cm.Width, Cm.Height, Xx + 0.5, Yy + 0.5);
+						Imp[size_t(Yy) * Cm.Width + Xx] = H::Uni_Luminance(Impostor(Cx, One, H::float3(float(Dw.X), float(Dw.Y), float(Dw.Z))));
+					} });
+				for (auto& T : Ts) T.join();
+			}
+			BindGalaxyMap(0u, nullptr);
+			double Sr = 0, Si = 0, L1 = 0; std::vector<double> Rel;
+			for (double v : Ref) Sr += v;
+			const double Mean = Sr / Ref.size();
+			for (size_t I = 0; I < Ref.size(); ++I) { Si += Imp[I]; L1 += std::abs(Imp[I] - Ref[I]); if (Ref[I] > 0.05 * Mean) Rel.push_back(std::abs(Imp[I] - Ref[I]) / Ref[I]); }
+			std::sort(Rel.begin(), Rel.end());
+			const auto Q = [&](double F) { return Rel.empty() ? 0.0 : Rel[size_t(F * (Rel.size() - 1))]; };
+			double L1i = 0; for (size_t I = 0; I < RefF.size(); ++I) L1i += std::abs(Imp[I] - RefF[I]);
+			std::printf("   against the fine reference: march L1 %.2f%% light %+.2f%%, impostor L1 %.2f%% light %+.2f%%\n", 100 * L1m / Sf, 100 * (Sr / Sf - 1), 100 * L1i / Sf, 100 * (Si / Sf - 1));
+			std::printf("K %d %s d %4.0f kpc inc %4.1f: light %+6.2f%%  L1 %6.2f%%  per-pixel p50 %5.1f%% p90 %5.1f%% p99 %6.1f%%  (galaxy %.0f%% of the frame)\n",
+				KNodes, NoDust ? "no dust" : "dust", D, Inc, 100.0 * (Si / Sr - 1.0), 100.0 * L1 / Sr, 100 * Q(0.5), 100 * Q(0.9), 100 * Q(0.99), 100.0 * Rel.size() / Ref.size());
+			std::fflush(stdout);
+		}
+	}
+	Uni::Check(9, "X.explore.impostor", "exploration").Pass(true, "printed");
+}

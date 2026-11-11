@@ -914,6 +914,14 @@ void UUniSubsystem::LogPerf()
 		(MFlags & 1u) ? TEXT(", with the background") : TEXT(""), BgPp - BgPerPixelAtPerf, PerfFrames - PerfFramesAtBg);
 	BgPerPixelAtPerf = BgPp;
 	PerfFramesAtBg = PerfFrames;
+	// D-228: the far cache.
+	{
+		static IConsoleVariable* CVarFar = IConsoleManager::Get().FindConsoleVariable(TEXT("uu.VolumeFar"));
+		static IConsoleVariable* CVarFarStart = IConsoleManager::Get().FindConsoleVariable(TEXT("uu.VolumeFarStartPc"));
+		UE_LOG(LogUnifiedUniverse, Log, TEXT("  far cache (uu.VolumeFar %d, split %.0f pc, %u^2 faces): %s, parallax %.3f texels a frame (on below uu.VolumeFarOnMotion, off above uu.VolumeFarOffMotion); so far %u frames on, %u switches, %u faces re-marched, %u scene changes, %u history drops"),
+			CVarFar ? CVarFar->GetInt() : -1, CVarFarStart ? CVarFarStart->GetFloat() : -1.0f, R.FarFaceSize.load(), UTF8_TO_TCHAR(UniCore::FarReasonName(UniCore::EFarReason(R.FarReason.load()))), R.FarMotion.load(),
+			R.FarFramesOn.load(), R.FarSwitches.load(), R.FarFacesFilled.load(), R.FarSceneChanges.load(), R.FarHistoryDrops.load());
+	}
 	uint32 Sl[FUniRenderStats::NumSliceCounts];
 	for (int32 I = 0; I < FUniRenderStats::NumSliceCounts; ++I) { Sl[I] = FUniRenderer::Get().Stats.VolumeSliceCounts[I].exchange(0u); }   // R is const
 	UE_LOG(LogUnifiedUniverse, Log, TEXT("  volume slicing since the last uu.Perf: 1/16 %u, 1/9 %u, 1/4 %u frames; not sliced %u (temporal off or a debug view %u, no history %u, march size changed %u, camera jump %u, same frame rendered again %u, frames skipped %u)"),

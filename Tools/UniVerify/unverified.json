@@ -222,5 +222,9 @@
   {
     "id": "UE-58",
     "what": "D-225: supersampling scales with sqrt(carrier weight) (UniVolume.ush): no hitch at the owner's angles with uu.VolumeMaxSubsamples 8 (default); the image as with uu.VolumeMaxSubsamples 1; cluster glows not blocky up close (REVIEW_TONIGHT section 59)."
+  },
+  {
+    "id": "UE-59",
+    "what": "D-228: the far cache (uu.VolumeFar 1): the new FarCS compiles; parked inside a galaxy uu.Perf shows the far cache on and Uni.Volume.March (near: far cache on) cheaper than the march with uu.VolumeFar 0; the image the same either way (no seam at the 2 kpc split, no blocky far light, no flash when it switches on or off); stars far away dimmed by dust the same; travelling it goes off (REVIEW_TONIGHT section 60)."
   }
 ]

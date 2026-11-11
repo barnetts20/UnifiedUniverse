@@ -189,6 +189,12 @@ The march's cost is rays x steps per ray x cost per step. These are the console 
 | `uu.BackgroundMode` | 2 | the background from its direction map, marched per pixel only while travelling fast | D-166 |
 | `uu.BackgroundPerPixelInterval` | 0 (automatic) | how often the background must change to be marched per pixel (D-224: judged on the march's pixels before the auto budget) | D-196, D-224 |
 | `uu.BackgroundPerPixelInside` | 0 | inside a galaxy (a local carrier) the background stays on its map while travelling; 1: per pixel there too (before D-224; ~8x the march) | D-224 |
+| `uu.VolumeFar` | 1 | the far cache: inside a galaxy and nearly still, the march stops at `uu.VolumeFarStartPc` and the rest comes from a six-face map refreshed face by face (~0.4x the march at rest). 0: off | D-228 |
+| `uu.VolumeFarStartPc` | 2000 | the far cache's split. Farther: refreshes rarer, the near march costlier | D-228 |
+| `uu.VolumeFarSize` | 0 (auto) | the far map's face size: auto = the march's pixels at the view's centre (before the auto budget), in 64s, 128-1024 | D-228 |
+| `uu.VolumeFarFillFrames` | 8 | frames a face's re-march is spread over (one face in one frame is ~3x the march) | D-228 |
+| `uu.VolumeFarOnFrames` / `OnMotion` / `OffMotion` | 30 / 0.02 / 0.04 | on below OnMotion texels of parallax at the split a frame, held OnFrames frames; off above OffMotion (break-even ~0.06) | D-228 |
+| `uu.VolumeFarDueTexels` | 0.3 | a face in view is re-marched past this parallax since it was marched (out of view: 1.2) | D-228 |
 
 **Steps per ray.**
 | Setting | Default | What it does | Decision |

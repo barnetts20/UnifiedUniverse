@@ -1,0 +1,175 @@
+// test_zz_farcache.cpp — exploration only (PARADIGMS #2, B-028; archived after the run).
+// The march split by distance: the near part (to R) marched every frame with today's slicing, the
+// far part (from R) marched into a world-aligned cube from an anchor position, refreshed when the
+// camera has moved Budget texels of parallax at R, composited B = B_near + T_near B_far(dir).
+// Against today's slicing of the whole march, every frame against the fine reference (the D-219
+// harness: error, crawl), and the steps it costs (near rays x steps + the cube's in-view refreshes).
+
+#include "../src/UniTest.h"
+#include "../src/UniRenderRef.h"
+#include "../src/UniVerifyCommon.h"
+#include "../src/UniVolumeRef.h"
+#include "../scenes/UniScenes.h"
+#include "UniVolume.h"
+#include <algorithm>
+#include <cmath>
+#include <string>
+#include <vector>
+
+using namespace UniCore;
+using namespace UniRender;
+namespace H = UniHlsl;
+
+namespace
+{
+	std::vector<H::float4> FineMarch(const FVolumeScene& Sc, const FCamera& Cam)
+	{
+		FVolumeScene F = Sc;
+		F.View.MarchFlags |= 2u;
+		F.View.MaxSteps *= 8u;
+		FTemporalVolume Full;
+		Full.Step(F, Cam, FV3{ 0, 0, 0 }, false, false, 4);
+		return Full.Vol;
+	}
+
+	FV3 Rotate(const FV3& V, const FV3& Axis, double A)
+	{
+		const FV3 K = Norm(Axis);
+		const double C = std::cos(A), S = std::sin(A);
+		return V * C + Cross(K, V) * S + K * (Dot(K, V) * (1.0 - C));
+	}
+
+	struct FRes { double Error = 0, Crawl = 0, Light = 0, StepsPerFrame = 0; int Frames = 0, Refreshes = 0; };
+
+	/** R <= 0: today's slicing of the whole march. */
+	FRes Fly(const FUniverseDef& D, FCoord Cam, FV3 Look, FV3 StepCm, FV3 Axis, double Turn, int Frames, int Warm, int W, int Ht, double R, int N, double Budget)
+	{
+		FUniverseModel M(D);
+		FRefGenerator G(M);
+		FVolumeBuilder VB(M, G);
+		FRefPipeline P(G);
+		P.bVelocityLod = false;
+		FTemporalVolume Tv;
+		FRes St;
+		FV3 Fwd = Norm(Look);
+		std::vector<double> PrevE;
+		FBackgroundCube Cube;
+		bool bCube = false;
+		FCoord Anchor = Cam;
+		const double TexelRad = 1.5707963 / double(N);
+		double Steps = 0.0;
+		for (int F = 0; F < Frames; ++F)
+		{
+			if (F > 0)
+			{
+				FVec3f Fr{};
+				AddDisplacement(Cam, Fr, FVec3d{ StepCm.X, StepCm.Y, StepCm.Z });
+				Fwd = Rotate(Fwd, Axis, Turn);
+			}
+			P.Update(Cam, FVec3f{});
+			FCamera Cm; Cm.Coord = Cam; Cm.Width = W; Cm.Height = Ht; Cm.DeltaMag = 0.0;
+			Cm.LookAlong(Fwd);
+			const FVolumeScene Sc = VB.Build(P, Cam, FVec3f{}, Cm.View()).Subset(false);
+			FVolumeScene Near = Sc;
+			if (R > 0.0) { for (auto& C : Near.Carriers) { C.TEnd = std::min(C.TEnd, float(R)); } }
+			{
+				const double ThetaPix = 2.0 * Cm.TanX() / double(W);
+				const double StepLen = std::sqrt(Dot(StepCm, StepCm));
+				const double Move = F > 0 && StepLen > 0.0 ? (Near.NearCm > 0.0 ? StepLen / Near.NearCm : 1.0e9) : 0.0;
+				const double MotionPx = ((F > 0 ? std::abs(Turn) : 0.0) + Move) / ThetaPix;
+				Tv.Interleave = H::Uni_TemporalInterleave(float(MotionPx), 4u);
+			}
+			const size_t S0 = Tv.Steps;
+			Tv.Step(Near, Cm, F > 0 ? StepCm : FV3{ 0, 0, 0 }, F > 0, true, 4);
+			if (F >= Warm) { Steps += double(Tv.Steps - S0); }
+			// The far cube: refreshed when the camera has moved Budget texels of parallax at R.
+			if (R > 0.0)
+			{
+				const FVec3d Mv = ToDouble(Sub(Cam, Anchor));
+				const double Moved = std::sqrt(Mv.X * Mv.X + Mv.Y * Mv.Y + Mv.Z * Mv.Z);
+				if (!bCube || Moved > Budget * TexelRad * R)
+				{
+					FVolumeScene Far = Sc;
+					for (auto& C : Far.Carriers) { C.TStart = std::max(C.TStart, float(R)); }
+					Cube = RenderBackgroundCube(Far, N);
+					Anchor = Cam;
+					bCube = true;
+					if (F >= Warm)
+					{
+						++St.Refreshes;
+						// The in-view share of the cube's texels (a refresh of what the view can see).
+						size_t In = 0;
+						const double Cv = std::cos(std::atan(std::sqrt(Cm.TanX() * Cm.TanX() + Cm.TanY() * Cm.TanY())) + 2.0 * TexelRad);
+						for (int Fc = 0; Fc < 6; ++Fc) for (int Y = 0; Y < N; ++Y) for (int X = 0; X < N; ++X)
+						{
+							const H::float3 Dd = H::Uni_CubeTexelDir(u32(Fc), X + 0.5f, Y + 0.5f, float(N));
+							if (Dd.x * Fwd.X + Dd.y * Fwd.Y + Dd.z * Fwd.Z > Cv) { ++In; }
+						}
+						Steps += double(Cube.Steps) * double(In) / double(6 * N * N);
+					}
+				}
+			}
+			std::vector<H::float4> Out = Tv.Vol;
+			if (R > 0.0)
+			{
+				for (int Y = 0; Y < Ht; ++Y) for (int X = 0; X < W; ++X)
+				{
+					const FV3 Dw = PixelDir(Cm, W, Ht, X + 0.5, Y + 0.5);
+					const H::float3 Bf = Cube.Sample(H::float3(float(Dw.X), float(Dw.Y), float(Dw.Z)));
+					H::float4& O = Out[size_t(Y) * W + X];
+					O.x += O.w * Bf.x; O.y += O.w * Bf.y; O.z += O.w * Bf.z;
+				}
+			}
+			if (F < Warm - 1) { continue; }
+			const std::vector<H::float4> Ref = FineMarch(Sc, Cm);
+			std::vector<double> E(Ref.size());
+			double Sa = 0, Sb = 0, Se = 0;
+			for (size_t I = 0; I < Ref.size(); ++I)
+			{
+				const double Om = PixelSolidAngle(Cm, W, Ht, double(I % W) + 0.5, double(I / W) + 0.5);
+				const double La = double(H::Uni_Luminance(H::float3(Out[I].x, Out[I].y, Out[I].z))) * Om;
+				const double Lb = double(H::Uni_Luminance(H::float3(Ref[I].x, Ref[I].y, Ref[I].z))) * Om;
+				E[I] = La - Lb; Sa += La; Sb += Lb; Se += std::abs(E[I]);
+			}
+			if (F >= Warm)
+			{
+				double Sc2 = 0.0;
+				for (size_t I = 0; I < E.size(); ++I) { Sc2 += std::abs(E[I] - PrevE[I]); }
+				St.Crawl += Sc2 / std::max(Sb, 1e-300);
+				St.Error += Se / std::max(Sb, 1e-300);
+				St.Light = std::max(St.Light, std::abs(Sa / std::max(Sb, 1e-300) - 1.0));
+				++St.Frames;
+			}
+			PrevE = E;
+		}
+		if (St.Frames > 0) { St.Error /= St.Frames; St.Crawl /= St.Frames; St.StepsPerFrame = Steps / St.Frames / double(W * Ht); }
+		return St;
+	}
+}
+
+UNI_TEST(explore, farcache)
+{
+	const double Pc = Units::Pc;
+	const FUniverseDef D = UniScenes::GalaxyToStar();
+	const FCoord Solar = UniScenes::SolarCamera();
+	const double Deg = 3.14159265358979 / 180.0;
+	struct FCase { const char* Name; FV3 Step; double Turn; };
+	const FCase Cases[] = {
+		{ "0.3 pc/frame, turning 0.05 deg", { -0.3 * Pc, 0.04 * Pc, 0.0 }, 0.05 * Deg },
+		{ "3 pc/frame, turning 0.1 deg", { -3.0 * Pc, 0.4 * Pc, 0.0 }, 0.1 * Deg },
+		{ "15 pc/frame", { -15.0 * Pc, 2.0 * Pc, 0.0 }, 0.0 },
+	};
+	const int W = 160, Ht = 100, Frames = 16, Warm = 6, N = 160;
+	for (const FCase& C : Cases)
+	{
+		const FRes Base = Fly(D, Solar, { -1, -0.12, -0.02 }, C.Step, { 0.2, 0, 1 }, C.Turn, Frames, Warm, W, Ht, 0.0, N, 0.5);
+		std::printf("%-32s today's slicing:          error %.3f%% crawl %.3f%% light %.3f%%, %.1f steps/px a frame\n", C.Name, 100 * Base.Error, 100 * Base.Crawl, 100 * Base.Light, Base.StepsPerFrame);
+		for (double R : { 300.0, 1000.0 })
+		{
+			const FRes A = Fly(D, Solar, { -1, -0.12, -0.02 }, C.Step, { 0.2, 0, 1 }, C.Turn, Frames, Warm, W, Ht, R * Pc, N, 0.5);
+			std::printf("%-32s far cache from %4.0f pc:   error %.3f%% crawl %.3f%% light %.3f%%, %.1f steps/px a frame, %d refreshes in %d frames\n", C.Name, R, 100 * A.Error, 100 * A.Crawl, 100 * A.Light, A.StepsPerFrame, A.Refreshes, A.Frames);
+			std::fflush(stdout);
+		}
+	}
+	Uni::Check(9, "X.explore.farcache", "exploration").Pass(true, "printed");
+}
