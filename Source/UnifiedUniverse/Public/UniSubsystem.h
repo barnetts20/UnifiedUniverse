@@ -293,6 +293,7 @@ private:
 
 	// Travel sensitivity (D-154): the owner's sensitivity plus a speed-driven boost
 	UniCore::FTravelSensitivity Warp;   // D-187: the same curve, 0..1, for the warp effects
+	UniCore::FMotionWebRamp MotionWebRamp;   // D-231: the motion web's ramp from the camera's speed
 	UniCore::FVolumeAutoBudget VolumeBudget;   // D-200: the glow's pixel budget follows the GPU frame time
 	// D-212 / D-214: the galaxy maps (a cache of GPU array slots): generation places a galaxy's
 	// stars from its map, the volume marches the camera's galaxy from it (uu.GalaxyMap).

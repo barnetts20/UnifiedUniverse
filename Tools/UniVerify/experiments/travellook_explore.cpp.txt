@@ -1,0 +1,184 @@
+// test_zz_travellook.cpp — exploration (archived after). D-230 previews: the motion web and the
+// Run (D-230): the flythrough universe + the delivered adhesion web + nodes, the void camera, 480 x 270
+//   at exposure gain 1 (intensity 1 = a star at the exposure magnitude: the engine's near-black sky).
+//   Motion web 0.002 / 0.006 / 0.02 disc brightness per Mpc: barely / subtly / clearly visible;
+//   threshold 2 shows walls and voids, 5-8 only clusters as blobs; near structure (< ~3 Mpc) is soft
+//   blobs (1.6 Mpc texels). Shift 0.5 / colour 1.0 reads; 1.0 / 1.5 is saturated. Adopted defaults:
+//   web 0.01, threshold 3, near 4 Mpc, depth 50 Mpc; shift 0.5, colour 1.0. A 90-frame flight at
+//   10 Mpc/s (384 wide) went to the owner as travel_look.mp4.
+// travel shift in the engine's universe (flythrough + the delivered adhesion web + its nodes),
+// from intergalactic space, every variant at the baseline frame's display gain (so faint things
+// compare). Writes PPMs (+ HUD json) to the render dir; make_images-style conversion afterwards.
+//   UNI_LOOK_FRAMES=N: also an N-frame flight (ahead, full travel) for an animation.
+
+#include "../src/UniTest.h"
+#include "../src/UniVerifyCommon.h"
+#include "../src/UniRenderRef.h"
+#include "../src/UniVolumeRef.h"
+#include "../scenes/UniScenes.h"
+#include "UniWebTexture.h"
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <string>
+#include <vector>
+#include <sys/stat.h>
+
+using namespace UniCore;
+using namespace UniRender;
+namespace H = UniHlsl;
+
+namespace
+{
+	struct FBind
+	{
+		explicit FBind(const FWebTexture& T) { BindWebTexture(&T); }
+		~FBind() { BindWebTexture(nullptr); }
+	};
+
+	std::string RenderDir()
+	{
+		const std::string D = "/tmp/claude-0/-home-claude/5ebb05c0-e0e6-544e-8d1b-ba7ff3e719ef/scratchpad/look";
+		::mkdir(D.c_str(), 0755);
+		return D;
+	}
+
+	void Write(const FImage& Img, const std::string& Name, const std::vector<std::string>& Hud)
+	{
+		const std::string Base = RenderDir() + "/" + Name;
+		Img.WritePpm(Base + ".ppm");
+		FILE* F = std::fopen((Base + ".hud.json").c_str(), "wb");
+		if (!F) { return; }
+		std::fprintf(F, "{\"lines\":[");
+		for (size_t I = 0; I < Hud.size(); ++I) { std::fprintf(F, "%s\"%s\"", I ? "," : "", Hud[I].c_str()); }
+		std::fprintf(F, "]}\n");
+		std::fclose(F);
+	}
+
+	float GainOf(const FImage& Img)
+	{
+		std::vector<float> L;
+		for (size_t I = 0; I + 2 < Img.Rgb.size(); I += 3) { L.push_back(0.2126f * Img.Rgb[I] + 0.7152f * Img.Rgb[I + 1] + 0.0722f * Img.Rgb[I + 2]); }
+		std::sort(L.begin(), L.end());
+		const float P = L.empty() ? 0.0f : L[size_t(double(L.size() - 1) * 0.995)];
+		return P > 0.0f ? 1.5f / P : 1.0f;
+	}
+}
+
+UNI_TEST(explore, travellook)
+{
+	FWebTexture T;
+	std::string Err;
+	if (!FWebTexture::LoadDelivered("Data/Noise", "web_adhesion_density_mid", T, &Err)) { Uni::Check(9, "X.explore.travellook", "x").Pass(false, Err); return; }
+	FBind Bind(T);
+	std::vector<FWebNode> Nodes;
+	std::string NErr;
+	const bool bNodes = LoadWebNodes("Data/Noise", "web_adhesion_density_mid", Nodes, &NErr);
+	const UniScenes::FClusterTuning Tun;
+	FUniverseDef Def = UniScenes::Flythrough(Tun);
+	const H::float4 Mean = T.Mean();
+	UniScenes::UseDeliveredWeb(Def, Tun, T.Size, Mean.z / (double(Mean.x) + Mean.y + Mean.z + Mean.w), bNodes ? &Nodes : nullptr);
+	FUniverseModel M(Def);
+	FRefGenerator G(M);
+	FVolumeBuilder VB(M, G);
+	FRefPipeline P(G);
+	P.bVelocityLod = false;
+	P.DeltaMag = 2.5;   // full travel sensitivity (the travel curve at 1)
+	const FCoord Cam0 = UniScenes::VoidCamera();
+	const FV3 Ahead = Norm(FV3{ 1.0, 0.3, 0.1 });
+	const int W = std::getenv("UNI_LOOK_W") ? std::atoi(std::getenv("UNI_LOOK_W")) : 480, Ht = W * 9 / 16;
+	const double Mpc = Units::Mpc;
+	const double Thr = std::getenv("UNI_LOOK_THR") ? std::atof(std::getenv("UNI_LOOK_THR")) : 2.0;
+	const double InvRef = 1.0 / ((double(Mean.y) + double(Mean.z)) * Thr);
+	const double DiscSb = 7.0e4;   // a galaxy disc's surface brightness, exposure units per sr (VOLUMETRICS §8)
+	auto Frame = [&](const FCoord& Cam, FV3 Look, double WebGain, double ShiftAmt, double ShiftK, FImage& Img, double* Ms)
+	{
+		P.Update(Cam, FVec3f{});
+		FCamera Cm; Cm.Coord = Cam; Cm.Width = W; Cm.Height = Ht; Cm.DeltaMag = 2.5;
+		Cm.LookAlong(Look);
+		Cm.ShiftAmount = ShiftAmt; Cm.ShiftK = ShiftK; Cm.ShiftVel = Ahead;
+		FVolumeSettings S;
+		S.MotionWebGain = float(WebGain * DiscSb / Mpc);
+		S.MotionWebInvRef = float(InvRef);
+		S.MotionWebNearCm = float((std::getenv("UNI_LOOK_NEAR") ? std::atof(std::getenv("UNI_LOOK_NEAR")) : 1.0) * Mpc);
+		S.MotionWebDepthCm = float((std::getenv("UNI_LOOK_DEPTH") ? std::atof(std::getenv("UNI_LOOK_DEPTH")) : 50.0) * Mpc);
+		const auto T0 = std::chrono::steady_clock::now();
+		const FVolumeScene Sc = VB.Build(P, Cam, FVec3f{}, Cm.View(), S);
+		RenderFrameWithVolume(P, Sc, Cm, Img);
+		if (Ms) { *Ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - T0).count(); }
+	};
+	// Baseline: today's look, ahead; its gain for every frame.
+	FImage Base(W, Ht);
+	double Ms = 0.0;
+	Frame(Cam0, Ahead, 0.0, 0.0, 0.0, Base, &Ms);
+	const float Gn = std::getenv("UNI_LOOK_AUTO") ? GainOf(Base) : 1.0f;   // 1: exposure units as displayed (intensity 1 = a star at the exposure magnitude)
+	std::printf("baseline frame %.0f ms; display gain %.4g (a pixel's radiance x solid angle x gain)\n", Ms, double(Gn));
+	auto Out = [&](FImage& Img, const std::string& Name, const std::string& Title)
+	{
+		for (float& V : Img.Rgb) { V *= Gn; }
+		Write(Img, Name, { Title });
+	};
+	if (std::getenv("UNI_LOOK_TAG"))
+	{
+		// One variant only: ahead and to the side, with the shift.
+		const std::string Tag = std::getenv("UNI_LOOK_TAG");
+		const double Gw = std::getenv("UNI_LOOK_GAIN") ? std::atof(std::getenv("UNI_LOOK_GAIN")) : 0.01;
+		const FV3 Side = Norm(FV3{ Ahead.X + 0.25, Ahead.Y - 0.9, Ahead.Z });
+		for (int Dir = 0; Dir < 2; ++Dir)
+		{
+			FImage I(W, Ht);
+			Frame(Cam0, Dir == 0 ? Ahead : Side, Gw, 0.5, 1.0, I, nullptr);
+			for (float& V : I.Rgb) { V *= Gn; }
+			Write(I, "v_" + Tag + (Dir == 0 ? "_a" : "_s"), { Uni::Fmt("%s: web %.3g, threshold %.1f, near %s Mpc; shift 0.5: %s", Tag.c_str(), Gw, Thr, std::getenv("UNI_LOOK_NEAR") ? std::getenv("UNI_LOOK_NEAR") : "1", Dir == 0 ? "ahead" : "45 deg off") });
+		}
+		Uni::Check(9, "X.explore.travellook", "x").Pass(true, "written");
+		return;
+	}
+	Out(Base, "look_0_base", "today (no motion web, no shift): ahead");
+	const double Gains[] = { 0.002, 0.006, 0.02 };
+	const char* GName[] = { "a", "b", "c" };
+	for (int K = 0; K < 3; ++K)
+	{
+		FImage I(W, Ht);
+		Frame(Cam0, Ahead, Gains[K], 0.0, 0.0, I, nullptr);
+		Out(I, std::string("look_1") + GName[K] + "_web", Uni::Fmt("motion web %.3g disc brightness per Mpc (threshold %.1fx): ahead", Gains[K], Thr));
+	}
+	const double Shifts[][2] = { { 0.5, 1.0 }, { 1.0, 1.5 } };
+	for (int K = 0; K < 2; ++K)
+	{
+		for (int Dir = 0; Dir < 2; ++Dir)
+		{
+			FImage I(W, Ht);
+			const FV3 L = Dir == 0 ? Ahead : FV3{ -Ahead.X, -Ahead.Y, -Ahead.Z };
+			Frame(Cam0, L, Gains[1], Shifts[K][0], Shifts[K][1], I, nullptr);
+			Out(I, Uni::Fmt("look_2%c_shift_%s", 'a' + K, Dir == 0 ? "ahead" : "behind"), Uni::Fmt("motion web %.3g + shift %.1f (colour %.1f): %s", Gains[1], Shifts[K][0], Shifts[K][1], Dir == 0 ? "ahead" : "behind"));
+		}
+	}
+	{
+		FImage I(W, Ht);
+		const FV3 Side = Norm(Cross(Ahead, FV3{ 0, 0, 1 }));
+		Frame(Cam0, Side, Gains[1], Shifts[0][0], Shifts[0][1], I, nullptr);
+		Out(I, "look_2c_shift_side", Uni::Fmt("motion web %.3g + shift %.1f: to the side", Gains[1], Shifts[0][0]));
+	}
+	// Optional flight for an animation (full travel: 10 Mpc/s, 0.167 Mpc a frame at 60 fps).
+	const int NF = std::getenv("UNI_LOOK_FRAMES") ? std::atoi(std::getenv("UNI_LOOK_FRAMES")) : 0;
+	const double WebG = std::getenv("UNI_LOOK_GAIN") ? std::atof(std::getenv("UNI_LOOK_GAIN")) : Gains[1];
+	const double StepMpc = std::getenv("UNI_LOOK_STEP") ? std::atof(std::getenv("UNI_LOOK_STEP")) : 0.167;
+	const int bBoth = std::getenv("UNI_LOOK_BOTH") ? 1 : 0;
+	for (int F = 0; F < NF; ++F)
+	{
+		FCoord C = Cam0;
+		{ FVec3f Fr{}; AddDisplacement(C, Fr, FVec3d{ Ahead.X * StepMpc * F * Mpc, Ahead.Y * StepMpc * F * Mpc, Ahead.Z * StepMpc * F * Mpc }); }
+		const FV3 Look = Norm(FV3{ Ahead.X + 0.25, Ahead.Y - 0.5, Ahead.Z });
+		for (int V = 0; V <= bBoth; ++V)
+		{
+			FImage I(W, Ht);
+			if (V == 0) { Frame(C, Look, WebG, Shifts[0][0], Shifts[0][1], I, &Ms); }
+			else { Frame(C, Look, 0.0, 0.0, 0.0, I, &Ms); }
+			Out(I, Uni::Fmt("anim%d_%03d", V, F), V == 0 ? "motion web + shift" : "today");
+		}
+		if (F % 10 == 0) { std::printf("frame %d %.0f ms\n", F, Ms); std::fflush(stdout); }
+	}
+	Uni::Check(9, "X.explore.travellook", "x").Pass(true, "written");
+}

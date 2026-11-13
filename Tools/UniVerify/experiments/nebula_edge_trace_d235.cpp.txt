@@ -1,0 +1,50 @@
+#include "../src/UniTest.h"
+#include "../src/UniVerifyCommon.h"
+#include "../scenes/UniScenes.h"
+#include "UniWebTexture.h"
+#include <cmath>
+#include <cstdio>
+using namespace UniCore;
+namespace H = UniHlsl;
+UNI_TEST(zz, nebedge)
+{
+	FWebTexture T[3];
+	for (int S = 0; S < 3; ++S) { std::string E; FWebTexture::LoadDelivered("Data/Noise", GalaxyTextureName(S), T[S], &E); BindGalaxyTexture(S, &T[S]); }
+	FUniverseDef D = UniScenes::GalaxyToStar();
+	UniScenes::UseGalaxyTextures(D, T[0].Size);
+	const H::FUniFieldParams P = D.Anchors.back().EmitterParams[0].ToHlsl();
+	const H::FUniGalaxyConst K = H::Uni_GalaxyConstOf(P);
+	const double O[3] = { 0.53, 0.0, 0.066 };
+	double Fw[3] = { -1.0, 0.15, -0.45 };
+	{ const double L = std::sqrt(Fw[0] * Fw[0] + Fw[1] * Fw[1] + Fw[2] * Fw[2]); for (double& V : Fw) { V /= L; } }
+	double Rt[3] = { -Fw[1], Fw[0], 0.0 };
+	{ const double L = std::sqrt(Rt[0] * Rt[0] + Rt[1] * Rt[1]); Rt[0] /= L; Rt[1] /= L; }
+	const double Up[3] = { Rt[1] * Fw[2] - Rt[2] * Fw[1], Rt[2] * Fw[0] - Rt[0] * Fw[2], Rt[0] * Fw[1] - Rt[1] * Fw[0] };
+	const double Tan = std::tan(0.5 * 70.0 * 3.14159265358979 / 180.0);
+	const double V0 = -(1.0 - 2.0 * 0.5 / 54) * Tan * 54.0 / 96.0 * 0.8;
+	double Dir[3]; double L = 0;
+	for (int A = 0; A < 3; ++A) { Dir[A] = Fw[A] + V0 * Up[A]; L += Dir[A] * Dir[A]; }
+	L = std::sqrt(L); for (double& V : Dir) { V /= L; }
+	std::printf("dir %.3f %.3f %.3f up %.3f %.3f %.3f\n", Dir[0], Dir[1], Dir[2], Up[0], Up[1], Up[2]);
+	const H::float3 Dd = H::float3(float(Dir[0]), float(Dir[1]), float(Dir[2]));
+	double Tt = 1e-4;
+	for (int N = 0; N < 200; ++N)
+	{
+		const H::float3 Pt(float(O[0] + Tt * Dir[0]), float(O[1] + Tt * Dir[1]), float(O[2] + Tt * Dir[2]));
+		if (H::dot(Pt, Pt) >= 1.0f) { break; }
+		const float Foot = float(0.0146 * Tt);
+		const double Hs = 3.0 * double(H::Uni_GalaxyStepHintFilteredK(Pt, Dd, P, Foot, K.Hp)), Cp = double(H::Uni_GalaxyNebulaStepCap(Pt, Dd, P, K.Hp));
+		double S = std::min(std::min(0.32 * Tt, Hs), Cp);
+		const double Tm = Tt + 0.5 * S;
+		const H::float3 Pm(float(O[0] + Tm * Dir[0]), float(O[1] + Tm * Dir[1]), float(O[2] + Tm * Dir[2]));
+		H::float4 C(0, 0, 0, 0), Nv(0, 0, 0, 0);
+		H::UniField_GalaxyFilteredCKN(Pm, P, K, float(0.0146 * Tm), C, Nv);
+		const float Inpl = float(std::sqrt(Dir[0] * Dir[0] + Dir[1] * Dir[1]));
+		const float B = H::Uni_GalaxyNebulaBlend(P, float(0.0146 * Tm), float(S) * Inpl);
+		if (Nv.x > 1e-4f) std::printf("T %.4f z %.4f S %.5f (log %.4f hint %.4f cap %.4g) src %.3g K %.3f B %.2f dens %.3g\n", Tt, Pm.z, S, 0.32 * Tt, Hs, Cp, Nv.x, Nv.y, B, H::Uni_GalaxyNebulaDensity(Nv, P, float(0.0146 * Tm), float(S) * Inpl));
+		Tt += S;
+	}
+	std::printf("A.y %.4f H.y %.3f G.w %.2f H.w %.0f\n", P.A.y, P.H.y, P.G.w, P.H.w);
+	for (int S = 0; S < 3; ++S) { BindGalaxyTexture(S, nullptr); }
+	Uni::Check(2, "Z.nebedge", "dbg").Pass(true, "ok");
+}

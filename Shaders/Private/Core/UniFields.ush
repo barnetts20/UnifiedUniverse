@@ -47,6 +47,53 @@
 #ifndef UNI_GAL_FINE_GAIN
 #define UNI_GAL_FINE_GAIN 15.2f
 #endif
+// D-232: the spheroid noise reads galaxy_detail at this mip at least (16 texels a period: its
+// structure from the 4-cycle base octave to part of the 8-cycle one). Finer octaves are finer
+// than the march's steps through a spheroid (0.3 of the profile's log-slope length, 0.25 beyond
+// 6 r_e) and slid as the steps moved: 0.2-1.2% of the light at mip 0, 0.06-0.21% at 3 (textured
+// spirals 0.09-0.13%). It also suits a spheroid: lumps of about r_e, not grain.
+#ifndef UNI_GAL_SPH_MIP_FLOOR
+#define UNI_GAL_SPH_MIP_FLOOR 3.0f
+#endif
+// D-235: the nebulae's read mip, its knot stretch, the blend's footprint and step thresholds and
+// the gas layer's step cap (read texels), here at the top: Uni_GalaxyTexTerms reads at
+// UNI_NEBULA_MIP (the C++ shim defines them first, so only the shader compiler saw the order).
+// Their use is documented with Uni_GalaxyNebulaDensity, Uni_GalaxyNebulaBlend and
+// Uni_GalaxyNebulaStepCap.
+#ifndef UNI_NEBULA_MIP
+#define UNI_NEBULA_MIP 1.0f
+#endif
+#ifndef UNI_NEBULA_STRETCH
+#define UNI_NEBULA_STRETCH 1.0694f
+#endif
+#ifndef UNI_NEBULA_RES
+#define UNI_NEBULA_RES 0.25f
+#endif
+#ifndef UNI_NEBULA_FOOT
+#define UNI_NEBULA_FOOT 3.0f
+#endif
+#ifndef UNI_NEBULA_STEP
+#define UNI_NEBULA_STEP 0.25f
+#endif
+// D-236: the early types' nebula filaments: their read's mip, its frequency (UNI_EARLY_NEB_FREQ
+// x G.w texture periods an effective radius: one period 8 r_e at G.w 1), the sphere they fill
+// (UNI_EARLY_NEB_RADIUS r_e), and the march's steps across it (Uni_GalaxyNebulaStepCap: a volume,
+// not a layer, so the steps are a chord's share; the read is coarse enough for them to sample).
+#ifndef UNI_EARLY_NEB_MIP
+#define UNI_EARLY_NEB_MIP 2.0f
+#endif
+#ifndef UNI_EARLY_NEB_FREQ
+#define UNI_EARLY_NEB_FREQ 0.125f
+#endif
+#ifndef UNI_EARLY_NEB_RADIUS
+#define UNI_EARLY_NEB_RADIUS 3.0f
+#endif
+#ifndef UNI_EARLY_NEB_MAX_STEPS
+#define UNI_EARLY_NEB_MAX_STEPS 192.0f
+#endif
+#ifndef UNI_EARLY_NEB_STEP
+#define UNI_EARLY_NEB_STEP 0.25f
+#endif
 
 #ifndef UNI_WEB_TEX_SAMPLE
 #error "Include UniWebTexture.ush (HLSL) or UniHlslShim.h (C++) before the cores"
@@ -507,6 +554,7 @@ struct FUniGalaxyConst
 	uint Ho;      // texture offsets: SeedMix(Hs, 1)
 	uint Hp;      // mode phases: SeedMix(Hs, 0)
 	uint4 ArmH;   // per-arm hashes: SeedMix(Hs, 8..11)
+	uint Hn;      // D-232: the spheroid noise's channel weights and signs: SeedMix(Hs, 12)
 };
 
 UNI_FN FUniGalaxyConst Uni_GalaxyConstOf(FUniFieldParams InPar)
@@ -517,6 +565,7 @@ UNI_FN FUniGalaxyConst Uni_GalaxyConstOf(FUniFieldParams InPar)
 	K.Ho = Uni_SeedMix(K.Hs, 1u);
 	K.Hp = Uni_SeedMix(K.Hs, 0u);
 	K.ArmH = uint4(Uni_SeedMix(K.Hs, 8u), Uni_SeedMix(K.Hs, 9u), Uni_SeedMix(K.Hs, 10u), Uni_SeedMix(K.Hs, 11u));
+	K.Hn = Uni_SeedMix(K.Hs, 12u);
 	return K;
 }
 
@@ -528,10 +577,11 @@ UNI_FN FUniFieldParams Uni_GalaxyConstPack(FUniGalaxyConst InK)
 	FUniFieldParams O;
 	const float2 S = Uni_GalaxyConstHalves(InK.Hs), Oo = Uni_GalaxyConstHalves(InK.Ho), P = Uni_GalaxyConstHalves(InK.Hp);
 	const float2 A0 = Uni_GalaxyConstHalves(InK.ArmH.x), A1 = Uni_GalaxyConstHalves(InK.ArmH.y), A2 = Uni_GalaxyConstHalves(InK.ArmH.z), A3 = Uni_GalaxyConstHalves(InK.ArmH.w);
+	const float2 N = Uni_GalaxyConstHalves(InK.Hn);
 	O.A = float4(S.x, S.y, Oo.x, Oo.y);
 	O.B = float4(P.x, P.y, A0.x, A0.y);
 	O.C = float4(A1.x, A1.y, A2.x, A2.y);
-	O.D = float4(A3.x, A3.y, 0.0f, 0.0f);
+	O.D = float4(A3.x, A3.y, N.x, N.y);
 	O.E = float4(0.0f, 0.0f, 0.0f, 0.0f); O.F = O.E; O.G = O.E; O.H = O.E;
 	return O;
 }
@@ -543,6 +593,7 @@ UNI_FN FUniGalaxyConst Uni_GalaxyConstUnpack(FUniFieldParams InB)
 	K.Ho = Uni_GalaxyConstJoin(InB.A.z, InB.A.w);
 	K.Hp = Uni_GalaxyConstJoin(InB.B.x, InB.B.y);
 	K.ArmH = uint4(Uni_GalaxyConstJoin(InB.B.z, InB.B.w), Uni_GalaxyConstJoin(InB.C.x, InB.C.y), Uni_GalaxyConstJoin(InB.C.z, InB.C.w), Uni_GalaxyConstJoin(InB.D.x, InB.D.y));
+	K.Hn = Uni_GalaxyConstJoin(InB.D.z, InB.D.w);
 	return K;
 }
 
@@ -585,6 +636,8 @@ struct FUniGalaxyShared
 	float Flare;
 	uint bDetail;
 	float FineN;    // D-220: the fine band's noise (warp_fine's A; 0 where off), Uni_GalaxyFineMul's input
+	float SphM;     // D-232: the spheroid noise's multiplier on the bulge (1 where off)
+	float3 NebK;    // D-235: the nebulae's read at a fixed mip: (knot term 2 G - 1, colour mix B, D-236 jitter A); D-236 early types: (ridged R, B, A); (-1, 0.5, 0.5) where not read
 	// D-210: shared by the evaluations whose parameters match (the dust's scale length, pitch
 	// and arm count are the emission's): -log(max(Rcyl, 1e-4)) and the disc's radial term.
 	float U;        // valid with bU
@@ -600,9 +653,18 @@ UNI_FN float Uni_GalaxyDiscSlab(FUniFieldParams InPar)
 	return 12.0f * max(InPar.A.y, 1.0e-6f) * (1.0f + max(InPar.E.w, 0.0f)) + abs(InPar.E.x) + 3.0f * abs(InPar.G.x);
 }
 
+/** D-232: the spheroid noise's amount: D.y on an emission parameter set with a bulge (an early
+ *  type's, rolled by UseGalaxyTextures; 0 for every other galaxy). A dust set's D.y is its sigma
+ *  (DustFrom), and it has no bulge (B.y 0), so it never reads as noise. */
+UNI_FN float Uni_GalaxySpheroidNoise(FUniFieldParams InPar)
+{
+	return (InPar.D.y > 0.0f && InPar.B.y > 0.0f) ? InPar.D.y : 0.0f;
+}
+
 UNI_FN bool Uni_GalaxyTextured(FUniFieldParams InPar)
 {
-	return InPar.G.x != 0.0f || InPar.G.y != 0.0f || InPar.H.x != 0.0f || InPar.H.y != 0.0f || InPar.D.z != 0.0f || InPar.D.w != 0.0f;
+	return InPar.G.x != 0.0f || InPar.G.y != 0.0f || InPar.H.x != 0.0f || InPar.H.y != 0.0f || InPar.D.z != 0.0f || InPar.D.w != 0.0f
+		|| Uni_GalaxySpheroidNoise(InPar) > 0.0f;
 }
 
 UNI_FN bool Uni_GalaxyNeedsDetail(FUniFieldParams InPar)
@@ -610,14 +672,105 @@ UNI_FN bool Uni_GalaxyNeedsDetail(FUniFieldParams InPar)
 	return InPar.H.x != 0.0f || InPar.H.y != 0.0f || InPar.D.z != 0.0f || InPar.D.w != 0.0f;
 }
 
+/** D-232: galaxy_detail's channel means and standard deviations (the delivered texture's
+ *  galaxy_detail.json: R ridged, G Perlin-Worley, B fBm, A inverted Worley). */
+static const float4 UNI_GAL_DETAIL_MEAN = float4(0.567247f, 0.522827f, 0.526189f, 0.493123f);
+static const float4 UNI_GAL_DETAIL_STD = float4(0.177406f, 0.106269f, 0.130053f, 0.136832f);
+
+/** D-232 (owner: ellipticals were a plain falloff; each should take its own organic variance,
+ *  its channel weights picked at random from the packed noise): the spheroid's multiplier from
+ *  one galaxy_detail texel InN. Each channel is standardised (mean 0, std 1 at mip 0) and mixed
+ *  by the galaxy's weights and signs from InHn (6 bits a weight, squared, so one or two
+ *  channels usually lead; bits 24..27 the signs: ridges as filaments or as lanes, Worley cells
+ *  as clumps or as holes), normalised to unit variance; 1 + InAmount x that, kept in
+ *  [0.3, 1.8]. A coarser mip has less variance, so the multiplier fades toward 1 with it. */
+UNI_FN float Uni_GalaxySpheroidMul(float4 InN, uint InHn, float InAmount)
+{
+	const float4 Q = float4(float(InHn & 63u), float((InHn >> 6u) & 63u), float((InHn >> 12u) & 63u), float((InHn >> 18u) & 63u)) * (1.0f / 63.0f);
+	const float4 Sg = float4((InHn & 0x1000000u) != 0u ? -1.0f : 1.0f, (InHn & 0x2000000u) != 0u ? -1.0f : 1.0f,
+		(InHn & 0x4000000u) != 0u ? -1.0f : 1.0f, (InHn & 0x8000000u) != 0u ? -1.0f : 1.0f);
+	const float4 W = float4(Q.x * Q.x * Sg.x, Q.y * Q.y * Sg.y, Q.z * Q.z * Sg.z, Q.w * Q.w * Sg.w);
+	const float4 Z = float4((InN.x - UNI_GAL_DETAIL_MEAN.x) / UNI_GAL_DETAIL_STD.x, (InN.y - UNI_GAL_DETAIL_MEAN.y) / UNI_GAL_DETAIL_STD.y,
+		(InN.z - UNI_GAL_DETAIL_MEAN.z) / UNI_GAL_DETAIL_STD.z, (InN.w - UNI_GAL_DETAIL_MEAN.w) / UNI_GAL_DETAIL_STD.w);
+	const float Norm = sqrt(max(dot(W, W), 1.0e-4f));
+	return clamp(1.0f + InAmount * dot(W, Z) / Norm, 0.3f, 1.8f);
+}
+
+/** D-236: an early type's nebula filaments' amount (F.x, rolled by UseGalaxyTextures; F.x is the
+ *  arms' asymmetry otherwise, read only with arms, and a dwarf with arms off has no spheroid noise),
+ *  0 for every other galaxy. */
+UNI_FN float Uni_GalaxyEarlyNebula(FUniFieldParams InPar)
+{
+	return (Uni_GalaxySpheroidNoise(InPar) > 0.0f && InPar.F.x > 0.0f) ? InPar.F.x : 0.0f;
+}
+
+/** D-236: the early filaments' read frequency (texture periods a field unit: they scale with the
+ *  galaxy's effective radius A.w) and its texel at UNI_EARLY_NEB_MIP (field units). */
+UNI_FN float Uni_GalaxyEarlyNebulaFreq(FUniFieldParams InPar)
+{
+	return UNI_EARLY_NEB_FREQ * max(InPar.G.w, 1.0e-3f) / max(InPar.A.w, 1.0e-5f);
+}
+
+UNI_FN float Uni_GalaxyEarlyNebulaTexel(FUniFieldParams InPar)
+{
+	return exp2(UNI_EARLY_NEB_MIP) / (Uni_GalaxyEarlyNebulaFreq(InPar) * max(InPar.H.w, 1.0f));
+}
+
+/** D-236: the filaments' envelope at the spheroid's (warp_large-displaced) point InPb: all inside
+ *  0.6 of the sphere's radius (UNI_EARLY_NEB_RADIUS r_e, isophote-rounded), none past it. */
+UNI_FN float Uni_GalaxyEarlyNebulaEnv(float3 InPb, FUniFieldParams InPar)
+{
+	const float Q = max(InPar.B.x, 0.05f);
+	const float3 Ps = float3(InPb.x, InPb.y, InPb.z / Q);
+	return 1.0f - smoothstep(0.15f, 1.0f, sqrt(dot(Ps, Ps)) / (UNI_EARLY_NEB_RADIUS * max(InPar.A.w, 1.0e-5f)));
+}
+
+/** D-236 (owner: ellipticals more interesting): tidal shells, the multiplier at the spheroid's
+ *  point InPs (isophote-rounded, as the spheroid noise's) for an early type with shells (C.y, the
+ *  arms' sharpness otherwise: no early type has arms): five shells at 1.6 r_e x 1.55^k, each
+ *  sharp outside (width 0.06 of its radius: the stars' turning points pile up there) with a long
+ *  tail inside (0.3), on alternate sides of a random axis (from the shape seed's hash InHs,
+ *  SeedMix 14, a new sub-index; the sides fade over -0.2..0.4 of the axis cosine). The stars are
+ *  moved, not added: the shells' mean over each sphere (0.45 of a shell's profile: its side's
+ *  share) is taken off, so every radius keeps its light; x (1 + 3 C.y x that), never below 0.
+ *  None in the core (all by r_e, none inside 0.5 r_e); widened to the footprint keeping each
+ *  shell's integral. */
+UNI_FN float Uni_GalaxyShells(float3 InPs, FUniFieldParams InPar, uint InHs, float InFoot)
+{
+	const uint H = Uni_SeedMix(InHs, 14u);
+	const float Ct = 2.0f * (float(H & 0xFFFFu) * (1.0f / 65535.0f)) - 1.0f;
+	const float Ph = 6.2831853f * float(H >> 16u) * (1.0f / 65536.0f);
+	const float St = sqrt(max(1.0f - Ct * Ct, 0.0f));
+	const float3 Ax = float3(St * cos(Ph), St * sin(Ph), Ct);
+	const float R = sqrt(dot(InPs, InPs));
+	const float Cs = R > 1.0e-6f ? dot(InPs, Ax) / R : 0.0f;
+	const float Re = max(InPar.A.w, 1.0e-5f);
+	float Sum = 0.0f;
+	float Rk = 1.6f * Re;
+	float Side = 1.0f;
+	for (uint K = 0u; K < 5u; ++K)
+	{
+		const float W = (R > Rk ? 0.06f : 0.3f) * Rk;
+		const float We = sqrt(W * W + 0.25f * InFoot * InFoot);
+		const float D = (R - Rk) / We;
+		const float G = exp(-D * D) * (W / We);
+		Sum += G * (smoothstep(-0.2f, 0.4f, Side * Cs) - 0.45f);
+		Rk = Rk * 1.55f;
+		Side = -Side;
+	}
+	return max(1.0f + 3.0f * InPar.C.y * Sum * smoothstep(0.5f * Re, Re, R), 0.0f);
+}
+
 /** D-179 / D-213: a galaxy sample's texture terms (the field's and the map's): the disc's point
  *  displaced by warp_fine (OutPd), the bulge's by warp_large (OutPb), and galaxy_detail read at the
  *  twisted unwarped point (OutDt, OutDetail 1 when read). Untextured: InP, InP, nothing read. */
 UNI_FN void Uni_GalaxyTexTerms(float3 InP, FUniFieldParams InPar, FUniGalaxyConst InK, float InFoot, float InSlab, bool InTex, bool InDetail,
-	UNI_OUT(float3) OutPd, UNI_OUT(float3) OutPb, UNI_OUT(float4) OutDt, UNI_OUT(uint) OutDetail, UNI_OUT(float) OutFineN)
+	UNI_OUT(float3) OutPd, UNI_OUT(float3) OutPb, UNI_OUT(float4) OutDt, UNI_OUT(uint) OutDetail, UNI_OUT(float) OutFineN, UNI_OUT(float) OutSphM, UNI_OUT(float3) OutNebK)
 {
 	OutPd = InP;
 	OutFineN = 0.0f;
+	OutSphM = 1.0f;
+	OutNebK = float3(-1.0f, 0.5f, 0.5f);
 	OutPb = InP;
 	OutDt = float4(0.0f, 0.0f, 0.0f, 0.0f);
 	OutDetail = 0u;
@@ -673,11 +826,51 @@ UNI_FN void Uni_GalaxyTexTerms(float3 InP, FUniFieldParams InPar, FUniGalaxyCons
 				OutPb = InP + float3(W.x, W.y, W.z) * (InPar.G.y * Fb * Wf);
 			}
 		}
+		// D-232: the spheroid's noise (early types): galaxy_detail at the bulge's (warped) point,
+		// its height divided by the axis ratio so the structure follows the isophotes, at G.w
+		// periods a field unit, faded with the footprint as the other reads are (mip 4 to 5) and
+		// inside the core (none within 0.2 r_e, all by r_e: the core stays smooth).
+		const float SphA = Uni_GalaxySpheroidNoise(InPar);
+		if (SphA > 0.0f)
+		{
+			const float Fq = max(InPar.G.w, 1.0e-3f);
+			const float Mip = log2(max(InFoot * Fq * TexN, 1.0f));
+			const float Wf = saturate(5.0f - Mip);
+			const float Re = max(InPar.A.w, 1.0e-5f);
+			const float Q = max(InPar.B.x, 0.05f);
+			const float3 Ps = float3(OutPb.x, OutPb.y, OutPb.z / Q);
+			const float Fc = smoothstep(0.2f * Re, Re, sqrt(dot(Ps, Ps)));
+			if (Wf > 0.0f && Fc > 0.0f)
+			{
+				const float4 N = UNI_GAL_DETAIL(Ps * Fq + float3(Off.z, Off.y, Off.x), max(Mip, UNI_GAL_SPH_MIP_FLOOR));
+				OutSphM = Uni_GalaxySpheroidMul(N, InK.Hn, SphA * Wf * Fc);
+			}
+			// D-236: tidal shells (C.y) and the nebula filaments' read (F.x; the same point, its own
+			// fixed mip and offset, so the pattern never depends on the view).
+			if (InPar.C.y > 0.0f) { OutSphM = OutSphM * Uni_GalaxyShells(Ps, InPar, InK.Hs, InFoot); }
+			if (InPar.F.x > 0.0f)
+			{
+				const float4 Nf = UNI_GAL_DETAIL(Ps * Uni_GalaxyEarlyNebulaFreq(InPar) + float3(Off.x, Off.z, Off.y), UNI_EARLY_NEB_MIP);
+				// The colour runs with the radius (core to edge of the sphere), the fBm channel moving it
+				// by a quarter either way: one colour inside, another outside, not confetti.
+				const float Rn = sqrt(dot(Ps, Ps)) / (UNI_EARLY_NEB_RADIUS * Re);
+				const float Mr = saturate(Rn + 0.25f * (Nf.z - UNI_GAL_DETAIL_MEAN.z) / UNI_GAL_DETAIL_STD.z);
+				OutNebK = float3(Nf.x, 0.526f + 0.26f * (Mr - 0.5f), Nf.w);
+			}
+		}
 		if (InDetail && bInSlab)
 		{
 			const float Mip = log2(max(InFoot * InPar.G.w * TexN, 1.0f));
 			OutDt = UNI_GAL_DETAIL(Fr * InPar.G.w + float3(Off.y, Off.z, Off.x), Mip);
 			OutDetail = 1u;
+			// D-235: the nebulae read the same point at a fixed mip, so their pattern does not change
+			// with the footprint (it morphed and moved as the camera did, and when the march's
+			// resolution changed); past it they go to their mean instead (Uni_GalaxyNebulaDensity).
+			if (InPar.H.y > 0.0f && Mip < UNI_NEBULA_MIP + 6.0f)   // a cube pass's footprint is coarser than the screen's they blend at
+			{
+				const float4 Nk = UNI_GAL_DETAIL(Fr * InPar.G.w + float3(Off.y, Off.z, Off.x), UNI_NEBULA_MIP);
+				OutNebK = float3(2.0f * Nk.y - 1.0f, Nk.z, Nk.w);
+			}
 		}
 	}
 }
@@ -692,6 +885,11 @@ UNI_FN void Uni_GalaxyDetailTerms(float4 InDt, FUniFieldParams InPar, UNI_OUT(fl
 	// D-180: dust only (D.z, D.w are zero for emission): ridged lanes and superbubble holes.
 	if (InPar.D.z != 0.0f) { OutCloud = max(1.0f + InPar.D.z * (2.0f * InDt.x - 1.0f), 0.0f); }
 	if (InPar.D.w != 0.0f) { OutCloud = OutCloud * max(1.0f - InPar.D.w * max(2.0f * InDt.w - 1.0f, 0.0f), 0.0f); }
+	// D-234: dark clouds (dust only: D.z marks a cloud-dust set, whose G.y no bulge reads): the
+	// dust gathers where the knots are, the molecular clouds the emission nebulae are born in;
+	// about the knot term's mean (0.0457, UNI_NEBULA_KNOT_MEAN), so linear, the dust's mean kept
+	// where it does not clip (as D-180's lanes).
+	if (InPar.D.z != 0.0f && InPar.G.y != 0.0f) { OutCloud = OutCloud * max(1.0f + InPar.G.y * (OutKnot - 0.0457f), 0.0f); }
 }
 
 /** D-220: the disc's fine-band multiplier for one parameter set: 1 + 15.2 x its warp amount x the
@@ -742,9 +940,11 @@ UNI_FN FUniGalaxyShared Uni_GalaxySharedK(float3 InP, FUniFieldParams InPar, FUn
 	S.Dt = float4(0.0f, 0.0f, 0.0f, 0.0f);
 	S.bDetail = 0u;
 	S.FineN = 0.0f;
+	S.SphM = 1.0f;
+	S.NebK = float3(-1.0f, 0.5f, 0.5f);
 	S.U = 0.0f; S.ExpR = 0.0f; S.Ax = 0.0f; S.bU = 0u;
 	const float Cut = InPar.D.x;
-	Uni_GalaxyTexTerms(InP, InPar, InK, InFoot, InSlab, InTex, InDetail, S.Pd, S.Pb, S.Dt, S.bDetail, S.FineN);   // D-213: shared with the map
+	Uni_GalaxyTexTerms(InP, InPar, InK, InFoot, InSlab, InTex, InDetail, S.Pd, S.Pb, S.Dt, S.bDetail, S.FineN, S.SphM, S.NebK);   // D-213: shared with the map
 	S.Rcyl = sqrt(S.Pd.x * S.Pd.x + S.Pd.y * S.Pd.y);
 	S.Theta = atan2(S.Pd.y, S.Pd.x);
 	S.ArmH = uint4(0u, 0u, 0u, 0u);
@@ -780,9 +980,165 @@ UNI_FN FUniGalaxyShared Uni_GalaxyShared(float3 InP, FUniFieldParams InPar, floa
 
 /** D-160..D-181: the galaxy field at InP for parameters InPar from the shared state (see
  *  UniField_GalaxyFiltered for what each term is). */
-UNI_FN float Uni_GalaxyFromSharedC(FUniGalaxyShared InS, float3 InP, FUniFieldParams InPar, float InFoot, UNI_OUT(float4) OutComp)
+// ------------------------------------------------------------------------------------------
+// D-234: nebulae (owner: emission and reflection nebulae and dark clouds, seen from outside
+// first, the field built so a fly-into layer can grow from it). Emission nebulae (H II regions)
+// are the star-forming knots' gas: a density in the field's own units, from the same terms the
+// light is made of (no read of its own): the young light (the arms' share, or the disc's for a
+// galaxy without arms) in a thinner gas layer (half the stars' scale height, as the dust), where
+// galaxy_detail's knot noise passes 0.3 (about 11% of texels), full by 0.7, squared; times the
+// galaxy's knot amount H.y (star formation: no knots, no nebulae). Plain light, not a population's
+// (no sprite counterpart, not conserved: D-128's v2 row): the march adds it at the galaxy's full
+// light per star (Uni_VolumeLutFull), so it stays when the stars resolve. The near layer (flying
+// into a nebula) is to grow from this density: finer octaves in the camera galaxy's frame.
+// ------------------------------------------------------------------------------------------
+#define UNI_NEBULA_KNOT0 0.3f
+#define UNI_NEBULA_KNOT1 0.7f
+#define UNI_NEBULA_HEIGHT 0.5f
+
+#define UNI_NEBULA_SCALE 60.0f
+static const float UNI_NEBULA_KNOT_MEAN = 0.0457f;   // galaxy_detail's knot term (2 G - 1): its mean
+// D-235: the nebulae's read's mip (UNI_NEBULA_MIP) and the knot term's stretch about its mean there
+// that keeps the knot shape's mean mip 0's (0.01122; measured on samples, trilinear:
+// experiments/nebula_knotstretch_d234: 1, 1.035, 1.069, 1.180, 1.294 at mips 0, 0.5, 1, 1.5, 2),
+// so the light is D-234's. Mip 1, the blend from a quarter texel per half step and the cap's
+// quarter-texel steps from the slide sweep (T2.galaxy.nebula_slide; experiments/nebula_slide_d235).
+static const float UNI_NEBULA_SHAPE_MEAN = 0.01122f;
+// D-236: the early types' filaments: the ridged channel over its mean (0.567) past T0, full by T1,
+// squared, its mean at UNI_EARLY_NEB_MIP (sampled) and the scale (uu.Nebula 1 the look).
+#define UNI_EARLY_NEB_T0 1.19f
+#define UNI_EARLY_NEB_T1 1.42f
+static const float UNI_EARLY_NEB_SHAPE_MEAN = 0.0471f;
+#define UNI_EARLY_NEB_SCALE 7.0f
+// D-235: the resolution (field units over the nebula read's texel) at which the pattern starts
+// to blend to its mean, and is fully blended at twice it.
+
+/** D-235: the emission nebulae's density from the field's source InNeb.x (D-234: young light x gas
+ *  layer x H.y; Uni_GalaxyFromSharedCN) and the fixed-mip knot term InNeb.y: over 0.3, full by
+ *  0.7, squared, x UNI_NEBULA_SCALE, the term stretched by UNI_NEBULA_STRETCH (the shape's mean
+ *  mip 0's, so D-234's light). InFoot is the pixel's footprint and InStep the march's step along
+ *  the disc plane (each sample stands for the step, so in-plane features finer than it are not
+ *  sampled but slide through its shells; a step across the plane passes over none): past them
+ *  (Uni_GalaxyNebulaBlend) it blends to the shape's mean over a factor 2: the light kept, the
+ *  pattern smooth, never moved (D-234 stretched a footprint-mip read instead: the pattern
+ *  changed as the camera moved). */
+/** D-235: the nebulae's blend to their mean (0: the pattern, 1: the mean) for a sample whose pixel
+ *  footprint is InFoot and whose step along the disc plane is InStep (field units): from
+ *  UNI_NEBULA_FOOT read texels per pixel (a knot's width: smaller knots average out in the pixel;
+ *  full at twice), and from UNI_NEBULA_RES texels per half step (features the steps skip would
+ *  slide through their shells). */
+UNI_FN float Uni_GalaxyNebulaBlend(FUniFieldParams InPar, float InFoot, float InStep)
+{
+	const float Texel = Uni_GalaxyEarlyNebula(InPar) > 0.0f ? Uni_GalaxyEarlyNebulaTexel(InPar)   // D-236
+		: exp2(UNI_NEBULA_MIP) / max(InPar.G.w * max(InPar.H.w, 1.0f), 1.0e-6f);
+	const float R = max(InFoot / (UNI_NEBULA_FOOT * Texel), 0.5f * InStep / (UNI_NEBULA_RES * Texel));
+	return saturate(log2(max(R, 1.0e-6f)));
+}
+
+UNI_FN float Uni_GalaxyNebulaDensity(float4 InNeb, FUniFieldParams InPar, float InFoot, float InStep)
+{
+	if (!(InNeb.x > 0.0f)) { return 0.0f; }
+	const float B = Uni_GalaxyNebulaBlend(InPar, InFoot, InStep);
+	const bool bEarly = Uni_GalaxyEarlyNebula(InPar) > 0.0f;   // D-236: filaments from the ridged channel
+	const float Mean = bEarly ? UNI_EARLY_NEB_SHAPE_MEAN : UNI_NEBULA_SHAPE_MEAN;
+	float Shape = Mean;
+	if (B < 1.0f)
+	{
+		float X;
+		if (bEarly) { X = saturate((InNeb.y * (1.0f / 0.567f) - UNI_EARLY_NEB_T0) * (1.0f / (UNI_EARLY_NEB_T1 - UNI_EARLY_NEB_T0))); }
+		else
+		{
+			const float K = UNI_NEBULA_KNOT_MEAN + (InNeb.y - UNI_NEBULA_KNOT_MEAN) * UNI_NEBULA_STRETCH;
+			X = saturate((K - UNI_NEBULA_KNOT0) * (1.0f / (UNI_NEBULA_KNOT1 - UNI_NEBULA_KNOT0)));
+		}
+		// D-236: each nebula its own brightness (the read's A channel, mean 0.493: x 0.2-1.8,
+		// about 1 on average), to the mean with the blend.
+		const float J = clamp(1.0f + 2.0f * (InNeb.w - 0.493f), 0.2f, 1.8f);
+		Shape = X * X * J + (Mean - X * X * J) * B;
+	}
+	return InNeb.x * (bEarly ? UNI_EARLY_NEB_SCALE : UNI_NEBULA_SCALE) * Shape;
+}
+
+// D-235: the gas layer's step cap: steps of UNI_NEBULA_STEP read texels along the disc plane
+// inside +-4 gas scale heights, lengthened to the ray's path through the layer over
+// UNI_NEBULA_MAX_STEPS where that is longer, up to 4x (where the blend is full anyway, so the
+// pattern fades smoothly with the ray's angle, not at a threshold); none past it (along the plane:
+// the far nebulae are their mean). A ray outside the layer heading into it stops at its surface,
+// so the capped steps start there (else where the last uncapped step landed in the layer moved
+// from pixel to pixel: a sharp, stepped edge across a nebula).
+#define UNI_NEBULA_MAX_STEPS 48.0f
+
+/** D-235: a galaxy carrier's step cap for its nebulae at InP (field units) along the unit local
+ *  direction InLd, field units (3e38: none): only for a galaxy with knots, at or toward its gas
+ *  layer, which follows the disc's warp and flare (D-178; InHp the mode phases' hash).
+ *  D-236: an early type's filaments fill a sphere (UNI_EARLY_NEB_RADIUS r_e, and the bulge
+ *  warp's reach): inside it, steps of UNI_NEBULA_STEP x 2 read texels (a volume: half a texel
+ *  is where its blend starts), lengthened to the ray's chord of it over UNI_EARLY_NEB_MAX_STEPS,
+ *  up to 4x; outside heading in, to its surface; none once the footprint InFoot (field units)
+ *  has blended the pattern out. */
+UNI_FN float Uni_GalaxyNebulaStepCap(float3 InP, float3 InLd, FUniFieldParams InPar, uint InHp, float InFoot)
+{
+	if (Uni_GalaxyEarlyNebula(InPar) > 0.0f)
+	{
+		const float Te = Uni_GalaxyEarlyNebulaTexel(InPar);
+		if (InFoot >= 2.0f * UNI_NEBULA_FOOT * Te) { return 3.0e38f; }
+		const float Rs = UNI_EARLY_NEB_RADIUS * max(InPar.A.w, 1.0e-5f) + 2.0f * abs(InPar.G.y);
+		const float Bq = dot(InP, InLd), Cq = dot(InP, InP) - Rs * Rs;
+		const float Dq = Bq * Bq - Cq;
+		if (!(Dq > 0.0f)) { return 3.0e38f; }
+		const float Sq = sqrt(Dq);
+		if (Cq > 0.0f) { return Bq < 0.0f ? max(-Bq - Sq, 1.0e-6f) : 3.0e38f; }
+		const float CapE = UNI_EARLY_NEB_STEP * Te;
+		const float StepE = max(CapE, 2.0f * Sq / UNI_EARLY_NEB_MAX_STEPS);
+		return StepE > 4.0f * CapE ? 3.0e38f : StepE;
+	}
+	if (!(InPar.H.y > 0.0f)) { return 3.0e38f; }
+	float Zc = 0.0f, Fl = 1.0f;
+	if (InPar.E.x != 0.0f || InPar.E.w > 0.0f)
+	{
+		const float Rn = saturate(sqrt(InP.x * InP.x + InP.y * InP.y) / max(InPar.D.x, 1.0e-6f));
+		if (InPar.E.x != 0.0f)
+		{
+			const float PhW = 6.2831853f * float(InHp & 0xFFFFu) * (1.0f / 65536.0f);
+			Zc = InPar.E.x * Rn * Rn * sin(atan2(InP.y, InP.x) - PhW - InPar.E.y * Rn);
+		}
+		if (InPar.E.w > 0.0f) { Fl = 1.0f + InPar.E.w * Rn; }
+	}
+	const float Hg = UNI_NEBULA_HEIGHT * max(InPar.A.y, 1.0e-6f) * Fl;
+	const float Inpl = max(sqrt(InLd.x * InLd.x + InLd.y * InLd.y), 0.05f);
+	const float Texel = exp2(UNI_NEBULA_MIP) / max(InPar.G.w * max(InPar.H.w, 1.0f), 1.0e-6f);
+	const float Cap = UNI_NEBULA_STEP * Texel / Inpl;
+	const float Path = min(8.0f * Hg / max(abs(InLd.z), 1.0e-3f), 2.0f);
+	const float Step = max(Cap, Path / UNI_NEBULA_MAX_STEPS);
+	if (Step > 4.0f * Cap) { return 3.0e38f; }
+	const float Dz = InP.z - Zc;
+	const float Az = abs(Dz);
+	if (Az <= 4.0f * Hg) { return Step; }
+	// Outside the layer: heading into it, stop at its surface.
+	if (Dz * InLd.z < 0.0f) { return max((Az - 4.0f * Hg) / max(abs(InLd.z), 1.0e-6f), 1.0e-6f); }
+	return 3.0e38f;
+}
+
+
+/** D-234: the gas layer's vertical factor over the stars' (scale heights UNI_NEBULA_HEIGHT x InH
+ *  and InH at height InZ, both widened to the footprint keeping their columns). */
+UNI_FN float Uni_GalaxyNebulaVert(float InZ, float InH, float InFoot)
+{
+	const float H = max(InH, 1.0e-6f), Hg = UNI_NEBULA_HEIGHT * H;
+	const float F2 = InFoot > 0.0f ? 0.25f * InFoot * InFoot : 0.0f;
+	const float He = sqrt(H * H + F2), Hge = sqrt(Hg * Hg + F2);
+	return exp(InZ / He - InZ / Hge) * (Hg * He) / (Hge * H);
+}
+
+UNI_FN float Uni_GalaxyFromSharedC(FUniGalaxyShared InS, float3 InP, FUniFieldParams InPar, float InFoot, UNI_OUT(float4) OutComp);
+
+/** D-234: Uni_GalaxyFromSharedC with the emission nebulae's terms (D-235): OutNeb = (source: young
+ *  light x gas layer x H.y in the field's units, soft edge included, 0 without knots; the
+ *  fixed-mip knot term; the colour mix; 0). Uni_GalaxyNebulaDensity makes the density. */
+UNI_FN float Uni_GalaxyFromSharedCN(FUniGalaxyShared InS, float3 InP, FUniFieldParams InPar, float InFoot, UNI_OUT(float4) OutComp, UNI_OUT(float4) OutNeb)
 {
 	OutComp = float4(0.0f, 0.0f, 0.0f, 0.0f);   // D-182: (bulge, disc, arms, knots), before the soft edge
+	OutNeb = float4(0.0f, InS.NebK.x, InS.NebK.y, InS.NebK.z);
 	const float Cut = InPar.D.x;
 	const float R2 = dot(InP, InP);
 	if (R2 >= Cut * Cut) { return 0.0f; }
@@ -876,26 +1232,37 @@ UNI_FN float Uni_GalaxyFromSharedC(FUniGalaxyShared InS, float3 InP, FUniFieldPa
 			OutComp.z = ArmLight * min(Wk, 1.0f);
 			OutComp.w = ArmLight * max(Wk - 1.0f, 0.0f);
 			OutComp.y = Disc * (1.0f - ArmAmp);
+			if (InPar.H.y > 0.0f) { OutNeb.x = InPar.H.y * ArmLight * Uni_GalaxyNebulaVert(Z, H, InFoot); }   // D-234
 			Disc = Disc * ((1.0f - ArmAmp) + ArmAmp * Wave * (1.0f + InPar.C.y));
 		}
 		else
 		{
 			OutComp.y = Disc;
+			if (InPar.H.y > 0.0f) { OutNeb.x = InPar.H.y * Disc * Uni_GalaxyNebulaVert(Z, H, InFoot); }   // D-234
 		}
 		Rho += Disc;
 	}
 	// The bulge: never warped by the disc modes (it holds the inner disc rigid); D-179: displaced
 	// by warp_large when on.
 	{
-		const float Bulge = Uni_GalaxyBulgeAt(InS.Pb, InPar, InFoot);
+		const float Bulge = Uni_GalaxyBulgeAt(InS.Pb, InPar, InFoot) * InS.SphM;   // D-232
 		OutComp.x = Bulge;
 		Rho += Bulge;
+		if (Uni_GalaxyEarlyNebula(InPar) > 0.0f) { OutNeb.x = Uni_GalaxyEarlyNebula(InPar) * Bulge * Uni_GalaxyEarlyNebulaEnv(InS.Pb, InPar); }   // D-236
 	}
 
 	// Soft edge over the outer 5% of the cut, so the field (and so the placed count) has no
 	// hard shell at the influence radius.
 	const float R = sqrt(R2);
-	return Rho * saturate((Cut - R) / (0.05f * Cut));
+	const float Edge = saturate((Cut - R) / (0.05f * Cut));
+	OutNeb.x = OutNeb.x * Edge;
+	return Rho * Edge;
+}
+
+UNI_FN float Uni_GalaxyFromSharedC(FUniGalaxyShared InS, float3 InP, FUniFieldParams InPar, float InFoot, UNI_OUT(float4) OutComp)
+{
+	float4 Neb = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	return Uni_GalaxyFromSharedCN(InS, InP, InPar, InFoot, OutComp, Neb);
 }
 
 
@@ -934,11 +1301,13 @@ UNI_FN void UniField_GalaxyPair(float3 InP, FUniFieldParams InPar, FUniFieldPara
 }
 
 /** D-182: UniField_GalaxyPair with the emission's components (bulge, disc, arms, knots).
- *  D-210: InK the emission's constants (the dust's are the same: DustFrom keeps the seed). */
-UNI_FN void UniField_GalaxyPairCK(float3 InP, FUniFieldParams InPar, FUniFieldParams InDust, FUniGalaxyConst InK, float InFoot, UNI_OUT(float) OutEmission, UNI_OUT(float) OutDust, UNI_OUT(float4) OutComp)
+ *  D-210: InK the emission's constants (the dust's are the same: DustFrom keeps the seed).
+ *  D-234: and the emission nebulae's density. */
+UNI_FN void UniField_GalaxyPairCKN(float3 InP, FUniFieldParams InPar, FUniFieldParams InDust, FUniGalaxyConst InK, float InFoot, UNI_OUT(float) OutEmission, UNI_OUT(float) OutDust, UNI_OUT(float4) OutComp, UNI_OUT(float4) OutNeb)
 {
 	OutEmission = 0.0f;
 	OutDust = 0.0f;
+	OutNeb = float4(0.0f, -1.0f, 0.5f, 0.0f);
 	OutComp = float4(0.0f, 0.0f, 0.0f, 0.0f);
 	const float Cut = max(InPar.D.x, InDust.D.x);
 	if (dot(InP, InP) >= Cut * Cut) { return; }
@@ -949,8 +1318,14 @@ UNI_FN void UniField_GalaxyPairCK(float3 InP, FUniFieldParams InPar, FUniFieldPa
 	FUniGalaxyShared S;
 	if (bTexA) { S = Uni_GalaxySharedK(InP, InPar, InK, InFoot, Slab, bTexA || bTexB, bDetail); }
 	else { S = Uni_GalaxySharedK(InP, InDust, InK, InFoot, Slab, bTexA || bTexB, bDetail); }
-	OutEmission = Uni_GalaxyFromSharedC(S, InP, InPar, InFoot, OutComp);
+	OutEmission = Uni_GalaxyFromSharedCN(S, InP, InPar, InFoot, OutComp, OutNeb);
 	OutDust = Uni_GalaxyFromShared(S, InP, InDust, InFoot);
+}
+
+UNI_FN void UniField_GalaxyPairCK(float3 InP, FUniFieldParams InPar, FUniFieldParams InDust, FUniGalaxyConst InK, float InFoot, UNI_OUT(float) OutEmission, UNI_OUT(float) OutDust, UNI_OUT(float4) OutComp)
+{
+	float4 Neb = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	UniField_GalaxyPairCKN(InP, InPar, InDust, InK, InFoot, OutEmission, OutDust, OutComp, Neb);
 }
 
 UNI_FN void UniField_GalaxyPairC(float3 InP, FUniFieldParams InPar, FUniFieldParams InDust, float InFoot, UNI_OUT(float) OutEmission, UNI_OUT(float) OutDust, UNI_OUT(float4) OutComp)
@@ -958,15 +1333,23 @@ UNI_FN void UniField_GalaxyPairC(float3 InP, FUniFieldParams InPar, FUniFieldPar
 	UniField_GalaxyPairCK(InP, InPar, InDust, Uni_GalaxyConstOf(InPar), InFoot, OutEmission, OutDust, OutComp);
 }
 
-/** D-182: the galaxy field with its components. D-210: InK its constants. */
-UNI_FN float UniField_GalaxyFilteredCK(float3 InP, FUniFieldParams InPar, FUniGalaxyConst InK, float InFoot, UNI_OUT(float4) OutComp)
+/** D-182: the galaxy field with its components. D-210: InK its constants. D-234: and the
+ *  emission nebulae's density. */
+UNI_FN float UniField_GalaxyFilteredCKN(float3 InP, FUniFieldParams InPar, FUniGalaxyConst InK, float InFoot, UNI_OUT(float4) OutComp, UNI_OUT(float4) OutNeb)
 {
 	OutComp = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	OutNeb = float4(0.0f, -1.0f, 0.5f, 0.0f);
 	const float Cut = InPar.D.x;
 	if (dot(InP, InP) >= Cut * Cut) { return 0.0f; }
 	const bool bTex = Uni_GalaxyTextured(InPar);
 	const FUniGalaxyShared S = Uni_GalaxySharedK(InP, InPar, InK, InFoot, Uni_GalaxyDiscSlab(InPar), bTex, bTex && Uni_GalaxyNeedsDetail(InPar));
-	return Uni_GalaxyFromSharedC(S, InP, InPar, InFoot, OutComp);
+	return Uni_GalaxyFromSharedCN(S, InP, InPar, InFoot, OutComp, OutNeb);
+}
+
+UNI_FN float UniField_GalaxyFilteredCK(float3 InP, FUniFieldParams InPar, FUniGalaxyConst InK, float InFoot, UNI_OUT(float4) OutComp)
+{
+	float4 Neb = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	return UniField_GalaxyFilteredCKN(InP, InPar, InK, InFoot, OutComp, Neb);
 }
 
 UNI_FN float UniField_GalaxyFilteredC(float3 InP, FUniFieldParams InPar, float InFoot, UNI_OUT(float4) OutComp)
@@ -1155,11 +1538,12 @@ UNI_FN float4 Uni_GalaxyMapTexel(float InX, float InY, FUniFieldParams InPar, FU
 }
 
 /** A galaxy's light and dust densities at InP from its map (InMapSize texels a side), with the
- *  components (bulge, disc, arms, knots) for its palette. */
-UNI_FN void Uni_GalaxyMapEval(float3 InP, FUniFieldParams InPar, FUniFieldParams InDust, bool InDust2, FUniGalaxyConst InK, float InFoot, float InMapSize, uint InSlot,
-	UNI_OUT(float) OutRe, UNI_OUT(float) OutRd, UNI_OUT(float4) OutComp)
+ *  components (bulge, disc, arms, knots) for its palette. D-234: and the emission nebulae's
+ *  density (the field's terms, from the map's arm part). */
+UNI_FN void Uni_GalaxyMapEvalN(float3 InP, FUniFieldParams InPar, FUniFieldParams InDust, bool InDust2, FUniGalaxyConst InK, float InFoot, float InMapSize, uint InSlot,
+	UNI_OUT(float) OutRe, UNI_OUT(float) OutRd, UNI_OUT(float4) OutComp, UNI_OUT(float4) OutNeb)
 {
-	OutRe = 0.0f; OutRd = 0.0f; OutComp = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	OutRe = 0.0f; OutRd = 0.0f; OutComp = float4(0.0f, 0.0f, 0.0f, 0.0f); OutNeb = float4(0.0f, -1.0f, 0.5f, 0.0f);
 	const float Cut = InPar.D.x;
 	const float R2 = dot(InP, InP);
 	if (R2 >= Cut * Cut) { return; }
@@ -1170,8 +1554,10 @@ UNI_FN void Uni_GalaxyMapEval(float3 InP, FUniFieldParams InPar, FUniFieldParams
 	float3 Pd, Pb;
 	float4 Dt;
 	uint bDt;
-	float FineN;
-	Uni_GalaxyTexTerms(InP, InPar, InK, InFoot, Uni_GalaxyDiscSlab(InPar), bTex || bNeed, bNeed, Pd, Pb, Dt, bDt, FineN);
+	float FineN, SphM;
+	float3 NebK;
+	Uni_GalaxyTexTerms(InP, InPar, InK, InFoot, Uni_GalaxyDiscSlab(InPar), bTex || bNeed, bNeed, Pd, Pb, Dt, bDt, FineN, SphM, NebK);
+	OutNeb = float4(0.0f, NebK.x, NebK.y, NebK.z);
 	float DetailN = 0.0f, Knot = 0.0f, Cloud = 1.0f;
 	if (bDt != 0u)
 	{
@@ -1198,12 +1584,19 @@ UNI_FN void Uni_GalaxyMapEval(float3 InP, FUniFieldParams InPar, FUniFieldParams
 		OutComp.z = ArmLight * min(Wk, 1.0f);
 		OutComp.w = ArmLight * max(Wk - 1.0f, 0.0f);
 		Disc = Base * (max(M.x, 0.0f) + max(M.w, 0.0f) * (Wk - 1.0f));
+		if (InPar.H.y > 0.0f)   // D-234: the field's nebulae (the arms' light, or the disc's without arms)
+		{
+			const float Src = (InPar.C.x > 0.0f && InPar.B.z > 0.0f) ? ArmLight : Base * max(M.x, 0.0f);
+			OutNeb.x = InPar.H.y * Src * Uni_GalaxyNebulaVert(Z, max(InPar.A.y, 1.0e-6f) * Flare, InFoot);
+		}
 	}
 	// The bulge, analytically at its warp_large-displaced point (the field's function).
-	const float Bulge = Uni_GalaxyBulgeAt(Pb, InPar, InFoot);
+	const float Bulge = Uni_GalaxyBulgeAt(Pb, InPar, InFoot) * SphM;   // D-232
 	OutComp.x = Bulge;
+	if (Uni_GalaxyEarlyNebula(InPar) > 0.0f) { OutNeb.x = Uni_GalaxyEarlyNebula(InPar) * Bulge * Uni_GalaxyEarlyNebulaEnv(Pb, InPar); }   // D-236
 	const float R = sqrt(R2);
 	OutRe = (Disc + Bulge) * saturate((Cut - R) / (0.05f * Cut));
+	OutNeb.x = OutNeb.x * saturate((Cut - R) / (0.05f * Cut));
 	if (InDust2 && InDust.A.z > 0.0f)
 	{
 		const float CutD = InDust.D.x;
@@ -1212,6 +1605,13 @@ UNI_FN void Uni_GalaxyMapEval(float3 InP, FUniFieldParams InPar, FUniFieldParams
 		const float Fd = (InDust.H.x != 0.0f ? max(1.0f + InDust.H.x * DetailN, 0.0f) : 1.0f) * Uni_GalaxyFineMul(FineN, InDust);   // D-220
 		OutRd = exp(-Z / Hde) * (Hd / Hde) * Fd * Cloud * max(M.y, 0.0f) * saturate((CutD - R) / (0.05f * CutD));
 	}
+}
+
+UNI_FN void Uni_GalaxyMapEval(float3 InP, FUniFieldParams InPar, FUniFieldParams InDust, bool InDust2, FUniGalaxyConst InK, float InFoot, float InMapSize, uint InSlot,
+	UNI_OUT(float) OutRe, UNI_OUT(float) OutRd, UNI_OUT(float4) OutComp)
+{
+	float4 Neb = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	Uni_GalaxyMapEvalN(InP, InPar, InDust, InDust2, InK, InFoot, InMapSize, InSlot, OutRe, OutRd, OutComp, Neb);
 }
 
 /** D-214: a galaxy's light density at InP from its map in slot InSlot, unfiltered (mip 0), with

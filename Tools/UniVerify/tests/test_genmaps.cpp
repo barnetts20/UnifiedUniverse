@@ -83,7 +83,7 @@ UNI_TEST(gen, map_placement)
 	double LightErr = 0.0, LightP95 = 0.0;
 	int SlotUsed = -1;
 	{
-		FCpuGalaxyMaps Host(Cache, 4u, 1024u, 4);
+		FCpuGalaxyMaps Host(Cache, 4u, 512u, 4);   // D-229: the default size
 		Mapped = RunStars(M, &Cache, Cam);
 		// The map's light against the field over the Milky Way's disc (field units).
 		if (Mapped.bHaveGalaxy)
@@ -114,7 +114,7 @@ UNI_TEST(gen, map_placement)
 	}
 	{
 		FGalaxyMapCache Cache2;
-		FCpuGalaxyMaps Host(Cache2, 4u, 1024u, 4);
+		FCpuGalaxyMaps Host(Cache2, 4u, 512u, 4);
 		Again = RunStars(M, &Cache2, Cam);
 	}
 	// Waiting: a cache with no host does not have the map: the task waits, the bake is pending;

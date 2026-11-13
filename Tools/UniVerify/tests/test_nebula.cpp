@@ -1,0 +1,574 @@
+// test_nebula.cpp
+// D-234 (owner, 2026-11-12: nebulae, option 3: seen from outside first, the field built so a
+// fly-into layer can grow from it): emission nebulae (H II regions on the arms' star-forming
+// knots), reflection nebulae (dust lit by the knots' young light) and dark clouds (the dust
+// gathering at the knots), as terms of the galaxy field and the march.
+//  - the field: the nebulae's density is never negative, zero without knots (early types without
+//    D-236's filaments, dust
+//    sets, H.y 0) and outside the cut; their light is a few to tens of percent of the stars', in
+//    knots (the brightest tenth of the face-on pixels holds most of it), and holds as a galaxy
+//    recedes (the knot contrast is stretched by mip);
+//  - the dark clouds keep the dust's mean within 15% and add contrast;
+//  - the LUT's full light per star (the nebulae's scale) is the unresolved light where nothing is
+//    resolved, and at least it everywhere;
+//  - the march: the Milky Way from 60 kpc and from the solar camera with the nebulae on adds light
+//    within bounds; with the near fade at infinity it is the frame with them off, bit for bit;
+//  - stills: a contact sheet of nine spirals with and without, the Milky Way from outside and
+//    inside with and without.
+
+#include "../src/UniTest.h"
+#include "../src/UniVerifyCommon.h"
+#include "../src/UniRenderRef.h"
+#include "../src/UniVolumeRef.h"
+#include "../scenes/UniScenes.h"
+#include "UniWebTexture.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <sys/stat.h>
+#include <vector>
+#include <fstream>
+#include <regex>
+#include <sstream>
+
+using namespace UniCore;
+using namespace UniRender;
+namespace H = UniHlsl;
+
+namespace
+{
+	struct FNebTex
+	{
+		FWebTexture T[3];
+		bool bOk = true;
+		std::string Err;
+		FNebTex()
+		{
+			for (int S = 0; S < 3; ++S)
+			{
+				std::string E;
+				if (!FWebTexture::LoadDelivered("Data/Noise", GalaxyTextureName(S), T[S], &E)) { bOk = false; Err += E + "; "; }
+			}
+		}
+	};
+
+	struct FNebBind
+	{
+		explicit FNebBind(const FNebTex& S) { for (int I = 0; I < 3; ++I) { BindGalaxyTexture(I, &S.T[I]); } }
+		~FNebBind() { for (int I = 0; I < 3; ++I) { BindGalaxyTexture(I, nullptr); } }
+	};
+
+	std::string NebDir()
+	{
+		const std::string D = UniVerify::Options().OutDir + "/render";
+		::mkdir(UniVerify::Options().OutDir.c_str(), 0755);
+		::mkdir(D.c_str(), 0755);
+		return D;
+	}
+
+	void NebWrite(const FImage& Img, const std::string& Name, const std::vector<std::string>& Hud)
+	{
+		const std::string Base = NebDir() + "/" + Name;
+		Img.WritePpm(Base + ".ppm");
+		FILE* F = std::fopen((Base + ".hud.json").c_str(), "wb");
+		if (!F) { return; }
+		std::fprintf(F, "{\"lines\":[");
+		for (size_t I = 0; I < Hud.size(); ++I) { std::fprintf(F, "%s\"%s\"", I ? "," : "", Hud[I].c_str()); }
+		std::fprintf(F, "]}\n");
+		std::fclose(F);
+	}
+
+	FFieldParams NebRolled(const FUniEmitter& E, u32 S, bool bEarly = false)
+	{
+		FFieldParams P = bEarly ? E.EarlyExemplar : E.Exemplar;
+		for (const FParamRange& R : bEarly ? E.EarlyRanges : E.Ranges) { P.V[R.Slot] = H::Uni_RollRange(S, ChannelIdUpper(R.Name), R.Min, R.Max, R.Bias, R.Quantize); }
+		return P;
+	}
+
+	double NebUnit(u32 S, u32 K) { return double(H::Uni_DrawUnit(S, 0xEB1u, K)); }
+
+	H::float3 NebPoint(u32 S, u32 I)
+	{
+		// Within the disc's slab mostly (a third of the points anywhere in the ball).
+		const double R = std::sqrt(NebUnit(S, 4 * I)), Ph = 6.2831853 * NebUnit(S, 4 * I + 1);
+		const double Z = (I % 3u == 0u) ? 2.0 * NebUnit(S, 4 * I + 2) - 1.0 : 0.06 * (2.0 * NebUnit(S, 4 * I + 2) - 1.0);
+		return H::float3(float(R * std::cos(Ph)), float(R * std::sin(Ph)), float(Z));
+	}
+
+	/** The face-on projections (Px a side over [-Half, Half]) of the stars' light and the nebulae's
+	 *  density at footprint Foot. */
+	void FaceOn(const H::FUniFieldParams& P, int Px, double Half, int Nz, float Foot, std::vector<double>& OutRho, std::vector<double>& OutNeb)
+	{
+		OutRho.assign(size_t(Px) * Px, 0.0);
+		OutNeb.assign(size_t(Px) * Px, 0.0);
+		const H::FUniGalaxyConst K = H::Uni_GalaxyConstOf(P);
+		const double Dz = 0.3 / Nz;
+		for (int Y = 0; Y < Px; ++Y) for (int X = 0; X < Px; ++X)
+		{
+			const double U = -Half + (X + 0.5) * 2.0 * Half / Px, V = -Half + (Y + 0.5) * 2.0 * Half / Px;
+			double Sr = 0.0, Sn = 0.0;
+			for (int Z = 0; Z < Nz; ++Z)
+			{
+				const H::float3 Pt(float(U), float(V), float(-0.15 + (Z + 0.5) * Dz));
+				H::float4 C(0, 0, 0, 0), Nb(0, 0, 0, 0);
+				Sr += double(H::UniField_GalaxyFilteredCKN(Pt, P, K, Foot, C, Nb)) * Dz;
+				Sn += double(H::Uni_GalaxyNebulaDensity(Nb, P, Foot, 0.0f)) * Dz;
+			}
+			OutRho[size_t(Y) * Px + X] = Sr;
+			OutNeb[size_t(Y) * Px + X] = Sn;
+		}
+	}
+
+	struct FMarchOut { std::vector<float> Rgb; double Lum = 0.0; };
+
+	FMarchOut NebMarch(const FVolumeScene& Sc, const FCamera& Cm)
+	{
+		FMarchOut R;
+		R.Rgb.assign(size_t(Cm.Width) * Cm.Height * 3, 0.0f);
+		const auto V = ToHlsl(Sc.View);
+		const auto Cb = Sc.CarrierBuf(); const auto Pb = Sc.ParamBuf(); const auto Lb = Sc.LutBuf();
+		for (int Y = 0; Y < Cm.Height; ++Y) for (int X = 0; X < Cm.Width; ++X)
+		{
+			bool bS = false;
+			const H::FUniVolumeResult Rs = MarchPixel(Cb, Pb, Lb, V, Cm, Cm.Width, Cm.Height, X, Y, 3.0e38f, bS);
+			float* O = &R.Rgb[(size_t(Y) * Cm.Width + X) * 3];
+			O[0] = Rs.Radiance.x; O[1] = Rs.Radiance.y; O[2] = Rs.Radiance.z;
+			R.Lum += double(H::Uni_Luminance(Rs.Radiance));
+		}
+		return R;
+	}
+}
+
+UNI_TEST(galaxy, nebulae)
+{
+	const FNebTex Tx;
+	if (!Tx.bOk) { Uni::Check(2, "T2.galaxy.nebulae", "D-234 nebulae").Pass(false, "textures not loaded: " + Tx.Err); return; }
+	FNebBind Bind(Tx);
+	FUniverseDef D = UniScenes::Base();
+	UniScenes::UseGalaxyTextures(D, Tx.T[0].Size);
+	const FUniEmitter& E = D.Arch(UniScenes::kGalaxy).Emitters.at(0);
+	const FVolumeProfile& Prof = D.Arch(UniScenes::kGalaxy).Volume;
+
+	// The field's density: never negative, zero without knots and outside the cut.
+	size_t Negative = 0, Leak = 0, Points = 0, Inside = 0, PatternMoved = 0, PatternN = 0;
+	for (u32 Gi = 0; Gi < 12u; ++Gi)
+	{
+		const FFieldParams Pf = NebRolled(E, H::Uni_SeedMix(0xEB10u, Gi));
+		FFieldParams Pk = Pf; Pk.V[29] = 0.0f;
+		FFieldParams Pe = NebRolled(E, H::Uni_SeedMix(0xEB11u, Gi), true); Pe.V[20] = 0.0f;   // D-236: early types' filaments off (T2.galaxy.early_nebulae has them)
+		const H::FUniFieldParams Sets[4] = { Pf.ToHlsl(), Pe.ToHlsl(), DustFrom(Pf, Prof).ToHlsl(), Pk.ToHlsl() };
+		for (int Si = 0; Si < 4; ++Si)
+		{
+			const H::FUniGalaxyConst K = H::Uni_GalaxyConstOf(Sets[0]);
+			for (u32 I = 0; I < 400u; ++I)
+			{
+				const H::float3 Pt = NebPoint(0xEB12u + Gi * 7u + u32(Si), I);
+				const float Sc = I % 5u == 0u ? 1.05f : 1.0f;   // a fifth just outside the unit ball
+				const H::float3 Pq(Pt.x * Sc, Pt.y * Sc, Pt.z * Sc);
+				H::float4 C(0, 0, 0, 0), Nv(0, 0, 0, 0);
+				const float Foot = float(0.01 * (I % 4u));
+				H::UniField_GalaxyFilteredCKN(Pq, Sets[Si], K, Foot, C, Nv);
+				const float Nb = H::Uni_GalaxyNebulaDensity(Nv, Sets[Si], Foot, 0.0f);
+				++Points;
+				if (Nb < 0.0f || !(Nb == Nb) || Nv.x < 0.0f) { ++Negative; }
+				const bool bOut = H::dot(Pq, Pq) >= Sets[Si].D.x * Sets[Si].D.x;
+				if ((Si > 0 || bOut) && (Nb != 0.0f || Nv.x != 0.0f)) { ++Leak; }
+				if (Si == 0 && Nb > 0.0f) { ++Inside; }
+				// D-235: the pattern does not change with the footprint below the blend.
+				if (Si == 0 && Nv.x > 0.0f)
+				{
+					H::float4 C2(0, 0, 0, 0), Nv2(0, 0, 0, 0);
+					H::UniField_GalaxyFilteredCKN(Pq, Sets[Si], K, Foot * 0.5f + 0.0005f, C2, Nv2);
+					if (Nv2.y != Nv.y || Nv2.z != Nv.z) { ++PatternMoved; }
+					++PatternN;
+				}
+			}
+		}
+	}
+
+	// Light (the nebulae's density x the gain 1 against the stars'), knots, and receding.
+	const int Ng = 9, Px = 72;
+	double ShareMin = 1e9, ShareMax = 0.0, ShareMean = 0.0, TopMin = 1e9, RecedeWorst = 0.0;
+	for (int Gi = 0; Gi < Ng; ++Gi)
+	{
+		const FFieldParams Pf = NebRolled(E, H::Uni_SeedMix(0x9A1Au, u32(Gi)));
+		const H::FUniFieldParams P = Pf.ToHlsl();
+		std::vector<double> R0, N0;
+		FaceOn(P, Px, 0.7, 48, 0.004f, R0, N0);
+		double Sr = 0.0, Sn = 0.0;
+		for (size_t I = 0; I < R0.size(); ++I) { Sr += R0[I]; Sn += N0[I]; }
+		const double Share = Sn / std::max(Sr, 1e-300);
+		ShareMin = std::min(ShareMin, Share); ShareMax = std::max(ShareMax, Share); ShareMean += Share / Ng;
+		std::vector<double> Sorted = N0;
+		std::sort(Sorted.begin(), Sorted.end(), [](double A, double B) { return A > B; });
+		double Top = 0.0;
+		for (size_t I = 0; I < Sorted.size() / 10; ++I) { Top += Sorted[I]; }
+		TopMin = std::min(TopMin, Top / std::max(Sn, 1e-300));
+		// Receding: the share at a footprint 6 and 12 times wider (mips ~2.6 more and ~3.6 more).
+		for (const float Foot : { 0.024f, 0.048f })
+		{
+			std::vector<double> R1, N1;
+			FaceOn(P, Px, 0.7, 48, Foot, R1, N1);
+			double S1r = 0.0, S1n = 0.0;
+			for (size_t I = 0; I < R1.size(); ++I) { S1r += R1[I]; S1n += N1[I]; }
+			RecedeWorst = std::max(RecedeWorst, std::abs((S1n / std::max(S1r, 1e-300)) / std::max(Share, 1e-300) - 1.0));
+			if (std::getenv("UU_NEBDBG")) { std::printf("galaxy %d G.w %.2f foot %.3f: share %.4f vs %.4f\n", Gi, Pf.V[27], Foot, S1n / std::max(S1r, 1e-300), Share); }
+		}
+	}
+
+	// Dark clouds: the dust's mean and contrast with the clumps and without.
+	double DustMeanRatio = 0.0, DustCvOn = 0.0, DustCvOff = 0.0;
+	{
+		FVolumeProfile Off = Prof; Off.DustClumps = 0.0f;
+		double S[2] = { 0, 0 }, S2[2] = { 0, 0 }; size_t N = 0;
+		for (u32 Gi = 0; Gi < 6u; ++Gi)
+		{
+			const FFieldParams Pf = NebRolled(E, H::Uni_SeedMix(0xEB13u, Gi));
+			const H::FUniFieldParams Dd[2] = { DustFrom(Pf, Prof).ToHlsl(), DustFrom(Pf, Off).ToHlsl() };
+			for (u32 I = 0; I < 3000u; ++I)
+			{
+				const double R = std::sqrt(NebUnit(0xEB14u + Gi, 3 * I)) * 0.8, Ph = 6.2831853 * NebUnit(0xEB14u + Gi, 3 * I + 1);
+				const H::float3 Pt(float(R * std::cos(Ph)), float(R * std::sin(Ph)), float(0.01 * (2.0 * NebUnit(0xEB14u + Gi, 3 * I + 2) - 1.0)));
+				for (int K = 0; K < 2; ++K) { const double V = double(H::UniField_GalaxyFiltered(Pt, Dd[K], 0.0f)); S[K] += V; S2[K] += V * V; }
+				++N;
+			}
+		}
+		DustMeanRatio = S[0] / std::max(S[1], 1e-300);
+		for (int K = 0; K < 2; ++K)
+		{
+			const double M = S[K] / N, Var = std::max(S2[K] / N - M * M, 0.0);
+			(K == 0 ? DustCvOn : DustCvOff) = std::sqrt(Var) / std::max(M, 1e-300);
+		}
+	}
+
+	// The LUT's full light per star, and the march on the Milky Way.
+	FUniverseDef Dm = UniScenes::GalaxyToStar();
+	UniScenes::UseGalaxyTextures(Dm, Tx.T[0].Size);
+	FUniverseModel M(Dm);
+	FRefGenerator G(M);
+	FVolumeBuilder VB(M, G);
+	double LutWorst = 0.0; size_t LutBelow = 0, LutChecked = 0;
+	struct FShot { const char* Name; FVec3d Off; FVec3d Look; int W, Ht; };
+	const FShot Shots[] = { { "60 kpc", { 0.0, -40.0 * Units::Kpc, 45.0 * Units::Kpc }, { 0.0, 40.0, -45.0 }, 240, 160 }, { "solar, along the disc", { 0, 0, 0 }, { -1, -0.12, -0.02 }, 300, 125 } };
+	double Added[2] = { 0, 0 };
+	double FarRatioWorst = 0.0;
+	std::vector<FMarchOut> Frames;
+	for (int Si = 0; Si < 2; ++Si)
+	{
+		const FShot& Sh = Shots[Si];
+		FRefPipeline P(G);
+		P.bVelocityLod = false;
+		FCoord Cam = UniScenes::SolarCamera(); FVec3f Fr{};
+		AddDisplacement(Cam, Fr, Sh.Off);
+		P.Update(Cam, FVec3f{});
+		FCamera Cm; Cm.Coord = Cam; Cm.Width = Sh.W; Cm.Height = Sh.Ht; Cm.DeltaMag = 0.0;
+		Cm.LookAlong({ Sh.Look.X, Sh.Look.Y, Sh.Look.Z });
+		auto Settings = [](float Gn, float Rf, double NearCm) { FVolumeSettings S; S.NebulaGain = Gn; S.NebulaReflect = Rf; S.NebulaNearCm = float(NearCm); return S; };
+		const FVolumeScene Off = VB.Build(P, Cam, FVec3f{}, Cm.View(), Settings(0.0f, 0.0f, 0.0)).Subset(false);
+		const FVolumeScene On = VB.Build(P, Cam, FVec3f{}, Cm.View(), Settings(1.0f, 6.0f, 0.0)).Subset(false);
+		const FVolumeScene Far = VB.Build(P, Cam, FVec3f{}, Cm.View(), Settings(1.0f, 6.0f, 1.0e35)).Subset(false);
+		if (Si == 0)
+		{
+			// Every galaxy carrier's block: the full light against the unresolved light per star
+			// where nothing is resolved (horizon dimming undone), and never below it.
+			for (const FCarrierGPU& C : On.Carriers)
+			{
+				if (C.FieldId != H::UNI_FIELD_GALAXY) { continue; }
+				const u32 Blk = C.LutIndex;
+				const double Full = double(On.Lut[size_t(Blk) * H::UNI_VOL_LUT_SIZE + 1u].w);
+				for (u32 I = 0; I < H::UNI_VOL_LUT_SIZE; ++I)
+				{
+					const double T = LutT(int(I));
+					const double Dim = double(H::Uni_HorizonDimming(float(T)));
+					if (!(Dim > 0.5)) { continue; }
+					const H::float4 L = On.Lut[size_t(Blk) * H::UNI_VOL_LUT_SIZE + I];
+					const double U = (0.2126 * L.x + 0.7152 * L.y + 0.0722 * L.z) / Dim;
+					if (U > Full * (1.0 + 1e-4)) { ++LutBelow; }
+					if (T > 1.0e26 && Dim > 0.95) { LutWorst = std::max(LutWorst, std::abs(U / std::max(Full, 1e-300) - 1.0)); ++LutChecked; }
+				}
+			}
+		}
+		const FMarchOut A = NebMarch(Off, Cm), B = NebMarch(On, Cm), C = NebMarch(Far, Cm);
+		Added[Si] = B.Lum / std::max(A.Lum, 1e-300) - 1.0;
+		FarRatioWorst = std::max(FarRatioWorst, std::abs(C.Lum / std::max(A.Lum, 1e-300) - 1.0));   // D-235: the gas layer's step cap changes the steps, nothing else
+		Frames.push_back(B); Frames.push_back(A);
+	}
+	// Stills: the Milky Way (each pair normalised to the frame without nebulae's peak luminance).
+	{
+		const int W0 = Shots[0].W, H0 = Shots[0].Ht, W1 = Shots[1].W, H1 = Shots[1].Ht;
+		FImage Img(std::max(2 * W0, W1), H0 + 2 * H1);
+		auto Put = [&](const FMarchOut& F, int W, int Ht, int Ox, int Oy, double Peak)
+		{
+			const float G = float(1.0 / std::max(Peak, 1e-300));
+			for (int Y = 0; Y < Ht; ++Y) for (int X = 0; X < W; ++X) { const float* C = &F.Rgb[(size_t(Y) * W + X) * 3]; Img.Add(Ox + X, Oy + Y, C[0] * G, C[1] * G, C[2] * G); }
+		};
+		auto PeakOf = [](const FMarchOut& F) { double P = 0.0; for (size_t I = 0; I < F.Rgb.size(); I += 3) { P = std::max(P, 0.2126 * F.Rgb[I] + 0.7152 * F.Rgb[I + 1] + 0.0722 * F.Rgb[I + 2]); } return P; };
+		Put(Frames[0], W0, H0, 0, 0, 0.25 * PeakOf(Frames[1]));
+		Put(Frames[1], W0, H0, W0, 0, 0.25 * PeakOf(Frames[1]));
+		Put(Frames[2], W1, H1, 0, H0, 0.8 * PeakOf(Frames[3]));
+		Put(Frames[3], W1, H1, 0, H0 + H1, 0.8 * PeakOf(Frames[3]));
+		NebWrite(Img, "still_nebula_milkyway", { "D-234: the Milky Way from 60 kpc with nebulae (left) and without; from the solar camera with (middle) and without (bottom)",
+			"the volume march (uu.Nebula 1, Reflect 6, NearKpc 2, dark clouds 1.2)" });
+	}
+	// Stills: nine spirals with nebulae and dark clouds (left) and without (right).
+	{
+		const int Tile = 160, Grid = 3;
+		FImage Img(Tile * Grid * 2, Tile * Grid);
+		const H::float3 Base = H::Uni_TemperatureColour(5500.0f);
+		const float BaseLum = H::Uni_Luminance(Base);
+		for (int Side = 0; Side < 2; ++Side)
+		{
+			FVolumeProfile Pr = Prof;
+			if (Side == 1) { Pr.DustClumps = 0.0f; }
+			for (int Gi = 0; Gi < Grid * Grid; ++Gi)
+			{
+				const FFieldParams Pf = NebRolled(E, H::Uni_SeedMix(0x9A1Au, u32(Gi)));
+				const H::FUniFieldParams P = Pf.ToHlsl(), Pd = DustFrom(Pf, Pr).ToHlsl();
+				const H::FUniGalaxyConst K = H::Uni_GalaxyConstOf(P);
+				const double Inc = (20.0 + 7.0 * Gi) * 3.14159265358979 / 180.0, Az = 0.7 * Gi;
+				const double Dv[3] = { std::sin(Inc) * std::cos(Az), std::sin(Inc) * std::sin(Az), -std::cos(Inc) };
+				const double Rt[3] = { -std::sin(Az), std::cos(Az), 0.0 };
+				const double Up[3] = { Dv[1] * Rt[2] - Dv[2] * Rt[1], Dv[2] * Rt[0] - Dv[0] * Rt[2], Dv[0] * Rt[1] - Dv[1] * Rt[0] };
+				std::vector<float> L(size_t(Tile) * Tile * 3, 0.0f);
+				float Peak = 0.0f;
+				const double Half = 0.65, Pxs = 2.0 * Half / Tile;
+				const int Steps = 600;
+				const double Dt = 2.0 / Steps;
+				for (int Y = 0; Y < Tile; ++Y) for (int X = 0; X < Tile; ++X)
+				{
+					const double U = -Half + (X + 0.5) * Pxs, V = Half - (Y + 0.5) * Pxs;
+					double O[3];
+					for (int Ax = 0; Ax < 3; ++Ax) { O[Ax] = U * Rt[Ax] + V * Up[Ax] - 1.0 * Dv[Ax]; }
+					double Col[3] = { 0, 0, 0 }, Tau[3] = { 0, 0, 0 };
+					const double Sig[3] = { 0.8, 1.0, 1.3 };
+					const float Foot = float(std::max(Pxs, 0.6 * Dt));
+					for (int S = 0; S < Steps; ++S)
+					{
+						const double T = (S + 0.5) * Dt;
+						const H::float3 Pt(float(O[0] + T * Dv[0]), float(O[1] + T * Dv[1]), float(O[2] + T * Dv[2]));
+						if (H::dot(Pt, Pt) >= 1.0f) { continue; }
+						float Re = 0.0f, Rd = 0.0f;
+						H::float4 Comp(0, 0, 0, 0), Nv(0, 0, 0, 0);
+						H::UniField_GalaxyPairCKN(Pt, P, Pd, K, Foot, Re, Rd, Comp, Nv);
+						const float Stp = float(Dt * std::sqrt(Dv[0] * Dv[0] + Dv[1] * Dv[1]));
+						const float Nb = H::Uni_GalaxyNebulaDensity(Nv, P, float(Pxs), Stp);
+						const H::float3 Cn = H::Uni_GalaxyNebulaColour(P, K.Hs, Nv.z, H::Uni_GalaxyNebulaBlend(P, float(Pxs), Stp));
+						double Em[3] = { Re * Base.x, Re * Base.y, Re * Base.z };
+						if (Side == 0)
+						{
+							// As the march: the nebulae x the gain (1) and the reflection (6) at the stars' light per star.
+							const float Sum = Comp.x + Comp.y + Comp.z + Comp.w;
+							const double Young = Sum > 0.0f ? double(Comp.w / Sum) : 0.0;
+							const double Ne = BaseLum * double(Nb), Rf = BaseLum * 6.0 * double(Rd) * Young;
+							Em[0] += Ne * Cn.x + Rf * H::UNI_NEBULA_REFLECT_COLOUR.x;
+							Em[1] += Ne * Cn.y + Rf * H::UNI_NEBULA_REFLECT_COLOUR.y;
+							Em[2] += Ne * Cn.z + Rf * H::UNI_NEBULA_REFLECT_COLOUR.z;
+						}
+						const double Du = double(Pd.D.y) * double(Rd) * Dt;
+						for (int C = 0; C < 3; ++C) { Col[C] += Em[C] * Dt * std::exp(-Tau[C]); Tau[C] += Sig[C] * Du; }
+					}
+					for (int C = 0; C < 3; ++C) { L[(size_t(Y) * Tile + X) * 3 + C] = float(Col[C]); Peak = std::max(Peak, float(Col[C])); }
+				}
+				const int Ox = Side * Tile * Grid + (Gi % Grid) * Tile, Oy = (Gi / Grid) * Tile;
+				const float Gain = Peak > 0.0f ? 5.0f / Peak : 0.0f;
+				for (int Y = 0; Y < Tile; ++Y) for (int X = 0; X < Tile; ++X) { const float* C = &L[(size_t(Y) * Tile + X) * 3]; Img.Add(Ox + X, Oy + Y, C[0] * Gain, C[1] * Gain, C[2] * Gain); }
+			}
+		}
+		NebWrite(Img, "still_galaxy_nebulae", { "D-234: nine textured spirals with emission and reflection nebulae and dark clouds (left) and without (right)",
+			"emission over a 5500 K glow with dust; each tile normalised to its peak" });
+	}
+
+	const bool bPass = Negative == 0 && Leak == 0 && Inside > 50 && PatternMoved == 0 && PatternN > 50 && ShareMin > 0.01 && ShareMax < 0.4 && TopMin > 0.5 && RecedeWorst < 0.6
+		&& std::abs(DustMeanRatio - 1.0) < 0.05 && DustCvOn > DustCvOff * 1.02 && LutBelow == 0 && LutChecked > 0 && LutWorst < 0.01
+		&& Added[0] > 0.03 && Added[0] < 0.3 && Added[1] > 0.02 && Added[1] < 0.4 && FarRatioWorst < 0.01;
+	Uni::Check(2, "T2.galaxy.nebulae", "D-234 nebulae: the density is never negative and zero without knots (early types without D-236's filaments, dust sets, H.y 0) and outside the cut; D-235: its pattern (the fixed-mip read) is the same at half the footprint; nine spirals' nebulae carry 1-40% of the stars' light face-on, the brightest tenth of their pixels over half of it, within 60% as the footprint widens 6-12x (the knots' stretch by mip; typically 20%); the dark clouds keep the dust's mean within 5% (linear about the knots' mean) and add contrast (2%, its lanes and holes dominating); the LUT's full light per star is the unresolved light where none is resolved (1%) and never below it; the Milky Way's march adds 3-30% from 60 kpc and 2-40% from the solar camera, and with the near fade at infinity (no nebula light; D-235's step cap still on) is the frame without within 1%")
+		.Metric("share_min", ShareMin).Metric("share_mean", ShareMean).Metric("share_max", ShareMax).Metric("top_tenth_min", TopMin).Metric("recede_worst", RecedeWorst)
+		.Metric("dust_mean_ratio", DustMeanRatio).Metric("dust_cv_on", DustCvOn).Metric("dust_cv_off", DustCvOff).Metric("lut_worst", LutWorst).Metric("added_out", Added[0]).Metric("added_in", Added[1])
+		.Pass(bPass, Uni::Fmt("%zu points: %zu negative, %zu nonzero without knots or outside, %zu with nebulae, the pattern different at half the footprint at %zu of %zu; share %.1f-%.1f%% (mean %.1f%%), top tenth >= %.0f%%, receding within %.0f%%; dust mean x%.3f, contrast %.3f vs %.3f; LUT: %zu entries checked, worst %.2e, %zu above the full light; Milky Way +%.1f%% (60 kpc), +%.1f%% (solar), faded out within %.2f%%",
+			Points, Negative, Leak, Inside, PatternMoved, PatternN, 100.0 * ShareMin, 100.0 * ShareMax, 100.0 * ShareMean, 100.0 * TopMin, 100.0 * RecedeWorst, DustMeanRatio, DustCvOn, DustCvOff, LutChecked, LutWorst, LutBelow,
+			100.0 * Added[0], 100.0 * Added[1], 100.0 * FarRatioWorst));
+}
+
+namespace
+{
+	/** The nebulae's light along one ray through a galaxy in field units from O along unit Dir, as
+	 *  the march steps it from inside (log steps at StepRatio, the galaxy's hint x HintScale) with
+	 *  the first step shifted by Phase of itself; Res the larger of the footprint (ThetaPx t) and
+	 *  half the step, as the march has it. */
+	double NebRay(const H::FUniFieldParams& P, const H::FUniGalaxyConst& K, const double O[3], const double Dir[3], double ThetaPx, double Phase, double StepRatio, double HintScale, int What = 0)
+	{
+		const H::float3 D = H::float3(float(Dir[0]), float(Dir[1]), float(Dir[2]));
+		// From the unit ball's entry when the origin is outside it (the march's chord), with the
+		// log steps' distance from the camera kept (Tc = T + Tc0 below).
+		double Bo = O[0] * Dir[0] + O[1] * Dir[1] + O[2] * Dir[2], Co = O[0] * O[0] + O[1] * O[1] + O[2] * O[2] - 1.0;
+		const double Disc = Bo * Bo - Co;
+		if (Disc <= 0.0) { return 0.0; }
+		const double Entry = std::max(-Bo - std::sqrt(Disc), 1.0e-4);
+		double T = Entry, Sum = 0.0;
+		bool bFirst = true;
+		for (int N = 0; N < 4000; ++N)
+		{
+			const H::float3 Pt(float(O[0] + T * Dir[0]), float(O[1] + T * Dir[1]), float(O[2] + T * Dir[2]));
+			if (H::dot(Pt, Pt) >= 1.0f && T > Entry + 1.0e-3) { break; }
+			const float Foot = float(ThetaPx * T);
+			double S = std::min(std::min(StepRatio * T, HintScale * double(H::Uni_GalaxyStepHintFilteredK(Pt, D, P, Foot, K.Hp))), double(H::Uni_GalaxyNebulaStepCap(Pt, D, P, K.Hp, Foot)));
+			S = std::max(S, 1.0e-6);
+			if (bFirst) { S *= (0.25 + Phase); bFirst = false; }
+			const double Tm = T + 0.5 * S;
+			const H::float3 Pm(float(O[0] + Tm * Dir[0]), float(O[1] + Tm * Dir[1]), float(O[2] + Tm * Dir[2]));
+			H::float4 C(0, 0, 0, 0), Nv(0, 0, 0, 0);
+			const float Rho = H::UniField_GalaxyFilteredCKN(Pm, P, K, float(ThetaPx * Tm), C, Nv);
+			const float Inpl = float(std::sqrt(Dir[0] * Dir[0] + Dir[1] * Dir[1]));
+			const double V = What == 1 ? double(Rho) : (What == 2 ? double(Nv.x) : double(H::Uni_GalaxyNebulaDensity(Nv, P, float(ThetaPx * Tm), float(S) * Inpl)));
+			Sum += V * S;
+			T += S;
+		}
+		return Sum;
+	}
+}
+
+UNI_TEST(galaxy, nebula_slide)
+{
+	// D-235 (owner, after D-234 in the engine: "substantial raymarch sliding in the nebula field";
+	// "they change location when the view swaps after being stationary"): from inside a textured
+	// spiral (solar-like, in its mid-plane), rays along and across the disc, the nebulae's light
+	// marched as the engine steps (StepRatio 0.32, hints x 3 inside) with the first step's phase
+	// moved (0, 1/4, 1/2, 3/4: the shells move with the camera): the spread over the mean,
+	// light-weighted; and the pattern itself does not depend on the footprint (checked in
+	// T2.galaxy.nebulae). The D-234 form is reported for comparison (its knot read at the
+	// footprint's mip, no step blend).
+	const FNebTex Tx;
+	if (!Tx.bOk) { Uni::Check(2, "T2.galaxy.nebula_slide", "D-235 nebula slide").Pass(false, "textures not loaded: " + Tx.Err); return; }
+	FNebBind Bind(Tx);
+	FUniverseDef D = UniScenes::GalaxyToStar();
+	UniScenes::UseGalaxyTextures(D, Tx.T[0].Size);
+	const FFieldParams* Mw = nullptr;
+	for (const FAnchor& A : D.Anchors) { if (!A.EmitterParams.empty()) { Mw = &A.EmitterParams[0]; } }
+	if (!Mw) { Uni::Check(2, "T2.galaxy.nebula_slide", "D-235 nebula slide").Pass(false, "no anchor"); return; }
+	const H::FUniFieldParams P = Mw->ToHlsl();
+	const H::FUniGalaxyConst K = H::Uni_GalaxyConstOf(P);
+	auto Measure = [&](double StepRatio, double HintScale, int NRays, double& OutMeanLight, int What = 0, bool bOutside = false)
+	{
+		double Wsum = 0.0, Ssum = 0.0;
+		OutMeanLight = 0.0;
+		for (int R = 0; R < NRays; ++R)
+		{
+			const double Az = 6.2831853 * NebUnit(0xEB20u, u32(2 * R)), El = (NebUnit(0xEB20u, u32(2 * R + 1)) - 0.5) * 0.6;
+			double Dir[3] = { std::cos(El) * std::cos(Az), std::cos(El) * std::sin(Az), std::sin(El) };
+			double O[3] = { 0.53, 0.0, 0.0015 };
+			if (bOutside)
+			{
+				// From 1.5 radii at 45 degrees, rays toward points of the disc out to 0.8.
+				const double Rr = 0.8 * std::sqrt(NebUnit(0xEB21u, u32(2 * R))), Ph = 6.2831853 * NebUnit(0xEB21u, u32(2 * R + 1));
+				O[0] = 1.06; O[1] = 0.0; O[2] = 1.06;
+				const double Tg[3] = { Rr * std::cos(Ph), Rr * std::sin(Ph), 0.0 };
+				double L = 0.0;
+				for (int A = 0; A < 3; ++A) { Dir[A] = Tg[A] - O[A]; L += Dir[A] * Dir[A]; }
+				L = std::sqrt(L);
+				for (int A = 0; A < 3; ++A) { Dir[A] /= L; }
+				O[0] -= 2.5 * Dir[0]; O[1] -= 2.5 * Dir[1]; O[2] -= 2.5 * Dir[2];   // the camera 4 radii out (60 kpc for the Milky Way)
+			}
+			double Lo = 1e300, Hi = -1e300, Mean = 0.0;
+			for (int Ph = 0; Ph < 4; ++Ph) { const double L = NebRay(P, K, O, Dir, 0.0012, 0.25 * Ph, StepRatio, HintScale, What); Lo = std::min(Lo, L); Hi = std::max(Hi, L); Mean += 0.25 * L; }
+			if (!(Mean > 0.0)) { continue; }
+			Wsum += Mean; Ssum += Hi - Lo;
+			OutMeanLight += Mean / NRays;
+		}
+		return Wsum > 0.0 ? Ssum / Wsum : 0.0;
+	};
+	double Light = 0.0, LightOut = 0.0;
+	const double Slide = Measure(0.32, 3.0, 160, Light);
+	const double SlideOut = Measure(0.32, 1.0, 160, LightOut, 0, true);
+	double Ls = 0.0;
+	const double SlideSrc = Measure(0.32, 3.0, 160, Ls, 2), SlideStars = Measure(0.32, 3.0, 160, Ls, 1);
+	// The shaders' constants against the C++ knobs.
+	double Cm = std::nan(""), Cs = std::nan(""), Cr = std::nan(""), Cp = std::nan(""), Cf = std::nan("");
+	{
+		std::ifstream F("Shaders/Private/Core/UniFields.ush");
+		std::stringstream B; B << F.rdbuf();
+		auto Def = [&](const std::string& N) { const std::regex Re("#define\\s+" + N + "\\s+([-0-9.eE]+)f?"); std::smatch M; const std::string T = B.str(); return std::regex_search(T, M, Re) ? std::stod(M[1].str()) : std::nan(""); };
+		Cm = Def("UNI_NEBULA_MIP"); Cs = Def("UNI_NEBULA_STRETCH"); Cr = Def("UNI_NEBULA_RES"); Cp = Def("UNI_NEBULA_STEP"); Cf = Def("UNI_NEBULA_FOOT");
+	}
+	const bool bConst = Cm == double(H::GKnobNebMip) && std::abs(Cs - double(H::GKnobNebStretch)) < 1e-6 && Cr == double(H::GKnobNebRes) && Cp == double(H::GKnobNebStep) && Cf == double(H::GKnobNebFoot);
+	Uni::Check(2, "T2.galaxy.nebula_slide", "D-235 the nebulae marched from inside a textured spiral as the engine steps (StepRatio 0.32, hints x 3), 160 rays along and across the disc, the first step's phase moved: the light's spread within 2% of the gas layer's own without knots (the stars' is reported); from 60 kpc at 45 degrees (hints x 1, the gas layer's step cap) under 1.5%; the shaders' nebula constants are the C++ knobs'")
+		.Metric("slide", Slide).Metric("slide_outside", SlideOut).Metric("slide_source", SlideSrc).Metric("slide_stars", SlideStars).Metric("light", Light)
+		.Pass(bConst && Slide < SlideSrc + 0.02 && SlideOut < 0.015 && Light > 0.0 && LightOut > 0.0, Uni::Fmt("inside: slide %.2f%% (the gas layer without knots %.2f%%, the stars %.2f%%); outside at 45 deg: %.2f%%; constants mip %.2f stretch %.4f res %.2f step %.2f foot %.1f %s",
+			100.0 * Slide, 100.0 * SlideSrc, 100.0 * SlideStars, 100.0 * SlideOut, Cm, Cs, Cr, Cp, Cf, bConst ? "match" : "DIFFER"));
+}
+
+UNI_TEST(galaxy, nebula_edges)
+{
+	// D-235 (owner, in the engine: a nebula "cut off in a straight line", the edge stepped): from
+	// above a disc, where the march's last long step before the gas layer landed moved from pixel to
+	// pixel, and so whether the nebula there was sampled with short steps (its pattern) or blended
+	// to its mean. The textured Milky Way's nebulae from 1 kpc above the disc looking down across
+	// it, as the engine steps (StepRatio 0.32, hints x 3 when inside the galaxy) against fine steps
+	// (StepRatio 0.005, hints x 0.25), 96 x 54 px: the per-pixel error's 95th percentile where the
+	// nebulae are over 5% of their peak, and the frame's nebula light.
+	const FNebTex Tx;
+	if (!Tx.bOk) { Uni::Check(2, "T2.galaxy.nebula_edges", "D-235 nebula edges").Pass(false, "textures not loaded: " + Tx.Err); return; }
+	FNebBind Bind(Tx);
+	FUniverseDef D = UniScenes::GalaxyToStar();
+	UniScenes::UseGalaxyTextures(D, Tx.T[0].Size);
+	const FFieldParams* Mw = nullptr;
+	for (const FAnchor& A : D.Anchors) { if (!A.EmitterParams.empty()) { Mw = &A.EmitterParams[0]; } }
+	if (!Mw) { Uni::Check(2, "T2.galaxy.nebula_edges", "D-235 nebula edges").Pass(false, "no anchor"); return; }
+	const H::FUniFieldParams P = Mw->ToHlsl();
+	const H::FUniGalaxyConst K = H::Uni_GalaxyConstOf(P);
+	const int W = 96, Ht = 54;
+	const double O[3] = { 0.53, 0.0, 0.066 };
+	double Fw[3] = { -0.5, 0.08, -0.85 };
+	{ const double L = std::sqrt(Fw[0] * Fw[0] + Fw[1] * Fw[1] + Fw[2] * Fw[2]); for (double& V : Fw) { V /= L; } }
+	double Rt[3] = { -Fw[1], Fw[0], 0.0 };
+	{ const double L = std::sqrt(Rt[0] * Rt[0] + Rt[1] * Rt[1]); Rt[0] /= L; Rt[1] /= L; }
+	const double Up[3] = { Rt[1] * Fw[2] - Rt[2] * Fw[1], Rt[2] * Fw[0] - Rt[0] * Fw[2], Rt[0] * Fw[1] - Rt[1] * Fw[0] };
+	const double Tan = std::tan(0.5 * 70.0 * 3.14159265358979 / 180.0), ThetaPx = 2.0 * Tan / W;
+	std::vector<double> A(size_t(W) * Ht), B(size_t(W) * Ht);
+	std::vector<char> Capped(size_t(W) * Ht, 0);
+	double Peak = 0.0;
+	const double Texel = std::exp2(double(H::GKnobNebMip)) / (double(P.G.w) * std::max(double(P.H.w), 1.0)), Hg = 0.5 * double(P.A.y);
+	for (int Y = 0; Y < Ht; ++Y) for (int X = 0; X < W; ++X)
+	{
+		const double U = (2.0 * (X + 0.5) / W - 1.0) * Tan, V = (1.0 - 2.0 * (Y + 0.5) / Ht) * Tan * Ht / W;
+		double Dir[3];
+		double L = 0.0;
+		for (int Ax = 0; Ax < 3; ++Ax) { Dir[Ax] = Fw[Ax] + U * Rt[Ax] + V * Up[Ax]; L += Dir[Ax] * Dir[Ax]; }
+		L = std::sqrt(L);
+		for (double& Dv : Dir) { Dv /= L; }
+		const size_t I = size_t(Y) * W + X;
+		A[I] = NebRay(P, K, O, Dir, ThetaPx, 0.0, 0.32, 3.0);
+		{
+			// Rays the gas layer's cap samples at its finest (its own steps, not lengthened).
+			const double Inpl = std::max(std::sqrt(Dir[0] * Dir[0] + Dir[1] * Dir[1]), 0.05);
+			const double Cap = double(H::GKnobNebStep) * Texel / Inpl, Path = std::min(8.0 * Hg / std::max(std::abs(Dir[2]), 1e-3), 2.0);
+			Capped[I] = Path / 48.0 <= Cap ? 1 : 0;
+		}
+		B[I] = NebRay(P, K, O, Dir, ThetaPx, 0.0, 0.005, 0.25);
+		Peak = std::max(Peak, B[I]);
+	}
+	std::vector<double> E;
+	double Sa = 0.0, Sb = 0.0;
+	for (size_t I = 0; I < A.size(); ++I)
+	{
+		Sa += A[I]; Sb += B[I];
+		if (B[I] > 0.05 * Peak && Capped[I]) { E.push_back(std::abs(A[I] - B[I]) / B[I]); }
+	}
+	std::sort(E.begin(), E.end());
+	const double P95 = E.empty() ? 1.0 : E[size_t(0.95 * double(E.size() - 1))];
+	const double Light = Sa / std::max(Sb, 1e-300) - 1.0;
+	{
+		FImage Img(W * 2, Ht);
+		for (int Y = 0; Y < Ht; ++Y) for (int X = 0; X < W; ++X)
+		{
+			const float Ga = float(A[size_t(Y) * W + X] / std::max(Peak, 1e-300)) * 2.0f, Gb = float(B[size_t(Y) * W + X] / std::max(Peak, 1e-300)) * 2.0f;
+			Img.Add(X, Y, Ga, Ga * 0.5f, Ga * 0.7f);
+			Img.Add(W + X, Y, Gb, Gb * 0.5f, Gb * 0.7f);
+		}
+		NebWrite(Img, "still_nebula_edges", { "D-235: the Milky Way's nebulae from 1 kpc above the disc, as the engine steps (left) and with fine steps (right)" });
+	}
+	Uni::Check(2, "T2.galaxy.nebula_edges", "D-235 the textured Milky Way's nebulae from 1 kpc above its disc looking down at 60 degrees (its warp lifts the gas layer there), as the engine steps against fine steps (96 x 54): where the gas layer's cap samples at its finest (rays crossing it steeply enough), the per-pixel error's 95th percentile under 25% where the nebulae are over 5% of their peak (a nebula cut where the last long step landed fails this); the frame's light (shallower rays blend to the mean) reported; still_nebula_edges")
+		.Metric("p95", P95).Metric("light", Light).Pass(P95 < 0.25 && E.size() > 50, Uni::Fmt("p95 %.1f%% over %zu capped px; the frame's light %+.1f%%", 100.0 * P95, E.size(), 100.0 * Light));
+}

@@ -1,0 +1,147 @@
+// Exploration for D-234 (nebulae): contact sheets and Milky Way views at gains from the
+// environment (UU_NEB, UU_REF, UU_CLUMP). Archived to experiments/ when done.
+#include "../src/UniTest.h"
+#include "../src/UniVerifyCommon.h"
+#include "../src/UniRenderRef.h"
+#include "../src/UniVolumeRef.h"
+#include "../scenes/UniScenes.h"
+#include "UniWebTexture.h"
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <sys/stat.h>
+#include <vector>
+
+using namespace UniCore;
+using namespace UniRender;
+namespace H = UniHlsl;
+
+namespace
+{
+	struct FTx
+	{
+		FWebTexture T[3]; bool bOk = true;
+		FTx() { for (int S = 0; S < 3; ++S) { std::string E; if (!FWebTexture::LoadDelivered("Data/Noise", GalaxyTextureName(S), T[S], &E)) { bOk = false; } } }
+	};
+	struct FBd { explicit FBd(const FTx& S) { for (int I = 0; I < 3; ++I) { BindGalaxyTexture(I, &S.T[I]); } } ~FBd() { for (int I = 0; I < 3; ++I) { BindGalaxyTexture(I, nullptr); } } };
+	double Env(const char* N, double D) { const char* V = std::getenv(N); return V ? std::atof(V) : D; }
+	FFieldParams RolledL(const FUniEmitter& E, u32 S)
+	{
+		FFieldParams P = E.Exemplar;
+		for (const FParamRange& R : E.Ranges) { P.V[R.Slot] = H::Uni_RollRange(S, ChannelIdUpper(R.Name), R.Min, R.Max, R.Bias, R.Quantize); }
+		return P;
+	}
+	std::string Dir() { const std::string D = UniVerify::Options().OutDir + "/render"; ::mkdir(UniVerify::Options().OutDir.c_str(), 0755); ::mkdir(D.c_str(), 0755); return D; }
+}
+
+UNI_TEST(zz, nebula_explore)
+{
+	const FTx Tx; FBd Bd(Tx);
+	const double Gn = Env("UU_NEB", 1.0), Gr = Env("UU_REF", 0.3), Cl = Env("UU_CLUMP", 0.8);
+	FUniverseDef D = UniScenes::Base();
+	UniScenes::UseGalaxyTextures(D, Tx.T[0].Size);
+	const bool bPal = Env("UU_PAL", 0.0) != 0.0;
+	if (bPal) { UniScenes::UseGalaxyPalettes(D); }
+	const FUniEmitter& E = D.Arch(UniScenes::kGalaxy).Emitters.at(0);
+	FVolumeProfile Prof = D.Arch(UniScenes::kGalaxy).Volume;
+	const H::float3 Base = H::Uni_TemperatureColour(5500.0f);
+	const float BaseLum = H::Uni_Luminance(Base);
+	const int Tile = 200, Grid = 3;
+	FImage Img(Tile * Grid * 2, Tile * Grid);
+	double NebShare = 0.0;
+	for (int Side = 0; Side < 2; ++Side)
+	{
+		FVolumeProfile Pr = Prof; Pr.DustClumps = Side == 0 ? float(Cl) : 0.0f;
+		for (int Gi = 0; Gi < Grid * Grid; ++Gi)
+		{
+			FFieldParams Pf = RolledL(E, H::Uni_SeedMix(0x9A1Au, u32(Gi)));
+			if (bPal) { Pf.V[23] = float(H::Uni_PaletteSeed(H::Uni_SeedMix(0x9A1Au, u32(Gi)))); }
+			const H::FUniFieldParams P = Pf.ToHlsl();
+			const H::FUniFieldParams Pd = DustFrom(Pf, Pr).ToHlsl();
+			const H::FUniGalaxyPalette Pal = H::Uni_GalaxyPalette(u32(Pf.V[23]));
+			const double Inc = (20.0 + 7.0 * Gi) * 3.14159265358979 / 180.0, Az = 0.7 * Gi;
+			const double Dv[3] = { std::sin(Inc) * std::cos(Az), std::sin(Inc) * std::sin(Az), -std::cos(Inc) };
+			const double Rt[3] = { -std::sin(Az), std::cos(Az), 0.0 };
+			const double Up[3] = { Dv[1] * Rt[2] - Dv[2] * Rt[1], Dv[2] * Rt[0] - Dv[0] * Rt[2], Dv[0] * Rt[1] - Dv[1] * Rt[0] };
+			std::vector<float> L(size_t(Tile) * Tile * 3, 0.0f);
+			float Peak = 0.0f;
+			const double Half = 0.65, Px = 2.0 * Half / Tile;
+			const int Steps = 320;
+			const double Dt = 2.0 / Steps;
+			double Sn = 0, Ss = 0;
+			for (int Y = 0; Y < Tile; ++Y) for (int X = 0; X < Tile; ++X)
+			{
+				const double U = -Half + (X + 0.5) * Px, V = Half - (Y + 0.5) * Px;
+				double O[3];
+				for (int Ax = 0; Ax < 3; ++Ax) { O[Ax] = U * Rt[Ax] + V * Up[Ax] - 1.0 * Dv[Ax]; }
+				double Col[3] = { 0, 0, 0 }, Tau[3] = { 0, 0, 0 };
+				const double Sig[3] = { 0.8, 1.0, 1.3 };
+				const float Foot = float(std::max(Px, 0.6 * Dt));
+				for (int S = 0; S < Steps; ++S)
+				{
+					const double T = (S + 0.5) * Dt;
+					const H::float3 Pt(float(O[0] + T * Dv[0]), float(O[1] + T * Dv[1]), float(O[2] + T * Dv[2]));
+					if (H::dot(Pt, Pt) >= 1.0f) { continue; }
+					float Re = 0.0f, Rd = 0.0f, Neb = 0.0f;
+					H::float4 Comp(0, 0, 0, 0);
+					H::UniField_GalaxyPairCKN(Pt, P, Pd, H::Uni_GalaxyConstOf(P), Foot, Re, Rd, Comp, Neb);
+					const H::float3 Lc = bPal ? H::Uni_TintKeepLuminance(Base, H::Uni_GalaxyTint(Pal, Comp, 0.0f)) : Base;
+					double Em[3] = { Re * Lc.x, Re * Lc.y, Re * Lc.z };
+					if (Side == 0)
+					{
+						const H::float3 Cn = bPal ? Pal.Knot : H::UNI_NEBULA_EMISSION_COLOUR;
+						const float Sum = Comp.x + Comp.y + Comp.z + Comp.w;
+						const float Young = Sum > 0 ? Comp.w / Sum : 0.0f;
+						const double Kn = BaseLum;
+						const double Ne = Kn * Gn * Neb, Rf = Kn * Gr * Rd * Young;
+						Em[0] += Ne * Cn.x + Rf * H::UNI_NEBULA_REFLECT_COLOUR.x; Em[1] += Ne * Cn.y + Rf * H::UNI_NEBULA_REFLECT_COLOUR.y; Em[2] += Ne * Cn.z + Rf * H::UNI_NEBULA_REFLECT_COLOUR.z;
+						Sn += Ne * Dt; Ss += Re * BaseLum * Dt;
+					}
+					const double Du = double(Pd.D.y) * double(Rd) * Dt;
+					for (int C = 0; C < 3; ++C) { Col[C] += Em[C] * Dt * std::exp(-Tau[C]); Tau[C] += Sig[C] * Du; }
+				}
+				for (int C = 0; C < 3; ++C) { L[(size_t(Y) * Tile + X) * 3 + C] = float(Col[C]); Peak = std::max(Peak, float(Col[C])); }
+			}
+			if (Side == 0) { NebShare += Sn / std::max(Ss, 1e-300) / (Grid * Grid); std::printf("galaxy %d: H.y %.2f nebula / star light %.3f\n", Gi, Pf.V[29], Sn / std::max(Ss, 1e-300)); }
+			const int Ox = Side * Tile * Grid + (Gi % Grid) * Tile, Oy = (Gi / Grid) * Tile;
+			const float Gain = Peak > 0.0f ? float(Env("UU_EXP", 5.0)) / Peak : 0.0f;
+			for (int Y = 0; Y < Tile; ++Y) for (int X = 0; X < Tile; ++X) { const float* C = &L[(size_t(Y) * Tile + X) * 3]; Img.Add(Ox + X, Oy + Y, C[0] * Gain, C[1] * Gain, C[2] * Gain); }
+		}
+	}
+	Img.WritePpm(Dir() + "/zz_nebula_sheet.ppm");
+	std::printf("mean nebula / star light %.3f\n", NebShare);
+
+	// The Milky Way: from outside (45 deg, 60 kpc) and from the solar camera along the disc.
+	if (Env("UU_MW", 1.0) == 0.0) { Uni::Check(2, "Z.nebula_explore", "exploration").Pass(true, "ok"); return; }
+	FUniverseDef Dm = UniScenes::GalaxyToStar();
+	UniScenes::UseGalaxyTextures(Dm, Tx.T[0].Size);
+	for (FArchetype& A : Dm.Archetypes) { A.Volume.DustClumps = float(Cl); }
+	for (const FAnchor& A : Dm.Anchors) { for (const FFieldParams& P : A.EmitterParams) { std::printf("anchor: H.x %.3f H.y %.3f G.w %.3f\n", P.V[28], P.V[29], P.V[27]); } }
+	FUniverseModel M(Dm);
+	FRefGenerator G(M);
+	FVolumeBuilder VB(M, G);
+	struct FShot { const char* Name; FVec3d Off; FVec3d Look; int W, Ht; };
+	const FShot Shots[] = { { "out", { 0.0, -40.0 * Units::Kpc, 45.0 * Units::Kpc }, { 0.0, 40.0, -45.0 }, 360, 240 }, { "in", { 0, 0, 0 }, { -1, -0.12, -0.02 }, 480, 200 } };
+	for (const FShot& Sh : Shots)
+	{
+		for (int On = 0; On < 2; ++On)
+		{
+			FRefPipeline P(G); P.bVelocityLod = false;
+			FCoord Cam = UniScenes::SolarCamera(); FVec3f Fr{};
+			AddDisplacement(Cam, Fr, Sh.Off);
+			P.Update(Cam, FVec3f{});
+			FCamera Cm; Cm.Coord = Cam; Cm.Width = Sh.W; Cm.Height = Sh.Ht; Cm.DeltaMag = 0.0;
+			Cm.LookAlong({ Sh.Look.X, Sh.Look.Y, Sh.Look.Z });
+			FVolumeSettings S;
+			S.NebulaGain = On ? float(Gn) : 0.0f; S.NebulaReflect = On ? float(Gr) : 0.0f; S.NebulaNearCm = float(Env("UU_NEAR", 1.0) * Units::Kpc);
+			const FVolumeScene Sc = VB.Build(P, Cam, FVec3f{}, Cm.View(), S).Subset(false);
+			FImage Im(Cm.Width, Cm.Height);
+			RenderVolume(Sc, Cm, Im, nullptr, 2);
+			double Lsum = 0; for (size_t I = 0; I < Im.Rgb.size(); I += 3) { Lsum += 0.2126 * Im.Rgb[I] + 0.7152 * Im.Rgb[I + 1] + 0.0722 * Im.Rgb[I + 2]; }
+			std::printf("MW %s nebula %d: light %.6g\n", Sh.Name, On, Lsum);
+			Im.WritePpm(Dir() + "/zz_nebula_mw_" + Sh.Name + (On ? "_on" : "_off") + ".ppm");
+		}
+	}
+	Uni::Check(2, "Z.nebula_explore", "exploration").Pass(true, "ok");
+}

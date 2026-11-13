@@ -414,11 +414,27 @@ namespace UniHlsl
 	inline float GKnobFineFreq = 3.3f;
 	inline float GKnobFineZ = 4.0f;
 	inline float GKnobFineGain = 15.2f;
+	// D-232: the spheroid noise's mip floor (experiments/ellipnoise_explore_d232 swept it; T2.galaxy.spheroid_noise
+	// checks the default equals the shaders' value).
+	inline float GKnobSphMipFloor = 3.0f;
+	// D-235: the nebulae's read mip, its knot stretch and the blend's resolution (the nebula slide
+	// exploration sweeps them; T2.galaxy.nebulae checks the defaults equal the shaders').
+	inline float GKnobNebMip = 1.0f;
+	inline float GKnobNebStretch = 1.0694f;
+	inline float GKnobNebRes = 0.25f;
+	inline float GKnobNebStep = 0.25f;
+	inline float GKnobNebFoot = 3.0f;
 }
 #define UNI_GAL_WARP_MIP_FLOOR (::UniHlsl::GKnobWarpMipFloor)
 #define UNI_GAL_FINE_FREQ (::UniHlsl::GKnobFineFreq)
 #define UNI_GAL_FINE_Z (::UniHlsl::GKnobFineZ)
 #define UNI_GAL_FINE_GAIN (::UniHlsl::GKnobFineGain)
+#define UNI_GAL_SPH_MIP_FLOOR (::UniHlsl::GKnobSphMipFloor)
+#define UNI_NEBULA_MIP (::UniHlsl::GKnobNebMip)
+#define UNI_NEBULA_STRETCH (::UniHlsl::GKnobNebStretch)
+#define UNI_NEBULA_RES (::UniHlsl::GKnobNebRes)
+#define UNI_NEBULA_STEP (::UniHlsl::GKnobNebStep)
+#define UNI_NEBULA_FOOT (::UniHlsl::GKnobNebFoot)
 #define UNI_GAL_WARP_FINE(P, Mip) UniGalaxyTexSample(0, P, Mip)
 #define UNI_GAL_WARP_LARGE(P, Mip) UniGalaxyTexSample(1, P, Mip)
 #define UNI_GAL_DETAIL(P, Mip) UniGalaxyTexSample(2, P, Mip)

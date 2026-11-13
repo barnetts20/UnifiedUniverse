@@ -267,6 +267,8 @@ public:
 		SHADER_PARAMETER(float, WarpAmount)        // D-187
 		SHADER_PARAMETER(FVector4f, WarpVelBeta)   // D-190
 		SHADER_PARAMETER(FVector4f, WarpDopplerKQ)
+		SHADER_PARAMETER(FVector4f, ShiftVelAmount)   // D-230
+		SHADER_PARAMETER(float, ShiftK)
 		SHADER_PARAMETER(float, ArrivalFrames)
 		SHADER_PARAMETER(uint32, DiscArchetypeMask)   // D-183
 		SHADER_PARAMETER(FUintVector4, FixedDiscSeeds)   // D-183
@@ -373,6 +375,8 @@ BEGIN_SHADER_PARAMETER_STRUCT(FUniVolumeCommonParameters, )
 	SHADER_PARAMETER(float, Pad0)
 	SHADER_PARAMETER(FVector4f, WarpVelBeta)     // D-190
 	SHADER_PARAMETER(FVector4f, WarpDopplerKQ)
+	SHADER_PARAMETER(FVector4f, ShiftVelAmount)  // D-230
+	SHADER_PARAMETER(float, ShiftK)
 	SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniWebTexture)   // D-164
 	SHADER_PARAMETER_SAMPLER(SamplerState, UniWebSampler)
 	SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalWarpFine)    // D-179

@@ -1933,3 +1933,207 @@ Not verified: the engine side (UE-59).
 Reroll impact: none (render only).
 Status: built; engine test pending (UE-59).
 
+D-229 — Galaxy detail in dense clusters: a quick integral for the volume; the galaxy map at 512^2
+Owner, 2026-11-11: galaxies should load by perceived scale; flying into dense clusters the pop-in is "galaxy detail late"; try a 512^2 galaxy map.
+Measured (explore.integrals, explore.mapsize; archived in Tools/UniVerify/experiments/):
+- A galaxy becomes a volume carrier only once its normalising integral is known (D-140). The exact one is 32^3 x 128 probes, ~2.2M field samples (275 ms here, ~0.2 s in the engine), on a worker, four at a time, first come.
+- Flying into a rich cluster (M -26) at 0.05 Mpc a frame, up to 239 galaxies are in the sprite-to-volume handoff at once.
+  - Their on-screen area waiting as plain sprites: 89% first come, 81% largest first.
+  - The longest wait of a galaxy past twice the handoff: ~40 frames in the simulation, 107 in the streamer with 12-frame jobs.
+- Carriers are already ranked by angular size (D-161), so the queue was the cause, not the cap.
+- Coarse grids are poor estimators (thin discs fall between samples): 16^3 x 32 is 2.2% mean, 12.5% worst.
+- Importance sampling (a third uniform in the ball, a third in the thin disc with z Laplace at the field's scale height, a third toward the centre) with 4096 samples: 2.0% mean, 5.6% worst, 0.8 ms (357x faster). The exact itself is 0.24% from a 2M-sample reference.
+Built (UniCore; no engine-specific code):
+- FRefGenerator::ComputeIntegralQuick (galaxy fields only, deterministic per contributor).
+- FUniStreamer::VolumeIntegral: the exact integral once known; until then the quick one, computed in batches of 32 on the job pool (largest on screen first, two batches at once; RunQuickJob, default RunJob); after a quick one was used, eased to the exact over 30 frames (log space, smoothstep).
+- FVolumeSource::VolumeIntegral: the carrier build uses it (it was IntegralReady + the exact integral).
+- Generation never reads the quick value: its cells still wait for the exact one. Star counts unchanged.
+- uu.Perf: a volume integrals line.
+Galaxy map: uu.GalaxyMap.Size 1024 -> 512, uu.GalaxyMap.Slots 4 -> 8.
+- 512^2 is within 0.3% in light of 1024^2 in nine views (inside, above, edge-on). Per-pixel p95 is up to 1.7% within ~0.5 kpc of a core (1024^2: 0.8%), elsewhere the same.
+- Bake 41 vs 133 ms (CPU), 2.7 vs 10.7 MB with mips.
+- Placement from it: star count 1.0006x the field's, map light 1.11% light-weighted (the check allows 3%).
+- Eight slots at 512^2 are half four at 1024^2's memory: twice the galaxies with maps at once.
+Verified offline:
+- T2.stream.quick_integral: mean 2.03%, worst 5.60%, 357x faster, deterministic.
+- T2.stream.quick_flyin: the streamer with delayed jobs, flying into the rich cluster.
+  - Area left as sprites 90.2% -> 3.8%; longest wait 107 -> 0 frames.
+  - Largest amplitude step a frame 0.53%; at rest every carrier on the exact value.
+- T2.vol.galaxy_map and T2.gen.map_placement now at 512^2.
+Reroll impact:
+- The integrals: none (render only).
+- The map size: stars placed in galaxies change where an accept decision flips on the map's value (placement reads the map, D-214). Seeds are unchanged.
+Status: built; engine test UE-60.
+
+D-230 — The travel look: the motion web and the travel shift
+Owner, 2026-11-11: intergalactic travel is mostly black with a few galaxies drifting by (galaxies are sparse, the volume subtle). Proposed: a speed-ramped view of the web's density, faded to zero before any edge, under the excuse of red/blue shift; distant galaxy and cluster sprites in the same shift system. Render only, art choices.
+Built:
+- The travel curve (Warp.Current: 0 at 100 kpc/s, 1 at 10 Mpc/s) ramps both, smoothstep from uu.TravelLook.Start (0.15, ~200 kpc/s) to uu.TravelLook.Full (0.75, ~3 Mpc/s). UniCore::TravelLookRamp.
+- The motion web (Uni_MotionWebEmission, in the march's textured-web branch, once a step though two web carriers read the texel):
+  - Emission from the web texture's filament + node channels over uu.MotionWeb.Threshold (3) x their mean, log over two decades.
+  - Faded in over uu.MotionWeb.Near (4 Mpc: nearer structure is soft blobs, the texture's texels being 0.78 Mpc, 200 Mpc / 256 (wording corrected in D-232's commit: it said cells of ~1.6 Mpc)), out over the second half of uu.MotionWeb.Depth (50 Mpc, inside the 100 Mpc march and the 200 Mpc tile: no edge).
+  - A cool white the shift colours. Strength uu.MotionWeb (0.01) in a galaxy disc's surface brightness (~7e4 per sr) per Mpc.
+  - FVolumeViewGPU grows by one row (112 -> 128 bytes): MotionWebGain, Near, Depth, InvRef (the threshold folded into the mean).
+- The travel shift (Uni_TravelShift, UniPhotometry.ush): Uni_DopplerTint by exp(uu.Shift x cos(angle to the motion)); ahead blue, behind red, luminance kept (hue only).
+  - Applied to the volume's output (DopplerOf: galaxies, the web, the background map, the far map) and to every sprite in projection (splats included).
+  - uu.Shift 0.5 (x1.65 ahead at full travel), uu.Shift.Colour 1.0.
+  - Independent of the warp optics (uu.Warp, still off): its own parameters (FUniView ShiftVel/ShiftAmount/ShiftK; the volume's ShiftVelAmount/ShiftK); the direction from the camera's step (UniCore::ShiftMotion, in double).
+- Previews (explore.travellook, archived): the flythrough universe with the delivered web from the void camera, at exposure gain 1 (the engine's near-black sky).
+  - Motion web 0.002 / 0.006 / 0.02: barely / subtly / clearly visible.
+  - Threshold 2 shows walls and voids, 5-8 only clusters.
+  - Shift 0.5 / colour 1 reads; 1.0 / 1.5 is saturated.
+  - A 90-frame flight at 10 Mpc/s went to the owner.
+- Found on the way: the march's Du is the step in the carrier's field units (for the web, fractions of its 200 Mpc tile); the emission is per cm, so it is multiplied by the step in cm.
+Verified offline:
+- T1.look.travel_shift: blue/red x2.7 ahead and x0.37 behind at 0.5, the side unchanged, luminance kept; the ramp; ShiftMotion's edge cases.
+- T2.look.motion_web:
+  - Off is bit for bit today's march; the added light is exactly linear in the gain.
+  - With two web carriers it is exactly one carrier's (without the once-a-step guard: 2.000, caught).
+  - Nothing from within 2 Mpc; less at depth 25.
+  - The shift keeps every pixel's luminance (4e-7).
+Not verified: the engine side (UE-61).
+Reroll impact: none (render only).
+Status: built; defaults chosen from the previews; engine test UE-61.
+
+D-231 — The motion web: organic detail, and an earlier, wider speed ramp
+Owner, 2026-11-11: "that actually looks quite nice". Add a single noise texture read to warp or multiply the web for a more organic feel. The web should show at a substantially lower speed and reach full over a larger range: seen while crossing a galaxy's worth of distance in 1-2 seconds.
+Built:
+- Detail: one galaxy_detail read (its R channel: ridged multifractal filaments, mean 0.567) multiplies the motion web.
+  - Read at the web carrier's point, tiled a whole number of times per 200 Mpc web tile (uu.MotionWeb.DetailMpc 20: ten tiles), so it stays periodic.
+  - Mip from the pixel footprint, so distant detail is averaged, never aliased.
+  - The pattern is (R / mean)^3, blended in by uu.MotionWeb.Detail (0.8).
+  - Multiply rather than warp: a warp would need a second read of the web texture itself.
+  - Off (0) or without the galaxy textures: D-230's web exactly.
+  - FVolumeViewGPU 128 -> 144 bytes (MotionWebDetailCm, MotionWebDetailGain, two pads).
+- The ramp: the motion web now has its own, from the camera's speed (the travel curve is 0 below 100 kpc/s). UniCore::FMotionWebRamp:
+  - Ease-out on log speed from uu.MotionWeb.StartKpcS (5) to uu.MotionWeb.FullKpcS (5000).
+  - Eased in time (0.3 s up, 0.6 s down) so speed jitter cannot flicker it.
+  - 0.36 at 20 kpc/s and 0.56 at 50 kpc/s (a 30 kpc galaxy in 1.5 s and 0.6 s); 0.95 at 1 Mpc/s.
+  - The travel shift keeps the travel-curve ramp (uu.TravelLook.*).
+- Previews (explore.travellook, D-231 version archived): a 20 Mpc period at 0.8 reads as wisps and tendrils over D-230's soft blobs; 10 Mpc is finer (cobweb); 40 adds little. A flight went to the owner.
+Verified offline:
+- T1.look.web_ramp: off at 2 kpc/s, 0.36 at 20, 0.56 at 50, 0.95 at 1 Mpc/s, 1 at 10. Monotone; 96% of a step within 1 s, no overshoot; +-50% frame jitter moves it 0.5% a frame.
+- T2.look.motion_web (extended): detail 0.8 keeps the added light within x1.16 and raises its pixel-to-pixel contrast x1.4 at 128 x 72 (prefiltered); off is D-230's exactly.
+Amendment (owner, the same day: "your demo video has texture march sliding"). Measured (explore.webslide, archived):
+- Method: flying at 10 Mpc/s, the frame-to-frame change of the march's image against a fine reference's (steps an eighth). Real motion is in both, swimming only in the march (D-219's crawl confounds the two at speed).
+- Physical web 0.17% crawl. Plain motion web: change 0.25% of the light above the reference's (6%). With the detail: 2.27% above (37%).
+- The detail's ridges (0.6-5 Mpc) are finer than the background's steps (~0.1 t, 0.5-5 Mpc). The steps sit at fixed distances from the camera, so the ridges swam through them.
+- Prefiltering the detail over the step as well as the pixel removed the swim (0.32%) but most of the detail. Finer steps everywhere barely helped (ratio 0.05, 157 steps: 1.44%).
+Fixed:
+- Within the motion web's band (half its near distance to its depth), with the detail on, the step is capped at uu.MotionWeb.StepMpc (0.5) and the detail blurred over it.
+  - Excess 0.03-0.05% (below the plain web's), the detail kept (uu.MotionWeb.Detail now 1.0).
+  - The background march's steps ~68 -> ~133 a ray while it is on. uu.MotionWeb.StepMpc 0: no cap, free, the detail then blurs away.
+- FVolumeViewGPU's pad becomes MotionWebStepCm.
+- MarchFlags bit 2 (checks only): the fine reference blurs the detail over the march's own step.
+- T2.look.web_swim: excess under 0.3% (0.05%).
+Not verified: the engine side (UE-62).
+Reroll impact: none (render only).
+Status: built; engine test UE-62.
+
+D-232 — Early types' spheroids: noise modulation, each its own mix
+Owner, 2026-11-11 (with a screenshot of a smooth elliptical): "globular galaxies are currently a simple falloff - they should also get noise based modulation so that they get some organic variance... should randomly pick channel weights to apply from a packed noise probably so that we have variance between globs."
+Found: early types (D-172) rolled no texture parameters (UseGalaxyTextures added "Tex.*" ranges to the late-type ranges only) and all shared shape seed 0, so even a texture read would have been the same pattern at the same offset in every elliptical.
+Built:
+- The spheroid's multiplier, in the shared texture terms (Uni_GalaxyTexTerms: field, galaxy map and placement alike, one field source): one galaxy_detail read at the bulge's (warp_large-displaced) point, its height divided by the axis ratio so the structure follows the isophotes, at G.w periods a field unit.
+  - Mix (Uni_GalaxySpheroidMul): each channel standardised (galaxy_detail.json's mean and std), weighted by w = q^2 (q 6 bits of the galaxy's hash, so one or two channels usually lead) with a random sign each (ridges as filaments or lanes, Worley cells as clumps or holes), normalised to unit variance (the channels are uncorrelated: |r| < 0.035); 1 + amount x that, clamped to [0.3, 1.8].
+  - The hash: a new per-galaxy constant, Hn = SeedMix(Hs, 12) on the shape seed's DISCMODE stream (a new sub-index; 0, 1, 8-11 were in use), carried in the march's constant block (D.z, D.w were free).
+  - Faded with the footprint as the other reads are (mip 4 to 5), and inside the core: none within 0.2 r_e, all by r_e (the core stays smooth and bright).
+  - Mip floor 3 (UNI_GAL_SPH_MIP_FLOOR; knob GKnobSphMipFloor): see the measurement below.
+- Parameters (early types only, textured scenes only; new names, so new streams):
+  - EarlyTex.ShapeSeed (V[22]): early types now have their own seed (texture offsets and the weights' hash).
+  - EarlyTex.Noise (V[13] = D.y, 0.25-0.6): the amount. D.y was unused on emission parameter sets; on a dust set it is sigma, and a dust set has no bulge, so Uni_GalaxySpheroidNoise reads it only with B.y > 0.
+  - EarlyTex.NoiseFreq (V[27] = G.w, 1.0-2.5 periods a field unit).
+  - EarlyTex.BulgeWarp (V[25] = G.y, 0.004-0.02) and EarlyTex.WarpFreq (V[26] = G.z, 0.8-1.6): warp_large's existing bend of the spheroid, now on for early types too.
+  - TexN (V[31]) set on the early exemplar.
+  - Their discs (lenticulars) stay smooth: no disc warp, noise or knots.
+- Measured (experiments/ellipnoise_explore_d232): the march's slide across step phases, close views (pixel 0.002 of the radius), 20 x 20 px: smooth spheroid 0.013%; textured spirals 0.09-0.13%; ellipticals by mip floor 0 / 1 / 2 / 3: 0.24-1.18% / 0.21-0.82% / 0.14-0.45% / 0.06-0.21%. The finest octaves are finer than the spheroid's steps (0.3 of the profile's log-slope length; 0.25 beyond 6 r_e). Floor 3 keeps lumps of about r_e (the 4- and part of the 8-cycle octave), which also reads better than grain on a spheroid (contact sheets at 1, 2, 3).
+Verified offline (T2.galaxy.spheroid_noise, new):
+- The shaders' floor equals the C++ knob; 256 rolls in range, 256 distinct shape seeds; late types, dwarfs, dust sets, the home galaxy and untextured scenes have none; the constant block round-trips Hn.
+- The core inside 0.2 r_e (warped radius) is the smooth profile exactly (1762 points).
+- 8 ellipticals: light within 3.9% (a low-frequency noise over one spheroid does not average to its mean; the normalising integral keeps the star count); face-on residual RMS 4.6% minimum, 10.2% mean in 1-4 r_e; mean |correlation| between galaxies' residuals 0.10.
+- The march: slide 0.12% (smooth 0.013%), error against fine steps 0.052% (smooth 0.044%).
+- Contact sheet still_galaxy_ellipticals (with and without).
+Not verified: the engine side (UE-63).
+Reroll impact: textured scenes' early types (cluster members drawn as such) change shape and light distribution; their stars move. Nothing else changes (spirals, dwarfs, the home galaxy, untextured scenes: bit for bit).
+Status: built; engine test UE-63.
+
+D-233 — The motion web's detail by region
+Owner, 2026-11-11: "it would be nice for the universe web noise to get balanced in different ways based on regions so that different areas of the web have different noise modulations."
+Built:
+- The motion web's detail texel (D-231's one galaxy_detail read) now uses all four channels, mixed by region:
+  - Each channel's pattern is (value / mean)^p with p set so every channel has the ridged one's contrast (p cv = 3 x 0.313: R 3, G 4.62, B 3.80, A 3.38), scaled to the ridged one's mean light (E[(R/m)^3] = 1.285; x 1, 0.950, 0.966, 0.978). Filaments (R), knots (G), cloud (B), cells (A).
+  - The weights: a second read of galaxy_detail at the regions' scale (uu.MotionWeb.RegionMpc 200: one region period a 200 Mpc web tile, so it stays periodic; regions ~50 Mpc across) at mip 4 (smooth), each channel standardised at that mip and exponentiated (x 2; x 1 / 1.5 / 3 measured on the texels: median leading share 0.49 / 0.59 / 0.79).
+  - The ridged-only weights give D-231's (R/m)^3 exactly; uu.MotionWeb.RegionMpc 0 is D-231's path.
+- FVolumeViewGPU's last pad becomes MotionWebRegionCm (still 144 bytes).
+- Cost: one more texture read per background step while the motion web is on (in its band only).
+Verified offline:
+- T2.look.web_regions (new): weights sum to 1 (2e-7); each channel leads in 22-28% of a tile; median leading share 0.54 (interpolated between texels); each channel alone has the ridged one's light within 1.1% and contrast within 16%; ridged weights = R^3 bit for bit; the frame's added light x0.98 of the ridged detail's, its per-pixel change 27% of it; slice still_motion_web_regions (regions vs ridged everywhere).
+- T2.look.web_swim now runs with the regions on: excess 0.03% (under 0.3%).
+Not verified: the engine side (UE-64).
+Reroll impact: none (render only).
+Status: built; engine test UE-64.
+
+D-234 — Nebulae: the outside view (emission, reflection, dark clouds)
+Owner, 2026-11-12 (option 3 of three): nebulae seen from outside first, the field built so a fly-into layer can grow from it later. Constraint (B-031): a field, no explicit entities (keep the cost flat).
+Built:
+- Emission nebulae (H II regions), in the shared galaxy core (Uni_GalaxyFromSharedCN; the field, the galaxy map's path Uni_GalaxyMapEvalN and the march; one field source):
+  - Density in the field's own units from terms the light is already made of (no texture read of its own): the young light (the arms' knot-free share, or the disc's for a galaxy without arms) x a gas layer half the stars' scale height (as the dust; Uni_GalaxyNebulaVert, footprint-widened keeping columns) x the knot shape x the galaxy's knot amount H.y (star formation: no knots, no nebulae; early types, dust sets and knot-less galaxies have none).
+  - Knot shape: galaxy_detail's knot term over 0.3 (about 11% of texels), full by 0.7, squared, x 60 (UNI_NEBULA_SCALE: uu.Nebula 1 is the look).
+  - Receding: a threshold of a filtered noise loses its peaks (measured: the share fell 8x by mip 3.4, to 0 by 4.5). The knot term is stretched about its mean by a factor measured per half mip (0-5) that keeps the shape's mean, so the light holds: within 20% typically and 53% at worst at 6-12x the footprint (T2.galaxy.nebulae). Trilinear sampling lowers the variance faster than the mips' own texels (mip 3: std 0.099 sampled, 0.146 texels), so the table is measured from samples (experiments/nebula_knotstretch_d234).
+  - Light: plain light, not a population's (no sprite counterpart; D-128's v2 row): the march adds it at the galaxy's full light per star, stored by the LUT builder in its emission block's second entry's w (Uni_VolumeLutFull, horizon-dimmed), so the nebulae stay as the stars resolve. Colour: H II pink (luminance 1), or the galaxy palette's knot colour where it has one.
+- Reflection nebulae (march only): the dust lit by the young clusters, its density x the knots' share of the sample's light (Comp.w / sum), blue, x uu.Nebula.Reflect.
+- Dark clouds: the textured dust x max(1 + 1.2 x (knot - its mean 0.0457), 0) (FVolumeProfile::DustClumps, carried in the dust set's G.y, which no bulge reads on a dust set; read in Uni_GalaxyDetailTerms with the lanes and holes). Linear about the mean, so the dust's mean is kept (T2.galaxy.dust: D-180's column within 25%; first built about 0, the mean rose 5% and that check failed at 29.5%). The dust's arms sit inward of the light's, so the clouds fall on the arms' inner flank beside the pink knots.
+- Near fade (render only): the nebulae fade in from uu.Nebula.NearKpc (2) to 3x: up close they are galaxy-scale blobs until the fly-into layer exists.
+- FVolumeViewGPU 160 bytes (NebulaGain, NebulaReflect, NebulaNearCm, pad); CVars uu.Nebula (1), uu.Nebula.Reflect (6), uu.Nebula.NearKpc (2).
+- Measured: nine rolled spirals' nebulae carry 3.9-17% (mean 9%) of the stars' light face-on, the brightest tenth of their pixels 96%+ of it; the Milky Way +17.3% from 60 kpc, +5.4% from the solar camera (near fade on).
+Verified offline:
+- T2.galaxy.nebulae (new): never negative, zero without knots and outside the cut (19,200 points); shares, knottiness and receding as above; dark clouds keep the dust's mean within 5%; the LUT's full light equals the unresolved light where none is resolved (4e-8) and is never below it; the Milky Way's march adds light within bounds, and with the near fade at infinity is the frame without, bit for bit (the off path is clean). Stills: still_galaxy_nebulae, still_nebula_milkyway.
+- T2.vol.galaxy_map_nebulae (new): the camera galaxy's map path against its field with nebulae, knots and cloud dust, three views at 512^2: light within 0.03%, p95 1.2%, the nebulae's added light within 0.7%.
+Not verified: the engine side (UE-65).
+Reroll impact: none for content (render only). The dark clouds change textured galaxies' dust (render only).
+Status: built; engine test UE-65. Follow-ups: B-034 (the fly-into layer, young stars in nebulae, the sprite's share, offset clouds).
+
+D-235 — Nebulae: no slide, fixed positions, seen up close, two colours a galaxy
+Owner, 2026-11-12, after D-234 in the engine: "substantial raymarch sliding in the nebula field"; "they also change location when the view swaps after being stationary"; "they seem to disappear up close"; "they should get their colors randomized along with the rest of the galaxy palette... a couple nebula colors per galaxy".
+Causes:
+- D-234 thresholded the knot term read at the footprint's mip, stretched by mip. The footprint changes as the camera moves and when the march's resolution changes (the view swap at rest), so the pattern itself changed: it morphed, and nebulae appeared elsewhere.
+- The march's steps (0.32 x distance, hints x 3 inside a galaxy) are far longer than a nebula: measured slide 48% of the nebulae's light inside a spiral (the stars 2-3%, the gas layer without knots 4-5%).
+- The near fade (2 to 6 kpc) hid them up close.
+Built:
+- One fixed-mip read for the nebulae (UNI_NEBULA_MIP 1, the same point as the detail read; Uni_GalaxyTexTerms' OutNebK: knot term and fBm), so their pattern never depends on the view; stretched by 1.0694 (mip 1's measured factor) so the light is D-234's. The field returns the nebulae's terms (source, knot, mix: Uni_GalaxyFromSharedCN / Uni_GalaxyMapEvalN, float4); Uni_GalaxyNebulaDensity makes the density.
+- Prefilter by blending to the mean, not by changing the pattern (Uni_GalaxyNebulaBlend): from 3 read texels per pixel (a knot's width) and from a quarter texel per half step along the disc plane (features the steps skip would slide), each full at twice. The light is kept and the pattern fades rather than moves.
+- The gas layer's step cap (Uni_GalaxyNebulaStepCap, in Uni_CarrierStepLimit, not loosened by HintScale): quarter-texel steps along the plane inside +-4 gas scale heights, where the ray's path through the layer takes at most 48 of them (a ray crossing the disc: the outside view keeps its knots); none along the plane (inside a galaxy, the far nebulae blend to a smooth glow instead). Only with uu.Nebula on, only for galaxies with knots.
+- The near fade off by default (uu.Nebula.NearKpc 0).
+- Colours (Uni_GalaxyNebulaColour): two a galaxy from its palette seed (F.w) or, without a palette, the shape seed's hash (SeedMix 13, a new sub-index), on the palette channel's draws 12..17: H-alpha pink-red 55%, magenta-violet 20%, [O III] teal 15%, [S II] orange-red 10%, saturation 0.55-0.85, luminance 1; mixed nebula to nebula by the fixed-mip read's fBm channel, toward their average where blended. Replaces D-234's fixed pink and the palette's knot colour.
+Measured (T2.galaxy.nebula_slide, new; experiments/nebula_slide_d235): inside a textured spiral as the engine steps, 160 rays: slide 6.0% (the gas layer without knots 5.5%, the stars 2.8%); from 60 kpc at 45 degrees: 0.9% (D-234: 3.3%). Sweep: mip 1-2 x blend 0.25-2 texels x cap 0.25-1 texel.
+Verified offline: T2.galaxy.nebula_slide; T2.galaxy.nebulae (the pattern identical at two footprints; receding within 20%, was 53%; the near fade at infinity within 0.03% of the frame without nebulae, the step cap aside); T2.vol.galaxy_map_nebulae.
+Known cost: the gas layer's cap adds up to 48 steps to rays crossing a large-on-screen galaxy's disc while uu.Nebula is on (ProfileGPU in UE-66).
+Known limit: inside a galaxy, nebulae farther than about 1 kpc along the plane are a smooth glow (their structure cannot be sampled at the march's steps without sliding); the fly-into layer (B-034) is where near structure grows.
+Reroll impact: none (render only).
+Second engine test (owner, with screenshots): a nebula cut off along a stepped curve ("straddling bands"). The gas layer's cap only took effect at a step starting inside +-4 gas scale heights of z = 0, so (1) where the last uncapped step landed in the layer moved from pixel to pixel: its sample stood for a long step and blended to the mean, the next were capped and showed the pattern (a hard, stepped edge), and (2) the disc's warp lifts the layer off z = 0 (at the Sun's radius the Milky Way's sits ~0.016 field units up), so part of it was never capped. Fixed: the cap follows the warp and flare (the disc's own D-178 terms, the mode phases' hash passed in), a ray heading into the layer stops at its surface, and the cap lengthens smoothly with the ray's angle up to 4x (the blend is full there) instead of switching off at a threshold. T2.galaxy.nebula_edges (new): from 1 kpc above the Milky Way's disc looking down 60 degrees, where the cap samples at its finest, the engine stepping against fine steps: p95 error 9.5% (the old cap: 77%). Also: the cube passes (the far cache's FarCS, BackgroundCS) set NebulaThetaPixel to the screen's, so the nebulae blend at the screen's footprint there too, not their coarser texels' (FUniVolumeView's last pad; T2.vol.far_split_nebulae, new: the nebulae's light across the far split within 5% with the map at 1/2 and 1/4 of the view's resolution; in that scene the far side was already blended by its steps, so this alone did not show the cut).
+First engine build: 'use of undeclared identifier UNI_NEBULA_MIP' (FUniGalMapBakeCS): the nebula macros' defaults were defined after Uni_GalaxyTexTerms, which reads at UNI_NEBULA_MIP; the C++ shim defines its knobs before including the cores, so the harness compiled. Moved to the top of UniFields.ush (Uni_GalaxyNebulaBlend defined before its use too), and a new static check, T4.static.shader_decl_order (shader_decl_order.py: each .usf with its includes in the compiler's order, every macro, static const, UNI_FN function and struct declared before its first use; it reports the broken version's 5 shaders).
+Status: built; engine test UE-66 (UE-65 superseded: its look changed).
+
+
+D-236 — Nebula colour variety; ellipticals: nebula filaments and tidal shells
+Owner, 2026-11-12, after D-235 in the engine ("ok thats much closer"): "more variance in possible nebula colors and a pass to make the globular galaxies more interesting - they could also get nebulas, potentially different colors, etc".
+Built:
+- Nebula colours (Uni_GalaxyNebulaColour, Uni_NebulaHue): three a galaxy (D-235: two), on the palette channel's draws 12..20 (new draws; 12..17 change meaning, render only), each from a family table, saturation 0.4-0.95 (was 0.55-0.85), luminance 1; nebula to nebula the colour runs from the first through the second to the third by the mix term, toward their average where blended.
+  - Spirals (H II regions): H-alpha red 30%, pink 18%, magenta-violet 14%, blue 8%, [O III] teal 14%, green 4%, [S II]/[N II] orange-gold 12%.
+  - Early types (cooling-flow and shock-lit filaments): H-alpha red 35%, orange-gold 22%, teal 13%, violet-blue 18%, magenta 12%.
+  - Each nebula its own brightness: x clamp(1 + 2 (A - 0.493), 0.2, 1.8) from the fixed-mip read's A channel (mean about 1), toward 1 with the blend.
+- Early types' nebula filaments (Uni_GalaxyEarlyNebula: amount F.x, rolled "EarlyTex.Nebula" -0.8..1.2, so about 60% of textured early types have them; F.x is the arms' asymmetry on other sets, read only with arms):
+  - Source: the amount x the spheroid's light (bulge, with its D-232 noise and the shells) x an envelope (Uni_GalaxyEarlyNebulaEnv: all inside 0.15, none past UNI_EARLY_NEB_RADIUS 3 r_e, isophote-rounded).
+  - Shape: galaxy_detail's ridged channel read at the spheroid's point at UNI_EARLY_NEB_MIP 2 and UNI_EARLY_NEB_FREQ 0.125 x G.w periods an effective radius (one period 8 r_e at G.w 1: they scale with the galaxy), over its mean (0.567) past 1.19, full by 1.42 (about the 75th and 99.3th percentiles at that mip), squared; mean 0.0471 (sampled, trilinear); x UNI_EARLY_NEB_SCALE 7. Light at amount 1: 9.5-23% of the stars' (mean 15%) over 3 r_e.
+  - Colour: the mix term runs with the radius (core to the sphere's edge), moved a quarter either way by the fBm channel: one colour inside, another outside (a first version mixed by fBm alone read as confetti).
+  - Sampling: the blend (Uni_GalaxyNebulaBlend) uses the early read's texel and the whole step (a volume, not a layer). The march's cap (Uni_GalaxyNebulaStepCap, early branch): inside the sphere (3 r_e plus twice the bulge warp's reach), steps of UNI_EARLY_NEB_STEP 0.25 read texels, lengthened to the ray's chord over UNI_EARLY_NEB_MAX_STEPS 192, up to 4x; a ray outside heading in stops at its surface; none once the screen footprint is past the blend (2 x 3 texels; Uni_CarrierStepLimit passes the nebulae's footprint, the screen's in the cube passes). First built at mip 3 with the galaxy's G.w frequency and the spheroid's own steps: blobs of trilinear facets, and blended out almost everywhere by the spheroid's long steps; then half-texel steps and 96 a chord: slide 6.9% from inside.
+- Tidal shells (Uni_GalaxyShells, in the spheroid's multiplier: field, map and placement): amount C.y, rolled "EarlyTex.Shells" -1.2..0.6 (about a third of textured early types). Five shells at 1.6 r_e x 1.55^k, sharp outside (0.06 of the radius), a long tail inside (0.3), on alternate sides of a random axis (SeedMix(Hs, 14), a new sub-index; sides fade over -0.2..0.4 of the axis cosine). The stars are moved, not added: the profile's mean over each sphere (0.45 of a side-masked shell) is taken off, so each radius keeps its light (a first version added up to 40%); x (1 + 3 C.y x that), never below 0; none inside 0.5 r_e, all by r_e; footprint-widened keeping each shell's integral.
+Measured (T2.galaxy.early_nebulae; experiments/earlyneb_explore_d236): marched as the engine steps, from outside the steps start at the sphere's surface (slide 0.00%); from a camera in the core (64 rays, 4 step phases) 1.96% (source 0.02%); the stars with shells 0.034% (0.024% without) outside, 0.018% (0.016%) inside. Cost: the cap's steps x 2.45 over the spheroid's own in close views of the cores, only while the pattern is resolved and uu.Nebula is on. One galaxy's core holds only a few of the texture's features, so its pattern's mean differs from the global one (x 0.86-1.97 on the same samples, x 1.17 geometric mean over eight).
+Verified offline:
+- T2.galaxy.early_nebulae (new): the shape mean is the sampled one (0.04706 vs 0.0471); 256 rolls: 151 with filaments, 83 with shells; spirals, untextured early types, dust sets and the home galaxy have neither; light, blend, slide as above; colours: three a galaxy at luminance 1, none nearly flat, 10 of 12 hue bins for spirals and 9 for early types. Stills: still_galaxy_early_nebulae (nine early types whole and their cores, as rolled and with filaments and shells forced on), still_nebula_colours (24 spirals' and 24 early types' three colours).
+- T2.galaxy.spheroid_noise: still passes with shells and filaments rolled (light within 3.1%, core exact).
+- T2.galaxy.nebulae: early types without filaments still have none (the early set now has F.x 0).
+- T2.galaxy.nebula_slide, nebula_edges, T2.vol.galaxy_map_nebulae, far_split_nebulae, T4.static.shader_decl_order: unchanged.
+Not verified: the engine side (UE-67).
+Reroll impact: textured scenes' early types: the shells move their stars (placement follows the field; each radius keeps its count), so their stars reroll. Filaments and colours are render only. Spirals, dwarfs, the home galaxy and untextured scenes: unchanged except the nebula colours (render only).
+Status: built; engine test UE-67.

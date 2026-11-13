@@ -1,0 +1,251 @@
+// test_zz_integrals.cpp — exploration (archived after). "Galaxy detail late" flying into a dense
+// Run (D-229; the anchored rich cluster, M -26):
+//   exact (32^3 x 128 probes) 275 ms a galaxy here; 534 galaxy contributors resident at the core.
+//   coarse grids: 8^3 x 32 4.7% mean / 14% worst; 16^3 x 32 2.2% / 12.5% (thin discs fall between).
+//   importance sampled (ball + thin disc + core), against the exact: 1024 4.4% / 12.8%;
+//   4096 2.0% / 5.6% (0.8 ms); 16384 1.2% / 3.7%. The exact against a 2M-sample reference 0.24%.
+//   fly-in 4 Mpc -> core at 0.05 Mpc/frame, a job 12 frames, 4 at a time: up to 239 galaxies in
+//   the handoff; on-screen area waiting: first come 89%, largest first 81%, provisional 0%.
+//   Adopted: 4096-sample importance estimate for the volume, eased to the exact (D-229).
+// cluster: a galaxy is a volume carrier only once its integral (D-140, 32^3 x 128 probes, on a
+// worker, 4 jobs at a time, first come) is known. Measures (1) the exact integral's time and how
+// close coarse grids get, (2) a fly-in to a rich cluster: how many galaxies queue, and the
+// on-screen share waiting under first-come vs largest-first vs a provisional coarse integral.
+
+#include "../src/UniTest.h"
+#include "../src/UniVerifyCommon.h"
+#include "../src/UniRenderRef.h"
+#include "../scenes/UniScenes.h"
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <deque>
+#include <map>
+#include <set>
+#include <string>
+#include <vector>
+
+using namespace UniCore;
+using namespace UniRender;
+namespace H = UniHlsl;
+
+namespace
+{
+	FUniverseDef RichCluster()
+	{
+		FUniverseDef D = UniScenes::Base();
+		FAnchor A;
+		A.Coord = FCoord::Origin();
+		A.ArchetypeId = UniScenes::kCluster;
+		A.AbsMag = -26.0f;
+		A.RadiusLog2 = float(std::log2(0.5 * Units::Mpc));
+		FFieldParams P = UniScenes::ClusterExemplar();
+		P.V[4] = 2.0f; P.V[5] = 0.6f; P.V[6] = 0.04f; P.V[7] = 4321.0f;
+		A.EmitterParams = { P };
+		A.bFixedOrientation = true;
+		A.Seed = 0xC1057E01u;
+		D.Anchors.push_back(A);
+		return D;
+	}
+
+	/** ComputeIntegral's sum on a G^3 grid with K probes a cell (the same seeding). */
+	double Coarse(const FContributor& C, int G, u32 K)
+	{
+		const H::FUniFieldParams P = C.Params.ToHlsl();
+		const float Cell = 2.0f / float(G);
+		const u32 Seed0 = H::Uni_SeedMix(C.Id, 0xA11A11u);
+		double Sum = 0.0;
+		for (int Z = 0; Z < G; ++Z) for (int Y = 0; Y < G; ++Y) for (int X = 0; X < G; ++X)
+		{
+			const H::float3 O(-1.0f + X * Cell, -1.0f + Y * Cell, -1.0f + Z * Cell);
+			const float Cx = std::max(std::max(-O.x - Cell, O.x), 0.0f), Cy = std::max(std::max(-O.y - Cell, O.y), 0.0f), Cz = std::max(std::max(-O.z - Cell, O.z), 0.0f);
+			if (Cx * Cx + Cy * Cy + Cz * Cz >= 1.0f) { continue; }
+			const u32 Seed = H::Uni_SeedMix(Seed0, u32((Z * G + Y) * G + X));
+			double S = 0.0;
+			for (u32 I = 0; I < K; ++I)
+			{
+				const H::float3 U = H::Uni_ProbeUnit(Seed, I);
+				S += H::Uni_FieldSample(C.Emitter->FieldId, H::float3(O.x + U.x * Cell, O.y + U.y * Cell, O.z + U.z * Cell), P);
+			}
+			Sum += S / double(K) * double(Cell) * double(Cell) * double(Cell);
+		}
+		return Sum;
+	}
+}
+
+namespace
+{
+	/** Importance-sampled integral over the unit ball: a third uniform in the ball, a third in a
+	 *  thin disc (x, y uniform in the unit disc, z Laplace with the scale height Par.A.y), a third
+	 *  toward the centre (r = 0.3 u^2 isotropic). Deterministic per contributor. */
+	double Mis(const FContributor& C, u32 N, u32 Salt = 0u)
+	{
+		const H::FUniFieldParams P = C.Params.ToHlsl();
+		const double Hz = std::max(double(P.A.y), 1.0e-4);
+		const double Rc = 0.3;
+		const double Pi = 3.14159265358979;
+		auto PdfBall = [&](double X, double Y, double Z) { return (X * X + Y * Y + Z * Z) < 1.0 ? 3.0 / (4.0 * Pi) : 0.0; };
+		auto PdfDisc = [&](double X, double Y, double Z) { return (X * X + Y * Y) < 1.0 ? (1.0 / Pi) * std::exp(-std::abs(Z) / Hz) / (2.0 * Hz) : 0.0; };
+		// r = Rc u^2: P(r) = sqrt(r / Rc) for r < Rc: pdf_r = 1 / (2 sqrt(r Rc)); 3D pdf = pdf_r / (4 pi r^2).
+		auto PdfCore = [&](double X, double Y, double Z) { const double R = std::sqrt(X * X + Y * Y + Z * Z); return R < Rc && R > 0.0 ? 1.0 / (2.0 * std::sqrt(R * Rc)) / (4.0 * Pi * R * R) : 0.0; };
+		u32 S = H::Uni_SeedMix(C.Id, 0x51A7u + Salt);
+		auto Rnd = [&]() { S = H::Uni_Avalanche(S + 0x9E3779B9u); return (double(S >> 8) + 0.5) / 16777216.0; };
+		double Sum = 0.0;
+		for (u32 I = 0; I < N; ++I)
+		{
+			double X, Y, Z;
+			const u32 Kind = I % 3u;
+			if (Kind == 0u) { do { X = 2 * Rnd() - 1; Y = 2 * Rnd() - 1; Z = 2 * Rnd() - 1; } while (X * X + Y * Y + Z * Z >= 1.0); }
+			else if (Kind == 1u)
+			{
+				const double R = std::sqrt(Rnd()), A = 2 * Pi * Rnd();
+				X = R * std::cos(A); Y = R * std::sin(A);
+				const double U = Rnd();
+				Z = (U < 0.5 ? 1.0 : -1.0) * (-Hz * std::log(1.0 - 2.0 * std::abs(U - 0.5) * 0.999999));
+			}
+			else
+			{
+				const double U = Rnd(), R = Rc * U * U, Ct = 2 * Rnd() - 1, St = std::sqrt(std::max(0.0, 1 - Ct * Ct)), A = 2 * Pi * Rnd();
+				X = R * St * std::cos(A); Y = R * St * std::sin(A); Z = R * Ct;
+			}
+			if (X * X + Y * Y + Z * Z >= 1.0) { continue; }
+			const double Q = (PdfBall(X, Y, Z) + PdfDisc(X, Y, Z) + PdfCore(X, Y, Z)) / 3.0;
+			if (!(Q > 0.0)) { continue; }
+			Sum += double(H::Uni_FieldSample(C.Emitter->FieldId, H::float3(float(X), float(Y), float(Z)), P)) / Q;
+		}
+		return Sum / double(N);
+	}
+}
+
+UNI_TEST(explore, integrals_mis)
+{
+	FUniverseModel M(RichCluster());
+	FRefGenerator G(M);
+	FRefPipeline P(G);
+	P.bVelocityLod = false;
+	FCoord Cam = FCoord::Origin();
+	{ FVec3f Fr{}; AddDisplacement(Cam, Fr, FVec3d{ 0.1 * Units::Mpc, -0.05 * Units::Mpc, 0.02 * Units::Mpc }); }
+	P.Update(Cam, FVec3f{});
+	std::vector<const FContributor*> Gal;
+	for (const auto& KV : P.Contributors()) { if (KV.second.Emitter && KV.second.Emitter->FieldId == H::UNI_FIELD_GALAXY) { Gal.push_back(&KV.second); } }
+	const size_t N = std::min<size_t>(Gal.size(), 40);
+	const u32 Ns[] = { 1024u, 4096u, 16384u };
+	double WE[3] = {}, ME[3] = {}, WR[3] = {}, MR[3] = {}, Ms[3] = {}, ExR = 0.0, ExRW = 0.0;
+	int Early = 0;
+	for (size_t I = 0; I < N; ++I)
+	{
+		const double E = FRefGenerator::ComputeIntegral(*Gal[I]);
+		const double Ref = 0.5 * (Mis(*Gal[I], 1u << 20, 1u) + Mis(*Gal[I], 1u << 20, 2u));
+		const double Er = std::abs(E / Ref - 1.0);
+		ExR += Er; ExRW = std::max(ExRW, Er);
+		Early += Gal[I]->bEarly ? 1 : 0;
+		for (int V = 0; V < 3; ++V)
+		{
+			const auto T0 = std::chrono::steady_clock::now();
+			const double A = Mis(*Gal[I], Ns[V]);
+			Ms[V] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - T0).count();
+			const double Ee = std::abs(A / E - 1.0), Rr = std::abs(A / Ref - 1.0);
+			WE[V] = std::max(WE[V], Ee); ME[V] += Ee; WR[V] = std::max(WR[V], Rr); MR[V] += Rr;
+		}
+	}
+	std::printf("%zu galaxies (%d early types); the exact (32^3 x 128) against a 2M-sample reference: mean %.2f%%, worst %.2f%%\n", N, Early, 100.0 * ExR / double(N), 100.0 * ExRW);
+	for (int V = 0; V < 3; ++V) { std::printf("  MIS %5u: %.2f ms; vs exact mean %.2f%% worst %.2f%%; vs reference mean %.2f%% worst %.2f%%\n", Ns[V], Ms[V] / double(N), 100.0 * ME[V] / double(N), 100.0 * WE[V], 100.0 * MR[V] / double(N), 100.0 * WR[V]); }
+	Uni::Check(9, "X.explore.integrals_mis", "x").Pass(true, "printed");
+}
+
+UNI_TEST(explore, integrals)
+{
+	FUniverseModel M(RichCluster());
+	FRefGenerator G(M);
+	FRefPipeline P(G);
+	P.bVelocityLod = false;
+	// (1) Exact vs coarse on the galaxies resident near the core.
+	{
+		FCoord Cam = FCoord::Origin();
+		{ FVec3f Fr{}; AddDisplacement(Cam, Fr, FVec3d{ 0.1 * Units::Mpc, -0.05 * Units::Mpc, 0.02 * Units::Mpc }); }
+		P.Update(Cam, FVec3f{});
+		std::vector<const FContributor*> Gal;
+		for (const auto& KV : P.Contributors()) { if (KV.second.Emitter && KV.second.Emitter->FieldId == H::UNI_FIELD_GALAXY) { Gal.push_back(&KV.second); } }
+		std::printf("galaxy contributors resident at the core: %zu\n", Gal.size());
+		struct FV { int G; u32 K; };
+		const FV Vs[] = { { 8, 8 }, { 8, 32 }, { 12, 16 }, { 16, 8 }, { 16, 32 } };
+		double Worst[5] = {}, Mean[5] = {}, Ms[5] = {}, ExactMs = 0.0;
+		const size_t N = std::min<size_t>(Gal.size(), 24);
+		for (size_t I = 0; I < N; ++I)
+		{
+			auto T0 = std::chrono::steady_clock::now();
+			const double E = FRefGenerator::ComputeIntegral(*Gal[I]);
+			ExactMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - T0).count();
+			for (int V = 0; V < 5; ++V)
+			{
+				T0 = std::chrono::steady_clock::now();
+				const double A = Coarse(*Gal[I], Vs[V].G, Vs[V].K);
+				Ms[V] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - T0).count();
+				const double Err = std::abs(A / E - 1.0);
+				Worst[V] = std::max(Worst[V], Err); Mean[V] += Err;
+			}
+		}
+		std::printf("exact (32^3 x 128): %.1f ms each\n", ExactMs / double(std::max<size_t>(N, 1)));
+		for (int V = 0; V < 5; ++V) { std::printf("  %2d^3 x %2u: %.3f ms each, mean |err| %.2f%%, worst %.2f%%\n", Vs[V].G, Vs[V].K, Ms[V] / double(N), 100.0 * Mean[V] / double(N), 100.0 * Worst[V]); }
+	}
+	// (2) Fly-in from 4 Mpc to the core at 0.05 Mpc a frame: galaxies entering the handoff
+	// (carrier candidates) and how long they wait, under three queue policies (a job: 12 frames,
+	// 0.2 s at 60 fps; 4 at a time).
+	{
+		FRefPipeline Pf(G);
+		Pf.bVelocityLod = false;
+		const double ThetaPix = 2.0 / 960.0;
+		const double T1 = std::min(double(H::UNI_VOL_HANDOFF_PX) * ThetaPix, double(H::UNI_THETA_PROMOTE));
+		const int Frames = 80, JobFrames = 12, Jobs = 4;
+		struct FPolicy { const char* Name; int Mode; std::set<u32> Done; std::map<u32, int> Running; double Waiting = 0.0, Total = 0.0; int MaxWaitBig = 0; std::map<u32, int> FirstSeen; };
+		FPolicy Pol[3] = { { "first come (by id)", 0, {}, {}, 0, 0, 0, {} }, { "largest first", 1, {}, {}, 0, 0, 0, {} }, { "provisional coarse + exact", 2, {}, {}, 0, 0, 0, {} } };
+		int MaxCands = 0;
+		for (int F = 0; F < Frames; ++F)
+		{
+			const double D = 4.0 - 0.05 * F;
+			FCoord Cam = FCoord::Origin();
+			{ FVec3f Fr{}; AddDisplacement(Cam, Fr, FVec3d{ D * Units::Mpc, 0.3 * Units::Mpc * D / 4.0, 0.1 * Units::Mpc }); }
+			Pf.Update(Cam, FVec3f{});
+			struct FC { u32 Id; double Theta; double Area; };
+			std::vector<FC> Cands;
+			for (const auto& KV : Pf.Contributors())
+			{
+				const FContributor& C = KV.second;
+				if (!C.Emitter || C.Emitter->FieldId != H::UNI_FIELD_GALAXY) { continue; }
+				const FObjectGPU* O = Pf.FindObject(C.Parent);
+				if (!O) { continue; }
+				const double R = Length(ToDouble(Sub(Cam, C.Centre)));
+				const double Radius = std::exp2(double(H::Uni_ObjectRadiusLog2(ToHlsl(*O))));
+				const double Th = R > 0.0 ? Radius / R : 1.0;
+				const double X = std::clamp((Th - 0.5 * T1) / (0.5 * T1), 0.0, 1.0);
+				const double W = X * X * (3.0 - 2.0 * X);
+				if (!(W > 0.0)) { continue; }
+				Cands.push_back({ KV.first, Th, W * Th * Th });
+			}
+			MaxCands = std::max(MaxCands, int(Cands.size()));
+			for (FPolicy& Pl : Pol)
+			{
+				// Finish jobs.
+				for (auto It = Pl.Running.begin(); It != Pl.Running.end();) { if (--It->second <= 0) { Pl.Done.insert(It->first); It = Pl.Running.erase(It); } else { ++It; } }
+				std::vector<FC> Order = Cands;
+				if (Pl.Mode == 0) { std::sort(Order.begin(), Order.end(), [](const FC& A, const FC& B) { return A.Id < B.Id; }); }
+				else { std::sort(Order.begin(), Order.end(), [](const FC& A, const FC& B) { return A.Theta > B.Theta; }); }
+				for (const FC& C : Order)
+				{
+					if (!Pl.FirstSeen.count(C.Id)) { Pl.FirstSeen[C.Id] = F; }
+					const bool bHave = Pl.Done.count(C.Id) || Pl.Mode == 2;
+					if (!bHave && !Pl.Running.count(C.Id) && int(Pl.Running.size()) < Jobs) { Pl.Running[C.Id] = JobFrames; }
+					Pl.Total += C.Area;
+					if (!bHave)
+					{
+						Pl.Waiting += C.Area;
+						if (C.Theta > 2.0 * T1) { Pl.MaxWaitBig = std::max(Pl.MaxWaitBig, F - Pl.FirstSeen[C.Id]); }
+					}
+				}
+			}
+		}
+		std::printf("fly-in: up to %d galaxies in the handoff at once\n", MaxCands);
+		for (const FPolicy& Pl : Pol) { std::printf("  %-28s on-screen area waiting %.1f%%, longest wait of a galaxy past 2x the handoff %d frames\n", Pl.Name, 100.0 * Pl.Waiting / std::max(Pl.Total, 1e-300), Pl.MaxWaitBig); }
+	}
+	Uni::Check(9, "X.explore.integrals", "x").Pass(true, "printed");
+}

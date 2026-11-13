@@ -57,13 +57,17 @@ float3 ViewUp;
 float Pad0;
 float4 WarpVelBeta;      // D-190: the camera's motion (unit) and the warp optics' effective speed (0: none)
 float4 WarpDopplerKQ;    // D-190: Doppler colour strength, beaming exponent
+float4 ShiftVelAmount;   // D-230: the travel shift: the motion (unit), ln of the factor ahead (0: none)
+float ShiftK;            // D-230: its colour strength
 
 /** D-190: the true direction behind an apparent one (a pixel's), and its Doppler colour shift. */
 float3 TrueDir(float3 InApparent) { return Uni_Aberrate(InApparent, WarpVelBeta.xyz, -WarpVelBeta.w); }
 float3 DopplerOf(float3 InRadiance, float3 InTrueDir)
 {
-	if (WarpVelBeta.w == 0.0f) { return InRadiance; }
-	return Uni_DopplerTint(InRadiance, Uni_DopplerFactor(InTrueDir, WarpVelBeta.xyz, WarpVelBeta.w), WarpDopplerKQ.x, WarpDopplerKQ.y);
+	// D-230: the travel shift (uu.Shift), whatever the warp optics.
+	const float3 R = Uni_TravelShift(InRadiance, InTrueDir, ShiftVelAmount.xyz, ShiftVelAmount.w, ShiftK);
+	if (WarpVelBeta.w == 0.0f) { return R; }
+	return Uni_DopplerTint(R, Uni_DopplerFactor(InTrueDir, WarpVelBeta.xyz, WarpVelBeta.w), WarpDopplerKQ.x, WarpDopplerKQ.y);
 }
 
 /** Unit view direction through a pixel of a W x H grid covering the view (same as the CPU
@@ -291,6 +295,7 @@ void BackgroundCS(uint3 Id : SV_DispatchThreadID)
 {
 	if (Id.x >= CubeSize || Id.y >= CubeSize) { return; }
 	FUniVolumeView V = InVolumeView[0];
+	V.NebulaThetaPixel = V.ThetaPixel;       // D-235: the nebulae blend at the screen's footprint, as the per-pixel march
 	V.ThetaPixel = 2.0f / (float)CubeSize;   // the texel's footprint drives prefiltering
 	const uint Face = FaceBase + Id.z;
 	const float3 Dir = Uni_CubeTexelDir(Face, (float)Id.x + 0.5f, (float)Id.y + 0.5f, (float)CubeSize);
@@ -315,6 +320,7 @@ void FarCS(uint3 Id : SV_DispatchThreadID)
 	const uint Y = FarRow0 + Id.y;
 	if (Id.x >= FarCubeSize || Id.y >= FarRows || Y >= FarCubeSize) { return; }
 	FUniVolumeView V = InVolumeView[0];
+	V.NebulaThetaPixel = V.ThetaPixel;       // D-235: the nebulae blend at the screen's footprint, as the per-pixel march
 	V.ThetaPixel = 2.0f / (float)FarCubeSize;
 	const float3 Dir = Uni_CubeTexelDir(FarFace, (float)Id.x + 0.5f, (float)Y + 0.5f, (float)FarCubeSize);
 	const FUniVolumeResult R = Uni_VolumeMarch(Dir, 3.0e38f, InCarriers, InParams, InLut, V);

@@ -1,0 +1,36 @@
+// D-235 exploration: the nebula slide sweep (was inside UNI_TEST(galaxy, nebula_slide), gated by
+// UU_NEBSWEEP; uses that test's Measure lambda). Measured (inside / outside at 45 deg, 100 rays):
+//   stars 2.05-2.80% inside, 0.16% outside; the gas layer without knots 3.9-5.5% inside, 0.72% outside.
+//   D-234's form (knots at the footprint's mip, no step blend): 47.7% inside, 3.3% outside.
+//   fixed mip, blend from RES texels per half in-plane step, cap STEP texels in the layer:
+//     mip 1.0 res 0.25: inside 4.5-5.6%; mip 1.5 res 0.25: 4.9-6.6%; mip 2.0 res 0.25: 6.3-8.7%;
+//     res 0.5: 6.5-21%; res 1: 18-28%; res 2: 30-59%.
+//     outside (cap on): step 0.5: 3.5%, step 0.25: 0.76-0.90%.
+//   Chosen: mip 1, res 0.25, step 0.25, the footprint blend from 3 texels (a knot's width; from 1
+//   texel the knots were gone at a few hundred px).
+	if (std::getenv("UU_NEBSWEEP"))
+	{
+		{
+			double L = 0;
+			std::printf("outside: stars %.2f%% source %.2f%% nebula %.2f%%; hints x1 nebula with StepCap 0.25: ", 100.0 * Measure(0.32, 1.0, 100, L, 1, true), 100.0 * Measure(0.32, 1.0, 100, L, 2, true), 100.0 * Measure(0.32, 1.0, 100, L, 0, true));
+			H::GKnobNebStep = 0.5f; std::printf("(cap 0.5) %.2f%%\n", 100.0 * Measure(0.32, 1.0, 100, L, 0, true)); H::GKnobNebStep = 0.25f;
+			std::printf("MW h %.4f G.w %.2f TexN %.0f\n", P.A.y, P.G.w, P.H.w);
+			if (std::getenv("UU_NEBSWEEP")[0] == '3') { return; }
+		}
+		for (const float Mip : { 1.0f, 1.5f, 2.0f })
+		{
+			const float St = Mip == 1.0f ? 1.0694f : (Mip == 1.5f ? 1.1798f : 1.2941f);
+			for (const float Res : { 0.25f, 0.5f })
+			{
+				for (const float Stp : { 0.5f, 1.0f, 2.0f })
+				{
+					H::GKnobNebMip = Mip; H::GKnobNebStretch = St; H::GKnobNebRes = Res; H::GKnobNebStep = Stp;
+					double L = 0.0, Lo = 0.0;
+					const double Sl = Measure(0.32, 3.0, 100, L), So = Measure(0.32, 1.0, 100, Lo, 0, true);
+					std::printf("mip %.1f res %.2f step %.1f: inside %.2f%% outside %.2f%%\n", Mip, Res, Stp, 100.0 * Sl, 100.0 * So);
+				}
+			}
+		}
+		H::GKnobNebMip = 1.0f; H::GKnobNebStretch = 1.0694f; H::GKnobNebRes = 0.25f; H::GKnobNebStep = 0.25f;
+	}
+}

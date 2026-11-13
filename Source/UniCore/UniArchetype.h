@@ -192,6 +192,9 @@ namespace UniCore
 		// Bubbles (2 A - 1)+, 0) (holes where the superbubble channel is high); no knots for dust.
 		float DustLanes = 2.2f;
 		float DustBubbles = 0.8f;
+		// D-234: dark clouds: the textured dust x max(1 + Clumps (knot - its mean), 0), knot = 2 G - 1,
+		// the knots the emission nebulae light (galaxy_detail's G; carried in the dust set's G.y). 0: none.
+		float DustClumps = 1.2f;
 	};
 
 	struct FArchetype

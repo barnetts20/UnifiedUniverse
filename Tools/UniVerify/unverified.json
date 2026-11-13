@@ -212,19 +212,27 @@
     "what": "D-220: galaxy discs warped at a structural level (warp_fine mip >= 2) with the fine band as a bounded multiplier (shader only; UniFields.ush): the rings flying top-down toward a galaxy's centre and the arcs inside one mostly gone; the look close to before (slightly grainier arms); stars in textured galaxies reroll (REVIEW_TONIGHT section 54)."
   },
   {
-    "id": "UE-56",
-    "what": "D-223: plain point sprites drawn by the splat path (uu.Sprite.Splat 1: atomic adds into fixed-point buffers, one shared gather; the rest stay quads): the new shaders compile (SplatCS, SplatGatherCS, SplatResolveVS/PS, the project pass's lists); stars look as with uu.Sprite.Splat 0 (shape, twinkle in motion, colour, nothing on a near body's edge); ProfileGPU Uni.Sprites vs Uni.Sprites.Splat against uu.Sprite.Splat 0 in a dense core (REVIEW_TONIGHT section 57). D-223 amendment: tile skipping (Uni.Sprites.Splat.Tiles / .Zero, persistent buffers); expect ~0.1-0.15 ms."
-  },
-  {
-    "id": "UE-57",
-    "what": "D-224: travelling inside a galaxy the background stays on its direction map (uu.BackgroundPerPixelInside 0) and the per-pixel decision no longer follows the auto budget: no frame drop at the owner's angles (mid-disc, 20 degrees below the plane, orbiting, moving in and out at speed); uu.Perf shows no per-pixel background frames inside the galaxy (REVIEW_TONIGHT section 58)."
-  },
-  {
-    "id": "UE-58",
-    "what": "D-225: supersampling scales with sqrt(carrier weight) (UniVolume.ush): no hitch at the owner's angles with uu.VolumeMaxSubsamples 8 (default); the image as with uu.VolumeMaxSubsamples 1; cluster glows not blocky up close (REVIEW_TONIGHT section 59)."
-  },
-  {
     "id": "UE-59",
     "what": "D-228: the far cache (uu.VolumeFar 1): the new FarCS compiles; parked inside a galaxy uu.Perf shows the far cache on and Uni.Volume.March (near: far cache on) cheaper than the march with uu.VolumeFar 0; the image the same either way (no seam at the 2 kpc split, no blocky far light, no flash when it switches on or off); stars far away dimmed by dust the same; travelling it goes off (REVIEW_TONIGHT section 60)."
+  },
+  {
+    "id": "UE-60",
+    "what": "D-229: flying into a dense cluster, galaxies take on their disc/arm look (volume carriers) as they grow on screen instead of staying plain sprites for seconds; no visible brightness step as each eases to its exact integral; uu.Perf's volume integrals line counts quick estimates; the galaxy map at 512^2 (uu.GalaxyMap.Size 512, 8 slots) looks the same as 1024 except perhaps right at a core (REVIEW_TONIGHT section 61)."
+  },
+  {
+    "id": "UE-61",
+    "what": "D-230: the travel look: the shaders compile (UniVolume.ush's FUniVolumeView is 128 bytes now); at intergalactic speed the web's filaments and clusters glow faintly and drift by (uu.MotionWeb 0.01), with no edge in the distance and no blobs right at the camera; ahead bluer, behind redder (uu.Shift 0.5), brightness unchanged; at rest and below ~200 kpc/s both are off (REVIEW_TONIGHT section 62)."
+  },
+  {
+    "id": "UE-62",
+    "what": "D-231: the motion web's organic detail and speed ramp: shaders compile (FUniVolumeView 144 bytes); the web reads as wisps and tendrils (uu.MotionWeb.Detail 1.0, 0 = D-230's look) that move with the scene and do not swim through it at speed (step cap uu.MotionWeb.StepMpc 0.5; its cost in ProfileGPU against 0); it shows faintly while crossing a galaxy in a second or two (~20-50 kpc/s) and grows to full by a few Mpc/s, without flicker as the speed changes (REVIEW_TONIGHT section 63)."
+  },
+  {
+    "id": "UE-66",
+    "what": "D-235: nebulae without slide: shaders compile (Uni_GalaxyTexTerms' OutNebK, the float4 nebula terms, Uni_GalaxyNebulaStepCap in Uni_CarrierStepLimit); no sliding while moving and no change of position when the view swaps at rest; visible up close; two colours a galaxy, varying nebula to nebula and galaxy to galaxy; ProfileGPU against uu.Nebula 0 near a large galaxy (the gas layer's step cap) (REVIEW_TONIGHT section 67)."
+  },
+  {
+    "id": "UE-67",
+    "what": "D-236: nebula colours and ellipticals: shaders compile (Uni_GalaxyShells, Uni_GalaxyEarlyNebula*, the early branch of Uni_GalaxyNebulaStepCap with the footprint passed from Uni_CarrierStepLimit, Uni_NebulaHue); spirals' nebulae in three colours a galaxy over wider families; about 60% of ellipticals with coloured filaments in their cores, stable while moving and from inside; about a third with tidal shells (nested ripples, sharp outer edges); ProfileGPU near a large elliptical against uu.Nebula 0 (REVIEW_TONIGHT section 68)."
   }
 ]

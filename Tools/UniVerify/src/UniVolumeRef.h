@@ -73,6 +73,7 @@ namespace UniRender
 		C.StartCm = 3.0e38f;
 		for (const FCarrierGPU& G : Bg.Carriers) { C.StartCm = std::min(C.StartCm, G.TStart); }
 		H::FUniVolumeView V = ToHlsl(Bg.View);
+		V.NebulaThetaPixel = V.ThetaPixel;   // D-235: as BackgroundCS
 		V.ThetaPixel = 2.0f / float(N);
 		const auto Cb = Bg.CarrierBuf(); const auto Pb = Bg.ParamBuf(); const auto Lb = Bg.LutBuf();
 		for (int F = 0; F < 6; ++F) for (int Y = 0; Y < N; ++Y) for (int X = 0; X < N; ++X)
@@ -159,6 +160,8 @@ namespace UniRender
 					H::FUniVolumeResult R = MarchPixel(Cb, Pb, Lb, V, Cam, Img.W, Img.H, X, Y, TScene, bSuper);
 					if (bSuper) { ++S.Supersampled; }
 					if (Cube && TScene > Cube->StartCm) { R.Radiance = R.Radiance + R.Transmittance * Cube->Sample(Dc); }
+					// D-230: the travel shift, as MarchCS and the composite apply it (DopplerOf).
+					R.Radiance = H::Uni_TravelShift(R.Radiance, Dc, H::float3(float(Cam.ShiftVel.X), float(Cam.ShiftVel.Y), float(Cam.ShiftVel.Z)), float(Cam.ShiftAmount), float(Cam.ShiftK));
 					const double Om = PixelSolidAngle(Cam, Img.W, Img.H, X + 0.5, Y + 0.5);
 					float* P = &Img.Rgb[(size_t(Y) * Img.W + X) * 3];
 					P[0] += float(R.Radiance.x * Om); P[1] += float(R.Radiance.y * Om); P[2] += float(R.Radiance.z * Om);

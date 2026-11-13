@@ -17,6 +17,7 @@
 #include "../src/UniFarRef.h"
 #include "../scenes/UniScenes.h"
 #include "UniFarCache.h"
+#include "UniWebTexture.h"
 #include <algorithm>
 #include <cmath>
 #include <string>
@@ -289,4 +290,76 @@ UNI_TEST(volume, far_flight)
 	const bool bOk = OnFrames > 40 && Switches >= 3 && Ratio < 0.7 && ErrOn < 0.01 && WorstSwitchJump < std::max(0.005, 2.0 * WorstJump) && Sim.Map.MaxRowsInFrame <= Sim.S.RowsPerFrame() && Sim.SceneChanges == 0;
 	Uni::Check(2, "T2.vol.far_flight", "D-228 the solar camera drifting, travelling, drifting again with the renderer's far-cache rules: on while drifting at under 0.7x today's steps (march + face fills), within 1% of the whole march, switching off and on again without a light jump (history converted: under 0.5% or 2x the other frames' change), a face's share of rows a frame at most, the scene key (what the map's light depends on) steady throughout")
 		.Metric("steps_ratio_on", Ratio).Metric("error_on", ErrOn).Metric("switch_jump", WorstSwitchJump).Metric("other_jump", WorstJump).Pass(bOk, Detail);
+}
+
+UNI_TEST(volume, far_split_nebulae)
+{
+	// D-235 (owner, D-235 in the engine: "the nebula are not getting rendered consistently in all
+	// clipmap bands... a nebula that is straddling bands and half of it is cut off"): the far map's
+	// texels are coarser than the screen's pixels, and the nebulae blended to their mean at its
+	// texel's footprint, so past the split they dimmed where the per-pixel march drew them. The
+	// textured Milky Way with nebulae, from the solar camera along the disc and 1 kpc above it,
+	// near (stopped at R) + the far map against the whole march, the map at a half and a quarter of
+	// the view's resolution: the nebulae's added light (on - off) within 5%.
+	FWebTexture Gt[3];
+	bool bTex = true;
+	for (int K = 0; K < 3; ++K) { std::string E; bTex = FWebTexture::LoadDelivered("Data/Noise", GalaxyTextureName(K), Gt[K], &E) && bTex; BindGalaxyTexture(K, &Gt[K]); }
+	struct FUnbind { ~FUnbind() { for (int K = 0; K < 3; ++K) { BindGalaxyTexture(K, nullptr); } } } Unbind;
+	if (!bTex) { Uni::Check(2, "T2.vol.far_split_nebulae", "D-235 nebulae across the far split").Pass(false, "textures not loaded"); return; }
+	FUniverseDef D = UniScenes::GalaxyToStar();
+	UniScenes::UseGalaxyTextures(D, Gt[0].Size);
+	FUniverseModel M(D);
+	FRefGenerator G(M);
+	FVolumeBuilder VB(M, G);
+	const int W = 160, Ht = 90;
+	struct FShot { const char* Name; FVec3d Off; FV3 Look; };
+	const FShot Shots[] = { { "along the disc", { 0, 0, 0 }, { -1, -0.12, -0.02 } }, { "1 kpc above, looking down", { 0, 0, 1.0 * Units::Kpc }, { -1, -0.1, -0.35 } } };
+	std::string Detail;
+	double Worst = 0.0;
+	for (const FShot& Sh : Shots)
+	{
+		FCoord Cam = UniScenes::SolarCamera(); FVec3f Fr{};
+		AddDisplacement(Cam, Fr, Sh.Off);
+		FRefPipeline P(G);
+		P.bVelocityLod = false;
+		P.Update(Cam, FVec3f{});
+		FCamera Cm; Cm.Coord = Cam; Cm.Width = W; Cm.Height = Ht; Cm.DeltaMag = 0.0;
+		Cm.LookAlong(Sh.Look);
+		FVolumeSettings Son; Son.NebulaGain = 1.0f; Son.NebulaReflect = 6.0f;
+		const FVolumeScene On = VB.Build(P, Cam, FVec3f{}, Cm.View(), Son).Subset(false);
+		const FVolumeScene Off = VB.Build(P, Cam, FVec3f{}, Cm.View()).Subset(false);
+		FTemporalVolume WOn, WOff;
+		WOn.Step(On, Cm, FV3{ 0, 0, 0 }, false, false, 2);
+		WOff.Step(Off, Cm, FV3{ 0, 0, 0 }, false, false, 2);
+		double Lw = 0.0;
+		for (size_t I = 0; I < WOn.Vol.size(); ++I) { Lw += double(H::Uni_Luminance(H::float3(WOn.Vol[I].x, WOn.Vol[I].y, WOn.Vol[I].z))) - double(H::Uni_Luminance(H::float3(WOff.Vol[I].x, WOff.Vol[I].y, WOff.Vol[I].z))); }
+		for (const int Div : { 2, 4 })
+		{
+			const double R = 2.0 * Units::Kpc;
+			double Lc = 0.0;
+			for (int Pass = 0; Pass < 2; ++Pass)
+			{
+				const FVolumeScene& Sc = Pass == 0 ? On : Off;
+				FFarMap Map;
+				Map.Reset(W / Div);
+				const FVolumeScene Far = FarSplit(Sc, R, true);
+				for (int F = 0; F < 6; ++F) { Map.MarchRows(Far, float(R), F, 0, Map.N); }
+				Map.LayerBits = 0x3Fu;
+				FTemporalVolume Near;
+				Near.FarSlice = [&](const FV3& Dd, u32 K) { return Map.SliceAt(Dd, K); };
+				Near.Step(FarSplit(Sc, R, false), Cm, FV3{ 0, 0, 0 }, false, false, 2);
+				for (int Y = 0; Y < Ht; ++Y) for (int X = 0; X < W; ++X)
+				{
+					const size_t I = size_t(Y) * W + X;
+					const H::float4 C = H::Uni_FarComposite(Near.Vol[I], Map.Sample(PixelDir(Cm, W, Ht, X + 0.5, Y + 0.5)));
+					Lc += (Pass == 0 ? 1.0 : -1.0) * double(H::Uni_Luminance(H::float3(C.x, C.y, C.z)));
+				}
+			}
+			const double E = std::abs(Lc / std::max(Lw, 1e-300) - 1.0);
+			Worst = std::max(Worst, E);
+			Detail += Uni::Fmt("%s%s, map 1/%d: nebulae's light %+.1f%%", Detail.empty() ? "" : "; ", Sh.Name, Div, 100.0 * (Lc / std::max(Lw, 1e-300) - 1.0));
+		}
+	}
+	Uni::Check(2, "T2.vol.far_split_nebulae", "D-235 the textured Milky Way's nebulae across the far cache's split (R 2 kpc, the map at a half and a quarter of the view's resolution), two views: the nebulae's added light (on - off) in near + far map within 5% of the whole march's")
+		.Metric("worst", Worst).Pass(Worst < 0.05, Detail);
 }

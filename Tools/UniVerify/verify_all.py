@@ -160,6 +160,19 @@ def lint_shader_params(results):
         {"shaders": int(m.group(1)) if m else 0, "problems": int(m.group(2)) if m else -1})
 
 
+def lint_shader_decl_order(results):
+    """D-235: every name a shader reaches is declared before its first use in the order the shader
+    compiler reads it (the C++ shim defines its knobs first, so the harness cannot see a late
+    default). shader_decl_order.py."""
+    code, out, secs = run([sys.executable, "-I", os.path.join(HERE, "shader_decl_order.py")])
+    last = out.strip().splitlines()[-1] if out.strip() else "no output"
+    bad = [l.strip() for l in out.splitlines() if "used before" in l][:6]
+    m = re.match(r"(\d+) shaders, (\d+) problems", last)
+    add(results, 4, "T4.static.shader_decl_order", "Every macro, constant, function and struct a shader reaches is declared before its first use, in the shader compiler's order (each .usf with its includes; the C++ shim defines its knobs first and cannot see this)",
+        code == 0 and m is not None, last if code == 0 else "; ".join(bad) or last,
+        {"shaders": int(m.group(1)) if m else 0, "problems": int(m.group(2)) if m else -1})
+
+
 # ------------------------------------------------------------------------------------------
 # Report
 # ------------------------------------------------------------------------------------------
@@ -350,6 +363,7 @@ def main():
     lint_gpu_structs(results)
     lint_ue_rules(results)
     lint_shader_params(results)
+    lint_shader_decl_order(results)
 
     unverified = json.load(open(UNVERIFIED)) if os.path.exists(UNVERIFIED) else []
     review = open(REVIEW).read() if os.path.exists(REVIEW) else ""
@@ -360,9 +374,9 @@ def main():
     # says it was withdrawn (what it tested was removed), so no section asks for a test nobody tracks.
     open_ids = {u["id"] for u in unverified}
     heads = [l for l in review.splitlines() if l.startswith("## ")]
-    stale = sorted({i for h in heads for i in re.findall(r"UE-\d+", h) if i not in open_ids and "withdrawn" not in h},
+    stale = sorted({i for h in heads for i in re.findall(r"UE-\d+", h) if i not in open_ids and "withdrawn" not in h and "verified" not in h},
                    key=lambda x: int(x[3:]))
-    add(results, 4, "T0.report.review_ids", "Every UE ID in a REVIEW_TONIGHT.md heading is open in unverified.json or marked withdrawn",
+    add(results, 4, "T0.report.review_ids", "Every UE ID in a REVIEW_TONIGHT.md heading is open in unverified.json or marked withdrawn or verified",
         not stale, f"{len(heads)} headings; stale IDs: {stale or 'none'}", {"headings": len(heads), "stale": len(stale)})
 
     write_report(results, unverified, time.time() - t0)

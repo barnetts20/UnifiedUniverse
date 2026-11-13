@@ -220,3 +220,25 @@ Sub-pixel stars added into a fixed-point light buffer with atomics (Schütz et a
 
 ## B-030: Long rays at some azimuths (D-224 side finding) — FOUND AND FIXED (D-225: faint cluster glows supersampled behind the core)
 From mid-disc 20 degrees below the plane looking at the core, azimuths 45-105 degrees have rays with 2-3x the steps of the rest (max 206 vs ~100 steps; mean +0.5%). On the GPU a wave runs as long as its longest ray, so where these rays fall decides how many waves pay. Check after UE-57: if a slowdown at those angles remains with the background on its map, find what these rays cross (the bar end-on or an arm along the line of sight) and look at their step hints.
+
+## B-031: Roadmap after the travel look (owner, 2026-11-11)
+Once the overarching look and feel is in a good state, short diversions for entity variety, then the gameplay bridge. In order:
+- **Nebulae:** emission and reflection nebulae and dark clouds in galaxies, as a field (no explicit entities: keep the cost flat). *Outside view done: D-234; the fly-into layer is B-034.*
+- **A galactic star-cluster layer:** clustering at the galaxy level baked as a density field modulating star placement and the glow, not as explicit cluster entities like the universe's (a dense entity layer spiked the cost before).
+- **Compact and exotic objects:** stellar and supermassive black holes, quasars, magnetars and the like.
+- **The gravity ship:** a pass in the gravity project for a walkable, gravity-enabled ship that flies in real space and drives the speed/scale system at universe scale. It's the bridge from the debug traversal mode to gameplay traversal.
+
+## B-032: Far cache follow-ups (D-228)
+- A split distance that grows with speed: 4 kpc is 0.68x today's at 1 pc a frame instead of 0.92x at 2 kpc, but 0.46x at rest instead of 0.38x.
+- Cell glow in the far map, so the cache does not switch off while cells load.
+
+## B-033: Motion web follow-ups (D-230)
+- Near structure is soft (the web texture's texels are 0.78 Mpc): a finer web texture or a detail octave would let the near fade come in closer.
+- The node channel dominates as round blobs. A separate filament / node weight (one more view float) would let the filaments read as threads.
+
+## B-034: Nebulae follow-ups (D-234)
+- **The fly-into layer (owner's option 3, second half):** inside the camera's galaxy, nebulae with structure of their own at pc scale: finer octaves of the same density in the galaxy's frame (the near fade, uu.Nebula.NearKpc, then shrinks to the new layer's reach), a step hint for the gas layer and the new octaves, and their own colour structure (an [O III] teal core in the brightest, ionisation fronts at the dark clouds' edges).
+- **Young stars in nebulae:** placement could weight O/B stars toward the nebulae's density (one field source: the same function), so the clusters lighting them are there when you arrive.
+- **The galaxy sprite lacks the nebulae's light** (a few to ~17% for star-forming spirals): the carrier brightens by that over the 4-8 px hand-off. A per-galaxy nebula share from the quick integral would close it.
+- **Dark clouds offset from the H II regions:** today they share the knots' positions (the dust's arms sit inward, so the clouds fall on the arms' inner flank); a shifted read would put ionisation fronts at cloud edges.
+

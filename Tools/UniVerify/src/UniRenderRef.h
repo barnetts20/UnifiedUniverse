@@ -43,6 +43,9 @@ namespace UniRender
 		u32 DiscArchetypeMask = 0u;          // D-183: archetypes drawn as inclined ellipses (0: every sprite round, as before)
 		u32 FixedDiscSeeds[4] = { 0u, 0u, 0u, 0u };   // D-183: fixed-orientation anchors (disc normal world z)
 		float HaloChroma = 1.0f;   // D-185: halo chroma; 1 here by default (sprites as before)
+		// D-230: the travel shift (Uni_TravelShift) on sprites and the volume (0: none).
+		double ShiftAmount = 0.0, ShiftK = 0.0;
+		FV3 ShiftVel{ 0, 0, 0 };
 
 		void LookAlong(FV3 F, FV3 WorldUp = { 0, 0, 1 })
 		{
@@ -71,7 +74,7 @@ namespace UniRender
 			V.SystemArchetypeMask = SystemArchetypeMask;
 			V.DiscArchetypeMask = DiscArchetypeMask;
 			V.FixedDiscSeeds = H::uint4(FixedDiscSeeds[0], FixedDiscSeeds[1], FixedDiscSeeds[2], FixedDiscSeeds[3]);
-			V.WarpVel = H::float3(0, 0, 0); V.WarpBeta = 0.0f; V.WarpDoppler = 0.0f; V.WarpBeaming = 0.0f; V.WarpPad0 = 0.0f; V.WarpPad1 = 0.0f;   // D-190: no warp optics
+			V.WarpVel = H::float3(0, 0, 0); V.WarpBeta = 0.0f; V.WarpDoppler = 0.0f; V.WarpBeaming = 0.0f; V.ShiftAmount = float(ShiftAmount); V.ShiftK = float(ShiftK); V.ShiftVel = H::float3(float(ShiftVel.X), float(ShiftVel.Y), float(ShiftVel.Z)); V.ShiftPad = 0.0f;   // D-190: no warp optics; D-230: the travel shift
 			return H::Uni_SpriteDefaults(V);   // D-156 sprite style
 		}
 	};

@@ -105,9 +105,9 @@ static TAutoConsoleVariable<int32> CVarUniSubmitDefer(TEXT("uu.SubmitDeferPerLev
 static TAutoConsoleVariable<float> CVarUniTravelExposure(TEXT("uu.TravelExposure"), 1.5f, TEXT("D-205: magnitudes everything is brightened by at full travel speed (render only: sprites, glow and background; windows and what is generated unchanged), lerped by the travel curve (100 kpc/s to 10 Mpc/s). Brings back the visibility travel sensitivity gave nearby clusters at speed without widening windows. 0: off."));
 static TAutoConsoleVariable<int32> CVarUniGenOneTrip(TEXT("uu.GenOneTrip"), 1, TEXT("D-207: cells whose objects never come back (stars) are generated in one GPU round trip (probe, allocation and place in one graph) instead of two (~6 -> ~3 frames). 0: two trips for every cell."));
 static TAutoConsoleVariable<int32> CVarUniGalaxyMap(TEXT("uu.GalaxyMap"), 1, TEXT("D-212: the galaxy the camera is in is marched from its baked 2D map (in-plane light, dust, disc centre, arm part; baked once per galaxy on the GPU) with the vertical profile, bulge, warp and detail read per sample. 0: its field at every step (A/B). D-214: placement always reads the maps (a galaxy's stars come from its map); this toggles the volume only."));
-static TAutoConsoleVariable<int32> CVarUniGalaxyMapSize(TEXT("uu.GalaxyMap.Size"), 1024, TEXT("D-212: the galaxy map's texels a side (a power of two, 256..4096): 1024 ~11 MB with mips, baked in one frame (p95 1% against the field; the owner sees no difference from 2048), 2048 ~43 MB (0.3%). Changing it rebakes."));
+static TAutoConsoleVariable<int32> CVarUniGalaxyMapSize(TEXT("uu.GalaxyMap.Size"), 512, TEXT("D-212, D-229: the galaxy map's texels a side (a power of two, 256..4096). 512 (default, D-229) ~2.7 MB with mips, a quarter of 1024's bake: within 0.3% in light of 1024 everywhere, per-pixel p95 up to 1.7% within ~0.5 kpc of a core (1024: 0.8%). 1024 ~11 MB; 2048 ~43 MB. Changing it rebakes (stars placed from it change where an accept decision flips)."));
 static TAutoConsoleVariable<int32> CVarUniGalaxyMapBudget(TEXT("uu.GalaxyMap.Budget"), 1048576, TEXT("D-212: texels of the galaxy maps the GPU bakes a frame (rows of a map): 1M bakes a 1024^2 map in one frame, 2048^2 in 4. The glow uses the field until the camera's galaxy's map is done; D-214: a galaxy's stars wait for theirs."));
-static TAutoConsoleVariable<int32> CVarUniGalaxyMapSlots(TEXT("uu.GalaxyMap.Slots"), 4, TEXT("D-214: galaxy maps kept on the GPU at once (1..16; ~11 MB each at 1024^2): every galaxy stars are placed in, and the camera's own. A galaxy beyond them waits (glow) until a slot frees (unused for 64 frames). Changing it rebakes."));
+static TAutoConsoleVariable<int32> CVarUniGalaxyMapSlots(TEXT("uu.GalaxyMap.Slots"), 8, TEXT("D-214, D-229: galaxy maps kept on the GPU at once (1..16; ~2.7 MB each at 512^2, ~11 MB at 1024^2): every galaxy stars are placed in, and the camera's own. A galaxy beyond them waits (glow) until a slot frees (unused for 64 frames). 8 at 512^2 is half 4 at 1024^2's memory. Changing it rebakes."));
 static TAutoConsoleVariable<int32> CVarUniGenFrameCandidates(TEXT("uu.GenFrameCandidates"), 1000000, TEXT("D-214: the most candidate positions a frame's one-trip generation batch evaluates up front (a galaxy star takes ~3, a dense core cell thousands); cells past it wait a frame as glow, the most needed first. The hard cap on a frame's generation work. 0: no cap."));
 static TAutoConsoleVariable<int32> CVarUniGenViewPriority(TEXT("uu.GenViewPriority"), 1, TEXT("D-214: cells in view are built before cells out of view (after the cells finer levels wait on). 0: by distance alone (D-203)."));
 static TAutoConsoleVariable<int32> CVarUniCellGlow(TEXT("uu.CellGlow"), 1, TEXT("D-203: a cell still loading is drawn as glow (the volume adds its children's expected light from the field) and its sprites fade in once it is Ready, instead of a hole that pops. 0: before D-203."));
@@ -134,6 +134,25 @@ static TAutoConsoleVariable<int32> CVarUniSkyWeb(TEXT("uu.SkyWeb"), 0, TEXT("D-1
 static TAutoConsoleVariable<float> CVarUniSkyWebGlow(TEXT("uu.SkyWeb.Glow"), 2.0f, TEXT("D-189: near-web glow gain (x overdensity)."));
 static TAutoConsoleVariable<float> CVarUniSkyWebDepth(TEXT("uu.SkyWeb.Depth"), 50.0f, TEXT("D-189: near-web glow depth, Mpc (it fades over the second half)."));
 static TAutoConsoleVariable<float> CVarUniSkyWebTail(TEXT("uu.SkyWeb.Tail"), 0.1f, TEXT("D-189: the far background's share kept in mode 2 (1: physical)."));
+// D-230: the travel look (render only, art choices): the motion web and the travel shift, both
+// ramped by the travel curve (0 at 100 kpc/s, 1 at 10 Mpc/s) between uu.TravelLook.Start and Full.
+static TAutoConsoleVariable<float> CVarUniTravelLookStart(TEXT("uu.TravelLook.Start"), 0.15f, TEXT("D-230: the travel curve value (0 at 100 kpc/s, 1 at 10 Mpc/s, log) where the travel shift starts to come in (0.15: ~200 kpc/s). D-231: the motion web has its own speed ramp (uu.MotionWeb.StartKpcS / FullKpcS)."));
+static TAutoConsoleVariable<float> CVarUniTravelLookFull(TEXT("uu.TravelLook.Full"), 0.75f, TEXT("D-230: the travel curve value where the travel shift is at full strength (0.75: ~3 Mpc/s)."));
+static TAutoConsoleVariable<float> CVarUniMotionWeb(TEXT("uu.MotionWeb"), 0.01f, TEXT("D-230: the motion web: while travelling, the cosmic web's filaments and nodes glow faintly so the structure shows motion (render only). Strength at full travel: a galaxy disc's surface brightness per Mpc of web (0.01: a few-Mpc filament at a few % of a disc). 0: off."));
+static TAutoConsoleVariable<float> CVarUniMotionWebStartKpcS(TEXT("uu.MotionWeb.StartKpcS"), 5.0f, TEXT("D-231: the speed (kpc/s) where the motion web starts to come in (crossing a galaxy in a second or two, ~15-50 kpc/s, shows it at about half strength)."));
+static TAutoConsoleVariable<float> CVarUniMotionWebFullKpcS(TEXT("uu.MotionWeb.FullKpcS"), 5000.0f, TEXT("D-231: the speed (kpc/s) where the motion web is at full strength (ease-out on log speed between: it comes in early and reaches full slowly)."));
+static TAutoConsoleVariable<float> CVarUniMotionWebDetail(TEXT("uu.MotionWeb.Detail"), 1.0f, TEXT("D-231: the motion web's organic detail: one galaxy_detail read (its ridged filaments) multiplies it. 0: none, 1: the full pattern."));
+static TAutoConsoleVariable<float> CVarUniMotionWebStepMpc(TEXT("uu.MotionWeb.StepMpc"), 0.5f, TEXT("D-231: with the detail on, the background march's step cap (Mpc) where the motion web is (half its near distance to its depth), so the detail is sampled instead of swimming (~2x the background's steps while travelling). 0: no cap (free; the detail then blurs away over the march's long steps)."));
+static TAutoConsoleVariable<float> CVarUniMotionWebDetailMpc(TEXT("uu.MotionWeb.DetailMpc"), 20.0f, TEXT("D-231: the detail texture's period (Mpc; rounded to a whole number per 200 Mpc web tile). Its ridges are 1/4 to 1/32 of it."));
+static TAutoConsoleVariable<float> CVarUniMotionWebRegionMpc(TEXT("uu.MotionWeb.RegionMpc"), 200.0f, TEXT("D-233: the period (Mpc; at most one per 200 Mpc web tile, else a whole number per tile) of the regions over which the detail's look changes: filaments, knots, cloud or cells, mixed by a smooth second read of the detail texture (regions ~50 Mpc across at 200). 0: the ridged filaments everywhere (D-231)."));
+static TAutoConsoleVariable<float> CVarUniNebula(TEXT("uu.Nebula"), 1.0f, TEXT("D-234: emission nebulae (H II regions) in galaxies: pink glows on the arms' star-forming knots, in a gas layer as thin as the dust, at this gain x the galaxy's full light per star (they stay as the stars resolve). Galaxies with a palette use its knot colour. 0: off."));
+static TAutoConsoleVariable<float> CVarUniNebulaReflect(TEXT("uu.Nebula.Reflect"), 6.0f, TEXT("D-234: reflection nebulae: galaxies' dust lit blue by the young clusters around it (the knots), at this gain. 0: off."));
+static TAutoConsoleVariable<float> CVarUniNebulaNearKpc(TEXT("uu.Nebula.NearKpc"), 0.0f, TEXT("D-234: the nebulae fade in from this distance (kpc) to 3x (render only). D-235: 0 by default (they were lost up close)."));
+static TAutoConsoleVariable<float> CVarUniMotionWebThreshold(TEXT("uu.MotionWeb.Threshold"), 3.0f, TEXT("D-230: the motion web shows the web where its filament + node matter is above this multiple of its mean (full two decades above). Lower: more of the web's shape (walls and voids); higher: only clusters and the densest filaments."));
+static TAutoConsoleVariable<float> CVarUniMotionWebNear(TEXT("uu.MotionWeb.Near"), 4.0f, TEXT("D-230: the motion web fades in over its first this many Mpc (nearer structure would fill the view as soft blobs: the web texture's texels are 0.78 Mpc, 200 Mpc / 256)."));
+static TAutoConsoleVariable<float> CVarUniMotionWebDepth(TEXT("uu.MotionWeb.Depth"), 50.0f, TEXT("D-230: the motion web fades out over the second half of this many Mpc (it is gone before the march or the web tile ends: no edge)."));
+static TAutoConsoleVariable<float> CVarUniShift(TEXT("uu.Shift"), 0.5f, TEXT("D-230: the travel shift: while travelling, light ahead is shifted blue and behind red, as a Doppler shift would, the brightness kept (render only). ln of the shift factor straight ahead at full travel (0.5: x1.65). 0: off."));
+static TAutoConsoleVariable<float> CVarUniShiftColour(TEXT("uu.Shift.Colour"), 1.0f, TEXT("D-230: the travel shift's colour strength (the Doppler tint's exponent)."));
 static TAutoConsoleVariable<float> CVarUniWarp(TEXT("uu.Warp"), 0.0f, TEXT("D-187: warp effects (streaks, arrival, D-190 optics, D-192 motes), 0..1 x the warp amount from speed (the travel-sensitivity curve). 0: physical. D-196: off by default (owner: at intergalactic speed the galaxies vanished with it on, B-018); 1 to try it."));
 static TAutoConsoleVariable<float> CVarUniWarpMotes(TEXT("uu.Warp.Motes"), 1.0f, TEXT("D-192: warp ambience, 0..1 (x the warp amount): decorative motes fixed in space around the camera, streaking past at speed so a void still reads as fast. 0: none. Live."));
 static TAutoConsoleVariable<float> CVarUniWarpMoteFrames(TEXT("uu.Warp.MoteFrames"), 30.0f, TEXT("D-192: the motes' lattice cell, in frames of the camera's motion (the nearest motes pass in about this many frames)."));
@@ -738,6 +757,9 @@ void UUniSubsystem::Tick(float DeltaTime)
 		Warp.RiseMagPerS = 2.0;
 		Warp.FallMagPerS = 1.0;
 		Warp.Update(Speed, Dt);
+		// D-231: the motion web's own ramp, from the speed itself (it starts well below the travel curve).
+		MotionWebRamp.Update(Speed, Dt, double(FMath::Max(CVarUniMotionWebStartKpcS.GetValueOnGameThread(), 0.001f)) * 3.0856775814913673e21,
+			double(FMath::Max(CVarUniMotionWebFullKpcS.GetValueOnGameThread(), 0.002f)) * 3.0856775814913673e21);
 		// D-205: render-only brightening at speed (the exposure travel sensitivity used to bring).
 		// Quantised to 0.05 mag so the volume's tables rebuild at most ~30 times over the ramp.
 		TravelExposureMag = FMath::RoundToFloat(FMath::Clamp(CVarUniTravelExposure.GetValueOnGameThread(), 0.0f, 5.0f) * float(FMath::Clamp(Warp.Current, 0.0, 1.0)) * 20.0f) / 20.0f;
@@ -914,6 +936,13 @@ void UUniSubsystem::LogPerf()
 		(MFlags & 1u) ? TEXT(", with the background") : TEXT(""), BgPp - BgPerPixelAtPerf, PerfFrames - PerfFramesAtBg);
 	BgPerPixelAtPerf = BgPp;
 	PerfFramesAtBg = PerfFrames;
+	// D-229: the volume's integrals (D-140's exact ones on workers; a galaxy's quick estimate
+	// meanwhile, so its carrier is not held back).
+	if (Streamer)
+	{
+		UE_LOG(LogUnifiedUniverse, Log, TEXT("  volume integrals: %d exact jobs running; so far %llu quick estimates, %llu carriers built on one (eased to the exact), %llu carrier-frames waiting for any"),
+			int32(Streamer->PendingIntegrals()), (unsigned long long)Streamer->QuickComputed, (unsigned long long)Streamer->QuickUsed, (unsigned long long)Streamer->VolumeIntegralWaits);
+	}
 	// D-228: the far cache.
 	{
 		static IConsoleVariable* CVarFar = IConsoleManager::Get().FindConsoleVariable(TEXT("uu.VolumeFar"));
@@ -992,6 +1021,12 @@ void UUniSubsystem::PushFrame()
 	F.WarpAmount = float(Warp.Current) * FMath::Clamp(CVarUniWarp.GetValueOnGameThread(), 0.0f, 1.0f);   // D-187
 	F.SpeedAmount = float(Warp.Current);   // D-198: the travel curve (0 at rest, 1 at 10 Mpc/s), whatever uu.Warp
 	{
+		// D-230: the travel shift (the render thread takes the direction from the camera's step).
+		const double Ramp = UniCore::TravelLookRamp(FMath::Clamp(Warp.Current, 0.0, 1.0), CVarUniTravelLookStart.GetValueOnGameThread(), CVarUniTravelLookFull.GetValueOnGameThread());
+		F.ShiftAmount = float(double(FMath::Clamp(CVarUniShift.GetValueOnGameThread(), -2.0f, 2.0f)) * Ramp);
+		F.ShiftK = FMath::Clamp(CVarUniShiftColour.GetValueOnGameThread(), 0.0f, 4.0f);
+	}
+	{
 		// D-200: the glow's pixel budget from the GPU's last frame time (the volume is most of it).
 		const float Fps = CVarUniVolumeTargetFps.GetValueOnGameThread();
 		const double GpuMs = FPlatformTime::ToMilliseconds(RHIGetGPUFrameCycles(0));
@@ -1043,7 +1078,32 @@ void UUniSubsystem::PushFrame()
 			const int32 SkyMode = CVarUniSkyWeb.GetValueOnGameThread();
 			Settings.WebGlowGain = (SkyMode & 1) ? FMath::Max(CVarUniSkyWebGlow.GetValueOnGameThread(), 0.0f) : 0.0f;
 			Settings.WebGlowDepthCm = float(double(FMath::Max(CVarUniSkyWebDepth.GetValueOnGameThread(), 0.1f)) * 3.0856775814913673e24);
+			Settings.NebulaGain = FMath::Max(CVarUniNebula.GetValueOnGameThread(), 0.0f);            // D-234
+			Settings.NebulaReflect = FMath::Max(CVarUniNebulaReflect.GetValueOnGameThread(), 0.0f);
+			Settings.NebulaNearCm = float(double(FMath::Max(CVarUniNebulaNearKpc.GetValueOnGameThread(), 0.0f)) * 3.0856775814913673e21);
 			Settings.TailDim = (SkyMode & 2) ? 1.0f - FMath::Clamp(CVarUniSkyWebTail.GetValueOnGameThread(), 0.0f, 1.0f) : 0.0f;
+		}
+		{
+			// D-230: the motion web, ramped by the travel curve; it reads the web texture's
+			// filament and node channels, so it needs their mean (no texture: off).
+			// D-231: its own ramp, from the speed (MotionWebRamp, updated with the camera).
+			const double Strength = double(FMath::Max(CVarUniMotionWeb.GetValueOnGameThread(), 0.0f)) * MotionWebRamp.Value;
+			const UniHlsl::float4 Mean = WebTexture.IsValid() ? WebTexture->Mean() : UniHlsl::float4(0.0f, 0.0f, 0.0f, 0.0f);
+			const double FnMean = double(Mean.y) + double(Mean.z);
+			if (Strength > 0.0 && FnMean > 0.0)
+			{
+				const double Mpc = 3.0856775814913673e24;
+				Settings.MotionWebGain = float(Strength * 7.0e4 / Mpc);   // a galaxy disc's surface brightness (~7e4 per sr, VOLUMETRICS section 8) per Mpc
+				Settings.MotionWebInvRef = float(1.0 / (FnMean * double(FMath::Max(CVarUniMotionWebThreshold.GetValueOnGameThread(), 1.0f))));
+				Settings.MotionWebNearCm = float(double(FMath::Max(CVarUniMotionWebNear.GetValueOnGameThread(), 0.01f)) * Mpc);
+				Settings.MotionWebDepthCm = float(double(FMath::Max(CVarUniMotionWebDepth.GetValueOnGameThread(), 1.0f)) * Mpc);
+				// D-231: the organic detail (galaxy_detail; off when the galaxy textures are not loaded).
+				const bool bDetailTex = GalaxyTextures[2].IsValid();
+				Settings.MotionWebDetailGain = bDetailTex ? FMath::Clamp(CVarUniMotionWebDetail.GetValueOnGameThread(), 0.0f, 1.0f) : 0.0f;
+				Settings.MotionWebDetailCm = float(double(FMath::Max(CVarUniMotionWebDetailMpc.GetValueOnGameThread(), 0.5f)) * Mpc);
+				Settings.MotionWebStepCm = float(double(FMath::Max(CVarUniMotionWebStepMpc.GetValueOnGameThread(), 0.0f)) * Mpc);
+				Settings.MotionWebRegionCm = float(double(FMath::Max(CVarUniMotionWebRegionMpc.GetValueOnGameThread(), 0.0f)) * Mpc);   // D-233
+			}
 		}
 		const UniCore::FVolumeScene Sc = VolumeBuilder->Build(*Streamer, Cam, UniCore::FVec3f{ CameraFraction.X, CameraFraction.Y, CameraFraction.Z }, V, Settings);
 		for (const UniCore::FCarrierGPU& C : Sc.Carriers)

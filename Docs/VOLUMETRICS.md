@@ -19,7 +19,8 @@ Dust is the same field machinery with absorption instead of emission (D-132).
 | Unresolved emission | Every emitter: field shape × N_total × the per-frame unresolved-luminosity LUT | Yes, so conservation applies (§3) |
 | Extinction (dust) | An archetype's volume profile: a dust field aligned with its emission field | Attenuates both the volume and the sprites (§7) |
 | Background (extragalactic light) | The root emitters (cosmic web → galaxies), with horizon dimming | Yes (galaxy sprites) |
-| Gas emission, nebulae, scattering | Later: authored volume profiles without children | No; plain light (v2) |
+| Nebulae (D-234) | Galaxy carriers: emission nebulae on the knots, reflection off dust near them, at the galaxy's full light per star | No; plain light, not conserved (the sprite lacks it: B-034) |
+| Other gas emission, scattering | Later | No; plain light (v2) |
 
 ## 3. Conservation (D-128)
 
@@ -195,6 +196,17 @@ The march's cost is rays x steps per ray x cost per step. These are the console 
 | `uu.VolumeFarFillFrames` | 8 | frames a face's re-march is spread over (one face in one frame is ~3x the march) | D-228 |
 | `uu.VolumeFarOnFrames` / `OnMotion` / `OffMotion` | 30 / 0.02 / 0.04 | on below OnMotion texels of parallax at the split a frame, held OnFrames frames; off above OffMotion (break-even ~0.06) | D-228 |
 | `uu.VolumeFarDueTexels` | 0.3 | a face in view is re-marched past this parallax since it was marched (out of view: 1.2) | D-228 |
+| `uu.TravelLook.Start` / `Full` | 0.15 / 0.75 | the travel curve values (0 at 100 kpc/s, 1 at 10 Mpc/s) between which the travel shift ramps in | D-230 |
+| `uu.MotionWeb.StartKpcS` / `FullKpcS` | 5 / 5000 | D-231: the motion web's own ramp from the camera's speed (ease-out on log speed, eased in time): ~0.36 at 20 kpc/s, 0.56 at 50 | D-231 |
+| `uu.MotionWeb.Detail` / `DetailMpc` | 1.0 / 20 | D-231: one galaxy_detail read (ridged) multiplies the web; its period. 0: none | D-231 |
+| `uu.MotionWeb.StepMpc` | 0.5 | D-231: with the detail on, the background's step cap in the web's band, so the detail is sampled, not swimming (~2x the background's steps while on). 0: no cap (the detail blurs away) | D-231 |
+| `uu.MotionWeb.RegionMpc` | 200 | D-233: the detail's look changes by region (filaments, knots, cloud, cells: galaxy_detail's four channels mixed by a smooth second read; regions ~50 Mpc). 0: the ridged filaments everywhere (D-231) | D-233 |
+| `uu.Nebula` | 1 | D-234: emission nebulae (H II regions) on galaxies' star-forming knots, in a gas layer as thin as the dust; D-235: two colours a galaxy, a fixed-mip pattern, blended to their mean where unresolved, a step cap through the gas layer for rays crossing it. 0: off (and no cap) | D-234, D-235 |
+| `uu.Nebula.Reflect` | 6 | D-234: reflection nebulae: dust near the knots lit blue. 0: off | D-234 |
+| `uu.Nebula.NearKpc` | 0 | D-234: nebulae fade in from here to 3x; D-235: off by default (they were lost up close) | D-234, D-235 |
+| `uu.MotionWeb` | 0.01 | the motion web: the web's filaments and nodes glow faintly while travelling; a galaxy disc's surface brightness per Mpc at full strength. 0: off | D-230 |
+| `uu.MotionWeb.Threshold` / `Near` / `Depth` | 3 / 4 / 50 | above this multiple of the filament + node mean; faded in over the first Near Mpc, out over the second half of Depth Mpc | D-230 |
+| `uu.Shift` / `uu.Shift.Colour` | 0.5 / 1.0 | the travel shift: ahead blue, behind red, luminance kept, on the volume and every sprite (ln of the factor ahead; the tint's strength). 0: off | D-230 |
 
 **Steps per ray.**
 | Setting | Default | What it does | Decision |
@@ -220,9 +232,9 @@ The march's cost is rays x steps per ray x cost per step. These are the console 
 |---|---|---|---|
 | `uu.CellGlow` | 1 | a cell still loading (or fading in) is drawn as glow from the field; its sprites fade in once it is Ready (section 13). 0: a hole until it loads (before D-203) | D-203 |
 | `uu.GalaxyMap` | 1 | the galaxy the camera is in is marched from its baked 2D map (arms and modes; warp, vertical profile, bulge and detail per sample; D-212). 0: its field at every step | D-212 |
-| `uu.GalaxyMap.Size` | 1024 | the map's texels a side (power of two): 1024 ~11 MB (one frame to bake), 2048 ~43 MB (no visible difference in the engine) | D-212 |
+| `uu.GalaxyMap.Size` | 512 | the map's texels a side (power of two): 512 ~2.7 MB (D-229: within 0.3% of 1024; p95 1.7% right at a core), 1024 ~11 MB, 2048 ~43 MB | D-212, D-229 |
 | `uu.GalaxyMap.Budget` | 1048576 | texels of the map the GPU bakes a frame (1024^2 in one frame, 2048^2 in 4) | D-212 |
-| `uu.GalaxyMap.Slots` | 4 | galaxy maps on the GPU at once (a texture array): every galaxy stars are placed in (D-214: placement reads the map too) and the camera's own; a galaxy past them waits as glow until a slot is unused for 64 frames | D-214 |
+| `uu.GalaxyMap.Slots` | 8 | galaxy maps on the GPU at once (a texture array): every galaxy stars are placed in (D-214: placement reads the map too) and the camera's own; a galaxy past them waits as glow until a slot is unused for 64 frames | D-214 |
 | `uu.CellFadeFrames` | 8 | frames a Ready cell's sprites take to fade in (its glow fades out by the same amount) | D-203 |
 | `uu.StreamBuildBudget` | 96 | cells built per frame over every level, those needed soonest first; the rest wait as glow. 0: D-173's per-level rule | D-203 |
 | `uu.VolumeInterleave` | 4 | most pixels per side of the temporal slicing's block: 4 x 4 below 0.1 march px of motion a frame, 3 x 3 below 0.5, else 2 x 2 | D-208 |

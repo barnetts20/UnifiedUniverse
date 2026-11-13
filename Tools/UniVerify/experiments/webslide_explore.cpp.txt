@@ -1,0 +1,114 @@
+// test_zz_webslide.cpp — exploration (archived after). Owner: the D-231 flight shows texture march
+// Run (D-231 amendment; 160 x 90, 10 frames at 0.167 Mpc a frame; frame change above the fine
+//   reference's, % of the light): physical web crawl 0.17%; plain motion web 0.25%; with detail 0.8
+//   (unfiltered) 2.27%; detail mip over the step 0.32% (detail mostly gone; vs a reference blurred
+//   alike); a second web read at the step's mip, no better; finer steps everywhere (ratio 0.1, 103
+//   steps) 2.08%, (0.05, 157) 1.44%; step cap in the band 1.0 Mpc 0.86% (85 steps), 0.5 Mpc 0.10%
+//   (133), 0.25 Mpc 0.00% (229); cap 0.5 + detail over the step 0.03% (133), cap 0.7 0.09% (105).
+//   (UNI_MW_* switches were temporary.) Adopted: cap 0.5 Mpc + the detail blurred over the step.
+// sliding. The motion web in a full march every frame (no temporal slicing) against a fine reference
+// (every step an eighth: MarchFlags bit 1), flying at 10 Mpc/s, as T2.vol.slide measures: error and
+// crawl (how much the error pattern moves frame to frame) of the background, for: no motion web,
+// the plain motion web, the motion web with its detail.
+
+#include "../src/UniTest.h"
+#include "../src/UniVerifyCommon.h"
+#include "../src/UniRenderRef.h"
+#include "../src/UniVolumeRef.h"
+#include "../scenes/UniScenes.h"
+#include "UniWebTexture.h"
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <string>
+#include <vector>
+
+using namespace UniCore;
+using namespace UniRender;
+namespace H = UniHlsl;
+
+UNI_TEST(explore, webslide)
+{
+	FWebTexture T;
+	std::string Err;
+	if (!FWebTexture::LoadDelivered("Data/Noise", "web_adhesion_density_mid", T, &Err)) { Uni::Check(9, "X.explore.webslide", "x").Pass(false, Err); return; }
+	BindWebTexture(&T);
+	FWebTexture Gt[3];
+	for (int K = 0; K < 3; ++K) { std::string E; FWebTexture::LoadDelivered("Data/Noise", GalaxyTextureName(K), Gt[K], &E); BindGalaxyTexture(K, &Gt[K]); }
+	const UniScenes::FClusterTuning Tun;
+	FUniverseDef Def = UniScenes::WebToGalaxy(Tun);
+	const H::float4 Mean = T.Mean();
+	UniScenes::UseDeliveredWeb(Def, Tun, T.Size, Mean.z / (double(Mean.x) + Mean.y + Mean.z + Mean.w));
+	FUniverseModel M(Def);
+	FRefGenerator G(M);
+	FVolumeBuilder VB(M, G);
+	FRefPipeline P(G);
+	P.bVelocityLod = false;
+	const double Mpc = Units::Mpc;
+	const FV3 Ahead = Norm(FV3{ 1.0, 0.3, 0.1 });
+	const FV3 Look = Norm(FV3{ Ahead.X + 0.25, Ahead.Y - 0.5, Ahead.Z });
+	const int W = 160, Ht = 90, Frames = 10;
+	const double StepMpc = std::getenv("UNI_SLIDE_STEP") ? std::atof(std::getenv("UNI_SLIDE_STEP")) : 0.167;
+	struct FV { const char* Name; double Gain; double Detail; };
+	const FV Vs[] = { { "motion web, no detail", 0.01, 0.0 }, { "motion web + detail 0.8", 0.01, 0.8 } };
+	for (const FV& Vr : Vs)
+	{
+		std::vector<double> PrevE, PrevA, PrevR;
+		double DA = 0.0, DR = 0.0;
+		double Error = 0.0, Crawl = 0.0, Steps = 0.0;
+		int N = 0;
+		for (int F = 0; F < Frames; ++F)
+		{
+			FCoord Cam = UniScenes::VoidCamera();
+			{ FVec3f Fr{}; AddDisplacement(Cam, Fr, FVec3d{ Ahead.X * StepMpc * F * Mpc, Ahead.Y * StepMpc * F * Mpc, Ahead.Z * StepMpc * F * Mpc }); }
+			P.Update(Cam, FVec3f{});
+			FCamera Cm; Cm.Coord = Cam; Cm.Width = W; Cm.Height = Ht; Cm.LookAlong(Look);
+			FVolumeSettings S;
+			S.MotionWebGain = float(Vr.Gain * 7.0e4 / Mpc);
+			S.MotionWebInvRef = float(1.0 / ((double(Mean.y) + double(Mean.z)) * 3.0));
+			S.MotionWebNearCm = float(4.0 * Mpc);
+			S.MotionWebDepthCm = float(50.0 * Mpc);
+			S.MotionWebDetailGain = float(Vr.Detail);
+			S.MotionWebDetailCm = float(20.0 * Mpc);
+			if (std::getenv("UNI_SLIDE_RATIO")) { S.TexturedWebStepRatio = float(std::atof(std::getenv("UNI_SLIDE_RATIO"))); }
+			FVolumeScene Sc = VB.Build(P, Cam, FVec3f{}, Cm.View(), S).Subset(true);
+			for (FCarrierGPU& C : Sc.Carriers) { C.Flags &= ~H::UNI_CARRIER_TAIL; }   // the marched web only
+			FImage A(W, Ht), R(W, Ht);
+			const FVolumeStats St = RenderVolume(Sc, Cm, A);
+			FVolumeScene Fine = Sc;
+			Fine.View.MarchFlags |= 2u | (std::getenv("UNI_SLIDE_SAMEBLUR") ? 4u : 0u);
+			Fine.View.MaxSteps *= 8u;
+			RenderVolume(Fine, Cm, R);
+			std::vector<double> E(size_t(W) * Ht), Av(E.size()), Rv(E.size());
+			double Sb = 0.0, Se = 0.0;
+			for (size_t I = 0; I < E.size(); ++I)
+			{
+				const double La = 0.2126 * A.Rgb[I * 3] + 0.7152 * A.Rgb[I * 3 + 1] + 0.0722 * A.Rgb[I * 3 + 2];
+				const double Lb = 0.2126 * R.Rgb[I * 3] + 0.7152 * R.Rgb[I * 3 + 1] + 0.0722 * R.Rgb[I * 3 + 2];
+				E[I] = La - Lb; Sb += Lb; Se += std::abs(E[I]); Av[I] = La; Rv[I] = Lb;
+			}
+			if (F > 0)
+			{
+				double a = 0.0, r = 0.0;
+				for (size_t I = 0; I < E.size(); ++I) { a += std::abs(Av[I] - PrevA[I]); r += std::abs(Rv[I] - PrevR[I]); }
+				DA += a / std::max(Sb, 1e-300); DR += r / std::max(Sb, 1e-300);
+			}
+			PrevA = Av; PrevR = Rv;
+			if (F > 0)
+			{
+				double Sc2 = 0.0;
+				for (size_t I = 0; I < E.size(); ++I) { Sc2 += std::abs(E[I] - PrevE[I]); }
+				Crawl += Sc2 / std::max(Sb, 1e-300);
+				Error += Se / std::max(Sb, 1e-300);
+				Steps += double(St.Steps) / std::max(double(St.Rays), 1.0);
+				++N;
+			}
+			PrevE = E;
+		}
+		std::printf("%-26s error %.2f%%  crawl %.2f%%  frame change: march %.2f%% reference %.2f%% (excess %.2f%%)  steps/ray %.1f\n", Vr.Name, 100.0 * Error / N, 100.0 * Crawl / N, 100.0 * DA / N, 100.0 * DR / N, 100.0 * (DA - DR) / N, Steps / N);
+		std::fflush(stdout);
+	}
+	for (int K = 0; K < 3; ++K) { BindGalaxyTexture(K, nullptr); }
+	BindWebTexture(nullptr);
+	Uni::Check(9, "X.explore.webslide", "x").Pass(true, "printed");
+}

@@ -486,17 +486,65 @@ namespace UniCore
 		static constexpr size_t MaxIntegralJobs = 4;
 		/** Runs a job on some worker thread (D-140). Empty: a detached std::thread. */
 		std::function<void(std::function<void()>)> RunJob;
+		/** D-229: runs a quick-integral batch (a few ms). Empty: RunJob. */
+		std::function<void(std::function<void()>)> RunQuickJob;
+		/** D-229: the volume's quick integrals: at most this many galaxies a batch (the largest on
+		 *  screen first), at most QuickJobs batches at once, and the frames the volume takes to
+		 *  ease from the quick value to the exact one when it arrives. */
+		size_t QuickBatch = 32;
+		size_t QuickJobs = 2;
+		double QuickBlendFrames = 30.0;
+		/** D-229: counters for uu.Perf: quick integrals computed, the volume's carriers built on one,
+		 *  and those still waiting for any (since start). */
+		mutable u64 QuickComputed = 0, QuickUsed = 0, VolumeIntegralWaits = 0;
 
 		~FUniStreamer()
 		{
 			// Jobs read the model through their contributor copy: wait for them (each < 1 s).
 			for (auto& KV : IntegralJobs) { while (!KV.second->bDone.load(std::memory_order_acquire)) { std::this_thread::yield(); } }
+			for (auto& B : QuickBatches) { while (!B->bDone.load(std::memory_order_acquire)) { std::this_thread::yield(); } }   // D-229
 		}
 		FUniStreamer(const FUniStreamer&) = delete;
 		FUniStreamer& operator=(const FUniStreamer&) = delete;
 
 		/** Integral jobs still running (D-140). */
 		size_t PendingIntegrals() const { return IntegralJobs.size(); }
+
+		/** D-229: the integral the volume's carrier for C uses this frame, or -1 (none yet: skip the
+		 *  carrier, the sprite stays). The exact one once known; until then a galaxy's quick estimate
+		 *  (GenRef::ComputeIntegralQuick, requested here, largest Theta first); after a quick one was
+		 *  used, eased to the exact over QuickBlendFrames (log space, smoothstep) so its correction
+		 *  is never a step. Generation never reads these: its cells wait for the exact value. */
+		double VolumeIntegral(const FContributor& C, double Theta) const
+		{
+			if (!bAsyncIntegrals) { return Gen.IntegralAll(C); }
+			if (IntegralReady(C))
+			{
+				const double E = Gen.IntegralAll(C);
+				auto It = QuickVals.find(C.Id);
+				if (It == QuickVals.end()) { return E; }
+				if (!It->second.bUsed) { QuickVals.erase(It); return E; }
+				if (It->second.ExactFrame == 0u) { It->second.ExactFrame = FrameNo; }
+				const double X = std::clamp(double(FrameNo - It->second.ExactFrame) / std::max(QuickBlendFrames, 1.0), 0.0, 1.0);
+				if (X >= 1.0 || !(It->second.Value > 0.0) || !(E > 0.0)) { QuickVals.erase(It); return E; }
+				const double Sm = X * X * (3.0 - 2.0 * X);
+				return std::exp(std::log(It->second.Value) + (std::log(E) - std::log(It->second.Value)) * Sm);
+			}
+			auto It = QuickVals.find(C.Id);
+			if (It != QuickVals.end())
+			{
+				if (!It->second.bUsed) { It->second.bUsed = true; ++QuickUsed; }
+				return It->second.Value;
+			}
+			if (C.Emitter && C.Emitter->FieldId == UniHlsl::UNI_FIELD_GALAXY && !C.bRoot && !QuickJobs_.count(C.Id))
+			{
+				auto R = QuickWanted.find(C.Id);
+				if (R == QuickWanted.end()) { QuickWanted.emplace(C.Id, std::make_pair(Theta, C)); }
+				else { R->second.first = std::max(R->second.first, Theta); }
+			}
+			++VolumeIntegralWaits;
+			return -1.0;
+		}
 
 		/** Measured backend latency, frames from submit to Ready (D-139). */
 		double LatencyFrames() const { return LatencyEst; }
@@ -810,7 +858,7 @@ namespace UniCore
 		bool AllReady() const
 		{
 			for (const auto& LKV : Levels) { if (!LevelReady(LKV.second)) { return false; } }
-			return Inflight.empty() && IntegralJobs.empty();
+			return Inflight.empty() && IntegralJobs.empty() && QuickBatches.empty();
 		}
 
 		const FCoord& CameraCoord() const { return Camera; }
@@ -1672,6 +1720,55 @@ namespace UniCore
 				Gen.StoreIntegral(It->first, It->second->Value);
 				It = IntegralJobs.erase(It);
 			}
+			PumpQuickIntegrals();
+		}
+
+		/** D-229: collect finished quick batches, then start batches for last frame's requests,
+		 *  the largest on screen first. */
+		void PumpQuickIntegrals()
+		{
+			for (auto It = QuickBatches.begin(); It != QuickBatches.end();)
+			{
+				if (!(*It)->bDone.load(std::memory_order_acquire)) { ++It; continue; }
+				for (size_t I = 0; I < (*It)->Ids.size(); ++I)
+				{
+					QuickJobs_.erase((*It)->Ids[I]);
+					if ((*It)->Values[I] > 0.0) { QuickVals[(*It)->Ids[I]] = FQuickVal{ (*It)->Values[I], false, 0u }; ++QuickComputed; }
+				}
+				It = QuickBatches.erase(It);
+			}
+			// Values never used (the galaxy left, or its exact one came first) are dropped in bulk.
+			if (QuickVals.size() > 8192u)
+			{
+				for (auto It = QuickVals.begin(); It != QuickVals.end();) { if (!It->second.bUsed) { It = QuickVals.erase(It); } else { ++It; } }
+			}
+			if (QuickWanted.empty()) { return; }
+			std::vector<std::pair<double, FContributor>> Want;
+			Want.reserve(QuickWanted.size());
+			for (auto& KV : QuickWanted) { if (!QuickJobs_.count(KV.first) && !QuickVals.count(KV.first)) { Want.push_back(KV.second); } }
+			QuickWanted.clear();   // asked again next frame if still wanted
+			std::stable_sort(Want.begin(), Want.end(), [](const auto& A, const auto& B) { return A.first > B.first; });
+			size_t Next = 0;
+			while (QuickBatches.size() < QuickJobs && Next < Want.size())
+			{
+				std::shared_ptr<FQuickBatch> B = std::make_shared<FQuickBatch>();
+				for (; Next < Want.size() && B->Work.size() < QuickBatch; ++Next)
+				{
+					B->Work.push_back(Want[Next].second);
+					B->Ids.push_back(Want[Next].second.Id);
+					QuickJobs_.insert(Want[Next].second.Id);
+				}
+				B->Values.assign(B->Work.size(), -1.0);
+				QuickBatches.push_back(B);
+				std::function<void()> Work = [B]()
+				{
+					for (size_t I = 0; I < B->Work.size(); ++I) { B->Values[I] = FRefGenerator::ComputeIntegralQuick(B->Work[I]); }
+					B->bDone.store(true, std::memory_order_release);
+				};
+				if (RunQuickJob) { RunQuickJob(std::move(Work)); }
+				else if (RunJob) { RunJob(std::move(Work)); }
+				else { std::thread(std::move(Work)).detach(); }
+			}
 		}
 
 		/** Advance every in-flight batch whose phase completed. */
@@ -2142,6 +2239,13 @@ namespace UniCore
 		int WakeStep = 0, WakeStepHold = 0;   // D-176: angle threshold = WakeTheta x 2^(step / 4)
 		double LatencyEst = 6.0;   // D-139: frames, submit to Ready; starts at the GPU's order
 		struct FIntegralJob { std::atomic<bool> bDone{ false }; double Value = 0.0; };
+		// D-229: the volume's quick integrals (VolumeIntegral, PumpQuickIntegrals).
+		struct FQuickVal { double Value = -1.0; bool bUsed = false; u64 ExactFrame = 0u; };
+		struct FQuickBatch { std::atomic<bool> bDone{ false }; std::vector<FContributor> Work; std::vector<u32> Ids; std::vector<double> Values; };
+		mutable std::map<u32, FQuickVal> QuickVals;
+		mutable std::map<u32, std::pair<double, FContributor>> QuickWanted;
+		mutable std::set<u32> QuickJobs_;
+		std::vector<std::shared_ptr<FQuickBatch>> QuickBatches;
 		mutable std::map<u32, std::shared_ptr<FIntegralJob>> IntegralJobs;   // D-140 (mutable: the volume builder requests jobs through a const streamer)
 		size_t BatchesSubmitted = 0, Regenerations = 0, MaxGather = 0, AllocFailures = 0, MaxLatency = 0;
 	};

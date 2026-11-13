@@ -83,6 +83,7 @@ namespace UniRender
 		void MarchRows(const UniCore::FVolumeScene& Far, float StartCm, int Face, int R0, int R1, int Threads = 2)
 		{
 			HF::FUniVolumeView V = UniCore::ToHlsl(Far.View);
+			V.NebulaThetaPixel = V.ThetaPixel;   // D-235: as FarCS
 			V.ThetaPixel = 2.0f / float(N);
 			const auto Cb = Far.CarrierBuf(); const auto Pb = Far.ParamBuf(); const auto Lb = Far.LutBuf();
 			const int L = Spare(Face);

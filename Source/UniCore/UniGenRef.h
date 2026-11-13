@@ -509,6 +509,60 @@ namespace UniCore
 			return Sum;   // periodic: period volume is 1, so this is the mean
 		}
 
+		/** D-229: a quick estimate of a galaxy's ComputeIntegral for the volume alone, while the
+		 *  exact one is on a worker (~0.2-0.3 s each, four at a time: flying into a rich cluster,
+		 *  hundreds of galaxies reach the volume handoff at once and stayed plain sprites for
+		 *  seconds). Importance sampled over the unit ball, deterministic per contributor:
+		 *  QuickIntegralSamples (4096) points, a third uniform in the ball, a third in the thin disc
+		 *  (x, y uniform in the unit disc, z Laplace with the field's scale height, Par.A.y), a third
+		 *  toward the centre (r = 0.3 u^2). Measured on a rich cluster's galaxies: ~2% from the exact
+		 *  (worst ~6%), ~0.8 ms. Never used for generation (counts wait for the exact value); the
+		 *  volume eases to the exact one when it arrives (FUniStreamer::VolumeIntegral). Galaxy
+		 *  fields only: -1 for every other (their integral is analytic or the exact path's). */
+		static constexpr u32 QuickIntegralSamples = 4096u;
+		static double ComputeIntegralQuick(const FContributor& C)
+		{
+			if (C.bRoot || C.Emitter->bDensityMode || C.Emitter->FieldId != H::UNI_FIELD_GALAXY) { return -1.0; }
+			const H::FUniFieldParams P = C.Params.ToHlsl();
+			const double Hz = std::max(double(P.A.y), 1.0e-4);
+			const double Rc = 0.3;
+			const double Pi = 3.14159265358979323846;
+			u32 S = H::Uni_SeedMix(C.Id, 0x51A7u);
+			auto Rnd = [&S]() { S = H::Uni_Avalanche(S + 0x9E3779B9u); return (double(S >> 8) + 0.5) / 16777216.0; };
+			double Sum = 0.0;
+			for (u32 I = 0; I < QuickIntegralSamples; ++I)
+			{
+				double X, Y, Z;
+				const u32 Kind = I % 3u;
+				if (Kind == 0u)
+				{
+					do { X = 2.0 * Rnd() - 1.0; Y = 2.0 * Rnd() - 1.0; Z = 2.0 * Rnd() - 1.0; } while (X * X + Y * Y + Z * Z >= 1.0);
+				}
+				else if (Kind == 1u)
+				{
+					const double R = std::sqrt(Rnd()), A = 2.0 * Pi * Rnd();
+					X = R * std::cos(A); Y = R * std::sin(A);
+					const double U = Rnd();
+					Z = (U < 0.5 ? 1.0 : -1.0) * (-Hz * std::log(1.0 - 2.0 * std::abs(U - 0.5) * 0.999999));
+				}
+				else
+				{
+					const double U = Rnd(), R = Rc * U * U, Ct = 2.0 * Rnd() - 1.0, St = std::sqrt(std::max(0.0, 1.0 - Ct * Ct)), A = 2.0 * Pi * Rnd();
+					X = R * St * std::cos(A); Y = R * St * std::sin(A); Z = R * Ct;
+				}
+				const double R2 = X * X + Y * Y + Z * Z;
+				if (R2 >= 1.0) { continue; }
+				// The mixture's density at the point (each component's pdf, averaged).
+				const double Ball = 3.0 / (4.0 * Pi);
+				const double Disc = (X * X + Y * Y) < 1.0 ? (1.0 / Pi) * std::exp(-std::abs(Z) / Hz) / (2.0 * Hz) : 0.0;
+				const double Rr = std::sqrt(R2);
+				const double Core = Rr < Rc && Rr > 0.0 ? 1.0 / (2.0 * std::sqrt(Rr * Rc)) / (4.0 * Pi * R2) : 0.0;
+				const double Q = (Ball + Disc + Core) / 3.0;
+				Sum += double(H::Uni_FieldSample(C.Emitter->FieldId, H::float3(float(X), float(Y), float(Z)), P)) / Q;
+			}
+			return Sum / double(QuickIntegralSamples);
+		}
+
 		/** lambda per unit of probe mean, for cell K and contributor C (slice already chosen). */
 		double LambdaScale(const FContributor& C, const FCellKey& K, const FSlice& S, float SizeP) const
 		{

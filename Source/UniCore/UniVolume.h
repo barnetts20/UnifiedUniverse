@@ -80,15 +80,29 @@ namespace UniCore
 		u32 GlowMask[4];        // D-203: levels with cells still loading or fading in (their grids follow the LUT blocks)
 		u32 GlowBase;           // float4 index of the first grid header in the LUT buffer
 		u32 GlowLevels;         // set bits in GlowMask (0: no cell glow)
-		u32 MarchFlags;         // D-206: bit 0: no shared web texel reads (checks only); D-219: bit 1: every step an eighth (the checks' fine reference)
+		u32 MarchFlags;         // D-206: bit 0: no shared web texel reads (checks only); D-219: bit 1: every step an eighth (the checks' fine reference); D-231: bit 2: with bit 1, the motion web's detail blurred over the unrefined step (checks only)
 		u32 GalaxyConstBase;    // D-210: params index of the galaxy constant blocks (one per parameter block); 0: hash inline
 		u32 MapCarrier;         // D-212: the mapped carrier's index + 1 (0: none)
 		u32 MapSize;            // texels a side of the map's mip 0
 		u32 MapSlot;            // D-214: its slot in the map array
 		u32 MapPad1;
+		// D-230: the motion web (render only; Uni_MotionWebEmission).
+		float MotionWebGain;     // radiance per cm at full strength (0: off)
+		float MotionWebNearCm;   // faded in over [0, this]
+		float MotionWebDepthCm;  // faded out over [half this, this]
+		float MotionWebInvRef;   // 1 / (the filament + node channels' mean x the threshold)
+		// D-231: the motion web's organic detail (one galaxy_detail read multiplies it).
+		float MotionWebDetailCm;   // the detail texture's period, cm (0: none)
+		float MotionWebDetailGain; // 0: none, 1: the full ridged pattern
+		float MotionWebStepCm;     // with the detail: the step cap within the web's band (0: none)
+		float MotionWebRegionCm;   // D-233: the regions' period, cm (0: the ridged channel alone)
+		float NebulaGain;          // D-234: the emission nebulae's gain (0: off)
+		float NebulaReflect;       // D-234: the reflection nebulae's gain (0: off)
+		float NebulaNearCm;        // D-234: the nebulae fade in from here to 3x
+		float NebulaThetaPixel;    // D-235: the cube passes set it to the screen's ThetaPixel (0: ThetaPixel)
 	};
-	static_assert(sizeof(FVolumeViewGPU) == 112, "FVolumeViewGPU must match FUniVolumeView (UniVolume.ush)");
-	static_assert(sizeof(HV::FUniVolumeView) == 112, "shim FUniVolumeView layout");
+	static_assert(sizeof(FVolumeViewGPU) == 160, "FVolumeViewGPU must match FUniVolumeView (UniVolume.ush)");
+	static_assert(sizeof(HV::FUniVolumeView) == 160, "shim FUniVolumeView layout");
 
 	inline HV::FUniCarrier ToHlsl(const FCarrierGPU& C) { HV::FUniCarrier H; std::memcpy(static_cast<void*>(&H), &C, sizeof(H)); return H; }
 	inline HV::FUniVolumeView ToHlsl(const FVolumeViewGPU& V) { HV::FUniVolumeView H; std::memcpy(static_cast<void*>(&H), &V, sizeof(H)); return H; }
@@ -247,7 +261,9 @@ namespace UniCore
 	 *  the table's first level: D_q(t), the light drawn as sprites at that level (what the
 	 *  emission block subtracts for it), horizon-dimmed and exposure-scaled like l(t). The march
 	 *  adds (1 - cell fade) D_q(t) where a cell is still loading (Uni_CellGlow). The emission
-	 *  block's first entry's w holds first level + 256 x count (0: none). */
+	 *  block's first entry's w holds first level + 256 x count (0: none). D-234: its second
+	 *  entry's w holds the luminance of the full light per child (every row's mean, none drawn),
+	 *  exposure-scaled, not horizon-dimmed: the nebulae's scale (Uni_VolumeLutFull). */
 	inline u32 BuildEmissionLut(const FUnresolvedTable& T, const FLutFrame& F, std::vector<HV::float4>& Lut, double Scale = 1.0, double Keep = 1.0, bool bDrawn = false)
 	{
 		const u32 Block = u32(Lut.size() / HV::UNI_VOL_LUT_SIZE);
@@ -255,6 +271,12 @@ namespace UniCore
 		const std::vector<double> Fl = RowFades(T, F);
 		std::vector<std::array<double, 3>> E(static_cast<size_t>(N));
 		for (int I = 0; I < N; ++I) { UnresolvedAt(T, F, Fl, LutT(I), E[size_t(I)].data(), Keep); Lut.push_back(HV::float4(float(E[size_t(I)][0] * Scale), float(E[size_t(I)][1] * Scale), float(E[size_t(I)][2] * Scale), 0.0f)); }
+		{
+			double Full[3] = { 0.0, 0.0, 0.0 };
+			for (const FUnresolvedTable::FRow& R : T.Rows) { for (int K = 0; K < 3; ++K) { Full[K] += R.P * R.LbarRgb[K]; } }
+			const double Exp = std::pow(10.0, 0.4 * F.ExposureMag);
+			Lut[size_t(Block) * size_t(N) + 1u].w = float((0.2126 * Full[0] + 0.7152 * Full[1] + 0.0722 * Full[2]) * Exp * Scale);   // D-234
+		}
 		// Tail: past t_hi the integrand falls as t^-2 (dimming) at constant l, so the remainder is
 		// l(t_hi) t_hi. Inside, sub-sampled trapezoids in ln t (dt = t d ln t).
 		std::vector<std::array<double, 3>> Tail(static_cast<size_t>(N));
@@ -342,6 +364,7 @@ namespace UniCore
 			D.V[14] = P.DustLanes;
 			D.V[15] = P.DustBubbles;
 			D.V[29] = 0.0f;
+			D.V[25] = P.DustClumps;   // D-234: dark clouds (G.y: no bulge reads it on a dust set)
 		}
 		return D;
 	}
@@ -435,6 +458,19 @@ namespace UniCore
 		float TailDim = 0.0f;                             // D-189: the web in the sky (uu.SkyWeb): 0 physical
 		float WebGlowGain = 0.0f;
 		float WebGlowDepthCm = 1.5428387907456837e26f;    // 50 Mpc
+		/** D-230: the motion web (uu.MotionWeb*): the textured web's filaments and nodes as a faint
+		 *  glow while travelling (ramped by the travel curve on the game thread; 0: off). */
+		float MotionWebGain = 0.0f;                       // radiance per cm at full strength
+		float MotionWebNearCm = 3.0856775814913673e24f;   // 1 Mpc
+		float MotionWebDepthCm = 1.5428387907456837e26f;  // 50 Mpc
+		float MotionWebInvRef = 0.0f;                     // 1 / (filament + node mean x threshold)
+		float MotionWebDetailCm = 0.0f;                   // D-231: the detail's period, cm (0: none)
+		float MotionWebDetailGain = 0.0f;                 // D-231: 0 none .. 1 the full pattern
+		float MotionWebStepCm = 0.0f;                     // D-231: the step cap within the web's band with the detail on (0: none)
+		float MotionWebRegionCm = 0.0f;                   // D-233: the detail's regions' period, cm (0: the ridged channel alone)
+		float NebulaGain = 0.0f;                          // D-234: the emission nebulae (x the galaxy's unresolved light per star; 0: off)
+		float NebulaReflect = 0.0f;                       // D-234: the reflection nebulae (0: off)
+		float NebulaNearCm = 0.0f;                        // D-234: the nebulae fade in from here to 3x (0: none)
 		/** D-203: cell glow: the LUT carries each table's drawn light per level, and the source's
 		 *  loading cells (FVolumeSource::CellGlow) are drawn as glow by the march. */
 		bool bCellGlow = false;
@@ -527,6 +563,11 @@ namespace UniCore
 		 *  integral is still being computed on a worker (the request starts it): skip its carrier
 		 *  this frame rather than compute it on the game thread. Empty: compute inline. */
 		std::function<bool(const FContributor&)> IntegralReady;
+		/** D-229: set for the runtime streamer (FUniStreamer::VolumeIntegral): the integral a local
+		 *  carrier uses this frame (the exact one, a galaxy's quick estimate meanwhile, eased between
+		 *  them), given its angular size (the largest are estimated first); -1: none yet, skip it.
+		 *  Empty: IntegralReady and the exact integral, as before. */
+		std::function<double(const FContributor&, double)> VolumeIntegral;
 		/** D-161: optional: the contributors whose influence radius subtends more than an angle,
 		 *  from the streamer's per-frame measured distances. The carrier build then rejects far
 		 *  contributors with no per-contributor map walk or 128-bit work. */
@@ -538,6 +579,8 @@ namespace UniCore
 		template <typename T> struct THasMeasured<T, std::void_t<decltype(std::declval<const T&>().NearContributors(0.0))>> : std::true_type {};
 		template <typename T, typename = void> struct THasCellGlow : std::false_type {};
 		template <typename T> struct THasCellGlow<T, std::void_t<decltype(std::declval<const T&>().CellGlow())>> : std::true_type {};
+		template <typename T, typename = void> struct THasVolumeIntegral : std::false_type {};
+		template <typename T> struct THasVolumeIntegral<T, std::void_t<decltype(std::declval<const T&>().VolumeIntegral(std::declval<const FContributor&>(), 0.0))>> : std::true_type {};
 		template <typename T, typename = void> struct THasRequestIntegral : std::false_type {};
 		template <typename T> struct THasRequestIntegral<T, std::void_t<decltype(std::declval<const T&>().RequestIntegral(std::declval<const FContributor&>()))>> : std::true_type {};
 
@@ -548,6 +591,7 @@ namespace UniCore
 			S.FindObject = [&P](const FObjectId& Id) { return P.FindObject(Id); };
 			S.LevelFade = [&P](int L) { return P.LevelFade(L); };
 			if constexpr (THasRequestIntegral<T>::value) { S.IntegralReady = [&P](const FContributor& C) { return P.RequestIntegral(C); }; }
+			if constexpr (THasVolumeIntegral<T>::value) { S.VolumeIntegral = [&P](const FContributor& C, double Theta) { return P.VolumeIntegral(C, Theta); }; }
 			if constexpr (THasMeasured<T>::value)
 			{
 				S.NearContributors = [&P](double MinTheta) { return P.NearContributors(MinTheta); };
@@ -789,8 +833,15 @@ namespace UniCore
 					const float Weight = W * V * Fg;
 					if (!(Weight > 0.0f)) { continue; }
 					// D-140: requested here, at the start of the handoff ramp (the carrier's weight is
-					// near 0), so it is normally ready long before the carrier matters.
-					if (P.IntegralReady && !P.IntegralReady(C)) { continue; }
+					// near 0), so it is normally ready long before the carrier matters. D-229: in a
+					// rich cluster hundreds reach it at once: a galaxy's quick estimate meanwhile.
+					double I = -1.0;
+					if (P.VolumeIntegral)
+					{
+						I = P.VolumeIntegral(C, Theta);
+						if (!(I > 0.0)) { continue; }
+					}
+					else if (P.IntegralReady && !P.IntegralReady(C)) { continue; }
 					FCand Cd;
 					Cd.Theta = Theta;
 					Cd.Parent = C.Parent;   // D-196: the sprite hands over exactly what the carrier takes
@@ -810,7 +861,7 @@ namespace UniCore
 					G.FieldId = C.Emitter->FieldId;
 					double KeepSig = 0.0;
 					G.LutIndex = KeepBlockOf(C.Emitter->ChildArchetypeId, C.Keep, KeepSig);   // D-197
-					const double I = Gen.IntegralAll(C);
+					if (!(I > 0.0)) { I = Gen.IntegralAll(C); }
 					G.Amplitude = float(C.NTotal * kTenPcCm * kTenPcCm / (I * C.InfluenceCm * C.InfluenceCm) / LutScale(Tables.at(C.Emitter->ChildArchetypeId)));
 					G.Weight = Weight;
 					G.Flags = 0u;
@@ -968,6 +1019,18 @@ namespace UniCore
 			V.TailDim = S.TailDim;
 			V.WebGlowGain = S.WebGlowGain;
 			V.WebGlowDepthCm = S.WebGlowDepthCm;
+			V.MotionWebGain = S.MotionWebGain;         // D-230
+			V.MotionWebNearCm = S.MotionWebNearCm;
+			V.MotionWebDepthCm = S.MotionWebDepthCm;
+			V.MotionWebInvRef = S.MotionWebInvRef;
+			V.MotionWebDetailCm = S.MotionWebDetailCm;   // D-231
+			V.MotionWebDetailGain = S.MotionWebDetailGain;
+			V.MotionWebStepCm = S.MotionWebStepCm;
+			V.MotionWebRegionCm = S.MotionWebRegionCm;   // D-233
+			V.NebulaGain = S.NebulaGain;                 // D-234
+			V.NebulaReflect = S.NebulaReflect;
+			V.NebulaNearCm = S.NebulaNearCm;
+			V.NebulaThetaPixel = 0.0f;   // D-235: set by the cube passes
 			V.HintScale = S.HintScale;
 			return Out;
 		}

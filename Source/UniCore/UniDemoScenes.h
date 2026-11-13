@@ -477,7 +477,8 @@ namespace UniScenes
 	/** D-179 (SPRITE_PASS_PLAN §3 A3): galaxies read the noise project's galaxy textures:
 	 *  warp_fine displaces discs and arms, warp_large bulges, galaxy_detail modulates discs (fBm)
 	 *  and arms (star-forming knots). Every galaxy rolls its amounts and frequencies by name;
-	 *  dwarfs are more irregular; early types stay smooth; the Milky Way anchor has one fixed set.
+	 *  dwarfs are more irregular; early types' spheroids take galaxy_detail as a multiplier and
+	 *  warp_large's bend (D-232); the Milky Way anchor has one fixed set.
 	 *  TexSize: texels per texture period (all three textures the same size). Call only with the
 	 *  textures bound (UniCore::BindGalaxyTexture): unbound, the terms read NaN and the galaxies
 	 *  place nothing (fail closed). Returns the number of emitters and anchors switched. */
@@ -499,6 +500,25 @@ namespace UniScenes
 			E.Ranges.push_back({ P + "DiscNoise", 28, bDwarf ? 0.4f : 0.2f, bDwarf ? 0.8f : 0.6f, 1.0f, 0.0f });
 			E.Ranges.push_back({ P + "Knots", 29, bDwarf ? 0.5f : 0.3f, bDwarf ? 1.0f : 0.9f, 1.0f, 0.0f });
 			E.Ranges.push_back({ P + "Twist", 30, 0.5f, 1.0f, 1.0f, 0.0f });
+			// D-232 (owner: ellipticals were a plain falloff): early types' spheroids take
+			// galaxy_detail as a multiplier (D.y its amount, G.w its frequency; its channel weights
+			// and signs hash from the shape seed, which early types now roll: until now they all
+			// shared seed 0, so their texture offsets too) and warp_large's bend (G.y, G.z).
+			// Their discs stay smooth (no disc warp, noise or knots).
+			if (E.bEarlyShape)
+			{
+				E.EarlyExemplar.V[31] = float(TexSize);
+				E.EarlyRanges.push_back({ "EarlyTex.ShapeSeed", 22, 0.0f, 16777215.0f, 1.0f, 1.0f });
+				E.EarlyRanges.push_back({ "EarlyTex.Noise", 13, 0.25f, 0.6f, 1.0f, 0.0f });
+				E.EarlyRanges.push_back({ "EarlyTex.NoiseFreq", 27, 1.0f, 2.5f, 1.0f, 0.0f });
+				E.EarlyRanges.push_back({ "EarlyTex.BulgeWarp", 25, 0.004f, 0.02f, 1.0f, 0.0f });
+				E.EarlyRanges.push_back({ "EarlyTex.WarpFreq", 26, 0.8f, 1.6f, 1.0f, 0.0f });
+				// D-236 (owner: ellipticals more interesting, nebulae too, other colours): nebula
+				// filaments (F.x: the arms' asymmetry slot, which no early type reads; about 40% none)
+				// and tidal shells (C.y: the arms' sharpness slot; about 2/3 none).
+				E.EarlyRanges.push_back({ "EarlyTex.Nebula", 20, -0.8f, 1.2f, 1.0f, 0.0f });
+				E.EarlyRanges.push_back({ "EarlyTex.Shells", 9, -1.2f, 0.6f, 1.0f, 0.0f });
+			}
 			++N;
 		};
 		for (FArchetype& A : D.Archetypes)

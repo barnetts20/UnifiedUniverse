@@ -101,13 +101,30 @@ struct FUniVolumeView
 	uint4 GlowMask;
 	uint GlowBase;          // float4 index of the first grid header in the LUT buffer
 	uint GlowLevels;        // set bits in GlowMask (0: no cell glow)
-	uint MarchFlags;        // D-206: bit 0: no shared web texel reads (checks only); D-219: bit 1: every step an eighth (the checks' fine reference)
+	uint MarchFlags;        // D-206: bit 0: no shared web texel reads (checks only); D-219: bit 1: every step an eighth (the checks' fine reference); D-231: bit 2: with bit 1, the motion web's detail blurred over the unrefined step (checks only)
 	uint GalaxyConstBase;   // D-210: params index of the galaxy constant blocks (one per parameter block, Uni_GalaxyConstPack); 0: hash inline
 	// D-212: the galaxy map (Uni_GalaxyMapEval): the camera's own galaxy from its baked 2D map.
 	uint MapCarrier;        // the mapped carrier's index + 1 (0: none)
 	uint MapSize;           // texels a side of its mip 0
 	uint MapSlot;           // D-214: its slot in the map array
 	uint MapPad1;
+	// D-230: the motion web (uu.MotionWeb; render-only art choice, 0 = off): the textured web's
+	// filaments and nodes as a faint glow while travelling (Uni_MotionWebEmission).
+	float MotionWebGain;     // radiance per cm at full strength
+	float MotionWebNearCm;   // faded in over [0, this] (no blob when passing through a node)
+	float MotionWebDepthCm;  // faded out over [half this, this] (gone before the march or the tile ends)
+	float MotionWebInvRef;   // 1 / (the filament + node channels' mean x the threshold)
+	// D-231: the motion web's organic detail: one galaxy_detail read (its ridged channel) multiplies it.
+	float MotionWebDetailCm; // the detail texture's period, cm (0: no detail)
+	float MotionWebDetailGain; // 0: none, 1: the full ridged pattern
+	float MotionWebStepCm;   // with the detail on: the march's step cap within the web's band (0: none; the detail then blurs over the march's own steps)
+	float MotionWebRegionCm; // D-233: the regions' period, cm: the detail's four channels mixed by region (0: the ridged channel alone, D-231)
+	// D-234: nebulae (galaxy carriers): the emission nebulae's gain (x the galaxy's full light per
+	// star) and the reflection nebulae's (dust lit by the knots' young light); 0: off.
+	float NebulaGain;
+	float NebulaReflect;
+	float NebulaNearCm;      // D-234: faded in from here to 3x (render only): up close the field has no structure yet
+	float NebulaThetaPixel;  // D-235: the screen's rad per pixel for the nebulae's blend in the cube passes (far cache, background), whose ThetaPixel is their texel's; 0: ThetaPixel
 };
 
 struct FUniVolumeResult
@@ -132,6 +149,13 @@ UNI_FN float3 Uni_VolumeLut(StructuredBuffer<float4> InLut, uint InBlock, float 
 	const float4 A = InLut[InBlock * UNI_VOL_LUT_SIZE + I0];
 	const float4 B = InLut[InBlock * UNI_VOL_LUT_SIZE + I0 + 1u];
 	return float3(A.x + (B.x - A.x) * F, A.y + (B.y - A.y) * F, A.z + (B.z - A.z) * F);
+}
+
+/** D-234: the luminance of a block's full light per child at distance InT (every star unresolved:
+ *  the builder's second entry's w), horizon-dimmed: the nebulae's scale. */
+UNI_FN float Uni_VolumeLutFull(StructuredBuffer<float4> InLut, uint InBlock, float InT)
+{
+	return InLut[InBlock * UNI_VOL_LUT_SIZE + 1u].w * Uni_HorizonDimming(InT);
 }
 
 // ------------------------------------------------------------------------------------------
@@ -290,6 +314,7 @@ UNI_FN float Uni_CarrierStepLimit(FUniCarrier InCa, FUniFieldParams InPar, float
 	const float3 P = Uni_CarrierPoint(InCa, InLd, InT);
 	const float FootH = (InCa.Flags & UNI_CARRIER_PREFILTER) != 0u ? InT * InView.ThetaPixel * InCa.InvRadius : 0.0f;   // D-160
 	float H;
+	float Neb = 3.0e38f;   // D-235: the nebulae's gas layer cap
 	if (InCluster) { H = Uni_ClusterStepHintC(P, InPar, InC0, InC1, InC2, InC3); }
 	else if (InCa.FieldId == UNI_FIELD_GALAXY)
 	{
@@ -298,6 +323,12 @@ UNI_FN float Uni_CarrierStepLimit(FUniCarrier InCa, FUniFieldParams InPar, float
 		if (InView.GalaxyConstBase != 0u) { const float4 Kb = InParams[InView.GalaxyConstBase + InCa.ParamIndex].B; Hp = Uni_GalaxyConstJoin(Kb.x, Kb.y); }
 		else { Hp = Uni_GalaxyConstOf(InPar).Hp; }
 		H = Uni_GalaxyStepHintFilteredK(P, InLd, InPar, FootH, Hp);
+		if (InView.NebulaGain > 0.0f)
+		{
+			// D-236: the screen's footprint (as the march's nebula blend), so a cube pass caps as the per-pixel march.
+			const float FootNb = (InCa.Flags & UNI_CARRIER_PREFILTER) != 0u ? InT * (InView.NebulaThetaPixel > 0.0f ? InView.NebulaThetaPixel : InView.ThetaPixel) * InCa.InvRadius : 0.0f;
+			Neb = Uni_GalaxyNebulaStepCap(P, InLd, InPar, Hp, FootNb);
+		}
 	}
 	else { H = Uni_FieldStepHintFoot(InCa.FieldId, P, InLd, InPar, FootH); }
 	// D-195: from inside a carrier (the camera within its bounds) rays run along its structure
@@ -308,7 +339,137 @@ UNI_FN float Uni_CarrierStepLimit(FUniCarrier InCa, FUniFieldParams InPar, float
 	// per pixel only then, and the glow is the fresh quarter alone there anyway.
 	const bool bPeriodic = (InCa.Flags & UNI_CARRIER_PERIODIC) != 0u;
 	const float Loose = bInside && InView.HintScale > 0.0f ? InView.HintScale : (bPeriodic && InView.WebHintScale > 0.0f ? InView.WebHintScale : 1.0f);
-	return Loose * H / InCa.InvRadius;
+	// D-235: the nebulae's gas layer, where a crossing can afford to sample them (not loosened).
+	return min(Loose * H, Neb) / InCa.InvRadius;
+}
+
+/** D-230: the motion web's emission per cm at distance InT, from the textured web's channels
+ *  (filaments y, nodes z): 0 at the threshold, full two decades above it (log), faded in near the
+ *  camera and out with distance, in a cool white the travel shift (Uni_TravelShift) colours.
+ *  D-231: times an organic pattern, one galaxy_detail read (its ridged channel, mean 0.567) at
+ *  InP (the web carrier's point, field units: one web tile) tiled a whole number of times per web
+ *  tile (so it stays periodic), prefiltered over the pixel's footprint InFoot and the step InDu
+ *  (field units: finer ridges would swim through the march's sample shells); its
+ *  contrast cubed, about 1 on average, blended in by MotionWebDetailGain. */
+static const float3 UNI_MOTION_WEB_COLOUR = float3(0.82f, 0.9f, 1.0f);
+// D-234: the reflection nebulae's colour at luminance 1 (scattered young light). D-235: the
+// emission nebulae's two colours a galaxy are Uni_GalaxyNebulaColour's.
+static const float3 UNI_NEBULA_REFLECT_COLOUR = float3(0.6822f, 1.0233f, 1.7054f);
+
+/** D-236: a nebula colour family's hue (degrees) for draws InF (which family) and InU (where in
+ *  it): spiral nebulae (H II regions): H-alpha red 30%, pink 18%, magenta-violet 14%, blue 8%,
+ *  [O III] teal 14%, green 4%, [S II]/[N II] orange-gold 12%; early types' filaments (cooling-flow
+ *  and shock-lit gas): H-alpha red 35%, orange-gold 22%, teal 13%, violet-blue 18%, magenta 12%. */
+UNI_FN float Uni_NebulaHue(float InF, float InU, bool InEarly)
+{
+	if (InEarly)
+	{
+		return InF < 0.35f ? 345.0f + 30.0f * InU : (InF < 0.57f ? 15.0f + 30.0f * InU : (InF < 0.70f ? 165.0f + 35.0f * InU : (InF < 0.88f ? 225.0f + 60.0f * InU : 300.0f + 40.0f * InU)));
+	}
+	return InF < 0.30f ? 345.0f + 30.0f * InU : (InF < 0.48f ? 320.0f + 25.0f * InU : (InF < 0.62f ? 265.0f + 55.0f * InU : (InF < 0.70f ? 215.0f + 50.0f * InU
+		: (InF < 0.84f ? 165.0f + 35.0f * InU : (InF < 0.88f ? 125.0f + 40.0f * InU : 15.0f + 30.0f * InU)))));
+}
+
+/** D-235, D-236 (owner: more variance in nebula colours): three colours (luminance 1) a galaxy from
+ *  its palette seed (F.w) or, without a palette, the shape seed's hash InHs (SeedMix 13), on the
+ *  palette channel's draws 12..20 (0..11 are the palette's), each from Uni_NebulaHue's families
+ *  (early types their own), saturation 0.4-0.95. Nebula to nebula (the fixed-mip read's fBm
+ *  channel InMix, standardised) the colour runs from the first through the second to the third;
+ *  toward their average with the blend InB. */
+UNI_FN float3 Uni_GalaxyNebulaColour(FUniFieldParams InPar, uint InHs, float InMix, float InB)
+{
+	const uint S = InPar.F.w > 0.0f ? uint(InPar.F.w) : (Uni_SeedMix(InHs, 13u) & 0xFFFFFFu) | 1u;
+	const bool bEarly = Uni_GalaxyEarlyNebula(InPar) > 0.0f;
+	float3 C[3];
+	for (uint I = 0u; I < 3u; ++I)
+	{
+		const float Hue = Uni_NebulaHue(Uni_DrawUnit(S, UNI_CH_PALETTE, 12u + 3u * I), Uni_DrawUnit(S, UNI_CH_PALETTE, 13u + 3u * I), bEarly);
+		C[I] = Uni_PaletteColour(Hue / 360.0f, 0.4f + 0.55f * Uni_DrawUnit(S, UNI_CH_PALETTE, 14u + 3u * I));
+	}
+	const float M = saturate((InMix - 0.526f) * (1.0f / 0.26f) + 0.5f);   // the fBm channel: mean 0.526, std 0.130
+	const float3 Cp = M < 0.5f ? C[0] + (C[1] - C[0]) * smoothstep(0.0f, 1.0f, 2.0f * M) : C[1] + (C[2] - C[1]) * smoothstep(0.0f, 1.0f, 2.0f * M - 1.0f);
+	const float3 Avg = (C[0] + C[1] + C[2]) * (1.0f / 3.0f);
+	const float3 Cm = Cp + (Avg - Cp) * saturate(InB);
+	return Cm * (1.0f / max(Uni_PaletteLum(Cm), 1.0e-4f));
+}
+
+static const float UNI_MOTION_WEB_DETAIL_MEAN = 0.567f;
+
+/** D-233 (owner: different areas of the web should have different noise modulations): the
+ *  motion web's detail as a regional mix of galaxy_detail's four channels instead of the ridged
+ *  one alone. Each channel's pattern is (value / mean)^p, p chosen so every channel has the
+ *  ridged one's contrast (p cv = 3 x 0.313: R 3, G 4.62, B 3.80, A 3.38), scaled to the ridged
+ *  one's mean (E[(R/m)^3] = 1.285: x 1, 0.950, 0.966, 0.978), so the light is the same whichever
+ *  leads: filaments (R), knots (G), cloud (B), cells (A). The weights come from a second read of
+ *  the same texture at the regions' scale and mip 4 (8 texels a period: smooth, about a quarter
+ *  period across), each channel standardised there (mip 4's std) and exponentiated (x 2): one
+ *  channel leads about two thirds of the mix at the median, each leads in about a quarter of the
+ *  regions (measured on the texture). InDt: the detail texel; InP: the web point (field units). */
+static const float4 UNI_MOTION_WEB_REGION_MEAN = float4(0.567247f, 0.522827f, 0.526189f, 0.493123f);
+static const float4 UNI_MOTION_WEB_REGION_STD = float4(0.0724f, 0.0380f, 0.0861f, 0.0873f);   // galaxy_detail's mip 4
+static const float4 UNI_MOTION_WEB_REGION_POW = float4(3.0f, 4.616f, 3.796f, 3.381f);
+static const float4 UNI_MOTION_WEB_REGION_NORM = float4(1.0f, 0.9504f, 0.9661f, 0.9776f);
+static const float UNI_MOTION_WEB_REGION_MIP = 4.0f;
+static const float UNI_MOTION_WEB_REGION_SHARP = 2.0f;
+
+/** D-233: the regional weights (sum 1) at InP for InRegionTiles regions a web period. */
+UNI_FN float4 Uni_MotionWebRegionWeights(float3 InP, float InRegionTiles)
+{
+	const float4 G = UNI_GAL_DETAIL(frac(InP * InRegionTiles + float3(0.5f, 0.25f, 0.75f)), UNI_MOTION_WEB_REGION_MIP);
+	const float4 W = float4(exp(UNI_MOTION_WEB_REGION_SHARP * (G.x - UNI_MOTION_WEB_REGION_MEAN.x) / UNI_MOTION_WEB_REGION_STD.x),
+		exp(UNI_MOTION_WEB_REGION_SHARP * (G.y - UNI_MOTION_WEB_REGION_MEAN.y) / UNI_MOTION_WEB_REGION_STD.y),
+		exp(UNI_MOTION_WEB_REGION_SHARP * (G.z - UNI_MOTION_WEB_REGION_MEAN.z) / UNI_MOTION_WEB_REGION_STD.z),
+		exp(UNI_MOTION_WEB_REGION_SHARP * (G.w - UNI_MOTION_WEB_REGION_MEAN.w) / UNI_MOTION_WEB_REGION_STD.w));
+	return W * (1.0f / max(W.x + W.y + W.z + W.w, 1.0e-20f));
+}
+
+/** D-233: the detail's pattern for one texel InDt under weights InW (about 1.285 on average). */
+UNI_FN float Uni_MotionWebRegionPattern(float4 InDt, float4 InW)
+{
+	const float4 V = float4(max(InDt.x / UNI_MOTION_WEB_DETAIL_MEAN, 0.0f), max(InDt.y / UNI_MOTION_WEB_REGION_MEAN.y, 0.0f),
+		max(InDt.z / UNI_MOTION_WEB_REGION_MEAN.z, 0.0f), max(InDt.w / UNI_MOTION_WEB_REGION_MEAN.w, 0.0f));
+	const float Pr = V.x * V.x * V.x;   // the ridged channel exactly as D-231 has it (its mean 0.567)
+	const float Pg = pow(V.y, UNI_MOTION_WEB_REGION_POW.y) * UNI_MOTION_WEB_REGION_NORM.y;
+	const float Pb = pow(V.z, UNI_MOTION_WEB_REGION_POW.z) * UNI_MOTION_WEB_REGION_NORM.z;
+	const float Pa = pow(V.w, UNI_MOTION_WEB_REGION_POW.w) * UNI_MOTION_WEB_REGION_NORM.w;
+	return InW.x * Pr + InW.y * Pg + InW.z * Pb + InW.w * Pa;
+}
+
+UNI_FN float3 Uni_MotionWebEmission(float4 InCh, float3 InP, float InFoot, float InDu, float InInvRadius, float InT, FUniVolumeView InView)
+{
+	const float Fn = (InCh.y + InCh.z) * InView.MotionWebInvRef;
+	if (!(Fn > 1.0f)) { return float3(0.0f, 0.0f, 0.0f); }
+	const float X = saturate(0.5f * log10(Fn));
+	const float Fade = smoothstep(0.0f, max(InView.MotionWebNearCm, 1.0f), InT) * (1.0f - smoothstep(0.5f * InView.MotionWebDepthCm, InView.MotionWebDepthCm, InT));
+	if (!(X * Fade > 0.0f)) { return float3(0.0f, 0.0f, 0.0f); }
+	float M = 1.0f;
+	if (InView.MotionWebDetailGain > 0.0f && InView.MotionWebDetailCm > 0.0f)
+	{
+		const float Tiles = max(round(1.0f / max(InInvRadius * InView.MotionWebDetailCm, 1.0e-6f)), 1.0f);   // detail periods per web period
+		// D-231 (owner: the flight showed the detail sliding): prefiltered over the step as well as
+		// the pixel. Ridges finer than the step swam through the march's sample shells (which sit at
+		// fixed distances from the camera): frame-to-frame change 37% over the fine reference's at
+		// 10 Mpc/s. With the step capped in the web's band (MotionWebStepCm, 0.5 Mpc) and the
+		// detail blurred over it: 0.5%, the detail kept. MarchFlags bit 2 (checks only): the fine
+		// reference (bit 1, steps an eighth) blurs the detail over the march's own step.
+		const float DuBlur = (InView.MarchFlags & 4u) != 0u ? InDu * 8.0f : InDu;
+		const float Mip = max(log2(max(max(InFoot, DuBlur) * Tiles * 128.0f, 1.0e-6f)), 0.0f);
+		const float4 Dt = UNI_GAL_DETAIL(frac(InP * Tiles), Mip);
+		float Pat;
+		if (InView.MotionWebRegionCm > 0.0f)
+		{
+			// D-233: regions (whole numbers a web period, so the mix stays periodic).
+			const float RegionTiles = max(round(1.0f / max(InInvRadius * InView.MotionWebRegionCm, 1.0e-6f)), 1.0f);
+			Pat = Uni_MotionWebRegionPattern(Dt, Uni_MotionWebRegionWeights(InP, RegionTiles));
+		}
+		else
+		{
+			const float R = Dt.x / UNI_MOTION_WEB_DETAIL_MEAN;
+			Pat = R * R * R;
+		}
+		M = 1.0f + (Pat - 1.0f) * saturate(InView.MotionWebDetailGain);
+	}
+	return UNI_MOTION_WEB_COLOUR * (InView.MotionWebGain * X * Fade * M);
 }
 
 UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
@@ -469,12 +630,20 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 			continue;
 		}
 		float S = min(max(Ratio * T, InView.MinStepCm), Hint) * RefDiv;
+		// D-231: within the motion web's band, with its detail on, steps no longer than
+		// MotionWebStepCm, so the detail's ridges are sampled instead of swimming through the
+		// march's sample shells (or blurred away over long steps).
+		if (InView.MotionWebStepCm > 0.0f && InView.MotionWebDetailGain > 0.0f && InView.MotionWebGain > 0.0f && T > 0.5f * InView.MotionWebNearCm && T < InView.MotionWebDepthCm)
+		{
+			S = min(S, InView.MotionWebStepCm * RefDiv);
+		}
 		S = max(min(S, Next - T), 1.0e-6f * T);
 		const float Tm = T + 0.5f * S;
 
 		float3 E = float3(0.0f, 0.0f, 0.0f);      // emission over this step
 		float3 Tau = float3(0.0f, 0.0f, 0.0f);    // optical depth over this step
 		float4 WebCh = float4(0.0f, 0.0f, 0.0f, 0.0f);   // D-206: this step's web texel
+		bool bMotionWebDone = false;                     // D-230: the motion web once a step (two web carriers read one texel)
 		uint WebFrom = UNI_VOL_MAX_ACTIVE;                // and the carrier that read it
 		for (uint J = 0u; J < NA; ++J)
 		{
@@ -501,6 +670,7 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 			const bool bPalette = (Ca.Flags & UNI_CARRIER_PALETTE) != 0u;
 			float4 Comp = float4(0.0f, 0.0f, 0.0f, 0.0f);
 			float RdPair = 0.0f;
+			float4 Neb = float4(0.0f, -1.0f, 0.5f, 0.0f);   // D-234, D-235: the emission nebulae's terms (Uni_GalaxyFromSharedCN)
 			// D-212: the camera's own galaxy from its map.
 			const bool bMapped = InView.MapCarrier == Act[J] + 1u && Blend < 1.0f;
 			// D-210: a galaxy's per-object hashes, read once from the builder's block.
@@ -510,22 +680,22 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 				if (InView.GalaxyConstBase != 0u) { GK = Uni_GalaxyConstUnpack(InParams[InView.GalaxyConstBase + Ca.ParamIndex]); }
 				else { GK = Uni_GalaxyConstOf(Par); }
 			}
-			else { GK.Hs = 0u; GK.Ho = 0u; GK.Hp = 0u; GK.ArmH = uint4(0u, 0u, 0u, 0u); }
+			else { GK.Hs = 0u; GK.Ho = 0u; GK.Hp = 0u; GK.ArmH = uint4(0u, 0u, 0u, 0u); GK.Hn = 0u; }
 			if (bMapped)
 			{
 				float Rm = 0.0f;
-				Uni_GalaxyMapEval(P, Par, InParams[Ca.DustParamIndex], (Ca.Flags & UNI_CARRIER_DUST) != 0u, GK, FootS, (float)InView.MapSize, InView.MapSlot, Rm, RdPair, Comp);
+				Uni_GalaxyMapEvalN(P, Par, InParams[Ca.DustParamIndex], (Ca.Flags & UNI_CARRIER_DUST) != 0u, GK, FootS, (float)InView.MapSize, InView.MapSlot, Rm, RdPair, Comp, Neb);
 				Rho = Rm + (Ca.MeanDensity - Rm) * Blend;
 			}
 			else if (bPair)
 			{
 				float Re = 0.0f;
-				UniField_GalaxyPairCK(P, Par, InParams[Ca.DustParamIndex], GK, FootS, Re, RdPair, Comp);
+				UniField_GalaxyPairCKN(P, Par, InParams[Ca.DustParamIndex], GK, FootS, Re, RdPair, Comp, Neb);
 				Rho = Blend < 1.0f ? Re + (Ca.MeanDensity - Re) * Blend : Ca.MeanDensity;
 			}
 			else if ((bPalette || Ca.FieldId == UNI_FIELD_GALAXY) && Blend < 1.0f)
 			{
-				Rho = UniField_GalaxyFilteredCK(P, Par, GK, FootS, Comp);
+				Rho = UniField_GalaxyFilteredCKN(P, Par, GK, FootS, Comp, Neb);
 				Rho = Rho + (Ca.MeanDensity - Rho) * Blend;
 			}
 			else if (Blend < 1.0f)
@@ -545,6 +715,13 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 					Rho = J == ClusterSlot ? UniField_ClusterC(P, Par, Cc0, Cc1, Cc2, Cc3) : Uni_FieldSampleFoot(Ca.FieldId, P, Par, FootS);
 				}
 				Rho = Rho + (Ca.MeanDensity - Rho) * Blend;
+				// D-230: the motion web (an art choice, render only): the textured web's filaments
+				// and nodes as a faint glow while travelling, so the structure shows motion.
+				if (InView.MotionWebGain > 0.0f && !bMotionWebDone && (Ca.Flags & UNI_CARRIER_PERIODIC) != 0u && Uni_CarrierWebTex(Ca, Par))
+				{
+					E = E + Uni_MotionWebEmission(WebCh, P, Tm * InView.ThetaPixel * Ca.InvRadius, Du, Ca.InvRadius, Tm, InView) * S;   // per cm x the step in cm (Du is in field units)
+					bMotionWebDone = true;
+				}
 				// D-189: the near-web glow (non-physical, an art choice): the periodic web's light
 				// lifted where it is overdense, so its structure shows in the sky.
 				if (InView.WebGlowGain > 0.0f && Ca.FieldId == UNI_FIELD_WEB && (Ca.Flags & UNI_CARRIER_PERIODIC) != 0u && Tm < InView.WebGlowDepthCm)
@@ -580,11 +757,39 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 				const float K = (Ca.Amplitude * Ca.Weight * AFade[J] * Rho) * Du;
 				E = E + L * K;
 			}
+			// D-234: nebulae, plain light at the galaxy's full light per star (none drawn), so they
+			// stay as the stars resolve; faded out with the prefilter's blend.
+			float Kn = 0.0f;
+			if (Ca.FieldId == UNI_FIELD_GALAXY && (InView.NebulaGain > 0.0f || InView.NebulaReflect > 0.0f) && Blend < 1.0f)
+			{
+				Kn = Ca.Amplitude * Ca.Weight * AFade[J] * Uni_VolumeLutFull(InLut, Ca.LutIndex, Tm) * Du * (1.0f - Blend)
+					* (InView.NebulaNearCm > 0.0f ? smoothstep(InView.NebulaNearCm, 3.0f * InView.NebulaNearCm, Tm) : 1.0f);
+				if (Neb.x > 0.0f && InView.NebulaGain > 0.0f)
+				{
+					// D-235: what one sample resolves: its footprint and its step along the disc plane.
+					// D-236: an early type's filaments are 3D: the whole step.
+					const float Inpl = Uni_GalaxyEarlyNebula(Par) > 0.0f ? Du : Du * sqrt(ADir[J].x * ADir[J].x + ADir[J].y * ADir[J].y);
+					// The screen's footprint, in the cube passes too: the far cache's coarser texels
+					// would blend a nebula the per-pixel march draws (cut along the split).
+					const float FootN = (Ca.Flags & UNI_CARRIER_PREFILTER) != 0u ? Tm * (InView.NebulaThetaPixel > 0.0f ? InView.NebulaThetaPixel : InView.ThetaPixel) * Ca.InvRadius : 0.0f;
+					const float Nd = Uni_GalaxyNebulaDensity(Neb, Par, FootN, Inpl);
+					const float3 Cn = Uni_GalaxyNebulaColour(Par, GK.Hs, Neb.z, Uni_GalaxyNebulaBlend(Par, FootN, Inpl));
+					E = E + Cn * (Kn * InView.NebulaGain * Nd);
+				}
+			}
 			if ((Ca.Flags & UNI_CARRIER_DUST) != 0u)
 			{
 				const FUniFieldParams DPar = InParams[Ca.DustParamIndex];
 				const float Rd = bPair ? RdPair : Uni_FieldSampleFoot(Ca.FieldId, P, DPar, FootS);
 				if (Rd > 0.0f) { Tau = Tau + InView.DustSigmaRgb * (DPar.D.y * Rd * Du * AFade[J]); }
+				// D-234: reflection nebulae: the dust lit by the young clusters (the knots' share of
+				// the sample's light: around the emission nebulae, wider), blue.
+				if (Kn > 0.0f && Rd > 0.0f && InView.NebulaReflect > 0.0f)
+				{
+					const float Sum = Comp.x + Comp.y + Comp.z + Comp.w;
+					const float Young = Sum > 0.0f ? Comp.w / Sum : 0.0f;
+					E = E + UNI_NEBULA_REFLECT_COLOUR * (Kn * InView.NebulaReflect * Rd * Young);
+				}
 			}
 			// D-210: this carrier's step limit at the next step's start, while it is loaded.
 			const float Tn = T + S;

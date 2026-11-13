@@ -183,4 +183,14 @@ UNI_FN float3 Uni_DopplerTint(float3 InC, float InD, float InK, float InQ)
 	return InQ != 0.0f ? C * pow(D, InQ) : C;
 }
 
+/** D-230: the travel shift (an art choice, render only; uu.Shift): while travelling, light ahead
+ *  is shifted blue and light behind red, as a Doppler shift would, the luminance kept (hue only,
+ *  never brightness). InAmount: ln of the shift factor straight ahead (0: none; the CPU ramps it
+ *  by the travel curve); InVel: the motion (unit). Uni_DopplerTint's strength InK. */
+UNI_FN float3 Uni_TravelShift(float3 InC, float3 InDir, float3 InVel, float InAmount, float InK)
+{
+	if (InAmount == 0.0f || !(dot(InVel, InVel) > 0.25f)) { return InC; }
+	return Uni_DopplerTint(InC, exp(InAmount * clamp(dot(InDir, InVel), -1.0f, 1.0f)), InK, 0.0f);
+}
+
 #endif // UNI_PHOTOMETRY_USH

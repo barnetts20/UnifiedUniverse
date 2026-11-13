@@ -52,6 +52,54 @@ namespace UniCore
 	 *  inf there, so the motion came out zero with the optics on: every direction shrank by
 	 *  sqrt(1 - b^2), and every sprite off the view's centre took a capped 64 px streak (its light
 	 *  spread 64x): at intergalactic speed nearly everything vanished. */
+	/** D-230: the travel look's ramp (the motion web, the travel shift): 0 below Start on the
+	 *  travel curve (0 at 100 kpc/s, 1 at 10 Mpc/s, log in between), 1 above Full, smooth between. */
+	inline double TravelLookRamp(double InSpeed01, double InStart, double InFull)
+	{
+		if (!(InFull > InStart)) { return InSpeed01 >= InStart ? 1.0 : 0.0; }
+		const double X = std::clamp((InSpeed01 - InStart) / (InFull - InStart), 0.0, 1.0);
+		return X * X * (3.0 - 2.0 * X);
+	}
+
+	/** D-231: the motion web's ramp, from the camera's speed itself (the travel curve is 0 below
+	 *  100 kpc/s; the owner wants the web while crossing a galaxy in a second or two, ~15-50 kpc/s):
+	 *  0 below Start, 1 above Full (cm/s), ease-out on log speed between (it comes in early and
+	 *  reaches full slowly). Eased in time so speed jitter cannot flicker it: up over UpSeconds,
+	 *  down over DownSeconds (time constants). */
+	struct FMotionWebRamp
+	{
+		double Value = 0.0;
+		double UpSeconds = 0.3, DownSeconds = 0.6;
+
+		static double Target(double InSpeed, double InStart, double InFull)
+		{
+			if (!(InSpeed > InStart) || !(InFull > InStart) || !(InStart > 0.0)) { return 0.0; }
+			const double X = std::clamp(std::log(InSpeed / InStart) / std::log(InFull / InStart), 0.0, 1.0);
+			return 1.0 - (1.0 - X) * (1.0 - X);
+		}
+		double Update(double InSpeed, double InDt, double InStart, double InFull)
+		{
+			const double T = Target(InSpeed, InStart, InFull);
+			const double Tau = T > Value ? UpSeconds : DownSeconds;
+			const double K = InDt > 0.0 ? 1.0 - std::exp(-InDt / std::max(Tau, 1e-3)) : 0.0;
+			Value += (T - Value) * K;
+			return Value;
+		}
+	};
+
+	/** D-230: the travel shift for a frame: the camera's motion (unit, from its step) and the shift
+	 *  amount (0 with no motion: never a direction from a zero step). */
+	inline void ShiftMotion(double InStepX, double InStepY, double InStepZ, double InAmount, float OutVelAmount[4])
+	{
+		OutVelAmount[0] = OutVelAmount[1] = OutVelAmount[2] = OutVelAmount[3] = 0.0f;
+		const double L = std::sqrt(InStepX * InStepX + InStepY * InStepY + InStepZ * InStepZ);
+		if (!(L > 0.0) || !std::isfinite(L) || InAmount == 0.0) { return; }
+		OutVelAmount[0] = float(InStepX / L);
+		OutVelAmount[1] = float(InStepY / L);
+		OutVelAmount[2] = float(InStepZ / L);
+		OutVelAmount[3] = float(InAmount);
+	}
+
 	inline void WarpMotion(double InStepX, double InStepY, double InStepZ, double InBeta, float OutVelBeta[4])
 	{
 		OutVelBeta[0] = OutVelBeta[1] = OutVelBeta[2] = OutVelBeta[3] = 0.0f;

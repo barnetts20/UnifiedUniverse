@@ -49,6 +49,14 @@ static FVector4f WarpVelBetaOf(const FUniFrameData& F)
 	UniCore::WarpMotion(double(F.CameraStepCm.X), double(F.CameraStepCm.Y), double(F.CameraStepCm.Z), double(Beta), Vb);
 	return FVector4f(Vb[0], Vb[1], Vb[2], Vb[3]);
 }
+/** D-230: the travel shift for a frame: the camera's motion (unit) and the ramped amount. */
+static FVector4f ShiftVelAmountOf(const FUniFrameData& F)
+{
+	if (!F.bCameraStepValid || F.ShiftAmount == 0.0f) { return FVector4f(0.0f, 0.0f, 0.0f, 0.0f); }
+	float Va[4];
+	UniCore::ShiftMotion(double(F.CameraStepCm.X), double(F.CameraStepCm.Y), double(F.CameraStepCm.Z), double(F.ShiftAmount), Va);
+	return FVector4f(Va[0], Va[1], Va[2], Va[3]);
+}
 static FVector4f WarpDopplerKQOf()
 {
 	return FVector4f(FMath::Clamp(CVarUniWarpDoppler.GetValueOnRenderThread(), 0.0f, 4.0f), FMath::Clamp(CVarUniWarpBeaming.GetValueOnRenderThread(), -4.0f, 4.0f), 0.0f, 0.0f);
@@ -761,6 +769,8 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		C.Pad0 = 0.0f;
 		C.WarpVelBeta = WarpVelBetaOf(F);   // D-190
 		C.WarpDopplerKQ = WarpDopplerKQOf();
+		C.ShiftVelAmount = ShiftVelAmountOf(F);   // D-230
+		C.ShiftK = F.ShiftK;
 	};
 	auto FillCommon = [&](FUniVolumeCommonParameters& C, const TArray<UniCore::FCarrierGPU>& Carriers, const UniCore::FVolumeViewGPU& V)
 	{
@@ -1400,6 +1410,8 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 		P->WarpAmount = FMath::Clamp(F.WarpAmount, 0.0f, 1.0f);   // D-187
 		P->WarpVelBeta = WarpVelBetaOf(F);   // D-190
 		P->WarpDopplerKQ = WarpDopplerKQOf();
+		P->ShiftVelAmount = ShiftVelAmountOf(F);   // D-230
+		P->ShiftK = F.ShiftK;
 		P->ArrivalFrames = FMath::Max(CVarUniWarpArrival.GetValueOnRenderThread(), 0.0f);
 		P->DiscArchetypeMask = F.DiscArchetypeMask;   // D-183
 		P->FixedDiscSeeds = FUintVector4(F.FixedDiscSeeds[0], F.FixedDiscSeeds[1], F.FixedDiscSeeds[2], F.FixedDiscSeeds[3]);

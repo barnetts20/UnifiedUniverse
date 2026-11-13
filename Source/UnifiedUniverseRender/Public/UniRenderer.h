@@ -48,6 +48,8 @@ struct FUniFrameData
 	bool bCameraStepValid = false;
 	float WarpAmount = 0.0f;   // D-187: 0 at rest, 1 at full warp (the travel curve), drives streaks and arrival
 	float SpeedAmount = 0.0f;  // D-198: the travel curve itself (not x uu.Warp): the volume march's budget falls with it
+	float ShiftAmount = 0.0f;  // D-230: the travel shift (ln of the factor straight ahead, ramped; 0: none)
+	float ShiftK = 0.0f;       // its colour strength
 	float VolumeBudgetScale = 1.0f;   // D-200: the auto budget's scale of the march pixel budget (1: off)
 	float VolumeNearCm = 0.0f;        // D-208: the nearest marched structure's distance (FVolumeScene::NearCm; 0: unknown)
 	// D-212 / D-214: the galaxy map array (UniCore::FGalaxyMapCache): its slots and texels a side

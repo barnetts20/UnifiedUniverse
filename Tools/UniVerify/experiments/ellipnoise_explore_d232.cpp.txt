@@ -1,0 +1,39 @@
+// D-232 exploration (archived from tests/test_zz section of test_ellipnoise.cpp; uses that file's helpers).
+// Measured (close views, foot 0.002, 20x20 px, 4 step phases): textured spirals slide 0.09-0.13%
+// (plain 0.09-0.16%); ellipticals with the spheroid noise by mip floor 0/1/2/3:
+//   Fq 1.47: 0.238 / 0.208 / 0.141 / 0.096%;  Fq 2.46: 1.176 / 0.819 / 0.449 / 0.209%;
+//   Fq 1.04: 0.340 / 0.228 / 0.143 / 0.064%  (smooth spheroid 0.013%). Floor 3 chosen.
+
+UNI_TEST(zz, ellip_explore)
+{
+	const FTexSet Tx;
+	FBind Bind(Tx);
+	FUniverseDef D = UniScenes::Base();
+	UniScenes::UseGalaxyTextures(D, Tx.T[0].Size);
+	const FUniEmitter& E = D.Arch(UniScenes::kGalaxy).Emitters.at(0);
+	for (int Gi = 0; Gi < 3; ++Gi)
+	{
+		FFieldParams Pf = RolledLate(E, H::Uni_SeedMix(0xE116u, u32(Gi)));
+		FFieldParams Pn = Pf; for (int I = 24; I < 31; ++I) { Pn.V[I] = 0.0f; }
+		const FView Vw(0.4 + 0.5 * Gi, 0.9 * Gi);
+		double Eo = 0, Ef = 0;
+		const double A = Swim(Pf.ToHlsl(), Vw, 20, 0.35, 0.002f, &Eo), B = Swim(Pn.ToHlsl(), Vw, 20, 0.35, 0.002f, &Ef);
+		std::printf("spiral %d: slide textured %.3f%% plain %.3f%%; err %.3f%% %.3f%%\n", Gi, 100 * A, 100 * B, 100 * Eo, 100 * Ef);
+	}
+	for (int Gi = 0; Gi < 3; ++Gi)
+	{
+		const FFieldParams Pf = RolledEarly(E, H::Uni_SeedMix(0xE116u, u32(Gi)));
+		const FView Vw(0.4 + 0.5 * Gi, 0.9 * Gi);
+		int St0 = 0, Stn = 0;
+		for (int I = 0; I < 50; ++I) { int S = 0; MarchHint(Pf.ToHlsl(), Vw, -0.35 + 0.014 * I, 0.05, 0.002f, 0.0, &S); St0 += S; }
+		(void)Stn;
+		for (const float Fl : { 0.0f, 1.0f, 2.0f, 3.0f })
+		{
+			const float Old = H::GKnobSphMipFloor; H::GKnobSphMipFloor = Fl;
+			double Eo = 0;
+			const double A = Swim(Pf.ToHlsl(), Vw, 20, 0.35, 0.002f, &Eo);
+			H::GKnobSphMipFloor = Old;
+			std::printf("ellip %d (Fq %.2f amp %.2f re %.3f) floor %.0f: slide %.3f%% err %.3f%% steps/ray %.1f\n", Gi, Pf.V[27], Pf.V[13], Pf.V[3], Fl, 100 * A, 100 * Eo, St0 / 50.0);
+		}
+	}
+}

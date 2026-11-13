@@ -114,8 +114,8 @@ namespace
 			float3 Pd, Pb;
 			float4 Dt;
 			uint32_t bDt = 0u;
-			float FineN = 0.0f;
-			H::Uni_GalaxyTexTerms(P, G.Par, G.K, 0.0f, G.Slab, true, false, Pd, Pb, Dt, bDt, FineN);
+			float FineN = 0.0f, SphM = 1.0f; H::float3 NebK(0.0f, 0.0f, 0.0f);
+			H::Uni_GalaxyTexTerms(P, G.Par, G.K, 0.0f, G.Slab, true, false, Pd, Pb, Dt, bDt, FineN, SphM, NebK);
 			return Pd;
 		}
 		const H::FUniFieldParams& Par = G.Par;
@@ -140,8 +140,8 @@ namespace
 		float3 Pd, Pb;
 		float4 Dt;
 		uint32_t bDt = 0u;
-		float FineN = 0.0f;
-		H::Uni_GalaxyTexTerms(P, G.Par, G.K, 0.0f, G.Slab, true, false, Pd, Pb, Dt, bDt, FineN);
+		float FineN = 0.0f, SphM = 1.0f; H::float3 NebK(0.0f, 0.0f, 0.0f);
+		H::Uni_GalaxyTexTerms(P, G.Par, G.K, 0.0f, G.Slab, true, false, Pd, Pb, Dt, bDt, FineN, SphM, NebK);
 		return FineN;
 	}
 
@@ -304,8 +304,8 @@ namespace
 		float3 Pd, Pb;
 		float4 Dt;
 		uint32_t bDt = 0u;
-		float FineN = 0.0f;
-		H::Uni_GalaxyTexTerms(P, G.NoWarp, G.K, 0.0f, G.Slab, true, H::Uni_GalaxyNeedsDetail(Par), Pd, Pb, Dt, bDt, FineN);
+		float FineN = 0.0f, SphM = 1.0f; H::float3 NebK(0.0f, 0.0f, 0.0f);
+		H::Uni_GalaxyTexTerms(P, G.NoWarp, G.K, 0.0f, G.Slab, true, H::Uni_GalaxyNeedsDetail(Par), Pd, Pb, Dt, bDt, FineN, SphM, NebK);
 		float DetailN = 0.0f, Knot = 0.0f, Cloud = 1.0f;
 		if (bDt != 0u) { H::Uni_GalaxyDetailTerms(Dt, Par, DetailN, Knot, Cloud); }
 		float Cz = 0.0f, Hh = 1.0f;
@@ -325,7 +325,7 @@ namespace
 			const float Wk = Par.H.y != 0.0f ? std::max(1.0f + Par.H.y * Knot, 0.0f) : 1.0f;
 			Disc = V * Fd * H::Uni_GalaxyFineMul(FineNAt(G, P), Par) * (std::max(T.x, 0.0f) + std::max(T.w, 0.0f) * (Wk - 1.0f));
 		}
-		const float Bulge = H::Uni_GalaxyBulgeAt(Pb, Par, 0.0f);
+		const float Bulge = H::Uni_GalaxyBulgeAt(Pb, Par, 0.0f) * SphM;   // D-232 (1 for spirals)
 		const float R = std::sqrt(R2);
 		return (Disc + Bulge) * std::clamp((Cut - R) / (0.05f * Cut), 0.0f, 1.0f);
 	}

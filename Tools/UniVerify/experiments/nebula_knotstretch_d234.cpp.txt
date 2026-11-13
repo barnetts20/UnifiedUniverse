@@ -1,0 +1,35 @@
+#include "../src/UniTest.h"
+#include "../src/UniVerifyCommon.h"
+#include "../scenes/UniScenes.h"
+#include "UniWebTexture.h"
+#include <cstdio>
+#include <vector>
+using namespace UniCore;
+namespace H = UniHlsl;
+UNI_TEST(zz, nebdbg)
+{
+	FWebTexture T[3];
+	for (int S = 0; S < 3; ++S) { std::string E; FWebTexture::LoadDelivered("Data/Noise", GalaxyTextureName(S), T[S], &E); BindGalaxyTexture(S, &T[S]); }
+	auto Shape = [](double K) { double X = std::min(std::max((K - 0.3) / 0.4, 0.0), 1.0); return X * X; };
+	std::vector<double> K0;
+	for (int M2 = 0; M2 <= 10; ++M2)
+	{
+		const float Mip = 0.5f * M2;
+		std::vector<double> Ks;
+		double S = 0, S2 = 0;
+		for (int I = 0; I < 200000; ++I)
+		{
+			const H::float3 Pt(H::Uni_DrawUnit(9u, 1u, u32(3 * I)), H::Uni_DrawUnit(9u, 1u, u32(3 * I + 1)), H::Uni_DrawUnit(9u, 1u, u32(3 * I + 2)));
+			const double K = 2.0 * double(UNI_GAL_DETAIL(Pt, Mip).y) - 1.0;
+			Ks.push_back(K); S += K; S2 += K * K;
+		}
+		if (M2 == 0) { K0 = Ks; }
+		double Target = 0; for (double K : K0) { Target += Shape(K); } Target /= K0.size();
+		const double Mu = 0.0457;
+		double Lo = 0.5, Hi = 60.0;
+		for (int It = 0; It < 60; ++It) { const double F = 0.5 * (Lo + Hi); double Sm = 0; for (double K : Ks) { Sm += Shape(Mu + (K - Mu) * F); } Sm /= Ks.size(); if (Sm < Target) { Lo = F; } else { Hi = F; } }
+		std::printf("mip %.1f: mean %.4f std %.4f calib %.4f\n", Mip, S / Ks.size(), std::sqrt(S2 / Ks.size() - (S / Ks.size()) * (S / Ks.size())), 0.5 * (Lo + Hi));
+	}
+	for (int S = 0; S < 3; ++S) { BindGalaxyTexture(S, nullptr); }
+	Uni::Check(2, "Z.nebdbg", "dbg").Pass(true, "ok");
+}

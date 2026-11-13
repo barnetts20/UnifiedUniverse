@@ -1,0 +1,115 @@
+#include "../src/UniTest.h"
+#include "../src/UniVerifyCommon.h"
+#include "../src/UniRenderRef.h"
+#include "../scenes/UniScenes.h"
+#include "UniVolume.h"
+#include "UniWebTexture.h"
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <sys/stat.h>
+#include <vector>
+#include <algorithm>
+using namespace UniCore;
+using namespace UniRender;
+namespace H = UniHlsl;
+namespace
+{
+	double ZEnv(const char* N, double D) { const char* V = std::getenv(N); return V ? std::atof(V) : D; }
+	FFieldParams ZRoll(const FUniEmitter& E, u32 S, bool bEarly)
+	{
+		FFieldParams P = bEarly ? E.EarlyExemplar : E.Exemplar;
+		for (const FParamRange& R : bEarly ? E.EarlyRanges : E.Ranges) { P.V[R.Slot] = H::Uni_RollRange(S, ChannelIdUpper(R.Name), R.Min, R.Max, R.Bias, R.Quantize); }
+		return P;
+	}
+}
+UNI_TEST(zz, ellneb)
+{
+	FWebTexture T[3];
+	for (int S = 0; S < 3; ++S) { std::string E; FWebTexture::LoadDelivered("Data/Noise", GalaxyTextureName(S), T[S], &E); BindGalaxyTexture(S, &T[S]); }
+	// The ridged shape's mean at the early read's mip.
+	{
+		double Sm = 0; const int N = 200000; std::vector<double> Rs;
+		for (int I = 0; I < N; ++I)
+		{
+			const H::float3 Pt(H::Uni_DrawUnit(9u, 2u, u32(3 * I)), H::Uni_DrawUnit(9u, 2u, u32(3 * I + 1)), H::Uni_DrawUnit(9u, 2u, u32(3 * I + 2)));
+			const H::float4 Tq = UNI_GAL_DETAIL(Pt, UNI_EARLY_NEB_MIP);
+			const double R = double(Tq.x) / 0.567; Rs.push_back(R);
+			{ const double Xq = std::min(std::max((R - double(UNI_EARLY_NEB_T0)) / (double(UNI_EARLY_NEB_T1) - double(UNI_EARLY_NEB_T0)), 0.0), 1.0);
+			  const double J = std::min(std::max(1.0 + 2.0 * (double(Tq.w) - 0.493), 0.2), 1.8); static double Sj = 0, Sjn = 0; Sj += Xq * Xq * J / N; Sjn += J / N; if (I == N - 1) std::printf("E[X2 J] %.5f E[J] %.4f\n", Sj, Sjn); }
+			const double X = std::min(std::max((R - double(UNI_EARLY_NEB_T0)) / (double(UNI_EARLY_NEB_T1) - double(UNI_EARLY_NEB_T0)), 0.0), 1.0);
+			Sm += X * X / N;
+		}
+		std::sort(Rs.begin(), Rs.end()); for (double Q : { 0.5, 0.75, 0.9, 0.95, 0.98, 0.99, 0.999 }) { std::printf("q%.3f %.3f\n", Q, Rs[size_t(Q * (N - 1))]); }
+		std::printf("early shape mean at mip %.1f: %.5f\n", double(UNI_EARLY_NEB_MIP), Sm);
+	}
+	FUniverseDef D = UniScenes::Base();
+	UniScenes::UseGalaxyTextures(D, T[0].Size);
+	const FUniEmitter& E = D.Arch(UniScenes::kGalaxy).Emitters.at(0);
+	const H::float3 Base = H::Uni_TemperatureColour(4800.0f);
+	const float BL = H::Uni_Luminance(Base);
+	const int Tile = 180, G = 3;
+	FImage Img(Tile * G * 2, Tile * G);
+	for (int Side = 0; Side < 2; ++Side) for (int Gi = 0; Gi < G * G; ++Gi)
+	{
+		FFieldParams Pf = ZRoll(E, H::Uni_SeedMix(0x9A1Au, u32(Gi + 40)), true);
+		if (Side == 1) { Pf.V[20] = std::max(Pf.V[20], 0.6f); Pf.V[9] = float(ZEnv("UU_SHELL", Gi % 2 ? 0.5 : Pf.V[9])); }   // right: forced on, to see them
+		const H::FUniFieldParams P = Pf.ToHlsl();
+		const H::FUniGalaxyConst K = H::Uni_GalaxyConstOf(P);
+		const double Inc = (20.0 + 7.0 * Gi) * 3.14159265358979 / 180.0, Az = 0.7 * Gi;
+		const double Dv[3] = { std::sin(Inc) * std::cos(Az), std::sin(Inc) * std::sin(Az), -std::cos(Inc) };
+		const double Rt[3] = { -std::sin(Az), std::cos(Az), 0.0 };
+		const double Up[3] = { Dv[1] * Rt[2] - Dv[2] * Rt[1], Dv[2] * Rt[0] - Dv[0] * Rt[2], Dv[0] * Rt[1] - Dv[1] * Rt[0] };
+		std::vector<float> L(size_t(Tile) * Tile * 3, 0.0f);
+		float Peak = 0;
+		const double Half = ZEnv("UU_HALF", 0.5), Px = 2 * Half / Tile, Dcam = 3.0, ThetaPx = Px / Dcam;
+		double Sn = 0, Ss = 0, Nsteps = 0;
+		for (int Y = 0; Y < Tile; ++Y) for (int X = 0; X < Tile; ++X)
+		{
+			double O[3], Dir[3]; const double U = -Half + (X + 0.5) * Px, V = Half - (Y + 0.5) * Px;
+			double Ln = 0;
+			for (int A = 0; A < 3; ++A) { O[A] = -Dcam * Dv[A]; Dir[A] = U * Rt[A] + V * Up[A] + Dcam * Dv[A]; Ln += Dir[A] * Dir[A]; }
+			Ln = std::sqrt(Ln); for (int A = 0; A < 3; ++A) { Dir[A] /= Ln; }
+			double Col[3] = { 0, 0, 0 };
+			const H::float3 Dd{ float(Dir[0]), float(Dir[1]), float(Dir[2]) };
+			double Bo = O[0] * Dir[0] + O[1] * Dir[1] + O[2] * Dir[2], Co = Dcam * Dcam - 1.0, Disc = Bo * Bo - Co;
+			if (Disc > 0)
+			{
+				double T = -Bo - std::sqrt(Disc); const double Tx = -Bo + std::sqrt(Disc);
+				T += ZEnv("UU_PHASE", 0.0) * 0.01;
+				for (int N = 0; N < 4000 && T < Tx; ++N)
+				{
+					const H::float3 Pt(float(O[0] + T * Dir[0]), float(O[1] + T * Dir[1]), float(O[2] + T * Dir[2]));
+					const float Foot = float(ThetaPx * T);
+					double S = std::min(std::min(0.32 * T, double(H::Uni_GalaxyStepHintFilteredK(Pt, Dd, P, Foot, K.Hp))), double(H::Uni_GalaxyNebulaStepCap(Pt, Dd, P, K.Hp, Foot)));
+					S = std::max(std::min(S, Tx - T), 1.0e-6);
+					const double Tm = T + 0.5 * S;
+					const H::float3 Pm(float(O[0] + Tm * Dir[0]), float(O[1] + Tm * Dir[1]), float(O[2] + Tm * Dir[2]));
+					H::float4 C(0, 0, 0, 0), Nv(0, 0, 0, 0);
+					const float Rho = float(ZEnv("UU_STAR", 1.0)) * H::UniField_GalaxyFilteredCKN(Pm, P, K, float(ThetaPx * Tm), C, Nv);
+					const float Nd = H::Uni_GalaxyNebulaDensity(Nv, P, float(ThetaPx * Tm), float(S)) * float(ZEnv("UU_NEB", 1.0));
+					const H::float3 Cn = H::Uni_GalaxyNebulaColour(P, K.Hs, Nv.z, H::Uni_GalaxyNebulaBlend(P, float(ThetaPx * Tm), float(S)));
+					Col[0] += (Rho * Base.x + BL * Nd * Cn.x) * S; Col[1] += (Rho * Base.y + BL * Nd * Cn.y) * S; Col[2] += (Rho * Base.z + BL * Nd * Cn.z) * S;
+					Sn += BL * Nd * S; Ss += Rho * BL * S; Nsteps += 1;
+					T += S;
+				}
+			}
+			for (int Cc = 0; Cc < 3; ++Cc) { L[(size_t(Y) * Tile + X) * 3 + Cc] = float(Col[Cc]); Peak = std::max(Peak, float(Col[Cc])); }
+		}
+		std::printf("  steps/px %.1f re %.3f freq %.2f texel %.4f\n", Nsteps / (Tile * Tile), Pf.V[3], Pf.V[27], H::Uni_GalaxyEarlyNebulaTexel(P));
+		std::printf("side %d galaxy %d: nebula %.2f shells %.2f -> nebula/star %.3f\n", Side, Gi, Pf.V[20], Pf.V[9], Sn / std::max(Ss, 1e-300));
+		const float Gn = float(ZEnv("UU_EXP", 3.0)) / std::max(Peak, 1e-30f);
+		for (int Y = 0; Y < Tile; ++Y) for (int X = 0; X < Tile; ++X)
+		{
+			const float* C = &L[(size_t(Y) * Tile + X) * 3];
+			// sqrt stretch to show the envelope
+			const float Lm = std::max(0.2126f * C[0] + 0.7152f * C[1] + 0.0722f * C[2], 1e-30f);
+			const float S2 = std::sqrt(Lm * Gn) / (Lm * Gn) * Gn;
+			Img.Add(Side * Tile * G + (Gi % G) * Tile + X, (Gi / G) * Tile + Y, C[0] * S2, C[1] * S2, C[2] * S2);
+		}
+	}
+	const std::string Dd = UniVerify::Options().OutDir + "/render"; ::mkdir(UniVerify::Options().OutDir.c_str(), 0755); ::mkdir(Dd.c_str(), 0755);
+	Img.WritePpm(Dd + "/zz_ellneb.ppm");
+	for (int S = 0; S < 3; ++S) { BindGalaxyTexture(S, nullptr); }
+	Uni::Check(2, "Z.ellneb", "x").Pass(true, "ok");
+}
