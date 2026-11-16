@@ -275,6 +275,33 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Galaxy|Shape and Noise", meta = (DisplayName = "Galaxy.StructureFreq", UniCVar = "uu.Galaxy.StructureFreq", UniReenable, ToolTip = "D-258/D-259: the structure read's frequency over the galaxy detail's (its roll DetailFreq: 2-4 periods; 0.25: the structure 4x larger than the detail, GAMER's noise at the galaxy's own scale). 0: no structure read. Applies at uu.Enable. [re-enables the scene on change]"))
 	float U_Galaxy_StructureFreq = 0.0f;
 
+	UPROPERTY(config, EditAnywhere, Category = "Galaxy|Detail Layers", meta = (DisplayName = "Galaxy.Detail.Dust0", UniCVar = "uu.Galaxy.Detail.Dust0", ToolTip = "D-265: detail layer 0's dust amplitude (0..1): the dust x 1 + this x (the shaped ridged channel - 1)."))
+	float U_Galaxy_Detail_Dust0 = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Galaxy|Detail Layers", meta = (DisplayName = "Galaxy.Detail.Dust1", UniCVar = "uu.Galaxy.Detail.Dust1", ToolTip = "D-265: detail layer 1's dust amplitude (0..1)."))
+	float U_Galaxy_Detail_Dust1 = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Galaxy|Detail Layers", meta = (DisplayName = "Galaxy.Detail.Foot", UniCVar = "uu.Galaxy.Detail.Foot", ToolTip = "D-265: a detail layer is read over at least this x its share of the step (the fade where the step does not resolve it: mean-kept blur instead of grain). 0: 0.5."))
+	float U_Galaxy_Detail_Foot = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Galaxy|Detail Layers", meta = (DisplayName = "Galaxy.Detail.Freq0", UniCVar = "uu.Galaxy.Detail.Freq0", ToolTip = "D-265: detail layer 0's frequency, x the galaxy's detail texture's (its knots' scale; the Milky Way's: an 8 kpc period, 62 pc texels): 4 = features a quarter the size (2 kpc, 16 pc texels; at the defaults resolved to ~1.2 kpc from the camera). Read from galaxy_shape (mean 1 at every mip), render only, near the camera: past where the march's step resolves it, it fades to its mean. 0: off."))
+	float U_Galaxy_Detail_Freq0 = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Galaxy|Detail Layers", meta = (DisplayName = "Galaxy.Detail.Freq1", UniCVar = "uu.Galaxy.Detail.Freq1", ToolTip = "D-265: detail layer 1's frequency, x the detail texture's (16: a sixteenth the size, the Milky Way's 500 pc and 4 pc texels; its reach a quarter of layer 0's, ~300 pc at the defaults). 0: off."))
+	float U_Galaxy_Detail_Freq1 = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Galaxy|Detail Layers", meta = (DisplayName = "Galaxy.Detail.Light0", UniCVar = "uu.Galaxy.Detail.Light0", ToolTip = "D-265: detail layer 0's light amplitude (0..1): the light x 1 + this x (the shaped fBm - 1). Mean 1: the brightness is kept."))
+	float U_Galaxy_Detail_Light0 = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Galaxy|Detail Layers", meta = (DisplayName = "Galaxy.Detail.Light1", UniCVar = "uu.Galaxy.Detail.Light1", ToolTip = "D-265: detail layer 1's light amplitude (0..1)."))
+	float U_Galaxy_Detail_Light1 = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Galaxy|Detail Layers", meta = (DisplayName = "Galaxy.Detail.StepTexels", UniCVar = "uu.Galaxy.Detail.StepTexels", ToolTip = "D-265: a detail layer's resolving step in its texels (dust: one step; light: uu.Volume.SegmentTaps taps a step). Smaller: sharper, more steps."))
+	float U_Galaxy_Detail_StepTexels = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Galaxy|Detail Layers", meta = (DisplayName = "Galaxy.Detail.Steps", UniCVar = "uu.Galaxy.Detail.Steps", ToolTip = "D-265: the steps each detail layer may spend at its resolving step past where the march's own step reaches it (its reach: each finer layer a shorter reach for the same steps). More: the detail further out, a costlier march in the disc. 0: no step cap (the layers only read, faded by the march's own step)."))
+	float U_Galaxy_Detail_Steps = 0.0f;
+
 	UPROPERTY(config, EditAnywhere, Category = "Galaxy|Balance", meta = (DisplayName = "Galaxy.DiffuseDust", UniCVar = "uu.Galaxy.DiffuseDust", ToolTip = "D-250: dusty galaxies' low background dust (render only), x this opacity: along the disc's mid-plane at ~the solar circle it reaches tau 1 over the galaxy's own reach (uu.Galaxy.DustReachMinKpc..MaxKpc by its seed), so the far side of the disc hazes out; looking out of the plane stays clear. It fades in past the galaxy's sprite handoff (D-245). 0: off."))
 	float U_Galaxy_DiffuseDust = 0.0f;
 

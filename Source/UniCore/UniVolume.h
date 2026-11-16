@@ -118,11 +118,19 @@ namespace UniCore
 		float StepFoot;               // D-255: a galaxy's field over at least this x the step along the disc (0: the pixel's)
 		u32 SegmentTaps;              // D-262: the camera's galaxy's step read at up to this many points along its run (paradigm C; 0, 1: one)
 		float OpaqueCutoff;           // D-262: a ray stops under this transmittance (0: 1e-3)
-		u32 SegPad1;
-		u32 SegPad2;
+		float DetailSteps;            // D-265: a detail layer's steps at its resolving step past the log step's reach (0: no step cap)
+		float DetailStepTexels;       // D-265: the resolving step in the layer's texels
+		float DetailFreq0;            // D-265: layer 0 x the detail's frequency (0: off), its light and dust amplitudes
+		float DetailLight0;
+		float DetailDust0;
+		float DetailFreq1;            // D-265: layer 1
+		float DetailLight1;
+		float DetailDust1;
+		float DetailFoot;             // D-265: a layer read over at least this x the step's share (0: 0.5)
+		float DetailPad;
 	};
-	static_assert(sizeof(FVolumeViewGPU) == 224, "FVolumeViewGPU must match FUniVolumeView (UniVolume.ush)");
-	static_assert(sizeof(HV::FUniVolumeView) == 224, "shim FUniVolumeView layout");
+	static_assert(sizeof(FVolumeViewGPU) == 256, "FVolumeViewGPU must match FUniVolumeView (UniVolume.ush)");
+	static_assert(sizeof(HV::FUniVolumeView) == 256, "shim FUniVolumeView layout");
 
 	inline HV::FUniCarrier ToHlsl(const FCarrierGPU& C) { HV::FUniCarrier H; std::memcpy(static_cast<void*>(&H), &C, sizeof(H)); return H; }
 	inline HV::FUniVolumeView ToHlsl(const FVolumeViewGPU& V) { HV::FUniVolumeView H; std::memcpy(static_cast<void*>(&H), &V, sizeof(H)); return H; }
@@ -514,6 +522,13 @@ namespace UniCore
 		float StepFoot = 0.0f;                            // D-255: a galaxy's field over at least this x the march's step along the disc (the cone rule; 0: the pixel's footprint alone)
 		u32 SegmentTaps = 1u;                             // D-262: the camera's galaxy's step read at up to this many points along its run (paradigm C; 1: one, D-255's)
 		float OpaqueCutoff = 1.0e-3f;                     // D-262: a ray stops when its transmittance is under this (uu.Volume.OpaqueCutoff)
+		// D-265: the camera's galaxy's detail layers (render only; Uni_GalaxyDetailLayers). Off here
+		// (the checks' march as before); the engine's defaults are uu.Galaxy.Detail*'s.
+		float DetailSteps = 0.0f;                         // a layer's steps at its resolving step past the log step's reach (0: no step cap)
+		float DetailStepTexels = 4.0f;                    // the resolving step in the layer's texels
+		float DetailFreq0 = 0.0f, DetailLight0 = 0.0f, DetailDust0 = 0.0f;   // layer 0: x the detail's frequency (0: off), amplitudes 0..1
+		float DetailFreq1 = 0.0f, DetailLight1 = 0.0f, DetailDust1 = 0.0f;   // layer 1
+		float DetailFoot = 0.5f;                          // a layer read over at least this x the step's share
 		/** D-203: cell glow: the LUT carries each table's drawn light per level, and the source's
 		 *  loading cells (FVolumeSource::CellGlow) are drawn as glow by the march. */
 		bool bCellGlow = false;
@@ -1197,7 +1212,11 @@ namespace UniCore
 			V.StepFoot = S.StepFoot;                     // D-255
 			V.SegmentTaps = S.SegmentTaps;               // D-262
 			V.OpaqueCutoff = S.OpaqueCutoff;             // D-262
-			V.SegPad1 = 0u; V.SegPad2 = 0u;
+			V.DetailSteps = S.DetailSteps;               // D-265
+			V.DetailStepTexels = S.DetailStepTexels;
+			V.DetailFreq0 = S.DetailFreq0; V.DetailLight0 = S.DetailLight0; V.DetailDust0 = S.DetailDust0;
+			V.DetailFreq1 = S.DetailFreq1; V.DetailLight1 = S.DetailLight1; V.DetailDust1 = S.DetailDust1;
+			V.DetailFoot = S.DetailFoot; V.DetailPad = 0.0f;
 			V.JitterShift = 0.0f;   // D-240: set per frame by the renderer
 			V.HintScale = S.HintScale;
 			return Out;

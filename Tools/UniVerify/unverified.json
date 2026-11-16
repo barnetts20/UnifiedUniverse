@@ -314,5 +314,9 @@
   {
     "id": "UE-88",
     "what": "D-264: the tuning page's Reset All / Reset Filtered To Defaults buttons show and work (CallInEditor on the settings object), the page refreshes, uu.Tuning.Reset [filter] does the same, the ini is untouched until Set as Default (REVIEW_TONIGHT section 89)."
+  },
+  {
+    "id": "UE-89",
+    "what": "D-265: the camera's galaxy's detail layers in the engine: cloudier near disc without grain or a fade band, the volume pass's cost with uu.Galaxy.Detail.Steps 0 / 16 / 32, the Galaxy|Detail Layers page live (REVIEW_TONIGHT section 90)."
   }
 ]

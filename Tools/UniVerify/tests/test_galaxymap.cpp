@@ -1,7 +1,8 @@
 // D-212: the galaxy map (UniGalaxyMap.h; Uni_GalaxyMapTexel / Uni_GalaxyMapEval in UniFields.ush):
 // the camera's own galaxy marched from its baked 2D map against its field. (D-211's clipmap, which
 // this file first tested, was removed in D-213.) D-255: T2.vol.galaxy_map_stepfoot, the map read over
-// the march's step along the disc (uu.Volume.StepFoot).
+// the march's step along the disc (uu.Volume.StepFoot). D-262: T2.vol.galaxy_segment. D-265:
+// T2.vol.galaxy_detail_layers, the camera's galaxy's detail layers and their step cap.
 #include "../src/UniTest.h"
 #include "../src/UniVerifyCommon.h"
 #include "../src/UniRenderRef.h"
@@ -405,4 +406,106 @@ UNI_TEST(volume, galaxy_segment)
 	Uni::Check(2, "T2.vol.galaxy_segment", "D-262 paradigm C: the camera's galaxy's step read at up to SegmentTaps points along its run; from the solar circle along and across the disc and from 300 pc above, 8 jitter phases against a fine reference (an eighth of the steps, unjittered, StepFoot 0): SegmentTaps 4 at StepFoot 0.5 nearer the reference than D-255's one tap, its spread over the phases within 1.5x D-255's and no more than StepFoot 0's")
 		.Metric("err_d255", SumErr[1]).Metric("err_taps4", SumErr[2]).Metric("err_taps8", SumErr[3]).Metric("spread_d255", SumSpread[1]).Metric("spread_taps4", SumSpread[2]).Metric("spread_foot0", SumSpread[0])
 		.Pass(bPass, "mean: " + Sum + "; " + Detail);
+}
+
+UNI_TEST(volume, galaxy_detail_layers)
+{
+	// D-265 (owner 2026-11-16: a layered density march: detail layers near the camera, steps scaled
+	// by their frequency): the camera's galaxy with the engine's default layers (x4 and x16 the
+	// detail's frequency, light and dust 0.5, 16 steps a layer at 4 of its texels), from the solar
+	// circle toward the centre and from 300 pc above looking down: 8 jitter phases against each
+	// configuration's own fine reference (an eighth of the steps, unjittered, StepFoot 0, one tap).
+	// Held: the layers keep the frame's light within 4% of the layers off (each multiplier's mean is 1
+	// at every mip; a frame holds only a few of the x4 layer's 2 kpc features, so its own mean
+	// wanders: -1.1% toward the centre, -2.5% from above when set); with the step cap the spread over
+	// the phases (grain) no more than the layers read without it (the step's fade alone) and the
+	// error against the reference under 2.5% (1.1%, 1.8% when set); the steps a ray at most 2x the
+	// layers off (x1.50).
+	const FCacheTex& Tx = GalTex();
+	if (!Tx.bOk) { Uni::Check(2, "T2.vol.galaxy_detail_layers", "D-265 detail layers").Pass(false, "textures not loaded: " + Tx.Err); return; }
+	FGalBindAll Bind(Tx);
+	FUniverseDef D = UniScenes::Flythrough();
+	UniScenes::UseGalaxyTextures(D, Tx.T[0].Size);
+	UniScenes::UseGalaxyPalettes(D);
+	FUniverseModel M(D);
+	FRefGenerator G(M);
+	FVolumeBuilder VB(M, G);
+	struct FView { const char* Name; FVec3d Pos; FV3 Look; };
+	const FView Views[] = {
+		{ "toward the centre", { 8.0 * Units::Kpc, 1.0 * Units::Kpc, 20.0 * Units::Pc }, { -1.0, 0.05, 0.02 } },
+		{ "300 pc above, down 30 deg", { 8.0 * Units::Kpc, 1.0 * Units::Kpc, 300.0 * Units::Pc }, { -0.85, 0.1, -0.5 } },
+	};
+	struct FCfg { const char* Name; bool bOn; float Steps; };
+	const FCfg Cfgs[] = { { "off", false, 0.0f }, { "layers, no step cap", true, 0.0f }, { "layers, 16 steps", true, 16.0f } };
+	constexpr int NC = 3, NV = 2;
+	double Err[NC] = {}, Spread[NC] = {}, Light[NC] = {}, Steps[NC] = {};
+	std::string Detail;
+	bool bPass = true;
+	FGalaxyMap Map;
+	bool bBaked = false;
+	for (const FView& Vw : Views)
+	{
+		const FCoord Cam = CamAt(Vw.Pos);
+		FRefPipeline P(G);
+		P.bVelocityLod = false;
+		P.Update(Cam, FVec3f{});
+		FCamera Cm; Cm.Coord = Cam; Cm.Width = 96; Cm.Height = 54; Cm.LookAlong(Vw.Look);
+		auto Scene = [&](const FCfg& C, bool bRef) -> FVolumeScene
+		{
+			FVolumeSettings S;
+			S.StepFoot = bRef ? 0.0f : 0.5f; S.SegmentTaps = bRef ? 1u : 4u;
+			if (C.bOn) { S.DetailFreq0 = 4.0f; S.DetailLight0 = 0.5f; S.DetailDust0 = 0.5f; S.DetailFreq1 = 16.0f; S.DetailLight1 = 0.5f; S.DetailDust1 = 0.5f; }
+			S.DetailSteps = C.Steps; S.DetailStepTexels = 4.0f; S.DetailFoot = 0.5f;
+			FVolumeScene Sc = VB.Build(P, Cam, FVec3f{}, Cm.View(), S).Subset(false);
+			const FCarrierGPU* Home = HomeCarrierOf(Sc);
+			if (Home && !bBaked) { Map.Bake(*Home, Sc.Params, 512u, 2); bBaked = true; }
+			if (Home) { PublishGalaxyMap(Sc.View, Sc.Home.Carrier, 512u); }
+			if (bRef) { Sc.View.MarchFlags |= 2u; Sc.View.MaxSteps = 65536u; }
+			return Sc;
+		};
+		{ FVolumeScene S0 = Scene(Cfgs[0], true); (void)S0; }
+		BindGalaxyMap(0u, &Map);
+		if (!bBaked) { bPass = false; Detail += Uni::Fmt("%s%s: NO HOME", Detail.empty() ? "" : "; ", Vw.Name); BindGalaxyMap(0u, nullptr); continue; }
+		double OffMean = 0.0;
+		std::string Vd;
+		for (int C = 0; C < NC; ++C)
+		{
+			const FRun Ref = March(Scene(Cfgs[C], true), Cm);
+			double RefMean = 0.0;
+			for (double L : Ref.Lum) { RefMean += L; }
+			RefMean /= double(Ref.Lum.size());
+			FVolumeScene Sc = Scene(Cfgs[C], false);
+			Sc.View.MarchFlags |= H::UNI_VOL_JITTER_FLAG;
+			const int Np = 8;
+			std::vector<double> S1(Ref.Lum.size(), 0.0), S2 = S1;
+			double St = 0.0;
+			for (int Ph = 0; Ph < Np; ++Ph)
+			{
+				Sc.View.JitterShift = float(Ph) * 0.61803398875f;
+				const FRun R = March(Sc, Cm);
+				St += R.Steps / Np;
+				for (size_t I = 0; I < R.Lum.size(); ++I) { S1[I] += R.Lum[I]; S2[I] += R.Lum[I] * R.Lum[I]; }
+			}
+			double Sm = 0.0, Ss = 0.0, Ea = 0.0;
+			for (size_t I = 0; I < S1.size(); ++I)
+			{
+				const double Mu = S1[I] / Np;
+				Sm += Mu;
+				Ss += std::sqrt(std::max(S2[I] / Np - Mu * Mu, 0.0));
+				Ea += std::abs(Mu - Ref.Lum[I]);
+			}
+			const double N = double(S1.size());
+			if (C == 0) { OffMean = Sm / N; }
+			const double E = Ea / std::max(RefMean * N, 1e-300), Sp = Ss / std::max(Sm, 1e-300), Li = Sm / N / std::max(OffMean, 1e-300) - 1.0;
+			Err[C] = std::max(Err[C], E); Spread[C] += Sp / NV; Light[C] = std::abs(Li) > std::abs(Light[C]) ? Li : Light[C]; Steps[C] += St / NV;
+			Vd += Uni::Fmt("%s%s err %.2f%% spread %.3f%% light %+.2f%% steps %.1f", Vd.empty() ? "" : ", ", Cfgs[C].Name, 100.0 * E, 100.0 * Sp, 100.0 * Li, St);
+		}
+		BindGalaxyMap(0u, nullptr);
+		Detail += Uni::Fmt("%s%s: %s", Detail.empty() ? "" : "; ", Vw.Name, Vd.c_str());
+	}
+	const double StepsX = Steps[2] / std::max(Steps[0], 1e-9);
+	bPass = bPass && std::abs(Light[1]) <= 0.04 && std::abs(Light[2]) <= 0.04 && Spread[2] <= Spread[1] && Err[2] < 0.025 && StepsX <= 2.0;
+	Uni::Check(2, "T2.vol.galaxy_detail_layers", "D-265 detail layers (x4, x16; light and dust 0.5; 16 steps a layer at 4 texels): from the solar circle toward the centre and 300 pc above, 8 jitter phases against each configuration's fine reference: the light within 4% of the layers off, with the step cap the grain no more than the layers' without it, the error under 2.5%, the steps at most 2x")
+		.Metric("light_on", Light[2]).Metric("spread_off", Spread[0]).Metric("spread_nocap", Spread[1]).Metric("spread_cap", Spread[2]).Metric("err_cap", Err[2]).Metric("steps_x", StepsX)
+		.Pass(bPass, Detail + Uni::Fmt("; steps x%.2f", StepsX));
 }

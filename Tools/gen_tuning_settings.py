@@ -70,6 +70,7 @@ CATEGORIES = [
     ("uu.GalaxyTextures", "Textures"),
     ("uu.WebTex", "Textures"),
     ("uu.WebSource", "Textures"),
+    ("uu.Galaxy.Detail.", "Galaxy|Detail Layers"),
     ("uu.Galaxy.Knot", "Galaxy|Shape and Noise"),
     ("uu.Galaxy.DustStructure", "Galaxy|Shape and Noise"),
     ("uu.Galaxy.LightStructure", "Galaxy|Shape and Noise"),
@@ -95,7 +96,7 @@ CATEGORIES = [
 ]
 # The page's order (the details panel keeps declaration order).
 CAT_ORDER = ["March|Paradigms", "March|Steps", "March|Sampling and Noise", "March|Temporal", "March|Resolution", "March|Galaxy Map",
-             "March|Voxel Grid (nebulae)", "March|Far Cache", "March|Other", "Textures", "Galaxy|Shape and Noise", "Galaxy|Balance",
+             "March|Voxel Grid (nebulae)", "March|Far Cache", "March|Other", "Textures", "Galaxy|Shape and Noise", "Galaxy|Detail Layers", "Galaxy|Balance",
              "Nebulae", "Population", "Population|Clusters", "Sprites", "Web", "Travel", "Lighting", "Background",
              "Streaming and Generation", "Debug"]
 REENABLE_PREFIX = ("uu.Cluster.", "uu.Group.", "uu.Star.", "uu.WebTex", "uu.WebSource", "uu.WebTexture", "uu.GalaxyTextures", "uu.GalaxyPalettes", "uu.GalaxyTexture.")

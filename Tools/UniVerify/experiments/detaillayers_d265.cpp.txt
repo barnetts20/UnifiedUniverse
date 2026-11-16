@@ -1,0 +1,233 @@
+// detaillayers_d265.cpp.txt (archived exploration; were UNI_TEST(zz, detaillayers) and UNI_TEST(zz, detailimg) in tests/test_galaxymap.cpp): D-265, the owner's layered density march (detail layers near the camera, steps scaled by their frequency). The Milky Way (radius 24 kpc, detail period 8 kpc, texel 62.5 pc; layer x4: 15.6 pc texels, x16: 3.9 pc) from the solar circle: per configuration the 8-phase jittered march against its own fine reference (error, spread = grain), the light against the layers off, steps a ray; and 320x180 images (det_<view>_<config>.ppm). Result (toward the centre): off err 0.46% spread 1.22% 40.7 steps; x4 fade only 0.78% / 1.51%; x4 32 steps 0.78% / 1.24% (x1.58 steps); x4+x16 fade only 1.07% / 1.72%; x4+x16 16 steps 1.09% / 1.40% (x1.49); x4+x16 32 steps 1.07% / 1.20% (x2.12); light -1.1% throughout. The images: organic cloud structure near the camera, none lost far.
+// Needs #include <thread>. Run: univerify test --group zz.detaillayers (UNI_DET="f0 l0 d0 f1 l1 d1 steps texels foot", UNI_SEG_VIEWS) / zz.detailimg (UNI_DET_OUT, UNI_DET_W, UNI_DET_VIEW).
+
+UNI_TEST(zz, detaillayers)
+{
+	// D-265 exploration (owner 2026-11-16: a layered density march, detail layers near the camera,
+	// steps scaled by the layers' frequency): the Milky Way from the solar circle toward the centre,
+	// along the disc, and 300 pc above looking down; per configuration the 8-phase jittered march
+	// against its own fine reference (an eighth of the steps, unjittered, StepFoot 0, one tap: the
+	// layers sharp): the error and the spread over the phases (grain), the light against the
+	// layers-off reference (what the layers change in brightness), steps a ray and time.
+	// UNI_DET="f0 l0 d0 f1 l1 d1 steps texels foot" adds a custom configuration.
+	const FCacheTex& Tx = GalTex();
+	if (!Tx.bOk) { std::printf("    textures not loaded: %s\n", Tx.Err.c_str()); return; }
+	FGalBindAll Bind(Tx);
+	FUniverseDef D = UniScenes::Flythrough();
+	UniScenes::UseGalaxyTextures(D, Tx.T[0].Size);
+	UniScenes::UseGalaxyPalettes(D);
+	FUniverseModel M(D);
+	FRefGenerator G(M);
+	FVolumeBuilder VB(M, G);
+	struct FView { const char* Name; FVec3d Pos; FV3 Look; };
+	const FView Views[] = {
+		{ "toward the centre", { 8.0 * Units::Kpc, 1.0 * Units::Kpc, 20.0 * Units::Pc }, { -1.0, 0.05, 0.02 } },
+		{ "along the disc", { 8.0 * Units::Kpc, 1.0 * Units::Kpc, 20.0 * Units::Pc }, { 0.05, 1.0, 0.02 } },
+		{ "300 pc above, down 30 deg", { 8.0 * Units::Kpc, 1.0 * Units::Kpc, 300.0 * Units::Pc }, { -0.85, 0.1, -0.5 } },
+	};
+	struct FCfg { std::string Name; float F0, L0, D0, F1, L1, D1, Steps, Texels, Foot; };
+	std::vector<FCfg> Cfgs = {
+		{ "off", 0, 0, 0, 0, 0, 0, 0, 4, 0.5f },
+		{ "L4 fade only", 4, 0.5f, 0.5f, 0, 0, 0, 0, 4, 0.5f },
+		{ "L4 steps 16", 4, 0.5f, 0.5f, 0, 0, 0, 16, 4, 0.5f },
+		{ "L4 steps 32", 4, 0.5f, 0.5f, 0, 0, 0, 32, 4, 0.5f },
+		{ "L4+L16 fade only", 4, 0.5f, 0.5f, 16, 0.5f, 0.5f, 0, 4, 0.5f },
+		{ "L4+L16 steps 16", 4, 0.5f, 0.5f, 16, 0.5f, 0.5f, 16, 4, 0.5f },
+		{ "L4+L16 steps 32", 4, 0.5f, 0.5f, 16, 0.5f, 0.5f, 32, 4, 0.5f },
+	};
+	if (const char* E = std::getenv("UNI_DET"))
+	{
+		FCfg C{ "custom", 0, 0, 0, 0, 0, 0, 0, 4, 0.5f };
+		if (std::sscanf(E, "%f %f %f %f %f %f %f %f %f", &C.F0, &C.L0, &C.D0, &C.F1, &C.L1, &C.D1, &C.Steps, &C.Texels, &C.Foot) >= 7)
+		{
+			if (std::getenv("UNI_DET_ONLY")) { Cfgs.resize(1); }
+			Cfgs.push_back(C);
+		}
+	}
+	const int NC = int(Cfgs.size());
+	const char* OnlyEnv = std::getenv("UNI_SEG_VIEWS");
+	const int NV = OnlyEnv ? std::max(1, std::min(3, std::atoi(OnlyEnv))) : 3;
+	FGalaxyMap Map;
+	bool bBaked = false;
+	std::vector<double> SumErr(NC, 0.0), SumSpread(NC, 0.0), SumLight(NC, 0.0), SumSteps(NC, 0.0), SumMs(NC, 0.0), SumRefSteps(NC, 0.0);
+	for (int Vi = 0; Vi < NV; ++Vi)
+	{
+		const FView& Vw = Views[Vi];
+		const FCoord Cam = CamAt(Vw.Pos);
+		FRefPipeline P(G);
+		P.bVelocityLod = false;
+		P.Update(Cam, FVec3f{});
+		FCamera Cm; Cm.Coord = Cam; Cm.Width = 96; Cm.Height = 54; Cm.LookAlong(Vw.Look);
+		auto Scene = [&](const FCfg& C, bool bRef) -> FVolumeScene
+		{
+			FVolumeSettings S;
+			S.StepFoot = bRef ? 0.0f : 0.5f; S.SegmentTaps = bRef ? 1u : 4u;
+			S.DetailFreq0 = C.F0; S.DetailLight0 = C.L0; S.DetailDust0 = C.D0;
+			S.DetailFreq1 = C.F1; S.DetailLight1 = C.L1; S.DetailDust1 = C.D1;
+			S.DetailSteps = C.Steps; S.DetailStepTexels = C.Texels; S.DetailFoot = C.Foot;
+			FVolumeScene Sc = VB.Build(P, Cam, FVec3f{}, Cm.View(), S).Subset(false);
+			const FCarrierGPU* Home = HomeCarrierOf(Sc);
+			if (Home && !bBaked)
+			{
+				Map.Bake(*Home, Sc.Params, 512u, 2); bBaked = true;
+				const auto& Pa = Sc.Params[Home->ParamIndex].V;
+				const double Rpc = 1.0 / double(Home->InvRadius) / Units::Pc;
+				std::printf("    home: radius %.0f pc, G.w %.3f, H.w %.0f: the detail's period %.0f pc, texel %.1f pc\n", Rpc, Pa[27], Pa[31], Rpc / Pa[27], Rpc / (Pa[27] * Pa[31]));
+			}
+			if (Home) { PublishGalaxyMap(Sc.View, Sc.Home.Carrier, 512u); }
+			if (bRef) { Sc.View.MarchFlags |= 2u; Sc.View.MaxSteps = 65536u; }
+			return Sc;
+		};
+		{ FVolumeScene S0 = Scene(Cfgs[0], true); (void)S0; }
+		BindGalaxyMap(0u, &Map);
+		if (!bBaked) { std::printf("    %s: NO HOME\n", Vw.Name); BindGalaxyMap(0u, nullptr); continue; }
+		const FRun Ref0 = March(Scene(Cfgs[0], true), Cm);
+		double Ref0Mean = 0.0;
+		for (double L : Ref0.Lum) { Ref0Mean += L; }
+		Ref0Mean /= double(Ref0.Lum.size());
+		std::printf("    %s (reference off: %.0f steps a ray)\n", Vw.Name, Ref0.Steps);
+		for (int C = 0; C < NC; ++C)
+		{
+			const FRun Ref = C == 0 ? Ref0 : March(Scene(Cfgs[C], true), Cm);
+			double RefMean = 0.0;
+			for (double L : Ref.Lum) { RefMean += L; }
+			RefMean /= double(Ref.Lum.size());
+			FVolumeScene Sc = Scene(Cfgs[C], false);
+			Sc.View.MarchFlags |= H::UNI_VOL_JITTER_FLAG;
+			const int Np = 8;
+			std::vector<double> S1(Ref.Lum.size(), 0.0), S2 = S1;
+			double Ms = 0.0, St = 0.0;
+			for (int Ph = 0; Ph < Np; ++Ph)
+			{
+				Sc.View.JitterShift = float(Ph) * 0.61803398875f;
+				const FRun R = March(Sc, Cm);
+				Ms += R.Ms; St += R.Steps;
+				for (size_t I = 0; I < R.Lum.size(); ++I) { S1[I] += R.Lum[I]; S2[I] += R.Lum[I] * R.Lum[I]; }
+			}
+			double Sm = 0.0, Ss = 0.0, Err = 0.0;
+			for (size_t I = 0; I < S1.size(); ++I)
+			{
+				const double Mu = S1[I] / Np;
+				Sm += Mu;
+				Ss += std::sqrt(std::max(S2[I] / Np - Mu * Mu, 0.0));
+				Err += std::abs(Mu - Ref.Lum[I]);
+			}
+			const double N = double(S1.size());
+			const double E = Err / std::max(RefMean * N, 1e-300), Spread = Ss / std::max(Sm, 1e-300);
+			const double Light = Sm / N / std::max(Ref0Mean, 1e-300) - 1.0, RefLight = RefMean / std::max(Ref0Mean, 1e-300) - 1.0;
+			SumErr[C] += E / NV; SumSpread[C] += Spread / NV; SumLight[C] += Light / NV; SumSteps[C] += St / Np / NV; SumMs[C] += Ms / Np / NV; SumRefSteps[C] += Ref.Steps / NV;
+			std::printf("      %-18s err %5.2f%%  spread %6.3f%%  light %+6.2f%% (its ref %+6.2f%%)  steps %6.1f  ref steps %7.0f  %5.0f ms\n",
+				Cfgs[C].Name.c_str(), 100.0 * E, 100.0 * Spread, 100.0 * Light, 100.0 * RefLight, St / Np, Ref.Steps, Ms / Np);
+		}
+		BindGalaxyMap(0u, nullptr);
+	}
+	std::printf("    mean over the views:\n");
+	for (int C = 0; C < NC; ++C)
+	{
+		std::printf("      %-18s err %5.2f%%  spread %6.3f%%  light %+6.2f%%  steps %6.1f (x%.2f)  ref steps %7.0f  %5.0f ms\n",
+			Cfgs[C].Name.c_str(), 100.0 * SumErr[C], 100.0 * SumSpread[C], 100.0 * SumLight[C], SumSteps[C], SumSteps[C] / std::max(SumSteps[0], 1e-9), SumRefSteps[C], SumMs[C]);
+	}
+}
+
+UNI_TEST(zz, detailimg)
+{
+	// D-265 exploration: images of the camera's galaxy with the detail layers off and on (8 jitter
+	// phases averaged, as the accumulation would), one exposure per view, to UNI_DET_OUT (PPM).
+	const FCacheTex& Tx = GalTex();
+	if (!Tx.bOk) { std::printf("    textures not loaded: %s\n", Tx.Err.c_str()); return; }
+	FGalBindAll Bind(Tx);
+	FUniverseDef D = UniScenes::Flythrough();
+	UniScenes::UseGalaxyTextures(D, Tx.T[0].Size);
+	UniScenes::UseGalaxyPalettes(D);
+	FUniverseModel M(D);
+	FRefGenerator G(M);
+	FVolumeBuilder VB(M, G);
+	const std::string Dir = std::getenv("UNI_DET_OUT") ? std::getenv("UNI_DET_OUT") : "/tmp";
+	const int W = std::getenv("UNI_DET_W") ? std::atoi(std::getenv("UNI_DET_W")) : 320, Hh = W * 9 / 16;
+	struct FView { const char* Name; FVec3d Pos; FV3 Look; };
+	const FView Views[] = {
+		{ "centre", { 8.0 * Units::Kpc, 1.0 * Units::Kpc, 20.0 * Units::Pc }, { -1.0, 0.05, 0.02 } },
+		{ "along", { 8.0 * Units::Kpc, 1.0 * Units::Kpc, 20.0 * Units::Pc }, { 0.05, 1.0, 0.02 } },
+		{ "above300", { 8.0 * Units::Kpc, 1.0 * Units::Kpc, 300.0 * Units::Pc }, { -0.85, 0.1, -0.5 } },
+		{ "above1k", { 8.0 * Units::Kpc, 1.0 * Units::Kpc, 1000.0 * Units::Pc }, { -0.5, 0.1, -0.85 } },
+	};
+	struct FCfg { const char* Name; float F0, L0, D0, F1, L1, D1, Steps; };
+	std::vector<FCfg> Cfgs = { { "off", 0, 0, 0, 0, 0, 0, 0 }, { "l4", 4, 0.5f, 0.5f, 0, 0, 0, 32 }, { "l4l16", 4, 0.5f, 0.5f, 16, 0.5f, 0.5f, 32 } };
+	if (const char* E = std::getenv("UNI_DET"))
+	{
+		static FCfg C{ "custom", 0, 0, 0, 0, 0, 0, 0 };
+		if (std::sscanf(E, "%f %f %f %f %f %f %f", &C.F0, &C.L0, &C.D0, &C.F1, &C.L1, &C.D1, &C.Steps) == 7) { Cfgs.push_back(C); }
+	}
+	const char* OnlyV = std::getenv("UNI_DET_VIEW");
+	FGalaxyMap Map;
+	bool bBaked = false;
+	for (const FView& Vw : Views)
+	{
+		if (OnlyV && std::strcmp(OnlyV, Vw.Name) != 0) { continue; }
+		const FCoord Cam = CamAt(Vw.Pos);
+		FRefPipeline P(G);
+		P.bVelocityLod = false;
+		P.Update(Cam, FVec3f{});
+		FCamera Cm; Cm.Coord = Cam; Cm.Width = W; Cm.Height = Hh; Cm.LookAlong(Vw.Look);
+		double Scale = 0.0;
+		for (const FCfg& C : Cfgs)
+		{
+			FVolumeSettings S;
+			S.StepFoot = 0.5f; S.SegmentTaps = 4u;
+			S.DetailFreq0 = C.F0; S.DetailLight0 = C.L0; S.DetailDust0 = C.D0;
+			S.DetailFreq1 = C.F1; S.DetailLight1 = C.L1; S.DetailDust1 = C.D1;
+			S.DetailSteps = C.Steps;
+			FVolumeScene Sc = VB.Build(P, Cam, FVec3f{}, Cm.View(), S).Subset(false);
+			const FCarrierGPU* Home = HomeCarrierOf(Sc);
+			if (!Home) { std::printf("    %s: NO HOME\n", Vw.Name); break; }
+			if (!bBaked) { Map.Bake(*Home, Sc.Params, 512u, 2); bBaked = true; }
+			PublishGalaxyMap(Sc.View, Sc.Home.Carrier, 512u);
+			BindGalaxyMap(0u, &Map);
+			Sc.View.MarchFlags |= H::UNI_VOL_JITTER_FLAG;
+			std::vector<double> Rgb(size_t(W) * Hh * 3, 0.0);
+			double Steps = 0.0;
+			const int Np = 8;
+			const auto T0 = std::chrono::steady_clock::now();
+			for (int Ph = 0; Ph < Np; ++Ph)
+			{
+				Sc.View.JitterShift = float(Ph) * 0.61803398875f;
+				const auto V = ToHlsl(Sc.View);
+				const auto Cb = Sc.CarrierBuf(); const auto Pb = Sc.ParamBuf(); const auto Lb = Sc.LutBuf();
+				std::vector<double> RowSteps(size_t(Hh), 0.0);
+				auto Rows = [&](int Y0, int Y1)
+				{
+					for (int Y = Y0; Y < Y1; ++Y)
+					{
+						for (int X = 0; X < W; ++X)
+						{
+							bool bS = false;
+							const H::FUniVolumeResult R = MarchPixel(Cb, Pb, Lb, V, Cm, W, Hh, X, Y, 3.0e38f, bS);
+							double* O = &Rgb[(size_t(Y) * W + X) * 3];
+							O[0] += R.Radiance.x / Np; O[1] += R.Radiance.y / Np; O[2] += R.Radiance.z / Np;
+							RowSteps[size_t(Y)] += R.Steps;
+						}
+					}
+				};
+				std::thread Th(Rows, 0, Hh / 2);
+				Rows(Hh / 2, Hh);
+				Th.join();
+				for (double Sr : RowSteps) { Steps += Sr / (double(W) * Hh * Np); }
+			}
+			BindGalaxyMap(0u, nullptr);
+			const double Ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - T0).count() / Np;
+			if (Scale == 0.0)
+			{
+				std::vector<double> L(size_t(W) * Hh);
+				for (size_t I = 0; I < L.size(); ++I) { L[I] = 0.2126 * Rgb[I * 3] + 0.7152 * Rgb[I * 3 + 1] + 0.0722 * Rgb[I * 3 + 2]; }
+				std::nth_element(L.begin(), L.begin() + L.size() * 98 / 100, L.end());
+				Scale = 2.0 / std::max(L[L.size() * 98 / 100], 1e-30);
+			}
+			FImage Img(W, Hh);
+			for (size_t I = 0; I < Rgb.size(); ++I) { Img.Rgb[I] = float(Rgb[I] * Scale); }
+			const std::string Path = Dir + "/det_" + Vw.Name + "_" + C.Name + ".ppm";
+			Img.WritePpm(Path);
+			std::printf("    %s %s: %.1f steps a ray, %.0f ms a phase -> %s\n", Vw.Name, C.Name, Steps, Ms, Path.c_str());
+			std::fflush(stdout);
+		}
+	}
+}
