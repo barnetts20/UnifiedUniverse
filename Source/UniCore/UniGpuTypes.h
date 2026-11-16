@@ -90,8 +90,9 @@ namespace UniCore
 		float Mean;
 		float Envelope;
 		float Oct[8];   // D-214: octant envelopes (galaxy fields; others: Envelope each)
+		float Gc[28];   // D-238: GcHead, GcIdx0, GcIdx1, GcMass0, GcMass1 (the clusters a small box holds); D-239: OcHead, OcRange
 	};
-	static_assert(sizeof(FTaskCountGPU) == 48, "FTaskCountGPU must match FUniTaskCount (UniGenTask.ush)");
+	static_assert(sizeof(FTaskCountGPU) == 160, "FTaskCountGPU must match FUniTaskCount (UniGenTask.ush)");
 
 	// GPU-MIRROR
 	struct FSliceGPU

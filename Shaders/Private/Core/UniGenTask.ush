@@ -88,8 +88,8 @@ struct FUniSlice
 	float FaintM;
 };
 
-/** Probe-phase result per task, read back to the CPU. 48 bytes (D-214: the octant envelopes).
- *  GPU-MIRROR: UniCore::FTaskCountGPU. */
+/** Probe-phase result per task, read back to the CPU. 128 bytes (D-214: the octant envelopes;
+ *  D-238: the globular clusters the task's box holds). GPU-MIRROR: UniCore::FTaskCountGPU. */
 struct FUniTaskCount
 {
 	uint Count;               // Poisson n (before truncation)
@@ -98,7 +98,39 @@ struct FUniTaskCount
 	float Envelope;           // the largest envelope (D-214: of the octants, galaxy fields)
 	float4 OctLo;             // D-214: octants 0..3's envelopes (galaxy fields; others: Envelope each)
 	float4 OctHi;             //        octants 4..7
+	float4 GcHead;            // D-238: (globulars listed, their masses in the box, that over the box's volume: the candidates' share, 0)
+	float4 GcIdx0;            // their lattice cells, packed (Uni_GcPack), 0..3
+	float4 GcIdx1;            //   4..7
+	float4 GcMass0;           // their masses in the box, 0..3
+	float4 GcMass1;           //   4..7
+	float4 OcHead;            // D-239: a larger box's open clusters, drawn by lattice cell: (their candidates' share: cells x the two bounds over the box's volume, the bound on weight x in-box share, on the saturated young light, their masses in the box over its volume)
+	float4 OcRange;           //        the lattice cells (x0, y0, nx, ny) the box reaches
 };
+
+static const uint UNI_GC_LIST = 8u;   // D-238: clusters a task lists (D-239: globulars and open clusters together)
+
+UNI_FN float Uni_GcPack(int3 InCell)
+{
+	return (float)(((uint)(InCell.x + (int)UNI_GC_PACK) & 255u) | ((((uint)(InCell.y + (int)UNI_GC_PACK)) & 255u) << 8u) | ((((uint)(InCell.z + (int)UNI_GC_PACK)) & 255u) << 16u));
+}
+
+UNI_FN int3 Uni_GcUnpack(float InV)
+{
+	const uint U = (uint)InV;
+	return int3((int)(U & 255u) - (int)UNI_GC_PACK, (int)((U >> 8u) & 255u) - (int)UNI_GC_PACK, (int)((U >> 16u) & 255u) - (int)UNI_GC_PACK);
+}
+
+/** D-239: an open cluster's lattice cell, packed negative (globulars' are non-negative). */
+UNI_FN float Uni_OcPack(int2 InCell)
+{
+	return -1.0f - (float)((((uint)(InCell.x + (int)UNI_OC_PACK)) & 4095u) | ((((uint)(InCell.y + (int)UNI_OC_PACK)) & 4095u) << 12u));
+}
+
+UNI_FN int2 Uni_OcUnpack(float InV)
+{
+	const uint U = (uint)(-1.0f - InV);
+	return int2((int)(U & 4095u) - (int)UNI_OC_PACK, (int)((U >> 12u) & 4095u) - (int)UNI_OC_PACK);
+}
 
 static const float UNI_OCTANT_PAD = 1.75f;   // D-214: an octant's envelope over its 16 probes' max (1.5: 3.0 candidates a star, 0.55% over it; 1.75: 3.5, 0.36%; 2.0: 4.0, 0.24%; one envelope: 6.2, 0.19%)
 static const uint UNI_GEN_CHUNK = 256u;     // D-214: candidates per group of the split place pass
@@ -111,8 +143,23 @@ struct FUniTaskEval
 	uint MapSlot;
 	uint bMap;                // a galaxy field with a map: its density is the map's light
 	uint bOctants;            // a galaxy field: one envelope per octant
-	uint Pad;
+	uint Hgc;                 // D-238: the globulars' hash
+	float GcN;                // D-238: the galaxy's globulars on average (0: none)
+	float GcL;                //        its lattice cell (field units)
+	uint bGcExact;            //        a box at most a lattice cell: its globulars listed and sampled exactly
+	uint bGcSmooth;           //        a larger box: the globulars as the smooth halo they average to
+	uint bOc;                 // D-239: the galaxy has open clusters
+	uint Hoc;                 //        their hash
+	float OcL;                //        their lattice cell (field units)
+	uint OcMode;              //        0 none; 1 a box at most half a cell: listed with the globulars; 2 up to UNI_OC_CELLS cells across: drawn by cell; 3 larger: their mean
 };
+
+/** D-238: the task's box edge along each axis, cell units (the whole cell where Span is 0). */
+UNI_FN float3 Uni_TaskBoxEdge(FUniGenTask InT)
+{
+	const float S = 1.0f / 4294967296.0f;
+	return float3(InT.BoxSpan.x == 0u ? 1.0f : (float)InT.BoxSpan.x * S, InT.BoxSpan.y == 0u ? 1.0f : (float)InT.BoxSpan.y * S, InT.BoxSpan.z == 0u ? 1.0f : (float)InT.BoxSpan.z * S);
+}
 
 UNI_FN FUniTaskEval Uni_TaskEvalOf(FUniGenTask InT)
 {
@@ -121,21 +168,68 @@ UNI_FN FUniTaskEval Uni_TaskEvalOf(FUniGenTask InT)
 	E.bOctants = InT.FieldId == UNI_FIELD_GALAXY ? 1u : 0u;
 	E.bMap = (InT.FieldId == UNI_FIELD_GALAXY && InT.BoxSpan.w != 0u) ? 1u : 0u;
 	E.MapSlot = E.bMap != 0u ? InT.BoxSpan.w - 1u : 0u;
-	E.Pad = 0u;
+	E.Hgc = Uni_SeedMix(E.K.Hs, 15u);
+	E.GcN = (InT.FieldId == UNI_FIELD_GALAXY && InT.Frame.Periodic == 0u) ? Uni_GalaxyGcCount(InT.Params, E.Hgc) : 0.0f;
+	E.GcL = Uni_GalaxyGcLattice(InT.Params);
+	const float3 Ed = Uni_TaskBoxEdge(InT);
+	const bool bSmall = InT.Frame.SizeP * max(Ed.x, max(Ed.y, Ed.z)) <= E.GcL;
+	E.bGcExact = (E.GcN > 0.0f && bSmall) ? 1u : 0u;
+	E.bGcSmooth = (E.GcN > 0.0f && !bSmall) ? 1u : 0u;
+	E.bOc = (InT.FieldId == UNI_FIELD_GALAXY && InT.Frame.Periodic == 0u && Uni_GalaxyOcOn(InT.Params)) ? 1u : 0u;
+	E.Hoc = Uni_SeedMix(E.K.Hs, 16u);
+	E.OcL = Uni_GalaxyOcLattice(InT.Params);
+	// The box's extent in the disc plane is at most its edge x sqrt(3) (any rotation); with a
+	// quarter cell either side for the clusters' halos, UNI_OC_CELLS - 2 cells of it fit the table.
+	const float Ext = InT.Frame.SizeP * max(Ed.x, max(Ed.y, Ed.z));
+	E.OcMode = E.bOc == 0u ? 0u : (Ext <= 0.5f * E.OcL ? 1u : (Ext * 1.7320508f <= (float)(UNI_OC_CELLS - 2u) * E.OcL ? 2u : 3u));
 	return E;
 }
 
-/** The density placement samples at box-unit position InU: the galaxy's map where it has one
- *  (D-214), the field otherwise. */
+/** D-238: the globulars' exact (unwidened) density at field point InP: the term the density
+ *  holds, which the probes and a larger box's samples take out. */
+UNI_FN float Uni_TaskGcExact(FUniGenTask InT, FUniTaskEval InE, float3 InP)
+{
+	return InE.GcN > 0.0f ? Uni_GalaxyGcDensity(InP, InT.Params, InE.Hgc, 0.0f, 0.0f) : 0.0f;
+}
+
+/** D-239: the field placement samples at field point InP, with its clusters' parts: OutYoung the
+ *  saturated young light the open clusters gather from, OutOc their part (that x C); soft edge
+ *  in. The galaxy's map where it has one (D-214), the field otherwise. */
+UNI_FN float Uni_TaskDensityParts(FUniGenTask InT, FUniTaskEval InE, float3 InP, UNI_OUT(float) OutYoung, UNI_OUT(float) OutOc)
+{
+	OutYoung = 0.0f; OutOc = 0.0f;
+	if (InT.FieldId != UNI_FIELD_GALAXY) { return Uni_FieldSample(InT.FieldId, InP, InT.Params); }
+	float4 Comp = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	float2 Oc = float2(0.0f, 0.0f);
+	const float Rho = InE.bMap != 0u ? Uni_GalaxyMapLightO(InP, InT.Params, InE.K, InE.MapSlot, Comp, Oc) : UniField_GalaxyO(InP, InT.Params, InE.K, Comp, Oc);
+	OutYoung = Oc.x; OutOc = Oc.y;
+	return Rho;
+}
+
+/** The density placement samples, from the parts at field point InP. D-238: a box larger than a
+ *  globular lattice cell samples the globulars as the smooth halo they average to (its probes
+ *  could not find them, nor its candidates fill them); a smaller one samples them exactly (its
+ *  count adds their mass in the box, its candidates are drawn from them too: Uni_TaskCandidate).
+ *  D-239: the open clusters likewise: exact where listed or drawn by cell (the probes take them
+ *  out, the count adds them), their mean (frac of the saturated young light) in a larger box. */
+UNI_FN float Uni_TaskDensityFrom(FUniGenTask InT, FUniTaskEval InE, float3 InP, float InRho, float InYoung, float InOc)
+{
+	float Rho = InRho;
+	if (InE.OcMode == 3u) { Rho = max(Rho - InOc, 0.0f) + UNI_OC_FRAC * InYoung; }
+	if (InE.bGcSmooth != 0u && dot(InP, InP) < InT.Params.D.x * InT.Params.D.x)
+	{
+		Rho = max(Rho - Uni_TaskGcExact(InT, InE, InP), 0.0f) + Uni_GalaxyGcSmooth(InP, InT.Params, InE.GcN, InE.GcL) * saturate((InT.Params.D.x - sqrt(dot(InP, InP))) / (0.05f * InT.Params.D.x));
+	}
+	return Rho;
+}
+
+/** The density placement samples at box-unit position InU (Uni_TaskDensityFrom). */
 UNI_FN float Uni_TaskDensity(FUniGenTask InT, FUniTaskEval InE, float3 InU)
 {
 	const float3 P = Uni_FieldFramePoint(InT.Frame, InU);
-	if (InE.bMap != 0u)
-	{
-		float4 Comp = float4(0.0f, 0.0f, 0.0f, 0.0f);
-		return Uni_GalaxyMapLight(P, InT.Params, InE.K, InE.MapSlot, Comp);
-	}
-	return Uni_FieldSample(InT.FieldId, P, InT.Params);
+	float Young, Oc;
+	const float Rho = Uni_TaskDensityParts(InT, InE, P, Young, Oc);
+	return Uni_TaskDensityFrom(InT, InE, P, Rho, Young, Oc);
 }
 
 /** D-214: probe K's octant of the sampling box (its stratum: 2 x 2 x 2 strata of the 4 x 4 x 4
@@ -166,14 +260,180 @@ UNI_FN float Uni_CountAccept(FUniTaskCount InC)
 	const bool bOne = InC.OctLo.x == InC.Envelope && InC.OctLo.y == InC.Envelope && InC.OctLo.z == InC.Envelope && InC.OctLo.w == InC.Envelope
 		&& InC.OctHi.x == InC.Envelope && InC.OctHi.y == InC.Envelope && InC.OctHi.z == InC.Envelope && InC.OctHi.w == InC.Envelope;
 	const float EnvMean = bOne ? InC.Envelope : (InC.OctLo.x + InC.OctLo.y + InC.OctLo.z + InC.OctLo.w + InC.OctHi.x + InC.OctHi.y + InC.OctHi.z + InC.OctHi.w) * 0.125f;
-	return max(InC.Mean / EnvMean, 1.0e-4f);
+	return max(InC.Mean / (EnvMean + InC.GcHead.z + InC.OcHead.x), 1.0e-4f);   // D-238, D-239: the clusters' candidates too
+}
+
+/** D-238: the octants' mean envelope (what a base candidate meets on average). */
+UNI_FN float Uni_CountEnvMean(FUniTaskCount InC)
+{
+	return (InC.OctLo.x + InC.OctLo.y + InC.OctLo.z + InC.OctLo.w + InC.OctHi.x + InC.OctHi.y + InC.OctHi.z + InC.OctHi.w) * 0.125f;
+}
+
+UNI_FN float Uni_CountGcIdx(FUniTaskCount InC, uint InK) { return InK < 4u ? Uni_F4At(InC.GcIdx0, InK) : Uni_F4At(InC.GcIdx1, InK - 4u); }
+UNI_FN float Uni_CountGcMass(FUniTaskCount InC, uint InK) { return InK < 4u ? Uni_F4At(InC.GcMass0, InK) : Uni_F4At(InC.GcMass1, InK - 4u); }
+
+/** D-238: a field point's position in the task's box units (the inverse of Uni_FieldFramePoint
+ *  composed with Uni_BoxUnit; galaxy frames are rotations). */
+UNI_FN float3 Uni_TaskBoxUnitOf(FUniGenTask InT, float3 InP)
+{
+	const float3 Q = InT.Frame.Rot0 * InP.x + InT.Frame.Rot1 * InP.y + InT.Frame.Rot2 * InP.z;
+	const float3 U = (Q - InT.Frame.OriginP) * (1.0f / InT.Frame.SizeP);
+	const float S = 1.0f / 4294967296.0f;
+	const float3 Lo = float3((float)InT.BoxLo.x * S, (float)InT.BoxLo.y * S, (float)InT.BoxLo.z * S);
+	const float3 Ed = Uni_TaskBoxEdge(InT);
+	return float3(InT.BoxSpan.x == 0u ? U.x : (U.x - Lo.x) / Ed.x, InT.BoxSpan.y == 0u ? U.y : (U.y - Lo.y) / Ed.y, InT.BoxSpan.z == 0u ? U.z : (U.z - Lo.z) / Ed.z);
+}
+
+/** D-238: a Gaussian's mass share inside the unit box, centre InV, sigma InS (box units per axis). */
+UNI_FN float Uni_GcBoxShare(float3 InV, float3 InS)
+{
+	const float3 K = float3(0.70710678f / max(InS.x, 1.0e-9f), 0.70710678f / max(InS.y, 1.0e-9f), 0.70710678f / max(InS.z, 1.0e-9f));
+	return 0.125f * (Uni_Erf((1.0f - InV.x) * K.x) + Uni_Erf(InV.x * K.x)) * (Uni_Erf((1.0f - InV.y) * K.y) + Uni_Erf(InV.y * K.y)) * (Uni_Erf((1.0f - InV.z) * K.z) + Uni_Erf(InV.z * K.z));
 }
 
 UNI_FN float Uni_TaskProbe(FUniGenTask InT, FUniTaskEval InE, uint InK)
 {
 	const float3 V = Uni_ProbeUnit(InT.CellSeed, InK);
 	const float3 U = float3(Uni_BoxUnit(V.x, InT.BoxLo.x, InT.BoxSpan.x), Uni_BoxUnit(V.y, InT.BoxLo.y, InT.BoxSpan.y), Uni_BoxUnit(V.z, InT.BoxLo.z, InT.BoxSpan.z));
-	return Uni_TaskDensity(InT, InE, U);
+	const float3 P = Uni_FieldFramePoint(InT.Frame, U);
+	float Young, Oc;
+	const float Rho = Uni_TaskDensityParts(InT, InE, P, Young, Oc);
+	float D = Uni_TaskDensityFrom(InT, InE, P, Rho, Young, Oc);
+	// D-238: a small box's probes see the field without its globulars (the count adds their mass
+	// in the box exactly; the envelope is the rest's).
+	if (InE.bGcExact != 0u) { D = max(D - Uni_TaskGcExact(InT, InE, P), 0.0f); }
+	// D-239: and without the open clusters, where its count adds them (listed or drawn by cell).
+	if (InE.OcMode == 1u || InE.OcMode == 2u) { D = max(D - Oc, 0.0f); }
+	return D;
+}
+
+/** D-238: a small box's globulars: those whose mass reaches it (up to UNI_GC_LIST, the most in it),
+ *  their mass inside it added to the count's mean and listed for the candidates. */
+UNI_FN void Uni_TaskCountGc(FUniGenTask InT, FUniTaskEval InE, UNI_INOUT(FUniTaskCount) C)
+{
+	C.GcHead = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	C.GcIdx0 = float4(0.0f, 0.0f, 0.0f, 0.0f); C.GcIdx1 = C.GcIdx0; C.GcMass0 = C.GcIdx0; C.GcMass1 = C.GcIdx0;
+	C.OcHead = C.GcIdx0; C.OcRange = C.GcIdx0;
+	if (InE.bGcExact == 0u && InE.OcMode != 1u && InE.OcMode != 2u) { return; }
+	// The box's corners in the field's frame: their bounds, and the lattice cells they reach.
+	float3 Lo = float3(3.0e38f, 3.0e38f, 3.0e38f), Hi = float3(-3.0e38f, -3.0e38f, -3.0e38f);
+	for (uint Cn = 0u; Cn < 8u; ++Cn)
+	{
+		const float3 U = float3(Uni_BoxUnit((Cn & 1u) != 0u ? 1.0f : 0.0f, InT.BoxLo.x, InT.BoxSpan.x), Uni_BoxUnit((Cn & 2u) != 0u ? 1.0f : 0.0f, InT.BoxLo.y, InT.BoxSpan.y), Uni_BoxUnit((Cn & 4u) != 0u ? 1.0f : 0.0f, InT.BoxLo.z, InT.BoxSpan.z));
+		const float3 P = Uni_FieldFramePoint(InT.Frame, U);
+		Lo = min(Lo, P); Hi = max(Hi, P);
+	}
+	const float L = InE.GcL;
+	const int3 A = int3((int)floor(Lo.x / L), (int)floor(Lo.y / L), (int)floor(Lo.z / L));
+	const int3 B = int3((int)floor(Hi.x / L), (int)floor(Hi.y / L), (int)floor(Hi.z / L));
+	const float3 Ed = Uni_TaskBoxEdge(InT);
+	const float3 Inv = float3(1.0f / (InT.Frame.SizeP * Ed.x), 1.0f / (InT.Frame.SizeP * Ed.y), 1.0f / (InT.Frame.SizeP * Ed.z));
+	const float Vol = InT.Frame.SizeP * Ed.x * InT.Frame.SizeP * Ed.y * InT.Frame.SizeP * Ed.z;
+	float Idx[UNI_GC_LIST];
+	float InBox[UNI_GC_LIST];
+	for (uint I0 = 0u; I0 < UNI_GC_LIST; ++I0) { Idx[I0] = 0.0f; InBox[I0] = 0.0f; }
+	uint N = 0u;
+	if (InE.bGcExact != 0u)
+	{
+	for (int Z = A.z; Z <= B.z; ++Z)
+	{
+		for (int Y = A.y; Y <= B.y; ++Y)
+		{
+			for (int X = A.x; X <= B.x; ++X)
+			{
+				if (abs(X) >= (int)UNI_GC_PACK || abs(Y) >= (int)UNI_GC_PACK || abs(Z) >= (int)UNI_GC_PACK) { continue; }
+				const FUniGc G = Uni_GalaxyGcAt(int3(X, Y, Z), InT.Params, InE.Hgc, InE.GcN, L);
+				if (!(G.M > 0.0f)) { continue; }
+				const float3 V = Uni_TaskBoxUnitOf(InT, G.C);
+				const float S2 = UNI_GC_HALO * G.S1;
+				const float Share = (1.0f - UNI_GC_HALO_SHARE) * Uni_GcBoxShare(V, G.S1 * Inv) + UNI_GC_HALO_SHARE * Uni_GcBoxShare(V, S2 * Inv);
+				const float Mb = G.M * Share;
+				if (!(Mb > 1.0e-6f * G.M)) { continue; }
+				// Keep the UNI_GC_LIST with the most mass in the box (replace the least).
+				uint Slot = N;
+				if (N >= UNI_GC_LIST)
+				{
+					Slot = 0u;
+					for (uint Q = 1u; Q < UNI_GC_LIST; ++Q) { if (InBox[Q] < InBox[Slot]) { Slot = Q; } }
+					if (!(Mb > InBox[Slot])) { continue; }
+				}
+				else { N = N + 1u; }
+				Idx[Slot] = Uni_GcPack(int3(X, Y, Z)); InBox[Slot] = Mb;
+			}
+		}
+	}
+	}
+	// D-239: the open clusters: a small box lists those reaching it with the globulars; a larger
+	// one sums the masses in it of those in the lattice cells it reaches (each the cluster's
+	// weight x its in-box share x the saturated young light at its centre) and keeps the cells
+	// and the two bounds its candidates draw them with (Uni_TaskCandidate).
+	if (InE.OcMode == 1u || InE.OcMode == 2u)
+	{
+		const float Lo2 = InE.OcL;
+		// A cluster's halo reaches at most a quarter cell from its centre (3 sigma).
+		const int2 Ao = int2((int)floor((Lo.x - 0.25f * Lo2) / Lo2), (int)floor((Lo.y - 0.25f * Lo2) / Lo2));
+		const int2 Bo = int2((int)floor((Hi.x + 0.25f * Lo2) / Lo2), (int)floor((Hi.y + 0.25f * Lo2) / Lo2));
+		if (InE.OcMode == 1u)
+		{
+			for (int Y2 = Ao.y; Y2 <= Bo.y; ++Y2)
+			{
+				for (int X2 = Ao.x; X2 <= Bo.x; ++X2)
+				{
+					if (abs(X2) >= (int)UNI_OC_PACK || abs(Y2) >= (int)UNI_OC_PACK) { continue; }
+					const FUniOc O = Uni_GalaxyOcAt(int2(X2, Y2), InT.Params, InE.Hoc, InE.K.Hp, Lo2);
+					if (!(O.Wm > 0.0f)) { continue; }
+					const float3 V = Uni_TaskBoxUnitOf(InT, O.C);
+					const float Share = (1.0f - UNI_OC_HALO_SHARE) * Uni_GcBoxShare(V, O.S1 * Inv) + UNI_OC_HALO_SHARE * Uni_GcBoxShare(V, UNI_OC_HALO * O.S1 * Inv);
+					if (!(Share > 1.0e-6f)) { continue; }
+					float Young, Oc;
+					Uni_TaskDensityParts(InT, InE, O.C, Young, Oc);
+					const float Mb = O.Wm * Young * Share;
+					if (!(Mb > 0.0f)) { continue; }
+					uint Slot = N;
+					if (N >= UNI_GC_LIST)
+					{
+						Slot = 0u;
+						for (uint Q = 1u; Q < UNI_GC_LIST; ++Q) { if (InBox[Q] < InBox[Slot]) { Slot = Q; } }
+						if (!(Mb > InBox[Slot])) { continue; }
+					}
+					else { N = N + 1u; }
+					Idx[Slot] = Uni_OcPack(int2(X2, Y2)); InBox[Slot] = Mb;
+				}
+			}
+		}
+		else
+		{
+			const int Nx = min(Bo.x - Ao.x + 1, (int)UNI_OC_CELLS), Ny = min(Bo.y - Ao.y + 1, (int)UNI_OC_CELLS);
+			float Sum = 0.0f, A1 = 0.0f, Ym = 0.0f;
+			for (int Y2 = 0; Y2 < Ny; ++Y2)
+			{
+				for (int X2 = 0; X2 < Nx; ++X2)
+				{
+					const FUniOc O = Uni_GalaxyOcAt(int2(Ao.x + X2, Ao.y + Y2), InT.Params, InE.Hoc, InE.K.Hp, Lo2);
+					if (!(O.Wm > 0.0f)) { continue; }
+					const float3 V = Uni_TaskBoxUnitOf(InT, O.C);
+					const float Aw = O.Wm * ((1.0f - UNI_OC_HALO_SHARE) * Uni_GcBoxShare(V, O.S1 * Inv) + UNI_OC_HALO_SHARE * Uni_GcBoxShare(V, UNI_OC_HALO * O.S1 * Inv));
+					if (!(Aw > 1.0e-6f * O.Wm)) { continue; }   // out of the box's reach: no field read
+					float Young, Oc;
+					Uni_TaskDensityParts(InT, InE, O.C, Young, Oc);
+					if (!(Young > 0.0f)) { continue; }
+					Sum += Aw * Young; A1 = max(A1, Aw); Ym = max(Ym, Young);
+				}
+			}
+			if (Sum > 0.0f)
+			{
+				C.OcHead = float4((float)(Nx * Ny) * A1 * Ym / Vol, A1, Ym, Sum / Vol);
+				C.OcRange = float4((float)Ao.x, (float)Ao.y, (float)Nx, (float)Ny);
+				C.Mean = C.Mean + Sum / Vol;
+			}
+		}
+	}
+	float SumIn = 0.0f;
+	for (uint I1 = 0u; I1 < N; ++I1) { SumIn += InBox[I1]; }
+	C.GcHead = float4((float)N, SumIn, SumIn / Vol, 0.0f);
+	C.GcIdx0 = float4(Idx[0], Idx[1], Idx[2], Idx[3]); C.GcIdx1 = float4(Idx[4], Idx[5], Idx[6], Idx[7]);
+	C.GcMass0 = float4(InBox[0], InBox[1], InBox[2], InBox[3]); C.GcMass1 = float4(InBox[4], InBox[5], InBox[6], InBox[7]);
+	C.Mean = C.Mean + SumIn / Vol;
 }
 
 /** Probe reduction -> count. Sum and max are over all UNI_PROBES_PER_CELL probes; InOctLo / Hi
@@ -232,8 +492,9 @@ UNI_FN FUniTaskCount Uni_TaskCount(FUniGenTask InT, FUniTaskEval InE, float InPr
 		C.OctLo = float4(C.Envelope, C.Envelope, C.Envelope, C.Envelope);
 		C.OctHi = C.OctLo;
 	}
+	Uni_TaskCountGc(InT, InE, C);   // D-238
 	const float Lambda = InT.LambdaScale * C.Mean;
-	C.Count = (C.Envelope > 0.0f) ? Uni_PoissonCount(Lambda, InT.CellSeed) : 0u;
+	C.Count = (C.Envelope > 0.0f || C.GcHead.z > 0.0f || C.OcHead.x > 0.0f) ? Uni_PoissonCount(Lambda, InT.CellSeed) : 0u;
 	// D-114: budget follows the expected acceptance with 4x headroom.
 	C.CandidateBudget = (uint)min(256.0f + 4.0f * (float)C.Count / Uni_CountAccept(C), 4.0e9f);
 	return C;
@@ -269,9 +530,117 @@ UNI_FN uint3 Uni_TaskCandidateOffset(FUniGenTask InT, FUniTaskEval InE, FUniTask
 	return Uni_BoxOffset(InT, O);
 }
 
-/** Candidate J: its offset, its density, the envelope it met, and whether it passes rejection. */
+/** D-238: a normal of mean InV and sigma InS truncated to [0, 1), at uniform InU: by its inverse
+ *  CDF between the bounds' CDFs (mirrored so the bounds' CDFs stay away from 1, where float erf
+ *  loses them). */
+UNI_FN float Uni_GcTruncNormal(float InV, float InS, float InU)
+{
+	const float S = max(InS, 1.0e-9f) * 1.41421356f;
+	const bool bFlip = InV < 0.5f;   // keep the box on the upper side of the mean's mirror
+	const float V = bFlip ? 1.0f - InV : InV;
+	// Box [0, 1) about V: the lower bound -V / S (<= 0 side), the upper (1 - V) / S.
+	const float Ea = Uni_Erf(-V / S), Eb = Uni_Erf((1.0f - V) / S);
+	const float X = V + S * Uni_ErfInv(Ea + (Eb - Ea) * InU);
+	const float Y = clamp(X, 0.0f, 0.99999994f);
+	return bFlip ? clamp(1.0f - Y, 0.0f, 0.99999994f) : Y;
+}
+
+/** D-238, D-239: a point of a cluster's two Gaussians (centre InC, field units; core sigma InS1,
+ *  the halo InHalo x wider holding InShare) truncated to the box, in box units: the Gaussian in
+ *  proportion to its mass in the box (draw InK of channel InCh), then each axis of the box frame
+ *  by its truncated normal (draws InK + 1..3; the Gaussians are isotropic). */
+UNI_FN float3 Uni_TaskClusterPoint(FUniGenTask InT, float3 InC, float InS1, float InHalo, float InShare, float3 InInv, uint InCh, uint InK)
+{
+	const float3 Vc = Uni_TaskBoxUnitOf(InT, InC);
+	const float S2 = InHalo * InS1;
+	const float Mc = (1.0f - InShare) * Uni_GcBoxShare(Vc, InS1 * InInv), Mh = InShare * Uni_GcBoxShare(Vc, S2 * InInv);
+	const float S = Uni_DrawUnit(InT.CellSeed, InCh, InK) * (Mc + Mh) < Mh ? S2 : InS1;
+	return float3(Uni_GcTruncNormal(Vc.x, S * InInv.x, Uni_DrawUnit(InT.CellSeed, InCh, InK + 1u)),
+		Uni_GcTruncNormal(Vc.y, S * InInv.y, Uni_DrawUnit(InT.CellSeed, InCh, InK + 2u)),
+		Uni_GcTruncNormal(Vc.z, S * InInv.z, Uni_DrawUnit(InT.CellSeed, InCh, InK + 3u)));
+}
+
+/** Candidate J: its offset, its density, the envelope it met, and whether it passes rejection.
+ *  D-238: a small box with globulars draws a share of its candidates from them (the share their
+ *  masses in the box are of the candidates' total: GcHead.z over it and the octants' mean
+ *  envelope), each from one of them in proportion to its mass in the box, from its two Gaussians
+ *  truncated to the box; every candidate is then tested against its octant's envelope plus the
+ *  clusters' density there, which is what the kinds of candidate together are drawn from, so the
+ *  accepted ones follow the density exactly. D-239: open clusters listed the same way; a larger
+ *  box's by lattice cell: a cell of those it reaches, kept with probability its weight x in-box
+ *  share over that bound (no field read: most stop here) and then its saturated young light
+ *  over that bound, so each is drawn in proportion to its mass in the box. Without clusters: no
+ *  draw of channel GLOBULAR or OPENCLUSTER, the candidates as before bit for bit. */
 UNI_FN bool Uni_TaskCandidate(FUniGenTask InT, FUniTaskEval InE, FUniTaskCount InC, uint InJ, UNI_OUT(uint3) OutOffset, UNI_OUT(float) OutDensity, UNI_OUT(float) OutEnvelope)
 {
+	const bool bClusters = InC.GcHead.z > 0.0f || InC.OcHead.x > 0.0f;
+	if (bClusters)
+	{
+		const float Wl = InC.GcHead.z, Wb = InC.OcHead.x;
+		const float Tot = Wl + Wb + Uni_CountEnvMean(InC);
+		const float Pick = Uni_DrawUnit(InT.CellSeed, UNI_CH_GLOBULAR, 8u * InJ);   // against the shares (D-238's test, bit for bit without open clusters)
+		const float Tw = 4294967296.0f;
+		const float3 Ed = Uni_TaskBoxEdge(InT);
+		const float3 Inv = float3(1.0f / (InT.Frame.SizeP * Ed.x), 1.0f / (InT.Frame.SizeP * Ed.y), 1.0f / (InT.Frame.SizeP * Ed.z));
+		if (Pick < (Wl + Wb) / Tot)
+		{
+			float3 V = float3(0.0f, 0.0f, 0.0f);
+			if (Pick < Wl / Tot)
+			{
+				// A listed cluster in proportion to its mass in the box.
+				const uint Ng = (uint)InC.GcHead.x;
+				const float X = Uni_DrawUnit(InT.CellSeed, UNI_CH_GLOBULAR, 8u * InJ + 1u) * InC.GcHead.y;
+				uint Kg = Ng - 1u;
+				float Acc = 0.0f;
+				for (uint K = 0u; K < Ng; ++K) { Acc += Uni_CountGcMass(InC, K); if (Kg == Ng - 1u && X < Acc) { Kg = K; } }
+				const float Id = Uni_CountGcIdx(InC, Kg);
+				if (Id >= 0.0f)
+				{
+					const FUniGc G = Uni_GalaxyGcAt(Uni_GcUnpack(Id), InT.Params, InE.Hgc, InE.GcN, InE.GcL);
+					if (!(G.M > 0.0f)) { OutOffset = uint3(0u, 0u, 0u); OutDensity = 0.0f; OutEnvelope = 1.0f; return false; }
+					V = Uni_TaskClusterPoint(InT, G.C, G.S1, UNI_GC_HALO, UNI_GC_HALO_SHARE, Inv, UNI_CH_GLOBULAR, 8u * InJ + 2u);
+				}
+				else
+				{
+					const FUniOc O = Uni_GalaxyOcAt(Uni_OcUnpack(Id), InT.Params, InE.Hoc, InE.K.Hp, InE.OcL);   // D-239
+					if (!(O.Wm > 0.0f)) { OutOffset = uint3(0u, 0u, 0u); OutDensity = 0.0f; OutEnvelope = 1.0f; return false; }
+					V = Uni_TaskClusterPoint(InT, O.C, O.S1, UNI_OC_HALO, UNI_OC_HALO_SHARE, Inv, UNI_CH_GLOBULAR, 8u * InJ + 2u);
+				}
+			}
+			else
+			{
+				// D-239: a cell of the box's open-cluster cells, kept in proportion to its mass in the box.
+				OutOffset = uint3(0u, 0u, 0u); OutDensity = 0.0f; OutEnvelope = 1.0f;
+				const int2 Cell = int2((int)InC.OcRange.x + min((int)(Uni_DrawUnit(InT.CellSeed, UNI_CH_OPENCLUSTER, 8u * InJ) * InC.OcRange.z), (int)InC.OcRange.z - 1),
+					(int)InC.OcRange.y + min((int)(Uni_DrawUnit(InT.CellSeed, UNI_CH_OPENCLUSTER, 8u * InJ + 1u) * InC.OcRange.w), (int)InC.OcRange.w - 1));
+				const FUniOc O = Uni_GalaxyOcAt(Cell, InT.Params, InE.Hoc, InE.K.Hp, InE.OcL);
+				if (!(O.Wm > 0.0f)) { return false; }
+				const float3 Vc = Uni_TaskBoxUnitOf(InT, O.C);
+				const float A = O.Wm * ((1.0f - UNI_OC_HALO_SHARE) * Uni_GcBoxShare(Vc, O.S1 * Inv) + UNI_OC_HALO_SHARE * Uni_GcBoxShare(Vc, UNI_OC_HALO * O.S1 * Inv));
+				if (!(Uni_DrawUnit(InT.CellSeed, UNI_CH_OPENCLUSTER, 8u * InJ + 2u) * InC.OcHead.y < A)) { return false; }
+				float Young, Ocv;
+				Uni_TaskDensityParts(InT, InE, O.C, Young, Ocv);
+				if (!(Uni_DrawUnit(InT.CellSeed, UNI_CH_OPENCLUSTER, 8u * InJ + 3u) * InC.OcHead.z < Young)) { return false; }
+				V = Uni_TaskClusterPoint(InT, O.C, O.S1, UNI_OC_HALO, UNI_OC_HALO_SHARE, Inv, UNI_CH_OPENCLUSTER, 8u * InJ + 4u);
+			}
+			const uint3 O3 = uint3((uint)min(V.x * Tw, 4294967040.0f), (uint)min(V.y * Tw, 4294967040.0f), (uint)min(V.z * Tw, 4294967040.0f));
+			OutOffset = Uni_BoxOffset(InT, O3);
+			OutEnvelope = Uni_CountOctant(InC, (V.x >= 0.5f ? 1u : 0u) | (V.y >= 0.5f ? 2u : 0u) | (V.z >= 0.5f ? 4u : 0u));
+		}
+		else
+		{
+			OutOffset = Uni_TaskCandidateOffset(InT, InE, InC, InJ, OutEnvelope);
+		}
+		// Tested against the envelope plus the clusters' density there: what the mixture is drawn from.
+		const float3 U = Uni_OffsetUnit(OutOffset);
+		const float3 Pu = Uni_FieldFramePoint(InT.Frame, U);
+		float Young, Ocv;
+		const float Rho = Uni_TaskDensityParts(InT, InE, Pu, Young, Ocv);
+		OutDensity = Uni_TaskDensityFrom(InT, InE, Pu, Rho, Young, Ocv);
+		if (InE.bGcExact != 0u) { OutEnvelope = OutEnvelope + Uni_TaskGcExact(InT, InE, Pu); }
+		if (InE.OcMode == 1u || InE.OcMode == 2u) { OutEnvelope = OutEnvelope + Ocv; }
+		return Uni_Accept(InT.CellSeed, InJ, OutDensity, OutEnvelope);
+	}
 	OutOffset = Uni_TaskCandidateOffset(InT, InE, InC, InJ, OutEnvelope);
 	OutDensity = Uni_TaskDensity(InT, InE, Uni_OffsetUnit(OutOffset));
 	return Uni_Accept(InT.CellSeed, InJ, OutDensity, OutEnvelope);

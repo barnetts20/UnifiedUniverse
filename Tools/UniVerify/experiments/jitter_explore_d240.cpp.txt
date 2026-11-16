@@ -1,0 +1,175 @@
+// test_zz_jitter.cpp: D-240 exploration (not part of the gate; run with --group zz.jitter).
+// Inside the Milky Way's brightest disc nebula (D-237's still): the current single march, the
+// fine reference (every step an eighth), the mean of jittered frames, and the temporal reference
+// accumulating a still camera; each against the fine reference, side by side.
+
+#include "../src/UniTest.h"
+#include "../src/UniRenderRef.h"
+#include "../src/UniVerifyCommon.h"
+#include "../src/UniVolumeRef.h"
+#include "../scenes/UniScenes.h"
+#include "UniVolume.h"
+#include "UniWebTexture.h"
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <string>
+#include <sys/stat.h>
+#include <vector>
+
+using namespace UniCore;
+using namespace UniRender;
+namespace H = UniHlsl;
+
+namespace
+{
+	FCoord ZjCamAt(const FVec3d& P) { FCoord C = FCoord::Origin(); FVec3f F; AddDisplacement(C, F, P); return C; }
+
+	std::vector<float> ZjMarch(const FVolumeScene& Sc, const FCamera& Cm, u32 Flags, float Shift, double& OutSteps)
+	{
+		auto V = ToHlsl(Sc.View);
+		V.MarchFlags |= Flags;
+		V.JitterShift = Shift;
+		if (Flags & 2u) { V.MaxSteps = 16384u; }
+		const auto Cb = Sc.CarrierBuf(); const auto Pb = Sc.ParamBuf(); const auto Lb = Sc.LutBuf();
+		std::vector<float> Rgb(size_t(Cm.Width) * Cm.Height * 3, 0.0f);
+		std::atomic<int> Next{ 0 };
+		std::atomic<long long> Steps{ 0 };
+		auto Work = [&]()
+		{
+			for (int Y = Next++; Y < Cm.Height; Y = Next++)
+			{
+				for (int X = 0; X < Cm.Width; ++X)
+				{
+					bool bS = false;
+					const H::FUniVolumeResult R = MarchPixel(Cb, Pb, Lb, V, Cm, Cm.Width, Cm.Height, X, Y, 3.0e38f, bS);
+					const size_t I = (size_t(Y) * Cm.Width + X) * 3;
+					Rgb[I] = R.Radiance.x; Rgb[I + 1] = R.Radiance.y; Rgb[I + 2] = R.Radiance.z;
+					Steps += R.Steps;
+				}
+			}
+		};
+		std::vector<std::thread> Ts;
+		for (int T = 1; T < 4; ++T) { Ts.emplace_back(Work); }
+		Work();
+		for (std::thread& T : Ts) { T.join(); }
+		OutSteps = double(Steps) / double(Cm.Width * Cm.Height);
+		return Rgb;
+	}
+
+	double ZjLum(const std::vector<float>& F, size_t I) { return 0.2126 * F[3 * I] + 0.7152 * F[3 * I + 1] + 0.0722 * F[3 * I + 2]; }
+
+	/** Mean and 95th percentile of |a - b| / the reference's mean luminance. */
+	void ZjErr(const std::vector<float>& A, const std::vector<float>& Ref, double& OutMean, double& OutP95)
+	{
+		const size_t N = A.size() / 3;
+		double M = 0.0;
+		for (size_t I = 0; I < N; ++I) { M += ZjLum(Ref, I) / N; }
+		std::vector<double> E;
+		double S = 0.0;
+		for (size_t I = 0; I < N; ++I) { const double D = std::abs(ZjLum(A, I) - ZjLum(Ref, I)) / std::max(M, 1e-300); E.push_back(D); S += D / N; }
+		std::sort(E.begin(), E.end());
+		OutMean = S; OutP95 = E[size_t(0.95 * (E.size() - 1))];
+	}
+}
+
+UNI_TEST(zz, jitter)
+{
+	FWebTexture T[3];
+	for (int S = 0; S < 3; ++S) { std::string E; if (!FWebTexture::LoadDelivered("Data/Noise", GalaxyTextureName(S), T[S], &E)) { std::printf("tex fail\n"); return; } }
+	for (int I = 0; I < 3; ++I) { BindGalaxyTexture(I, &T[I]); }
+	FUniverseDef D = UniScenes::Flythrough();
+	UniScenes::UseGalaxyTextures(D, T[0].Size);
+	UniScenes::UseGalaxyPalettes(D);
+	const FFieldParams* Mw = nullptr;
+	for (const FAnchor& A : D.Anchors) { if (!A.EmitterParams.empty()) { Mw = &A.EmitterParams[0]; } }
+	const H::FUniFieldParams P = Mw->ToHlsl();
+	const H::FUniGalaxyConst K = H::Uni_GalaxyConstOf(P);
+	double Hx = 0.0, Hy = 0.0, Hbest = -1.0;
+	for (int I = 0; I < 60000; ++I)
+	{
+		const double R = 0.3 + 0.4 * H::Uni_DrawUnit(0xF374u, 2u, u32(2 * I)), Ph = 6.2831853 * H::Uni_DrawUnit(0xF374u, 2u, u32(2 * I + 1));
+		const H::float3 Pt{ float(R * std::cos(Ph)), float(R * std::sin(Ph)), 0.0f };
+		H::float4 C(0, 0, 0, 0), Nv(0, 0, 0, 0);
+		const float Rho = H::UniField_GalaxyFilteredCKN(Pt, P, K, 1e-5f, C, Nv);
+		const double Score = double(H::Uni_GalaxyNebulaX(Nv, P)) * double(H::Uni_GalaxyNebulaDensity(Nv, P, 1e-5f)) / std::max(double(Rho), 1e-30);
+		if (Score > Hbest) { Hbest = Score; Hx = Pt.x; Hy = Pt.y; }
+	}
+	FUniverseModel Mo(D);
+	FRefGenerator G(Mo);
+	FVolumeBuilder VB(Mo, G);
+	double Radius = 0.0;
+	auto Build = [&](const FCoord& Cam, const FCamera& Cm)
+	{
+		FRefPipeline Pp(G);
+		Pp.bVelocityLod = false;
+		Pp.Update(Cam, FVec3f{});
+		FVolumeSettings S;
+		S.NebulaGain = 1.0f; S.NebulaReflect = 6.0f;
+		FVolumeScene Sc = VB.Build(Pp, Cam, FVec3f{}, Cm.View(), S).Subset(false);
+		for (const FCarrierGPU& Cg : Sc.Carriers)
+		{
+			const double Rl = std::sqrt(double(Cg.CamLocal[0]) * Cg.CamLocal[0] + double(Cg.CamLocal[1]) * Cg.CamLocal[1] + double(Cg.CamLocal[2]) * Cg.CamLocal[2]);
+			if (Cg.FieldId == H::UNI_FIELD_GALAXY && Rl < 1.0) { Radius = 1.0 / double(Cg.InvRadius); }
+		}
+		return Sc;
+	};
+	{ FCamera Cm; Cm.Coord = ZjCamAt({ 8.0 * Units::Kpc, 0.0, 0.0 }); Cm.Width = 4; Cm.Height = 4; Cm.LookAlong({ 0.0, 1.0, 0.0 }); Build(Cm.Coord, Cm); }
+	const FVec3d Knot{ Hx * Radius, Hy * Radius, 5.0 * Units::Pc };
+	const int W = 160, Ht = 90;
+	FImage Img(W * 4, Ht * 2);
+	for (int Vi = 0; Vi < 2; ++Vi)
+	{
+		FCamera Cm; Cm.Coord = ZjCamAt({ Knot.X, Knot.Y - (Vi == 0 ? 0.0 : 250.0) * Units::Pc, Knot.Z }); Cm.Width = W; Cm.Height = Ht; Cm.LookAlong({ 0.3, 1.0, 0.05 });
+		const FVolumeScene Sc = Build(Cm.Coord, Cm);
+		double S0 = 0, Sf = 0, Sj = 0;
+		const std::vector<float> A = ZjMarch(Sc, Cm, 0u, 0.0f, S0);
+		const std::vector<float> Ref = ZjMarch(Sc, Cm, 2u, 0.0f, Sf);
+		std::vector<float> Jm(A.size(), 0.0f);
+		const int Nj = 32;
+		for (int K2 = 0; K2 < Nj; ++K2)
+		{
+			double Sk = 0;
+			const std::vector<float> J = ZjMarch(Sc, Cm, 8u, float(std::fmod(K2 * 0.6180339887, 1.0)), Sk);
+			for (size_t I = 0; I < J.size(); ++I) { Jm[I] += J[I] / Nj; }
+			Sj += Sk / Nj;
+		}
+		double Ej1 = 0, Pj1 = 0;
+		{
+			double Sk = 0;
+			const std::vector<float> J1 = ZjMarch(Sc, Cm, 8u, 0.0f, Sk);
+			ZjErr(J1, Ref, Ej1, Pj1);
+		}
+		// The temporal reference: a still camera, 2 x 2 slicing, 64 frames, accumulation over 16.
+		FVolumeScene Sj8 = Sc;
+		Sj8.View.MarchFlags |= 8u;
+		FTemporalVolume Tv;
+		Tv.MaxSamples = 16.0f;
+		for (int F = 0; F < 64; ++F) { Tv.Step(Sj8, Cm, FV3{ 0, 0, 0 }, true, true, 4); }
+		std::vector<float> Tr(A.size(), 0.0f);
+		for (size_t I = 0; I < Tv.Vol.size(); ++I) { Tr[3 * I] = Tv.Vol[I].x; Tr[3 * I + 1] = Tv.Vol[I].y; Tr[3 * I + 2] = Tv.Vol[I].z; }
+		double E0, P0, Ej, Pj, Et, Pt;
+		ZjErr(A, Ref, E0, P0); ZjErr(Jm, Ref, Ej, Pj); ZjErr(Tr, Ref, Et, Pt);
+		std::printf("view %d: steps %.1f (fine %.1f, jittered %.1f); vs fine: unjittered mean %.4f p95 %.4f; one jittered frame %.4f / %.4f; mean of %d jittered %.4f / %.4f; temporal 64 frames %.4f / %.4f (accumulated %zu, restarted %zu)\n",
+			Vi, S0, Sf, Sj, E0, P0, Ej1, Pj1, Nj, Ej, Pj, Et, Pt, Tv.Accumulated, Tv.Restarted);
+		std::vector<double> L; for (size_t I = 0; I < size_t(W) * Ht; ++I) { L.push_back(ZjLum(Ref, I)); }
+		std::sort(L.begin(), L.end());
+		const double Top = L[size_t(0.995 * (L.size() - 1))];
+		const std::vector<float>* Fr[4] = { &A, &Ref, &Jm, &Tr };
+		for (int Q = 0; Q < 4; ++Q)
+		{
+			const std::vector<float>& F = *Fr[Q];
+			for (int Y = 0; Y < Ht; ++Y) for (int X = 0; X < W; ++X)
+			{
+				const size_t I = size_t(Y) * W + X;
+				const double Lr = ZjLum(F, I) / std::max(Top, 1e-300);
+				const double S = Lr > 0.0 ? (Lr / (1.0 + 0.25 * Lr)) / Lr / std::max(Top, 1e-300) : 0.0;
+				Img.Add(Q * W + X, Vi * Ht + Y, float(F[3 * I] * S), float(F[3 * I + 1] * S), float(F[3 * I + 2] * S));
+			}
+		}
+	}
+	const std::string Dir = UniVerify::Options().OutDir + "/render";
+	::mkdir(UniVerify::Options().OutDir.c_str(), 0755); ::mkdir(Dir.c_str(), 0755);
+	Img.WritePpm(Dir + "/zz_jitter.ppm");
+	for (int I = 0; I < 3; ++I) { BindGalaxyTexture(I, nullptr); }
+}

@@ -1,0 +1,42 @@
+// test_zz_nebstats.cpp: D-241 exploration (not part of the gate; --group zz.nebstats).
+// galaxy_detail's channels at the nebula detail's mip (2): each over its mip-0 mean, its mean,
+// spread (cv), skew and percentiles, at the walls' and the texture's frequencies.
+#include "../src/UniTest.h"
+#include "../src/UniVerifyCommon.h"
+#include "../scenes/UniScenes.h"
+#include "UniWebTexture.h"
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <string>
+#include <vector>
+using namespace UniCore;
+namespace H = UniHlsl;
+UNI_TEST(zz, nebstats)
+{
+	FWebTexture T[3];
+	for (int S = 0; S < 3; ++S) { std::string E; if (!FWebTexture::LoadDelivered("Data/Noise", GalaxyTextureName(S), T[S], &E)) { std::printf("tex fail\n"); return; } }
+	for (int I = 0; I < 3; ++I) { BindGalaxyTexture(I, &T[I]); }
+	for (float Mip : { 1.0f, 2.0f })
+	{
+		std::vector<double> C[4];
+		const int N = 400000;
+		for (int I = 0; I < N; ++I)
+		{
+			const H::float3 P{ H::Uni_DrawUnit(0x77u, 2u, u32(3 * I)) * 4.0f, H::Uni_DrawUnit(0x77u, 2u, u32(3 * I + 1)) * 4.0f, H::Uni_DrawUnit(0x77u, 2u, u32(3 * I + 2)) * 4.0f };
+			const H::float4 V = UNI_GAL_DETAIL(P, Mip);
+			C[0].push_back(V.x / H::UNI_GAL_DETAIL_MEAN0.x); C[1].push_back(V.y / H::UNI_GAL_DETAIL_MEAN0.y); C[2].push_back(V.z / H::UNI_GAL_DETAIL_MEAN0.z); C[3].push_back(V.w / H::UNI_GAL_DETAIL_MEAN0.w);
+		}
+		for (int K = 0; K < 4; ++K)
+		{
+			double M = 0, M2 = 0, M3 = 0;
+			for (double v : C[K]) { M += v / N; }
+			for (double v : C[K]) { M2 += (v - M) * (v - M) / N; M3 += (v - M) * (v - M) * (v - M) / N; }
+			const double Sd = std::sqrt(M2);
+			std::sort(C[K].begin(), C[K].end());
+			auto Q = [&](double F) { return C[K][size_t(F * (N - 1))]; };
+			std::printf("mip %.0f ch %d: mean %.5f cv %.5f skew %.3f; p5 %.4f p25 %.4f p50 %.4f p75 %.4f p95 %.4f\n", Mip, K, M, Sd, M3 / (Sd * Sd * Sd), Q(0.05), Q(0.25), Q(0.5), Q(0.75), Q(0.95));
+		}
+	}
+	for (int I = 0; I < 3; ++I) { BindGalaxyTexture(I, nullptr); }
+}

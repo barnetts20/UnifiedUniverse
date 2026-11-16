@@ -173,6 +173,15 @@ def lint_shader_decl_order(results):
         {"shaders": int(m.group(1)) if m else 0, "problems": int(m.group(2)) if m else -1})
 
 
+def lint_tuning_settings(results):
+    """D-261: the tuning page (UUniTuningSettings) is generated from the uu.* console variables:
+    regenerating it changes nothing (a new or renamed variable is on the page)."""
+    code, out, secs = run([sys.executable, "-I", os.path.join(PLUGIN, "Tools", "gen_tuning_settings.py"), "--check"])
+    last = out.strip().splitlines()[-1] if out.strip() else "no output"
+    add(results, 4, "T4.static.tuning_settings", "The tuning page (Project Settings > Plugins > Unified Universe Tuning) is current: Tools/gen_tuning_settings.py regenerates UniTuningSettings.h / .cpp from the uu.* console variables unchanged",
+        code == 0, last)
+
+
 # ------------------------------------------------------------------------------------------
 # Report
 # ------------------------------------------------------------------------------------------
@@ -364,6 +373,7 @@ def main():
     lint_ue_rules(results)
     lint_shader_params(results)
     lint_shader_decl_order(results)
+    lint_tuning_settings(results)
 
     unverified = json.load(open(UNVERIFIED)) if os.path.exists(UNVERIFIED) else []
     review = open(REVIEW).read() if os.path.exists(REVIEW) else ""

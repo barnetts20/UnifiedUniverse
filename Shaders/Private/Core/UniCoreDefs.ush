@@ -6,7 +6,7 @@
 // included, so the definitions below are skipped.
 //
 // THE SHARED SUBSET (D-015). A core may use only:
-//   - scalar float / uint / int / bool, and float2/3/4, uint2/3/4, int3 with .x .y .z .w
+//   - scalar float / uint / int / bool, and float2/3/4, uint2/3/4, int2/3 with .x .y .z .w
 //     member access. NO multi-component swizzles (.xy, .xyz), NO vector comparisons,
 //     NO implicit scalar-to-vector promotion in constructors (write float3(a, a, a)).
 //   - the intrinsics UniHlslShim.h defines. Anything else is a C++ compile error, which
@@ -34,5 +34,40 @@
 	#define UNI_LOOP [loop]
 	#define UNI_UNROLL [unroll]
 #endif
+
+/** D-187: erf, Abramowitz and Stegun 7.1.26 (|error| < 1.5e-7), the same on CPU and GPU. D-238:
+ *  here (it was in UniProject.ush) so the fields' globular box masses share it. */
+UNI_FN float Uni_Erf(float InX)
+{
+	const float X = abs(InX);
+	const float T = 1.0f / (1.0f + 0.3275911f * X);
+	const float P = T * (0.254829592f + T * (-0.284496736f + T * (1.421413741f + T * (-1.453152027f + T * 1.061405429f))));
+	const float E = 1.0f - P * exp(-X * X);
+	return InX < 0.0f ? -E : E;
+}
+
+/** D-238: the inverse of erf on (-1, 1), Giles (2010)'s single-precision form (relative error
+ *  ~1e-7 within float's reach of +-1). */
+UNI_FN float Uni_ErfInv(float InX)
+{
+	const float X = clamp(InX, -0.99999994f, 0.99999994f);
+	float W = -log((1.0f - X) * (1.0f + X));
+	float P;
+	if (W < 5.0f)
+	{
+		W = W - 2.5f;
+		P = 2.81022636e-08f;
+		P = 3.43273939e-07f + P * W; P = -3.5233877e-06f + P * W; P = -4.39150654e-06f + P * W; P = 0.00021858087f + P * W;
+		P = -0.00125372503f + P * W; P = -0.00417768164f + P * W; P = 0.246640727f + P * W; P = 1.50140941f + P * W;
+	}
+	else
+	{
+		W = sqrt(W) - 3.0f;
+		P = -0.000200214257f;
+		P = 0.000100950558f + P * W; P = 0.00134934322f + P * W; P = -0.00367342844f + P * W; P = 0.00573950773f + P * W;
+		P = -0.0076224613f + P * W; P = 0.00943887047f + P * W; P = 1.00167406f + P * W; P = 2.83297682f + P * W;
+	}
+	return P * X;
+}
 
 #endif // UNI_CORE_DEFS_USH

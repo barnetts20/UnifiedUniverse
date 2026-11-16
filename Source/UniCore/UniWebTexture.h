@@ -407,12 +407,97 @@ namespace UniCore
 		UniHlsl::UniWebTextureView = View;
 	}
 
-	/** D-179: the galaxy textures the galaxy field samples (UNI_GAL_WARP_FINE / _WARP_LARGE /
-	 *  _DETAIL): the noise project's warp_fine and warp_large (curl displacement, RGB, RMS 1;
-	 *  A fBm) and galaxy_detail (R ridged lanes, G star-forming knots, B fBm, A superbubbles).
-	 *  nullptr unbinds one (a galaxy whose texture terms are on then reads NaN and places
-	 *  nothing: fail closed). Each must outlive every sample. */
-	inline void BindGalaxyTexture(int Slot, const FWebTexture* T)
+	/** D-259: the powers galaxy_shape (UNI_GAL_SHAPED, slot 4) is baked with (D-258's look): the
+	 *  ridged channel to the 4th (the dust lanes), the fBm cubed (the light's streaks), the knots
+	 *  to the 8th. The engine sets them from uu.Galaxy.DustStructure / .LightStructure / .KnotPower
+	 *  before it binds galaxy_detail; a power 0 bakes 1 (that term off: UNI_GAL_SHAPE y, z, x 0). */
+	struct FGalaxyShapePowers
+	{
+		float Dust = 4.0f;
+		float Light = 3.0f;
+		float Knot = 8.0f;
+		bool operator==(const FGalaxyShapePowers& O) const { return Dust == O.Dust && Light == O.Light && Knot == O.Knot; }
+	};
+	inline FGalaxyShapePowers& GalaxyShapePowers() { static FGalaxyShapePowers P; return P; }
+
+	/** D-259: the knots' mean the linear term (2 G - 1) keeps: D-179's consumers, 1 + H.y Knot. */
+	inline constexpr double kGalKnotMean = 0.0457;
+
+	/** D-259: galaxy_shape from a galaxy_detail texture: the shaped channels taken before they are
+	 *  filtered (a power of a filtered read is not the filtered power: D-258's knots, sharper than a
+	 *  march step, aliased into grain; its structure drifted with the footprint). Mip 0: R^Dust,
+	 *  B^Light, G^Knot, each over its mean over the tile; the mips the box means (BuildMips), so
+	 *  every mip's mean, and a trilinear read's at a random point, is 1 and a read at any
+	 *  footprint is the shaped field's mean over it. A: the knots' amplitude alpha at that mip,
+	 *  E[max(kGalKnotMean + alpha (G^Knot / mean - 1), 0)] = E[max(2 G - 1, 0)] over its texels (the
+	 *  young share: the knots' light over the arms', which the reflection nebulae, the open
+	 *  clusters and the palette read, as the linear term's; without it the 8th power moved 4.6x
+	 *  the arms' light into the knots); past mip 4 (the linear term no longer negative) mip 4's. */
+	inline FWebTexture BuildGalaxyShapeTexture(const FWebTexture& InDetail, const FGalaxyShapePowers& InPow)
+	{
+		FWebTexture T;
+		if (!InDetail.IsValid()) { return T; }
+		T.Name = "galaxy_shape";
+		T.Size = InDetail.Size;
+		auto Pw = [](float X, float P) { return P > 0.0f ? std::pow(std::max(X, 0.0f), P) : 1.0f; };
+		const size_t N = InDetail.TexelCount(0u);
+		std::vector<float> V(N * 3u);
+		double Sum[3] = { 0.0, 0.0, 0.0 };
+		for (size_t I = 0; I < N; ++I)
+		{
+			const UniHlsl::float4 C = InDetail.TexelAt(0u, I);
+			const float A = Pw(C.x, InPow.Dust), B = Pw(C.z, InPow.Light), G = Pw(C.y, InPow.Knot);
+			V[3 * I] = A; V[3 * I + 1] = B; V[3 * I + 2] = G;
+			Sum[0] += A; Sum[1] += B; Sum[2] += G;
+		}
+		const double Inv[3] = { double(N) / std::max(Sum[0], 1e-300), double(N) / std::max(Sum[1], 1e-300), double(N) / std::max(Sum[2], 1e-300) };
+		std::vector<uint16_t> M0(N * 4u);
+		for (size_t I = 0; I < N; ++I) { FWebTexture::PutTexel(M0, I, V[3 * I] * Inv[0], V[3 * I + 1] * Inv[1], V[3 * I + 2] * Inv[2], 0.0); }
+		T.Mips.push_back(std::move(M0));
+		T.BuildMips();
+		// The knots' amplitude by mip (both textures' texels at that mip).
+		double Alpha = 0.0;
+		const uint32_t Nm = std::min(T.NumMips(), InDetail.NumMips());
+		for (uint32_t Mi = 0; Mi < T.NumMips(); ++Mi)
+		{
+			if (Mi <= 4u && Mi < Nm)
+			{
+				const size_t Nt = T.TexelCount(Mi);
+				double Target = 0.0;
+				std::vector<double> Ks(Nt);
+				for (size_t I = 0; I < Nt; ++I) { Target += std::max(2.0 * double(InDetail.TexelAt(Mi, I).y) - 1.0, 0.0); Ks[I] = double(T.TexelAt(Mi, I).z) - 1.0; }
+				Target /= double(Nt);
+				auto Young = [&](double A) { double Y = 0.0; for (double K : Ks) { Y += std::max(kGalKnotMean + A * K, 0.0); } return Y / double(Nt); };
+				double Lo = 0.0, Hi = 1.0;
+				if (InPow.Knot > 0.0f && Young(0.0) < Target)
+				{
+					while (Young(Hi) < Target && Hi < 64.0) { Hi *= 2.0; }
+					for (int It = 0; It < 50; ++It) { const double A = 0.5 * (Lo + Hi); if (Young(A) < Target) { Lo = A; } else { Hi = A; } }
+					Alpha = 0.5 * (Lo + Hi);
+				}
+				else { Alpha = 0.0; }
+			}
+			std::vector<uint16_t>& M = T.Mips[Mi];
+			const size_t Nt = T.TexelCount(Mi);
+			for (size_t I = 0; I < Nt; ++I) { M[I * 4u + 3u] = FloatToHalf(float(Alpha)); }
+		}
+		return T;
+	}
+
+	/** D-259: the galaxy_shape derived from the galaxy_detail bound in slot 2 (rebuilt when that
+	 *  texture's texels change; released when slot 2 is unbound). */
+	struct FGalaxyShapeCache
+	{
+		FWebTexture Tex;
+		uint64_t SourceHash = 0u;
+		FGalaxyShapePowers Powers;
+	};
+	inline FGalaxyShapeCache& GalaxyShapeCache() { static FGalaxyShapeCache C; return C; }
+
+	/** D-259: the bound galaxy_detail's galaxy_shape (slot 4), or nullptr: what the engine uploads. */
+	inline const FWebTexture* BoundGalaxyShapeTexture() { const FGalaxyShapeCache& C = GalaxyShapeCache(); return C.Tex.IsValid() ? &C.Tex : nullptr; }
+
+	inline void BindGalaxyTextureView(int Slot, const FWebTexture* T)
 	{
 		if (Slot < 0 || Slot >= UniHlsl::UNI_GAL_TEX_COUNT) { return; }
 		if (!T || !T->IsValid()) { UniHlsl::UniGalaxyTextureViews[Slot] = UniHlsl::FWebTexView(); return; }
@@ -425,10 +510,40 @@ namespace UniCore
 		UniHlsl::UniGalaxyTextureViews[Slot] = View;
 	}
 
+	/** D-179: the galaxy textures the galaxy field samples (UNI_GAL_WARP_FINE / _WARP_LARGE /
+	 *  _DETAIL): the noise project's warp_fine and warp_large (curl displacement, RGB, RMS 1;
+	 *  A fBm) and galaxy_detail (R ridged lanes, G star-forming knots, B fBm, A superbubbles).
+	 *  nullptr unbinds one (a galaxy whose texture terms are on then reads NaN and places
+	 *  nothing: fail closed). Each must outlive every sample. D-259: binding slot 2 binds its
+	 *  galaxy_shape in slot 4 too (derived here, cached by the texels' hash). */
+	inline void BindGalaxyTexture(int Slot, const FWebTexture* T)
+	{
+		if (Slot < 0 || Slot >= UniHlsl::UNI_GAL_TEX_COUNT) { return; }
+		BindGalaxyTextureView(Slot, T);
+		if (Slot != 2) { return; }
+		FGalaxyShapeCache& C = GalaxyShapeCache();
+		if (!T || !T->IsValid())
+		{
+			BindGalaxyTextureView(4, nullptr);
+			C = FGalaxyShapeCache();
+			return;
+		}
+		uint64_t H = 1469598103934665603ull ^ uint64_t(T->Size);
+		for (const uint16_t X : T->Mips[0]) { H = (H ^ X) * 1099511628211ull; }
+		const FGalaxyShapePowers Pw = GalaxyShapePowers();
+		if (!C.Tex.IsValid() || C.SourceHash != H || !(C.Powers == Pw))
+		{
+			C.Tex = BuildGalaxyShapeTexture(*T, Pw);
+			C.SourceHash = H;
+			C.Powers = Pw;
+		}
+		BindGalaxyTextureView(4, &C.Tex);
+	}
+
 	/** D-179: the delivered names of the galaxy textures, by slot. */
 	inline const char* GalaxyTextureName(int Slot)
 	{
-		static const char* Names[] = { "warp_fine", "warp_large", "galaxy_detail" };
+		static const char* Names[] = { "warp_fine", "warp_large", "galaxy_detail", "nebula_detail", "galaxy_shape" };   // D-249: 3 has no file of its own by default; D-259: 4 derived from 2
 		return (Slot >= 0 && Slot < UniHlsl::UNI_GAL_TEX_COUNT) ? Names[Slot] : "";
 	}
 

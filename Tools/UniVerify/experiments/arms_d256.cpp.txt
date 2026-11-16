@@ -1,0 +1,107 @@
+// arms_d256.cpp.txt (archived exploration; was tests/test_zz_arms.cpp, --group zz.arms): D-256 Ringermacher & Mead arms: face-on stills of the Milky Way and rolled galaxies (UNI_ARMS_OUT), or a grid over the winding and the openness (UNI_ARMS_GRID). The paper's N and B rendered as their Fig. 7 (most of the variety the total winding); the D-256 parameterization (total winding, openness setting the bar's length) from these stills.
+// test_zz_arms.cpp (exploration, --group zz.arms): D-256 Ringermacher & Mead arms. Face-on stills
+// (15 deg) of the Milky Way (first tile) and rolled galaxies, emission with the dust lanes, each
+// tile normalised to its peak; a PPM to UNI_ARMS_OUT (default arms.ppm). UNI_ARMS_N / UNI_ARMS_B:
+// a grid over the winding number and openness instead of rolls.
+#include "../src/UniTest.h"
+#include "../src/UniRenderRef.h"
+#include "../src/UniVerifyCommon.h"
+#include "../scenes/UniScenes.h"
+#include "UniVolume.h"
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <thread>
+#include <vector>
+
+using namespace UniCore;
+using namespace UniRender;
+namespace H = UniHlsl;
+
+UNI_TEST(zz, arms)
+{
+	const FUniverseDef D = UniScenes::Base();
+	const FUniEmitter& E = D.Arch(UniScenes::kGalaxy).Emitters.at(0);
+	const FVolumeProfile& Prof = D.Arch(UniScenes::kGalaxy).Volume;
+	FFieldParams Mw = E.Exemplar;
+	{
+		const FUniverseDef F = UniScenes::Flythrough();
+		for (const FAnchor& A : F.Anchors) { if (!A.EmitterParams.empty()) { Mw = A.EmitterParams[0]; } }
+	}
+	const bool bGrid = std::getenv("UNI_ARMS_GRID") != nullptr;
+	const int Tile = 128, Gx = bGrid ? 7 : 5, Gy = bGrid ? 5 : 4;
+	FImage Img(Tile * Gx, Tile * Gy);
+	std::vector<FFieldParams> Ps;
+	if (bGrid)
+	{
+		const float Bs[7] = { 0.05f, 0.1f, 0.2f, 0.35f, 0.5f, 0.75f, 1.0f };
+		const float Ns[5] = { 1.5f, 2.5f, 4.0f, 6.0f, 9.0f };
+		for (int J = 0; J < Gy; ++J) for (int I = 0; I < Gx; ++I)
+		{
+			FFieldParams P = Mw; P.V[6] = 2.0f; P.V[20] = 0.0f; P.V[7] = Ns[J]; P.V[21] = Bs[I]; Ps.push_back(P);
+		}
+	}
+	else
+	{
+		Ps.push_back(Mw);
+		for (int G = 1; G < Gx * Gy; ++G)
+		{
+			FFieldParams P = E.Exemplar;
+			const u32 Seed = H::Uni_SeedMix(0xA2A5u, u32(G));
+			for (const FParamRange& R : E.Ranges) { P.V[R.Slot] = H::Uni_RollRange(Seed, ChannelIdUpper(R.Name), R.Min, R.Max, R.Bias, R.Quantize); }
+			Ps.push_back(P);
+			std::printf("  tile %d: arms %.0f N %.2f B %.3f asym %.2f inner %.2f\n", G, P.V[6], P.V[7], P.V[21], P.V[20], P.V[11]);
+		}
+	}
+	std::atomic<int> Next{ 0 };
+	auto Work = [&]()
+	{
+		for (int Gi = Next++; Gi < int(Ps.size()); Gi = Next++)
+		{
+			const H::FUniFieldParams P = Ps[size_t(Gi)].ToHlsl();
+			const H::FUniFieldParams Pd = DustFrom(Ps[size_t(Gi)], Prof).ToHlsl();
+			const double Inc = 15.0 * 3.14159265358979 / 180.0, Az = 0.3;
+			const double Dv[3] = { std::sin(Inc) * std::cos(Az), std::sin(Inc) * std::sin(Az), -std::cos(Inc) };
+			const double Rt[3] = { -std::sin(Az), std::cos(Az), 0.0 };
+			const double Up[3] = { Dv[1] * Rt[2] - Dv[2] * Rt[1], Dv[2] * Rt[0] - Dv[0] * Rt[2], Dv[0] * Rt[1] - Dv[1] * Rt[0] };
+			std::vector<float> L(size_t(Tile) * Tile * 3, 0.0f);
+			float Peak = 0.0f;
+			const double Half = 0.65, Px = 2.0 * Half / Tile;
+			const int Steps = 200;
+			const double Len = 2.0, Dt = Len / Steps;
+			for (int Y = 0; Y < Tile; ++Y) for (int X = 0; X < Tile; ++X)
+			{
+				const double U = -Half + (X + 0.5) * Px, V = Half - (Y + 0.5) * Px;
+				double O[3];
+				for (int Ax = 0; Ax < 3; ++Ax) { O[Ax] = U * Rt[Ax] + V * Up[Ax] - 1.0 * Dv[Ax]; }
+				double Col[3] = { 0, 0, 0 }, Tau[3] = { 0, 0, 0 };
+				const double Sig[3] = { 0.8, 1.0, 1.3 };
+				const float Foot = float(Px);
+				for (int S = 0; S < Steps; ++S)
+				{
+					const double T = (S + 0.5) * Dt;
+					const H::float3 Pt(float(O[0] + T * Dv[0]), float(O[1] + T * Dv[1]), float(O[2] + T * Dv[2]));
+					if (H::dot(Pt, Pt) >= 1.0f) { continue; }
+					const double Em = H::UniField_GalaxyFiltered(Pt, P, Foot) * Dt;
+					const double Du = Pd.D.y * H::UniField_GalaxyFiltered(Pt, Pd, Foot) * Dt;
+					for (int C = 0; C < 3; ++C) { Col[C] += Em * std::exp(-Tau[C]); Tau[C] += Sig[C] * Du; }
+				}
+				for (int C = 0; C < 3; ++C) { L[(size_t(Y) * Tile + X) * 3 + C] = float(Col[C]); Peak = std::max(Peak, float(Col[C])); }
+			}
+			const int Ox = (Gi % Gx) * Tile, Oy = (Gi / Gx) * Tile;
+			const float Gain = Peak > 0.0f ? 6.0f / Peak : 0.0f;
+			for (int Y = 0; Y < Tile; ++Y) for (int X = 0; X < Tile; ++X)
+			{
+				const float* C = &L[(size_t(Y) * Tile + X) * 3];
+				Img.Add(Ox + X, Oy + Y, C[0] * Gain * 0.95f, C[1] * Gain * 0.9f, C[2] * Gain * 0.8f);
+			}
+		}
+	};
+	std::thread T1(Work); Work(); T1.join();
+	const char* Out = std::getenv("UNI_ARMS_OUT");
+	Img.WritePpm(Out ? Out : "arms.ppm");
+	Uni::Check(2, "zz.arms", "D-256 stills").Pass(true, "see the image");
+}

@@ -153,6 +153,21 @@ UNI_FN float Uni_CarrierHandoff(float InPhysAngularRadius, float InThetaPixel)
 	return X * X * (3.0f - 2.0f * X);
 }
 
+/** D-245 (B-034: the galaxy sprite lacks the nebulae's light, a few to ~17% for star-forming
+ *  spirals, so the carrier brightened by that over the handoff's 4-8 px): a galaxy carrier's
+ *  nebulae fade in after the handoff completes, from its end (T1) to UNI_NEB_HANDOFF_SPAN x it,
+ *  smoothly in the log of the size, so the brightening is spread over a 6x zoom instead of the
+ *  handoff's 2x (where the nebulae are blended to their mean anyway: unresolved, below 3 knot
+ *  texels a pixel). Returns the hidden share, 1 to 0 (render only). */
+static const float UNI_NEB_HANDOFF_SPAN = 6.0f;
+
+UNI_FN float Uni_CarrierNebulaHide(float InPhysAngularRadius, float InThetaPixel)
+{
+	const float T1 = min(UNI_VOL_HANDOFF_PX * InThetaPixel, UNI_THETA_PROMOTE);
+	const float X = saturate(log2(max(InPhysAngularRadius / T1, 1.0e-6f)) / log2(UNI_NEB_HANDOFF_SPAN));
+	return 1.0f - X * X * (3.0f - 2.0f * X);
+}
+
 /** Visibility of an object before the level fade: point fade from its apparent magnitude and,
  *  for extended sources, the resolved surface-brightness fade (D-121). Shared by the sprite
  *  and the volume carrier, which must agree on it (D-128). */
@@ -475,15 +490,7 @@ UNI_FN float Uni_SpriteEdgeWindow(float InRPx, float InReachPx)
 	return 1.0f - smoothstep(0.9f * InReachPx, InReachPx, InRPx);
 }
 
-/** D-187: erf, Abramowitz and Stegun 7.1.26 (|error| < 1.5e-7), the same on CPU and GPU. */
-UNI_FN float Uni_Erf(float InX)
-{
-	const float X = abs(InX);
-	const float T = 1.0f / (1.0f + 0.3275911f * X);
-	const float P = T * (0.254829592f + T * (-0.284496736f + T * (1.421413741f + T * (-1.453152027f + T * 1.061405429f))));
-	const float E = 1.0f - P * exp(-X * X);
-	return InX < 0.0f ? -E : E;
-}
+// D-187's Uni_Erf lives in UniCoreDefs.ush (D-238: the globulars' box masses use it too).
 
 /** D-187: a normalised Gaussian of sigma InSigma smeared evenly along a segment from the
  *  centre to InL pixels along (InAx, InAy) (a unit vector in the quad's basis): the light a

@@ -1,6 +1,7 @@
 // D-212: the galaxy map (UniGalaxyMap.h; Uni_GalaxyMapTexel / Uni_GalaxyMapEval in UniFields.ush):
 // the camera's own galaxy marched from its baked 2D map against its field. (D-211's clipmap, which
-// this file first tested, was removed in D-213.)
+// this file first tested, was removed in D-213.) D-255: T2.vol.galaxy_map_stepfoot, the map read over
+// the march's step along the disc (uu.Volume.StepFoot).
 #include "../src/UniTest.h"
 #include "../src/UniVerifyCommon.h"
 #include "../src/UniRenderRef.h"
@@ -227,4 +228,181 @@ UNI_TEST(volume, galaxy_map_nebulae)
 	Uni::Check(2, "T2.vol.galaxy_map_nebulae", "D-234 the camera's own galaxy with nebulae, knots and cloud dust, from its 512^2 map against its field, three views: the frame's light within 1% and per-pixel p95 under 5%, the nebulae's added light within 5%")
 		.Metric("light", WorstLight).Metric("p95", WorstP95).Metric("added", WorstAdded)
 		.Pass(WorstLight < 0.01 && WorstP95 < 0.05 && WorstAdded < 0.05, Detail);
+}
+
+UNI_TEST(volume, galaxy_map_stepfoot)
+{
+	// D-255 (the cone rule; uu.Volume.StepFoot): the camera's galaxy's map and texture terms read
+	// over at least StepFoot x the step's run along the disc (the height profiles keep the pixel's
+	// footprint). From the solar circle along and across the disc, jittered marches at 8 phases
+	// (the temporal path's samples): the spread over the phases (the grain the accumulation sees)
+	// lower at 0.5 than at 0, the frame's light within 5%; 0 is the old read.
+	const FCacheTex& Tx = GalTex();
+	if (!Tx.bOk) { Uni::Check(2, "T2.vol.galaxy_map_stepfoot", "D-255 starlight over the step").Pass(false, "textures not loaded: " + Tx.Err); return; }
+	FGalBindAll Bind(Tx);
+	FUniverseDef D = UniScenes::Flythrough();
+	UniScenes::UseGalaxyTextures(D, Tx.T[0].Size);
+	UniScenes::UseGalaxyPalettes(D);
+	FUniverseModel M(D);
+	FRefGenerator G(M);
+	FVolumeBuilder VB(M, G);
+	struct FView { const char* Name; FVec3d Pos; FV3 Look; };
+	const FView Views[] = {
+		{ "solar toward the centre", { 8.0 * Units::Kpc, 1.0 * Units::Kpc, 20.0 * Units::Pc }, { -1.0, 0.05, 0.02 } },
+		{ "solar along the disc", { 8.0 * Units::Kpc, 1.0 * Units::Kpc, 20.0 * Units::Pc }, { 0.05, 1.0, 0.02 } },
+	};
+	std::string Detail;
+	bool bPass = true;
+	double WorstLight = 0.0, WorstSpread = 0.0;
+	FGalaxyMap Map;
+	bool bBaked = false;
+	for (const FView& Vw : Views)
+	{
+		const FCoord Cam = CamAt(Vw.Pos);
+		FRefPipeline P(G);
+		P.bVelocityLod = false;
+		P.Update(Cam, FVec3f{});
+		FCamera Cm; Cm.Coord = Cam; Cm.Width = 96; Cm.Height = 54; Cm.LookAlong(Vw.Look);
+		double Mean[2] = { 0.0, 0.0 }, Spread[2] = { 0.0, 0.0 };
+		for (int K = 0; K < 2; ++K)
+		{
+			FVolumeSettings S;
+			S.StepFoot = K == 0 ? 0.0f : 0.5f;
+			FVolumeScene Sc = VB.Build(P, Cam, FVec3f{}, Cm.View(), S).Subset(false);
+			const FCarrierGPU* Home = HomeCarrierOf(Sc);
+			if (!Home) { bPass = false; Detail += Uni::Fmt("%s%s: NO HOME", Detail.empty() ? "" : "; ", Vw.Name); break; }
+			if (!bBaked) { Map.Bake(*Home, Sc.Params, 512u, 2); bBaked = true; }
+			PublishGalaxyMap(Sc.View, Sc.Home.Carrier, 512u);
+			Sc.View.MarchFlags |= H::UNI_VOL_JITTER_FLAG;
+			BindGalaxyMap(0u, &Map);
+			const int Np = 8;
+			std::vector<double> S1(size_t(Cm.Width) * Cm.Height, 0.0), S2 = S1;
+			for (int Ph = 0; Ph < Np; ++Ph)
+			{
+				Sc.View.JitterShift = float(Ph) * 0.61803398875f;
+				const FRun R = March(Sc, Cm);
+				for (size_t I = 0; I < R.Lum.size(); ++I) { S1[I] += R.Lum[I]; S2[I] += R.Lum[I] * R.Lum[I]; }
+			}
+			BindGalaxyMap(0u, nullptr);
+			double Sm = 0.0, Ss = 0.0;
+			for (size_t I = 0; I < S1.size(); ++I)
+			{
+				const double Mu = S1[I] / Np;
+				Sm += Mu;
+				Ss += std::sqrt(std::max(S2[I] / Np - Mu * Mu, 0.0));
+			}
+			Mean[K] = Sm / double(S1.size());
+			Spread[K] = Ss / std::max(Sm, 1e-300);
+		}
+		const double Light = Mean[1] / std::max(Mean[0], 1e-300) - 1.0;
+		const double SpreadX = Spread[1] / std::max(Spread[0], 1e-300);
+		WorstLight = std::max(WorstLight, std::abs(Light));
+		WorstSpread = std::max(WorstSpread, SpreadX);
+		bPass = bPass && std::abs(Light) <= 0.05 && SpreadX < 1.0;
+		Detail += Uni::Fmt("%s%s: spread over the phases %.3f%% -> %.3f%% (x%.2f), light %+.2f%%", Detail.empty() ? "" : "; ", Vw.Name, 100.0 * Spread[0], 100.0 * Spread[1], SpreadX, 100.0 * Light);
+	}
+	Uni::Check(2, "T2.vol.galaxy_map_stepfoot", "D-255 uu.Volume.StepFoot 0.5: from the solar circle along and across the disc (the 512^2 map, 8 jitter phases) the spread over the phases lower than at 0, the frame's light within 5%")
+		.Metric("spread_x", WorstSpread).Metric("light", WorstLight)
+		.Pass(bPass, Detail);
+}
+
+UNI_TEST(volume, galaxy_segment)
+{
+	// D-262 (paradigm C; owner 2026-11-15: the knots sharper outside the galaxy than in it,
+	// uu.Volume.StepFoot 0 "resolves it"): the camera's galaxy's step read at up to SegmentTaps
+	// points along its run (each over the pixel's footprint and StepFoot x its share of the run).
+	// From the solar circle along and across the disc and 300 pc above it looking down at 30
+	// degrees, jittered marches at 8 phases: per configuration the spread over the phases (the
+	// grain the accumulation sees), the 8-phase mean's per-pixel error against a fine reference
+	// (an eighth of the steps, unjittered, StepFoot 0, one tap: the sharp field), the frame's light
+	// and the cost (taps and time). Held: SegmentTaps 4 with StepFoot 0.5 nearer the reference than
+	// D-255 (one tap, 0.5) with a spread no more than 1.5x its and at most StepFoot 0's.
+	const FCacheTex& Tx = GalTex();
+	if (!Tx.bOk) { Uni::Check(2, "T2.vol.galaxy_segment", "D-262 paradigm C").Pass(false, "textures not loaded: " + Tx.Err); return; }
+	FGalBindAll Bind(Tx);
+	FUniverseDef D = UniScenes::Flythrough();
+	UniScenes::UseGalaxyTextures(D, Tx.T[0].Size);
+	UniScenes::UseGalaxyPalettes(D);
+	FUniverseModel M(D);
+	FRefGenerator G(M);
+	FVolumeBuilder VB(M, G);
+	struct FView { const char* Name; FVec3d Pos; FV3 Look; };
+	const FView Views[] = {
+		{ "solar toward the centre", { 8.0 * Units::Kpc, 1.0 * Units::Kpc, 20.0 * Units::Pc }, { -1.0, 0.05, 0.02 } },
+		{ "solar along the disc", { 8.0 * Units::Kpc, 1.0 * Units::Kpc, 20.0 * Units::Pc }, { 0.05, 1.0, 0.02 } },
+		{ "300 pc above, down 30 deg", { 8.0 * Units::Kpc, 1.0 * Units::Kpc, 300.0 * Units::Pc }, { -0.85, 0.1, -0.5 } },
+	};
+	struct FCfg { const char* Name; float Foot; u32 Taps; };
+	const FCfg Cfgs[] = { { "foot 0", 0.0f, 1u }, { "foot 0.5 (D-255)", 0.5f, 1u }, { "foot 0.5 taps 4", 0.5f, 4u }, { "foot 0.5 taps 8", 0.5f, 8u }, { "foot 0 taps 8", 0.0f, 8u } };
+	constexpr int NC = int(sizeof(Cfgs) / sizeof(Cfgs[0]));
+	const char* OnlyEnv = std::getenv("UNI_SEG_VIEWS");   // exploration: fewer views
+	const int NV = OnlyEnv ? std::max(1, std::min(3, std::atoi(OnlyEnv))) : 3;
+	std::string Detail;
+	bool bPass = true;
+	double SumErr[NC] = {}, SumSpread[NC] = {}, SumLight[NC] = {}, SumMs[NC] = {};
+	FGalaxyMap Map;
+	bool bBaked = false;
+	for (int Vi = 0; Vi < NV; ++Vi)
+	{
+		const FView& Vw = Views[Vi];
+		const FCoord Cam = CamAt(Vw.Pos);
+		FRefPipeline P(G);
+		P.bVelocityLod = false;
+		P.Update(Cam, FVec3f{});
+		FCamera Cm; Cm.Coord = Cam; Cm.Width = 96; Cm.Height = 54; Cm.LookAlong(Vw.Look);
+		auto Scene = [&](float Foot, u32 Taps) -> FVolumeScene
+		{
+			FVolumeSettings S;
+			S.StepFoot = Foot; S.SegmentTaps = Taps;
+			FVolumeScene Sc = VB.Build(P, Cam, FVec3f{}, Cm.View(), S).Subset(false);
+			const FCarrierGPU* Home = HomeCarrierOf(Sc);
+			if (Home && !bBaked) { Map.Bake(*Home, Sc.Params, 512u, 2); bBaked = true; }
+			if (Home) { PublishGalaxyMap(Sc.View, Sc.Home.Carrier, 512u); }
+			return Sc;
+		};
+		FVolumeScene Rs = Scene(0.0f, 1u);
+		BindGalaxyMap(0u, &Map);   // after the bake (the binding takes the map's mips)
+		if (!bBaked) { bPass = false; Detail += Uni::Fmt("%s%s: NO HOME", Detail.empty() ? "" : "; ", Vw.Name); BindGalaxyMap(0u, nullptr); continue; }
+		Rs.View.MarchFlags |= 2u; Rs.View.MaxSteps = 16384u;
+		const FRun Ref = March(Rs, Cm);
+		double RefMean = 0.0;
+		for (double L : Ref.Lum) { RefMean += L; }
+		RefMean /= double(Ref.Lum.size());
+		std::string Vd;
+		for (int C = 0; C < NC; ++C)
+		{
+			FVolumeScene Sc = Scene(Cfgs[C].Foot, Cfgs[C].Taps);
+			Sc.View.MarchFlags |= H::UNI_VOL_JITTER_FLAG;
+			const int Np = 8;
+			std::vector<double> S1(Ref.Lum.size(), 0.0), S2 = S1;
+			double Ms = 0.0;
+			for (int Ph = 0; Ph < Np; ++Ph)
+			{
+				Sc.View.JitterShift = float(Ph) * 0.61803398875f;
+				const FRun R = March(Sc, Cm);
+				Ms += R.Ms;
+				for (size_t I = 0; I < R.Lum.size(); ++I) { S1[I] += R.Lum[I]; S2[I] += R.Lum[I] * R.Lum[I]; }
+			}
+			double Sm = 0.0, Ss = 0.0, Err = 0.0;
+			for (size_t I = 0; I < S1.size(); ++I)
+			{
+				const double Mu = S1[I] / Np;
+				Sm += Mu;
+				Ss += std::sqrt(std::max(S2[I] / Np - Mu * Mu, 0.0));
+				Err += std::abs(Mu - Ref.Lum[I]);
+			}
+			const double Spread = Ss / std::max(Sm, 1e-300), E = Err / std::max(RefMean * double(S1.size()), 1e-300), Light = Sm / std::max(RefMean * double(S1.size()), 1e-300) - 1.0;
+			SumErr[C] += E / NV; SumSpread[C] += Spread / NV; SumLight[C] += Light / NV; SumMs[C] += Ms / Np / NV;
+			Vd += Uni::Fmt("%s%s err %.2f%% spread %.3f%% light %+.1f%% %.0f ms", Vd.empty() ? "" : ", ", Cfgs[C].Name, 100.0 * E, 100.0 * Spread, 100.0 * Light, Ms / Np);
+		}
+		BindGalaxyMap(0u, nullptr);
+		Detail += Uni::Fmt("%s%s: %s", Detail.empty() ? "" : "; ", Vw.Name, Vd.c_str());
+	}
+	std::string Sum;
+	for (int C = 0; C < NC; ++C) { Sum += Uni::Fmt("%s%s err %.2f%% spread %.3f%% light %+.1f%% %.0f ms", Sum.empty() ? "" : ", ", Cfgs[C].Name, 100.0 * SumErr[C], 100.0 * SumSpread[C], 100.0 * SumLight[C], SumMs[C]); }
+	std::printf("    galaxy_segment mean: %s\n    %s\n", Sum.c_str(), Detail.c_str());
+	bPass = bPass && SumErr[2] < SumErr[1] && SumSpread[2] <= 1.5 * SumSpread[1] && SumSpread[2] <= SumSpread[0];
+	Uni::Check(2, "T2.vol.galaxy_segment", "D-262 paradigm C: the camera's galaxy's step read at up to SegmentTaps points along its run; from the solar circle along and across the disc and from 300 pc above, 8 jitter phases against a fine reference (an eighth of the steps, unjittered, StepFoot 0): SegmentTaps 4 at StepFoot 0.5 nearer the reference than D-255's one tap, its spread over the phases within 1.5x D-255's and no more than StepFoot 0's")
+		.Metric("err_d255", SumErr[1]).Metric("err_taps4", SumErr[2]).Metric("err_taps8", SumErr[3]).Metric("spread_d255", SumSpread[1]).Metric("spread_taps4", SumSpread[2]).Metric("spread_foot0", SumSpread[0])
+		.Pass(bPass, "mean: " + Sum + "; " + Detail);
 }

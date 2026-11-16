@@ -234,5 +234,85 @@
   {
     "id": "UE-67",
     "what": "D-236: nebula colours and ellipticals: shaders compile (Uni_GalaxyShells, Uni_GalaxyEarlyNebula*, the early branch of Uni_GalaxyNebulaStepCap with the footprint passed from Uni_CarrierStepLimit, Uni_NebulaHue); spirals' nebulae in three colours a galaxy over wider families; about 60% of ellipticals with coloured filaments in their cores, stable while moving and from inside; about a third with tidal shells (nested ripples, sharp outer edges); ProfileGPU near a large elliptical against uu.Nebula 0 (REVIEW_TONIGHT section 68)."
+  },
+  {
+    "id": "UE-69",
+    "what": "D-238: globular clusters: shaders compile (UniGenTask.ush's globular counts and candidates, Uni_GalaxyGc* in the fields, Uni_Erf/Uni_ErfInv in UniCoreDefs.ush; FTaskCountGPU 128 bytes, the readback); GPU placement matches the CPU's (UnifiedUniverse.Core.Layouts, T2.gen parity); globulars visible as dense balls of stars in the Milky Way's halo and around other galaxies' bulges (many around ellipticals); no stutter from the count pass (REVIEW_TONIGHT section 70)."
+  },
+  {
+    "id": "UE-70",
+    "what": "D-239: open clusters: shaders compile (UniGenTask.ush's open-cluster modes, counts and candidates; Uni_GalaxyOc* and the float2 cluster outputs in the fields; FTaskCountGPU 160 bytes, the readback); GPU placement matches the CPU's (UnifiedUniverse.Core.Layouts, T2.gen parity); compact clusters of stars along the Milky Way's and other textured spirals' arms, denser in bright knots, bright stars among them; no stutter from the count pass, which sums up to 256 lattice cells in one thread (REVIEW_TONIGHT section 71)."
+  },
+  {
+    "id": "UE-71",
+    "what": "D-240, D-241: the volume march jittered and accumulated, and the nebulae rebuilt cloud-style: shaders compile (UniVolume.usf MarchCS via Uni_VolumeMarchJ, ReconstructCS with HistAge/OutAge and MaxSamples; UniFields.ush's D-241 nebula block); FUniVolumeView 176 bytes; no slices inside or near nebulae, history converges within a fraction of a second at rest, no ghosting in motion (uu.VolumeJitter, uu.VolumeAccumulate); nebula walls ~42 pc and texture ~10 pc up close, unchanged light from afar (uu.Nebula.Fine); march cost about D-236's (REVIEW_TONIGHT section 72)."
+  },
+  {
+    "id": "UE-72",
+    "what": "D-242: each spiral nebula's balance of glow and dark dust: shaders compile (UniFields.ush's dark share, Uni_GalaxyNebulaDensityAt's new arguments; the march's reflection multiplier); FUniVolumeView 176 bytes (NebulaDark); uu.Nebula.Dark 0 -> 1 turns the arms' nebulae from glowing to dark clouds with glowing rims, seen along the disc; no change from a few kpc out (REVIEW_TONIGHT section 73)."
+  },
+  {
+    "id": "UE-73",
+    "what": "D-243, D-244, D-245: shaders compile (UniFields.ush's fronts and split shape; the march's refinement loop; UniProject.ush's Uni_CarrierNebulaHide); FUniCarrier 128 bytes (stride); dark and glowing parts with bright fronts inside nebulae (uu.Nebula.Dark); uu.Nebula.Refine 1 vs 4 cost and far knots (ProfileGPU); no brightening at a spiral's sprite-to-volume handoff (REVIEW_TONIGHT section 74)."
+  },
+  {
+    "id": "UE-74",
+    "what": "D-246: shaders compile (UniVolume.usf's CloudResolve, the blue noise before the core include, RayJitterPx); the ages G16R16F; FastBlueNoise_scalar_128x128x8 bound (no warning); the BeforeDOF hook ahead of CloudAtmosphere (priority 100) and space behind the atmosphere; grain against the clouds with uu.VolumeBeforeTSR / uu.VolumeResolve / uu.VolumeBlueNoise 0 and 1; the full-resolution march's cost (ProfileGPU); TSR ghosting in fast motion; the texture cooked in a packaged build (REVIEW_TONIGHT section 75)."
+  },
+  {
+    "id": "UE-75",
+    "what": "D-247, D-248: shaders and C++ compile (UniNebTune / UniNebTune2 in the volume passes, not the map bake; TemporalPhaseMarch); the per-cell blue noise against D-246's grain; uu.Nebula.Scale / Prevalence / FineScale / FineOctave / FineLodBias change the nebulae live without pops between near detail and far blend; uu.Nebula.FineReachKpc 7's cost (ProfileGPU); the sky light follows the handles (REVIEW_TONIGHT section 76)."
+  },
+  {
+    "id": "UE-76",
+    "what": "D-249, D-250: shaders and C++ compile (UniNebDetail, the fourth galaxy texture slot; FUniVolumeView 192 bytes); uu.GalaxyTexture.* and uu.ReloadTextures swap the textures live (the nebula slot render only); uu.Galaxy.DiffuseDust hazes the far side of a galaxy's disc from inside, varies by galaxy (uu.Galaxy.DustReachMinKpc / MaxKpc), keeps the view out of the plane clear and adds no step at the handoff (REVIEW_TONIGHT section 77)."
+  },
+  {
+    "id": "UE-77",
+    "what": "D-251: shaders and C++ compile (DenoiseCS pass 6, the moments history and march moments, UniNebTune3); uu.Nebula.StepRatio 0.08 removes most of the nebulae's speckle (vs 0 and 0.16) at an acceptable march cost (ProfileGPU) and no far-cache hitch; uu.VolumeDenoise 1 and uu.Nebula.FineStepLod as options (REVIEW_TONIGHT section 78)."
+  },
+  {
+    "id": "UE-78",
+    "what": "D-252: shaders and C++ compile (pass 7 NebGridResetCS / ReleaseCS / AllocCS / BakeCS, the nebula grid in the volume's common parameters, FUniVolumeView 208 bytes); uu.Nebula.Grid 1 removes the nebulae's speckle at mid and far distance (vs 0), softer, 128 vs 256 cells; uu.Perf's grid line (memory, slots, overflow, waiting); the bake's and reads' GPU cost (ProfileGPU Uni.NebulaGrid, Uni.Volume.March); flights at several speeds without pops or stale blocks; the far cache consistent (REVIEW_TONIGHT section 79)."
+  },
+  {
+    "id": "UE-79",
+    "what": "D-253: shaders and C++ compile; nebulae stay visible (soft) past 8 kpc with uu.Nebula.GridReachKpc 32, their dark parts fading with their glow; uu.Nebula.Peak (200 default; 100 / 400 / 0) gives the wanted brightness; uu.Perf's grid line at 8 levels (REVIEW_TONIGHT section 80)."
+  },
+  {
+    "id": "UE-80",
+    "what": "D-254: shaders and C++ compile (12 grid levels); flying into a spiral from outside shows no nebula pop at its edge (the grid on well before, uu.Perf); switching between spirals' grids acceptable (REVIEW_TONIGHT section 81)."
+  },
+  {
+    "id": "UE-81",
+    "what": "D-255: shaders and C++ compile; the nebula grain at 250 pc / 1 kpc / 3 kpc gone or near it, still and moving; the volume pass's cost against UE-80's (fewer steps, more grid reads); uu.Volume.StepFoot 0 / 0.5 / 1 and uu.Nebula.GridCells 128 / 256 compared (REVIEW_TONIGHT section 82)."
+  },
+  {
+    "id": "UE-82",
+    "what": "D-256: shaders and C++ compile; the Milky Way barred and two-armed from outside, no core rings; field spirals varied (barred, open, tight), none spoked; inside, arms and stars agree (REVIEW_TONIGHT section 83)."
+  },
+  {
+    "id": "UE-83",
+    "what": "D-258: shaders compile; knots, sharp dust lanes and streaky arms on textured spirals from outside; brightness steady flying in from 100 kpc (no pop at mip changes); grain inside no worse than D-255 (REVIEW_TONIGHT section 84)."
+  },
+  {
+    "id": "UE-84",
+    "what": "D-259: C++ and shaders compile (galaxy_shape texture and UniGalShapeTune in four parameter structs); knots on the arms without grain from outside; no pop flying in; reflection nebulae back to their D-256 brightness; uu.Galaxy.Knots / StructureFreq handles (REVIEW_TONIGHT section 85)."
+  },
+  {
+    "id": "UE-85",
+    "what": "D-261: the module builds with DeveloperSettings; Project Settings > Plugins > Unified Universe Tuning lists the uu.* variables at their console values; edits live in PIE; enable-time settings re-enable the scene; uu.Volume.DustGain live; saved values applied at play (REVIEW_TONIGHT section 86)."
+  },
+  {
+    "id": "UE-86",
+    "what": "D-262: the volume view struct at 224 bytes compiles and binds; inside the Milky Way the knots as sharp as from outside without grain at uu.Volume.SegmentTaps 4; the volume pass's GPU cost at 1 / 4 / 8 taps; DustGain / OpaqueCutoff look and cost; presets save and load (REVIEW_TONIGHT section 87)."
+  },
+  {
+    "id": "UE-87",
+    "what": "D-263: uu.Galaxy.DustHeight on the tuning page re-enables and thins / thickens every galaxy's dust layer (edge-on darker and thinner below 1, face-on unchanged); its effect on the volume pass's cost along the plane with DustGain and OpaqueCutoff (REVIEW_TONIGHT section 88)."
+  },
+  {
+    "id": "UE-88",
+    "what": "D-264: the tuning page's Reset All / Reset Filtered To Defaults buttons show and work (CallInEditor on the settings object), the page refreshes, uu.Tuning.Reset [filter] does the same, the ini is untouched until Set as Default (REVIEW_TONIGHT section 89)."
   }
 ]

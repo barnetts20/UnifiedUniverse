@@ -1,0 +1,52 @@
+// dustcut_d262.cpp.txt (archived exploration; was UNI_TEST(zz, dustcut) in tests/test_galaxymap.cpp): D-262, the owner's idea of darker dust ending the costliest rays sooner. From the solar circle toward the centre and along the disc: steps a ray and light at uu.Volume.DustGain 1-100 and uu.Volume.OpaqueCutoff 1e-3 / 2e-2. Result: toward the centre x100 dust light x0.42, steps x0.83 (x0.78 with the 2e-2 cutoff); along the disc x0.66, steps x0.97: the dust layer is thinner than the stars', so rays leave it before they become opaque.
+
+UNI_TEST(zz, dustcut)
+{
+	// D-262 exploration (owner 2026-11-15: "ramp up dust darkness more and have it basically eat the
+	// march by about 30-70% of the galaxy disc ... a faster truncation in the most expensive rays"):
+	// the Milky Way from the solar circle along and across the disc (its map), steps a ray and the
+	// frame's light at uu.Volume.DustGain 1 / 2 / 4 and uu.Volume.OpaqueCutoff 1e-3 / 1e-2 / 2e-2.
+	const FCacheTex& Tx = GalTex();
+	if (!Tx.bOk) { return; }
+	FGalBindAll Bind(Tx);
+	FUniverseDef D = UniScenes::Flythrough();
+	UniScenes::UseGalaxyTextures(D, Tx.T[0].Size);
+	UniScenes::UseGalaxyPalettes(D);
+	FUniverseModel M(D);
+	FRefGenerator G(M);
+	FVolumeBuilder VB(M, G);
+	struct FView { const char* Name; FVec3d Pos; FV3 Look; };
+	const FView Views[] = {
+		{ "toward the centre", { 8.0 * Units::Kpc, 1.0 * Units::Kpc, 20.0 * Units::Pc }, { -1.0, 0.05, 0.02 } },
+		{ "along the disc", { 8.0 * Units::Kpc, 1.0 * Units::Kpc, 20.0 * Units::Pc }, { 0.05, 1.0, 0.02 } },
+	};
+	FGalaxyMap Map;
+	bool bBaked = false;
+	for (const FView& Vw : Views)
+	{
+		const FCoord Cam = CamAt(Vw.Pos);
+		FRefPipeline P(G);
+		P.bVelocityLod = false;
+		P.Update(Cam, FVec3f{});
+		FCamera Cm; Cm.Coord = Cam; Cm.Width = 96; Cm.Height = 54; Cm.LookAlong(Vw.Look);
+		double L0 = 0.0, St0 = 0.0;
+		for (float Dg : { 1.0f, 4.0f, 10.0f, 30.0f, 100.0f }) for (float Oc : { 1.0e-3f, 2.0e-2f })
+		{
+			FVolumeSettings S;
+			S.StepFoot = 0.5f; S.OpaqueCutoff = Oc;
+			for (int K = 0; K < 3; ++K) { S.DustSigmaRgb[K] *= Dg; }
+			FVolumeScene Sc = VB.Build(P, Cam, FVec3f{}, Cm.View(), S).Subset(false);
+			const FCarrierGPU* Home = HomeCarrierOf(Sc);
+			if (!Home) { continue; }
+			if (!bBaked) { Map.Bake(*Home, Sc.Params, 512u, 2); bBaked = true; }
+			PublishGalaxyMap(Sc.View, Sc.Home.Carrier, 512u);
+			BindGalaxyMap(0u, &Map);
+			const FRun R = March(Sc, Cm);
+			BindGalaxyMap(0u, nullptr);
+			double L = 0.0; for (double V : R.Lum) { L += V; }
+			if (Dg == 1.0f && Oc == 1.0e-3f) { L0 = L; St0 = R.Steps; }
+			std::printf("    %s: dust x%.0f cutoff %.0e: steps a ray %.1f (x%.2f), light x%.3f, %.0f ms\n", Vw.Name, double(Dg), double(Oc), R.Steps, R.Steps / std::max(St0, 1e-9), L / std::max(L0, 1e-300), R.Ms);
+		}
+	}
+	Uni::Check(2, "zz.dustcut", "x").Pass(true, "stdout");
+}

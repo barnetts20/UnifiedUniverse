@@ -23,6 +23,7 @@
 #include "UniTravel.h"
 #include "UniProfile.h"
 #include "UniWebTexture.h"
+#include "UniNebGrid.h"
 
 int main()
 {
@@ -38,6 +39,15 @@ int main()
 	std::vector<FCellGPU> SysCells;
 	std::vector<FObjectGPU> SysRecs;
 	FPromotionManager Prom;
+	{
+		// D-252: the nebula grid's plan instantiated.
+		FNebGridConfig Nc; Nc.Cell0 = 1.0e-4; Nc.LayerHalf = 0.02; Nc.KnotTexel = 5.0e-3;
+		FNebGridPlanner Np; Np.Configure(Nc, 1u);
+		FNebGridPlanner::FFrameOps Ops;
+		const double Cam[3] = { -0.33, 0.0, 0.0 };
+		Np.Update(Cam, 0.0, 64u, Ops);
+		(void)Np.Pending();
+	}
 	Prom.Update(Sys, UniScenes::SolarCamera(), 0.0, 0);
 	const std::set<u32> Culled = Prom.CulledSpriteIds();
 	Sys.Build(UniScenes::SolarCamera(), 0.0, 0u, 256u, SysCells, SysRecs, &Culled);

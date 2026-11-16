@@ -124,7 +124,8 @@ namespace
 		const float R0 = std::sqrt(P.x * P.x + P.y * P.y);
 		const float Rn0 = std::clamp(R0 / std::max(Par.D.x, 1.0e-6f), 0.0f, 1.0f);
 		const float U0 = std::min(-std::log(std::max(R0, 1.0e-4f)), 6.0f);
-		const float Tw = (U0 + 0.5f * std::max(Par.F.y, 0.0f) * U0 * U0) / std::max(Par.B.w, 1.0e-3f) * Rn0 * Par.H.z;
+		float TwRate = 0.0f;
+		const float Tw = H::Uni_GalaxyWindingU(std::max(R0, 1.0e-4f), U0, Par, TwRate) * Rn0 * Par.H.z;   // D-256: the shader's winding
 		const float St = std::sin(Tw), Ct = std::cos(Tw);
 		const float3 Fr = float3(P.x * Ct - P.y * St, P.x * St + P.y * Ct, 2.0f * P.z / G.ZStretch);
 		if (Par.G.x == 0.0f || std::abs(P.z) > G.Slab) { return P; }
@@ -305,9 +306,10 @@ namespace
 		float4 Dt;
 		uint32_t bDt = 0u;
 		float FineN = 0.0f, SphM = 1.0f; H::float3 NebK(0.0f, 0.0f, 0.0f);
-		H::Uni_GalaxyTexTerms(P, G.NoWarp, G.K, 0.0f, G.Slab, true, H::Uni_GalaxyNeedsDetail(Par), Pd, Pb, Dt, bDt, FineN, SphM, NebK);
+		float4 DtL(0.0f, 0.0f, 0.0f, 0.0f);
+		H::Uni_GalaxyTexTermsL(P, G.NoWarp, G.K, 0.0f, G.Slab, true, H::Uni_GalaxyNeedsDetail(Par), Pd, Pb, Dt, bDt, FineN, SphM, NebK, DtL);
 		float DetailN = 0.0f, Knot = 0.0f, Cloud = 1.0f;
-		if (bDt != 0u) { H::Uni_GalaxyDetailTerms(Dt, Par, DetailN, Knot, Cloud); }
+		if (bDt != 0u) { H::Uni_GalaxyDetailTerms(Dt, DtL.w, Par, DetailN, Knot, Cloud); }
 		float Cz = 0.0f, Hh = 1.0f;
 		FrameAt(G, C, P.x, P.y, Cz, Hh);
 		float Q = M.N <= 1 ? 0.0f : ((P.z - Cz) / Hh + 1.0f) * 0.5f * float(M.N - 1);

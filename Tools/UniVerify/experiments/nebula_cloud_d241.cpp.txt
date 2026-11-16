@@ -1,0 +1,172 @@
+// test_zz_nebcloud.cpp: D-241 exploration (not part of the gate; --group zz.nebcloud).
+// The rebuilt nebula field (Uni_GalaxyNebulaShapeAt) on the Milky Way's gas layer: the fade means
+// solved so the light is the same either side of each detail layer's fade, the lanes' mean, the
+// shape's mean (the scale); and slices through the brightest knot (D-234's shape and the rebuilt
+// one at a few erosion and warp settings).
+
+#include "../src/UniTest.h"
+#include "../src/UniRenderRef.h"
+#include "../src/UniVerifyCommon.h"
+#include "../scenes/UniScenes.h"
+#include "UniWebTexture.h"
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <string>
+#include <sys/stat.h>
+#include <vector>
+
+using namespace UniCore;
+using namespace UniRender;
+namespace H = UniHlsl;
+
+namespace
+{
+	struct FZnSample { H::float3 P; H::float4 Neb; };
+
+	/** The shape's mean over the samples with the given footprint and detail (0: faded). */
+	double ZnMean(const std::vector<FZnSample>& S, const H::FUniFieldParams& P, float Foot, float Detail, double* OutLane = nullptr)
+	{
+		double Sum = 0.0, Lane = 0.0; size_t NL = 0;
+		for (const FZnSample& Q : S)
+		{
+			float X = 0.0f, Md = 1.0f;
+			Sum += double(H::Uni_GalaxyNebulaShapeAt(Q.P, Q.Neb, P, Foot, Detail, X, Md));
+			if (OutLane && X > 0.0f)
+			{
+				// X - D1: re-derive D1 from the dust multiplier is not possible; the lane is measured separately.
+				++NL;
+			}
+		}
+		(void)Lane; (void)NL;
+		return Sum / double(S.size());
+	}
+}
+
+UNI_TEST(zz, nebcloud)
+{
+	FWebTexture T[3];
+	for (int S = 0; S < 3; ++S) { std::string E; if (!FWebTexture::LoadDelivered("Data/Noise", GalaxyTextureName(S), T[S], &E)) { std::printf("tex fail\n"); return; } }
+	for (int I = 0; I < 3; ++I) { BindGalaxyTexture(I, &T[I]); }
+	FUniverseDef D = UniScenes::Flythrough();
+	UniScenes::UseGalaxyTextures(D, T[0].Size);
+	const FFieldParams* Mw = nullptr;
+	for (const FAnchor& A : D.Anchors) { if (!A.EmitterParams.empty()) { Mw = &A.EmitterParams[0]; } }
+	const H::FUniFieldParams P = Mw->ToHlsl();
+	const H::FUniGalaxyConst K = H::Uni_GalaxyConstOf(P);
+
+	// Samples: the gas layer of an annulus, the knot terms from the field (footprint ~0).
+	std::vector<FZnSample> S;
+	const int N = 240000;
+	for (int I = 0; I < N; ++I)
+	{
+		const double R = 0.2 + 0.5 * H::Uni_DrawUnit(0xA11u, 2u, u32(3 * I)), Ph = 6.2831853 * H::Uni_DrawUnit(0xA11u, 2u, u32(3 * I + 1));
+		const double Z = (2.0 * H::Uni_DrawUnit(0xA11u, 2u, u32(3 * I + 2)) - 1.0) * 0.5 * double(P.A.y);
+		const H::float3 Pt{ float(R * std::cos(Ph)), float(R * std::sin(Ph)), float(Z) };
+		H::float4 C(0, 0, 0, 0), Nv(0, 0, 0, 0);
+		H::UniField_GalaxyFilteredCKN(Pt, P, K, 1e-6f, C, Nv);
+		S.push_back({ Pt, Nv });
+	}
+	const float Te1 = H::Uni_GalaxyNebulaFineTexel(P, 0.0f), Te2 = H::Uni_GalaxyNebulaFineTexel(P, 1.0f);
+	const float FootTexOff = Te2 * std::exp2(5.0f - UNI_NEB_FINE_MIP);   // the texture's read at mip 5 (faded), the walls' at mip 2 (full)
+	std::printf("texels: walls %.3g, texture %.3g field units; texture-off footprint %.3g (walls lod %.2f strength %.3f, texture lod %.2f %.3f)\n", Te1, Te2, FootTexOff,
+		H::Uni_GalaxyNebulaFineLod(P, 0.0f, FootTexOff), H::Uni_GalaxyNebulaFineStrength(H::Uni_GalaxyNebulaFineLod(P, 0.0f, FootTexOff)),
+		H::Uni_GalaxyNebulaFineLod(P, 1.0f, FootTexOff), H::Uni_GalaxyNebulaFineStrength(H::Uni_GalaxyNebulaFineLod(P, 1.0f, FootTexOff)));
+	const float Fq[3] = { 16.0f, 6.0f, 4.0f }, Oc[3] = { 8.0f, 4.0f, 4.0f };
+	for (int Ci = 0; Ci < 3; ++Ci)
+	{
+		const float E1 = 0.75f;
+		H::GKnobNebErosion1 = E1;
+		H::GKnobNebErosion2 = 0.5f;
+		H::GKnobNebFreq = Fq[Ci]; H::GKnobNebOctave = Oc[Ci];
+		const float FootOff = H::Uni_GalaxyNebulaFineTexel(P, 1.0f) * std::exp2(5.0f - UNI_NEB_FINE_MIP);   // the texture's read at mip 5 (faded)
+		H::GKnobNebShapeMean2 = H::UNI_NEBULA_SHAPE_MEAN;   // the shape unnormalised
+		// FM2: the texture's fade mean, the walls on.
+		auto Bis = [&](float& Knob, auto Fn, double Target)
+		{
+			float Lo = 0.0f, Hi = 1.0f;
+			for (int It = 0; It < 30; ++It) { Knob = 0.5f * (Lo + Hi); if (Fn() > Target) { Lo = Knob; } else { Hi = Knob; } }   // a higher fade mean erodes more: less light
+			Knob = 0.5f * (Lo + Hi);
+		};
+		H::GKnobNebFm1 = 0.5f; H::GKnobNebFm2 = 0.5f;
+		const double Full = ZnMean(S, P, 0.0f, 1.0f);
+		Bis(H::GKnobNebFm2, [&]() { return ZnMean(S, P, FootOff, 1.0f); }, Full);
+		Bis(H::GKnobNebFm1, [&]() { return ZnMean(S, P, 0.0f, 0.0f); }, Full);
+		const double Mid = ZnMean(S, P, FootOff, 1.0f), Off = ZnMean(S, P, 0.0f, 0.0f);
+		// The lanes' mean (X - D1 where X > 0), the walls full.
+		double Lane = 0.0; size_t NL = 0;
+		double DustM = 0.0;
+		for (const FZnSample& Q : S)
+		{
+			const float X = H::Uni_GalaxyNebulaX(Q.Neb, P);
+			if (!(X > 0.0f)) { continue; }
+			// D1 by the shape at detail 1 with the texture faded and no texture erosion: recompute directly.
+			const float W = H::saturate((Q.Neb.z - 0.526f) * (1.0f / 0.26f) + 0.5f);
+			const float F0 = std::max(P.G.w, 1.0e-3f) * UNI_NEB_FINE_FREQ;
+			const H::float3 D1w = H::float3((Q.Neb.z - H::UNI_GAL_DETAIL_MEAN0.z) / H::UNI_NEB_KNOT_SD.z, (Q.Neb.w - H::UNI_GAL_DETAIL_MEAN0.w) / H::UNI_NEB_KNOT_SD.w,
+				(Q.Neb.y - 0.0457f) / H::UNI_NEB_KNOT_SD.y) * (UNI_NEB_WARP1 * std::exp2(UNI_NEB_FINE_MIP) / std::max(P.H.w, 1.0f));
+			const H::float4 N1 = UNI_GAL_DETAIL(Q.P * F0 + D1w + H::float3(0.371f, 0.113f, 0.729f), UNI_NEB_FINE_MIP);
+			const float D1 = H::Uni_GalaxyNebulaErode(X * UNI_NEB_CORE, H::Uni_GalaxyNebulaModifier(N1, W), UNI_NEB_EROSION1);
+			Lane += double(X * UNI_NEB_CORE - D1); ++NL;
+		}
+		Lane /= std::max<size_t>(NL, 1);
+		H::GKnobNebLaneMean = float(Lane);
+		for (const FZnSample& Q : S)
+		{
+			float X = 0.0f, Md = 1.0f;
+			H::Uni_GalaxyNebulaShapeAt(Q.P, Q.Neb, P, 0.0f, 1.0f, X, Md);
+			if (X > 0.0f) { DustM += Md; }
+		}
+		DustM /= std::max<size_t>(NL, 1);
+		std::printf("freq %.0f octave %.0f: E1 %.2f E2 %.2f warp %.1f/%.1f: shape mean full %.6g (D-234's %.6g, x %.3f); FM2 %.5f -> %.6g, FM1 %.5f -> %.6g; lanes %.5f over %zu (dust mean %.4f where X > 0)\n",
+			Fq[Ci], Oc[Ci], E1, UNI_NEB_EROSION2, UNI_NEB_WARP1, UNI_NEB_WARP2, Full, double(H::UNI_NEBULA_SHAPE_MEAN), Full / H::UNI_NEBULA_SHAPE_MEAN, H::GKnobNebFm2, Mid, H::GKnobNebFm1, Off, Lane, NL, DustM);
+	}
+
+	// Slices through the brightest knot: D-234's X^2 J, and the rebuilt shape (E1 0.6 / 0.75 / 0.9),
+	// 800 pc a side (24 kpc a field unit), the mid-plane.
+	double Hx = 0.0, Hy = 0.0, Hb = -1.0;
+	for (int I = 0; I < 60000; ++I)
+	{
+		const double R = 0.3 + 0.4 * H::Uni_DrawUnit(0xF374u, 2u, u32(2 * I)), Ph = 6.2831853 * H::Uni_DrawUnit(0xF374u, 2u, u32(2 * I + 1));
+		const H::float3 Pt{ float(R * std::cos(Ph)), float(R * std::sin(Ph)), 0.0f };
+		H::float4 C(0, 0, 0, 0), Nv(0, 0, 0, 0);
+		const float Rho = H::UniField_GalaxyFilteredCKN(Pt, P, K, 1e-5f, C, Nv);
+		const double Sc = double(H::Uni_GalaxyNebulaX(Nv, P)) * double(H::Uni_GalaxyNebulaDensity(Nv, P, 1e-5f)) / std::max(double(Rho), 1e-30);
+		if (Sc > Hb) { Hb = Sc; Hx = Pt.x; Hy = Pt.y; }
+	}
+	const int W = 256;
+	FImage Img(W * 4, W * 2);
+	for (int Row = 0; Row < 2; ++Row)
+	{
+	const double Span = (Row == 0 ? 800.0 : 200.0) / 24000.0;
+	const float Foot = float(Span / W);
+	std::vector<H::float4> Nb(size_t(W) * W);
+	for (int Y = 0; Y < W; ++Y) for (int X = 0; X < W; ++X)
+	{
+		const H::float3 Pt{ float(Hx + ((X + 0.5) / W - 0.5) * Span), float(Hy + (0.5 - (Y + 0.5) / W) * Span), 0.0f };
+		H::float4 C(0, 0, 0, 0), Nv(0, 0, 0, 0);
+		H::UniField_GalaxyFilteredCKN(Pt, P, K, 1e-6f, C, Nv);
+		Nb[size_t(Y) * W + X] = Nv;
+	}
+	for (int Pn = 0; Pn < 4; ++Pn)
+	{
+		if (Pn > 0) { H::GKnobNebErosion1 = 0.75f; H::GKnobNebFreq = Fq[Pn - 1]; H::GKnobNebOctave = Oc[Pn - 1]; }
+		H::GKnobNebShapeMean2 = H::UNI_NEBULA_SHAPE_MEAN;
+		for (int Y = 0; Y < W; ++Y) for (int X = 0; X < W; ++X)
+		{
+			const H::float3 Pt{ float(Hx + ((X + 0.5) / W - 0.5) * Span), float(Hy + (0.5 - (Y + 0.5) / W) * Span), 0.0f };
+			const H::float4& Nv = Nb[size_t(Y) * W + X];
+			float V = 0.0f, Xs = 0.0f, Md = 1.0f;
+			if (Pn == 0) { const float Xx = H::Uni_GalaxyNebulaX(Nv, P); V = Xx * Xx * std::clamp(1.0f + 2.0f * (Nv.w - 0.493f), 0.2f, 1.8f); }
+			else { V = H::Uni_GalaxyNebulaShapeAt(Pt, Nv, P, Foot, 1.0f, Xs, Md); }
+			const float G = std::sqrt(std::min(V / 1.2f, 1.0f));
+			const float Dk = std::min(std::max(Md - 1.0f, 0.0f) * 0.3f, 1.0f);
+			Img.Add(Pn * W + X, Row * W + Y, G, 0.55f * G + 0.25f * Dk, 0.65f * G + 0.4f * Dk);
+		}
+	}
+	}
+	const std::string Dir = UniVerify::Options().OutDir + "/render";
+	::mkdir(UniVerify::Options().OutDir.c_str(), 0755); ::mkdir(Dir.c_str(), 0755);
+	Img.WritePpm(Dir + "/zz_nebcloud.ppm");
+	for (int I = 0; I < 3; ++I) { BindGalaxyTexture(I, nullptr); }
+}

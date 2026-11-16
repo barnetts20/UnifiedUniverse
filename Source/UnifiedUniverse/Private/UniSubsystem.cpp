@@ -1,4 +1,5 @@
 #include "UniSubsystem.h"
+#include "UniTuningSettings.h"
 
 #include "UnifiedUniverseModule.h"
 #include "UniDemoScenes.h"
@@ -24,6 +25,7 @@
 #include "Engine/SkyLight.h"
 #include "Components/SkyLightComponent.h"
 #include "Engine/TextureCube.h"
+#include "Engine/Texture2D.h"   // D-246: the blue noise
 #include "InputCoreTypes.h"
 #include "UniScaleLadder.h"
 #include "UniCoordLibrary.h"
@@ -66,6 +68,7 @@ namespace UniClusterCVars
 	TAutoConsoleVariable<float> StarKeep(TEXT("uu.Star.Keep"), float(Defaults.StarKeep), TEXT("D-197: share of every galaxy's stars that are generated and drawn (the rest of their light is the galaxy's glow). 1: all, as before D-197; D-198 0.5; D-205 0.35. Applies at uu.Enable."));
 	TAutoConsoleVariable<float> DustScale(TEXT("uu.Galaxy.DustScale"), float(Defaults.DustScale), TEXT("D-198: galaxies' dust optical depth x this (darker lanes; 1: the D-132 dust). Applies at uu.Enable."));
 	TAutoConsoleVariable<float> DustLanes(TEXT("uu.Galaxy.DustLanes"), float(Defaults.DustLanes), TEXT("D-198: contrast of textured galaxies' dust lanes (D-180: 2.2). Applies at uu.Enable."));
+	TAutoConsoleVariable<float> DustHeight(TEXT("uu.Galaxy.DustHeight"), float(Defaults.DustHeight), TEXT("D-263: galaxies' dust layer scale height x this (how fast the dust falls off from the disc's plane; the stars' is unchanged). The face-on optical depth is kept, so a thinner layer is denser: darker edge-on and along the plane (rays in the disc end sooner), the same face-on. 1: half the stars' height (0.67: a third, ~real: the Milky Way's ~100 pc of dust under ~300 pc of stars). Render-only. Applies at uu.Enable."));
 	TAutoConsoleVariable<float> EarlyColour(TEXT("uu.Cluster.EarlyColour"), float(Defaults.EarlyColourShift), TEXT("D-172: early types' colour shift in log10 K (negative: redder)."));
 
 	UniScenes::FClusterTuning Read()
@@ -94,6 +97,7 @@ namespace UniClusterCVars
 		T.StarKeep = FMath::Clamp(double(StarKeep.GetValueOnGameThread()), 0.05, 1.0);
 		T.DustScale = FMath::Clamp(double(DustScale.GetValueOnGameThread()), 0.0, 10.0);   // D-198
 		T.DustLanes = FMath::Clamp(double(DustLanes.GetValueOnGameThread()), 0.0, 10.0);
+		T.DustHeight = FMath::Clamp(double(DustHeight.GetValueOnGameThread()), 0.05, 4.0);   // D-263
 		return T;
 	}
 }
@@ -145,8 +149,37 @@ static TAutoConsoleVariable<float> CVarUniMotionWebDetail(TEXT("uu.MotionWeb.Det
 static TAutoConsoleVariable<float> CVarUniMotionWebStepMpc(TEXT("uu.MotionWeb.StepMpc"), 0.5f, TEXT("D-231: with the detail on, the background march's step cap (Mpc) where the motion web is (half its near distance to its depth), so the detail is sampled instead of swimming (~2x the background's steps while travelling). 0: no cap (free; the detail then blurs away over the march's long steps)."));
 static TAutoConsoleVariable<float> CVarUniMotionWebDetailMpc(TEXT("uu.MotionWeb.DetailMpc"), 20.0f, TEXT("D-231: the detail texture's period (Mpc; rounded to a whole number per 200 Mpc web tile). Its ridges are 1/4 to 1/32 of it."));
 static TAutoConsoleVariable<float> CVarUniMotionWebRegionMpc(TEXT("uu.MotionWeb.RegionMpc"), 200.0f, TEXT("D-233: the period (Mpc; at most one per 200 Mpc web tile, else a whole number per tile) of the regions over which the detail's look changes: filaments, knots, cloud or cells, mixed by a smooth second read of the detail texture (regions ~50 Mpc across at 200). 0: the ridged filaments everywhere (D-231)."));
-static TAutoConsoleVariable<float> CVarUniNebula(TEXT("uu.Nebula"), 1.0f, TEXT("D-234: emission nebulae (H II regions) in galaxies: pink glows on the arms' star-forming knots, in a gas layer as thin as the dust, at this gain x the galaxy's full light per star (they stay as the stars resolve). Galaxies with a palette use its knot colour. 0: off."));
+static TAutoConsoleVariable<float> CVarUniNebula(TEXT("uu.Nebula"), 0.0f, TEXT("D-260: off by default (owner: the shaped knots and structure are closer to the nebulae wanted, without a layer of their own). D-234: emission nebulae (H II regions) in galaxies: pink glows on the arms' star-forming knots, in a gas layer as thin as the dust, at this gain x the galaxy's full light per star (they stay as the stars resolve). Galaxies with a palette use its knot colour. 0: off."));
 static TAutoConsoleVariable<float> CVarUniNebulaReflect(TEXT("uu.Nebula.Reflect"), 6.0f, TEXT("D-234: reflection nebulae: galaxies' dust lit blue by the young clusters around it (the knots), at this gain. 0: off."));
+static TAutoConsoleVariable<float> CVarUniNebulaFine(TEXT("uu.Nebula.Fine"), 1.0f, TEXT("D-237, D-241: the nebulae's detail layers: their structure eroded by warped walls (~40 pc in the Milky Way) and texture (~10 pc), with dark lanes in the dust, near the camera; level of detail by the pixel's footprint. 0: off (their mean)."), ECVF_Default);
+static TAutoConsoleVariable<float> CVarUniNebulaDark(TEXT("uu.Nebula.Dark"), 0.35f, TEXT("D-242: the nebulae's mean dark share: each spiral nebula balances glow (an H II region) against dark dust (an opaque cloud glowing at its rims, seen up close; from afar the dust is D-241's) by its own share around this mean. 0: all glow (~14% brighter), 1: all dust; 0.35 keeps D-241's light. Below 0: off (D-241)."), ECVF_Default);
+static TAutoConsoleVariable<int32> CVarUniNebulaRefine(TEXT("uu.Nebula.Refine"), 1, TEXT("D-244: inside a spiral's gas layer, a long march step is split into up to this many sub-samples about a nebula knot texel apart, each evaluating the whole galaxy field (CloudAtmosphere-style fine steps inside the structure): far knots stay sharp this many times farther out (offline at 4: ~2.5x the galaxy work along the disc, one frame's noise 6% -> 12%). 0 or 1: off."), ECVF_Default);
+static TAutoConsoleVariable<float> CVarUniNebulaFineReachKpc(TEXT("uu.Nebula.FineReachKpc"), 7.0f, TEXT("D-237, D-241: the nebulae's detail layers out to this distance, faded over its second half at each sample's own distance. D-248: 1 -> 7 (owner)."), ECVF_Default);
+static TAutoConsoleVariable<float> CVarUniGalaxyDiffuseDust(TEXT("uu.Galaxy.DiffuseDust"), 1.0f, TEXT("D-250: dusty galaxies' low background dust (render only), x this opacity: along the disc's mid-plane at ~the solar circle it reaches tau 1 over the galaxy's own reach (uu.Galaxy.DustReachMinKpc..MaxKpc by its seed), so the far side of the disc hazes out; looking out of the plane stays clear. It fades in past the galaxy's sprite handoff (D-245). 0: off."), ECVF_Default);
+static TAutoConsoleVariable<float> CVarUniGalaxyDustReachMinKpc(TEXT("uu.Galaxy.DustReachMinKpc"), 0.75f, TEXT("D-250: the shortest diffuse-dust reach a galaxy rolls (kpc; log-uniform to uu.Galaxy.DustReachMaxKpc)."), ECVF_Default);
+static TAutoConsoleVariable<float> CVarUniGalaxyDustReachMaxKpc(TEXT("uu.Galaxy.DustReachMaxKpc"), 10.0f, TEXT("D-250: the longest diffuse-dust reach a galaxy rolls (kpc)."), ECVF_Default);
+static TAutoConsoleVariable<float> CVarUniVolumeStepFoot(TEXT("uu.Volume.StepFoot"), 0.5f, TEXT("D-255: the camera's galaxy's map read over at least this x the march's step along the disc (the cone rule: one sample stands for its step; 0: the pixel's footprint alone)."), ECVF_Default);
+static TAutoConsoleVariable<int32> CVarUniVolumeSegmentTaps(TEXT("uu.Volume.SegmentTaps"), 4, TEXT("D-262 (paradigm C; default 4: against a fine reference 0.67% per pixel and a 1.3% spread over jitter phases, D-255's one read 3.1% and 4.7%, at ~2x the march's cost on the CPU): the camera's galaxy's march step read at up to this many points along its run in the disc's plane, each over the pixel's footprint and uu.Volume.StepFoot x its share of the run (sharp across the ray, averaged along it). 1: one read, D-255's (StepFoot blurs across the ray too)."), ECVF_Default);
+static TAutoConsoleVariable<float> CVarUniVolumeOpaqueCutoff(TEXT("uu.Volume.OpaqueCutoff"), 0.001f, TEXT("D-262: a volume ray stops when its transmittance falls under this (every channel). Higher ends rays in thick dust sooner (edge-on discs: the costliest rays): 0.01-0.02 is common in cloud renderers; the light behind is lost. 0.001: the old constant."), ECVF_Default);
+static TAutoConsoleVariable<float> CVarUniGalaxyDiffuseDustHeight(TEXT("uu.Galaxy.DiffuseDustHeight"), 1.5f, TEXT("D-250: the diffuse dust's scale height over the galaxy's dust layer's (thicker than the lanes)."), ECVF_Default);
+static TAutoConsoleVariable<float> CVarUniNebulaScale(TEXT("uu.Nebula.Scale"), 1.0f, TEXT("D-248: the nebulae's size (x 0.25..4; 2: twice as large, half as many across the disc). Away from 1 they leave the stars' knots (the young clusters stay where they are). Render only."), ECVF_Default);
+static TAutoConsoleVariable<float> CVarUniNebulaPrevalence(TEXT("uu.Nebula.Prevalence"), 1.0f, TEXT("D-248: how much of the gas layer is nebula, over the default's (~11%): 0.5 half as much, 2 twice (x0.05..x5.6). Each nebula keeps its brightness, so their light grows with it. Render only."), ECVF_Default);
+static TAutoConsoleVariable<float> CVarUniNebulaFineScale(TEXT("uu.Nebula.FineScale"), 1.0f, TEXT("D-248: the nebulae's detail layers' size (x; walls ~40 pc and texture ~10 pc in the Milky Way at 1): larger is softer, less detail inside a march step (less grain). Render only."), ECVF_Default);
+static TAutoConsoleVariable<float> CVarUniNebulaFineOctave(TEXT("uu.Nebula.FineOctave"), 4.0f, TEXT("D-248: the texture layer's frequency over the walls' (4: a quarter of their size). Render only."), ECVF_Default);
+static TAutoConsoleVariable<float> CVarUniNebulaStepRatio(TEXT("uu.Nebula.StepRatio"), 0.08f, TEXT("D-251: the march's step ratio (step = this x the distance) through a spiral's gas layer within the nebulae's detail reach (uu.Nebula.FineReachKpc), where the nebulae's detail is: the detail sampled along the ray instead of drawn at one jittered point of a long step (the grain). 0: the carrier's own ratio (uu.VolumeStepRatio's hints). Render only."), ECVF_Default);
+// D-252: the nebula grid (UniCore/UniNebGrid.h; Core/UniVolume.ush THE NEBULA GRID). Render only.
+static TAutoConsoleVariable<int32> CVarUniNebulaGrid(TEXT("uu.Nebula.Grid"), 1, TEXT("D-252: the nebula grid: the camera's spiral's nebulae baked into galaxy-local cells (each the average of its cell, the same from any camera), read along each step instead of drawn at one jittered point (the grain): softer, stable. 0: off (D-251's march)."), ECVF_Default);
+static TAutoConsoleVariable<int32> CVarUniNebulaGridCells(TEXT("uu.Nebula.GridCells"), 128, TEXT("D-252: the grid's cells across a level (128 or 256): 256 is sharper at mid distance (cells half as wide) for about 4x the memory (uu.Perf shows it)."), ECVF_Default);
+static TAutoConsoleVariable<int32> CVarUniNebulaGridSamples(TEXT("uu.Nebula.GridSamples"), 1, TEXT("D-252: the bake's samples a grid point (1, or 8: a 2 x 2 x 2 stratified average, 8x the bake's cost; slightly closer to the converged look)."), ECVF_Default);
+static TAutoConsoleVariable<int32> CVarUniNebulaGridBudget(TEXT("uu.Nebula.GridBudget"), 128, TEXT("D-252: the grid's bricks (8^3 cells) processed a frame at most: classified and, holding a nebula, baked. Fewer: cheaper, and a fresh grid or fast travel takes longer to fill (the next level is read meanwhile)."), ECVF_Default);
+static TAutoConsoleVariable<float> CVarUniNebulaGridFetches(TEXT("uu.Nebula.GridFetches"), 32.0f, TEXT("D-252: a march step's grid reads at most (a longer step reads a coarser level)."), ECVF_Default);
+static TAutoConsoleVariable<float> CVarUniNebulaGridCellPc(TEXT("uu.Nebula.GridCellPc"), 4.0f, TEXT("D-252: the finest level's cell (pc in the Milky Way, scaled with the galaxy's size); each level doubles it."), ECVF_Default);
+static TAutoConsoleVariable<float> CVarUniNebulaGridReachKpc(TEXT("uu.Nebula.GridReachKpc"), 64.0f, TEXT("D-252: the grid's levels cover at least this far from the camera (kpc; at most 12 levels); beyond, the march's field, whose knots blend to their mean with distance (D-241). D-253: 8 -> 32 (owner: the nebulae were lost past a distance). D-254: 32 -> 64, and the grid follows the nearest spiral whose disc is within it (from outside too)."), ECVF_Default);
+static TAutoConsoleVariable<float> CVarUniNebulaGridPool(TEXT("uu.Nebula.GridPool"), 1.25f, TEXT("D-252: the grid's pool slots over the share of bricks expected to hold a nebula (past it a brick is read from the next level; uu.Perf shows the overflow)."), ECVF_Default);
+static TAutoConsoleVariable<float> CVarUniNebulaGridLayer(TEXT("uu.Nebula.GridLayer"), 3.0f, TEXT("D-252: the grid's levels cover the gas layer to this many of its scale heights either side of its mid-plane."), ECVF_Default);
+static TAutoConsoleVariable<float> CVarUniNebulaPeak(TEXT("uu.Nebula.Peak"), 200.0f, TEXT("D-253: the nebulae's brightest parts held softly under this x the nebulae's mean density (a nebula's median is ~20x, its cores up to ~800x): lower dims the cores more, the faint parts kept. 0: off (D-252's)."), ECVF_Default);
+static TAutoConsoleVariable<float> CVarUniNebulaFineStepLod(TEXT("uu.Nebula.FineStepLod"), 0.0f, TEXT("D-251: the nebulae's detail is prefiltered over at least this x the march's step (on top of the pixel's footprint): detail finer than a step, which a ray cannot resolve, is averaged instead of drawn at a jittered point of the step (the grain). 0: the pixel's footprint alone (D-241..D-250). Render only."), ECVF_Default);
+static TAutoConsoleVariable<float> CVarUniNebulaFineLodBias(TEXT("uu.Nebula.FineLodBias"), 0.0f, TEXT("D-248: mips added to the detail layers' reads by the pixel's footprint: +1 blurs each layer an octave sooner and fades it out an octave nearer (less grain), -1 the reverse. Render only."), ECVF_Default);
 static TAutoConsoleVariable<float> CVarUniNebulaNearKpc(TEXT("uu.Nebula.NearKpc"), 0.0f, TEXT("D-234: the nebulae fade in from this distance (kpc) to 3x (render only). D-235: 0 by default (they were lost up close)."));
 static TAutoConsoleVariable<float> CVarUniMotionWebThreshold(TEXT("uu.MotionWeb.Threshold"), 3.0f, TEXT("D-230: the motion web shows the web where its filament + node matter is above this multiple of its mean (full two decades above). Lower: more of the web's shape (walls and voids); higher: only clusters and the densest filaments."));
 static TAutoConsoleVariable<float> CVarUniMotionWebNear(TEXT("uu.MotionWeb.Near"), 4.0f, TEXT("D-230: the motion web fades in over its first this many Mpc (nearer structure would fill the view as soft blobs: the web texture's texels are 0.78 Mpc, 200 Mpc / 256)."));
@@ -160,6 +193,18 @@ static TAutoConsoleVariable<float> CVarUniWarpMoteMag(TEXT("uu.Warp.MoteMag"), 1
 static TAutoConsoleVariable<int32> CVarUniSpriteEllipses(TEXT("uu.SpriteEllipses"), 1, TEXT("D-183: disc galaxies' sprites are ellipses at their disc's inclination (energy unchanged; round below a few pixels). 0: every sprite round. Render-only, live."));
 static TAutoConsoleVariable<int32> CVarUniGalaxyPalettes(TEXT("uu.GalaxyPalettes"), 1, TEXT("D-182: every galaxy its own colour palette (bulge, disc, arms, knots), which its stars and glow take (chroma only: brightness unchanged). 0: physical colours. Applies at uu.Enable; rerolls star and galaxy colours only."));
 static TAutoConsoleVariable<int32> CVarUniGalaxyTextures(TEXT("uu.GalaxyTextures"), 1, TEXT("D-179: galaxies read the noise project's galaxy textures (warp_fine, warp_large, galaxy_detail in Plugins/UnifiedUniverse/Data/Noise): texture warps of discs, arms and bulges, disc noise and star-forming knots. 0: off. Applies at uu.Enable; rerolls galaxies' stars."));
+// D-249 (owner 2026-11-15: "configure the volume textures used for the various components ... to
+// test different versions"): each galaxy texture's file in Data/Noise (<name>.bin + <name>_mips.bin).
+static TAutoConsoleVariable<FString> CVarUniGalTexWarpFine(TEXT("uu.GalaxyTexture.WarpFine"), TEXT("warp_fine"), TEXT("D-249: the galaxies' fine warp texture (a file in Plugins/UnifiedUniverse/Data/Noise, without .bin). Applies at uu.Enable or uu.ReloadTextures; rerolls galaxies' stars (placement reads it)."));
+static TAutoConsoleVariable<FString> CVarUniGalTexWarpLarge(TEXT("uu.GalaxyTexture.WarpLarge"), TEXT("warp_large"), TEXT("D-249: the galaxies' large warp texture (Data/Noise). Applies at uu.Enable or uu.ReloadTextures; rerolls galaxies' stars."));
+static TAutoConsoleVariable<FString> CVarUniGalTexDetail(TEXT("uu.GalaxyTexture.Detail"), TEXT("galaxy_detail"), TEXT("D-249: the galaxies' detail texture (Data/Noise: R ridged lanes, G star-forming knots, B fBm, A superbubbles; the nebulae's knots too). Applies at uu.Enable or uu.ReloadTextures; rerolls galaxies' stars."));
+static TAutoConsoleVariable<FString> CVarUniGalTexNebulaDetail(TEXT("uu.GalaxyTexture.NebulaDetail"), TEXT(""), TEXT("D-249: the nebulae's detail layers' texture (Data/Noise; walls from R ridged and A Worley-walls, D-243's split from B fBm). Empty: uu.GalaxyTexture.Detail's. Render only (no reroll). Applies at uu.Enable or uu.ReloadTextures."));
+static TAutoConsoleVariable<float> CVarUniVolumeDustGain(TEXT("uu.Volume.DustGain"), 1.0f, TEXT("D-261: every galaxy dust layer's optical depth in the volume x this (render only; the light / dust balance: 0 no extinction, 2 twice as dark). uu.Galaxy.DustScale scales the dust itself (at uu.Enable), uu.Galaxy.DiffuseDust the background dust."));
+static TAutoConsoleVariable<float> CVarUniGalaxyKnots(TEXT("uu.Galaxy.Knots"), 1.0f, TEXT("D-258/D-259: textured galaxies' star-forming knots, galaxy_detail's knot channel to uu.Galaxy.KnotPower (prefiltered: galaxy_shape), x this amplitude over the one that keeps the knots' share of the light the linear term's (1). 0: D-179's linear knots. Applies at uu.Enable (stars follow the light)."));
+static TAutoConsoleVariable<float> CVarUniGalaxyKnotPower(TEXT("uu.Galaxy.KnotPower"), 8.0f, TEXT("D-258/D-259: the knots' power (GAMER's star-forming clumps: 8; higher: sparser, brighter knots). galaxy_shape is rebaked with it. Applies at uu.Enable."));
+static TAutoConsoleVariable<float> CVarUniGalaxyDustStructure(TEXT("uu.Galaxy.DustStructure"), 4.0f, TEXT("D-258/D-259: the large dust lanes: galaxy_detail's ridged channel read at uu.Galaxy.StructureFreq, to this power (GAMER's dust: 4), multiplying the dust. 0: off. Applies at uu.Enable."));
+static TAutoConsoleVariable<float> CVarUniGalaxyLightStructure(TEXT("uu.Galaxy.LightStructure"), 3.0f, TEXT("D-258/D-259: the arms' streaks: galaxy_detail's fBm read at uu.Galaxy.StructureFreq, to this power, multiplying the disc's light. 0: off. Applies at uu.Enable."));
+static TAutoConsoleVariable<float> CVarUniGalaxyStructureFreq(TEXT("uu.Galaxy.StructureFreq"), 0.25f, TEXT("D-258/D-259: the structure read's frequency over the galaxy detail's (its roll DetailFreq: 2-4 periods; 0.25: the structure 4x larger than the detail, GAMER's noise at the galaxy's own scale). 0: no structure read. Applies at uu.Enable."));
 static TAutoConsoleVariable<FString> CVarUniWebTexture(TEXT("uu.WebTexture"), TEXT("web_adhesion_density_mid"), TEXT("D-165: which web texture uu.WebSource 1 uses: a texture delivered by the noise project in Plugins/UnifiedUniverse/Data/Noise (web_adhesion_density_young / _mid / _old), or standin (the procedural web baked here). Applies at uu.Enable; rerolls the web."));
 static TAutoConsoleVariable<int32> CVarUniWebTexSize(TEXT("uu.WebTexSize"), 128, TEXT("D-164: stand-in web texture texels per period (power of two, 32..512). 128: 0.78 Mpc texels for the demo's 100 Mpc period."));
 static TAutoConsoleVariable<int32> CVarUniWebTexSupersample(TEXT("uu.WebTexSupersample"), 2, TEXT("D-164: samples per texel axis when baking the stand-in web texture (1..4)."));
@@ -190,10 +235,21 @@ bool UUniSubsystem::ShouldCreateSubsystem(UObject* Outer) const
 	return World && (World->WorldType == EWorldType::Game || World->WorldType == EWorldType::PIE);
 }
 
+// D-261: a re-enable requested by the tuning page (FPlatformTime seconds; 0: none).
+static double GUniReenableAt = 0.0;
+
+void UUniSubsystem::RequestReenable()
+{
+	GUniReenableAt = FPlatformTime::Seconds() + 0.5;
+}
+
 void UUniSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
 	Super::Initialize(Collection);
 	GLastSubsystem = this;
+	// D-261: the tuning page's saved values (DefaultGame.ini) to their console variables, before
+	// anything reads them (uu.AutoStart enables later, from the first tick).
+	if (const UUniTuningSettings* T = GetDefault<UUniTuningSettings>()) { T->ApplyAll(); }
 }
 
 // D-216: start-up without console commands.
@@ -235,6 +291,7 @@ void UUniSubsystem::EnableUniverse(const FString& Scene)
 		return;
 	}
 	SceneName = Scene.IsEmpty() ? TEXT("galaxy") : Scene.ToLower();
+	++NebGridEpoch;   // D-252: the textures may have changed: the nebula grid rebakes
 	ClusterTuning = UniClusterCVars::Read();
 	Warp.Current = 0.0;
 	bCameraJumped = true;
@@ -243,7 +300,7 @@ void UUniSubsystem::EnableUniverse(const FString& Scene)
 	SetupGalaxyTextures(Def);   // D-179: likewise
 	if (CVarUniGalaxyPalettes.GetValueOnGameThread() != 0) { UniScenes::UseGalaxyPalettes(Def); }   // D-182
 	UniScenes::UseSpriteKeep(Def, ClusterTuning.StarKeep, ClusterTuning.MemberKeep);   // D-197: after the web (it rebuilds cluster and group emitters)
-	UniScenes::UseDustTuning(Def, ClusterTuning.DustScale, ClusterTuning.DustLanes);   // D-198
+	UniScenes::UseDustTuning(Def, ClusterTuning.DustScale, ClusterTuning.DustLanes, ClusterTuning.DustHeight);   // D-198, D-263
 	Model = MakeUnique<UniCore::FUniverseModel>(MoveTemp(Def));
 	for (const std::string& Problem : Model->Validate())
 	{
@@ -357,7 +414,7 @@ void UUniSubsystem::DisableUniverse()
 	Model.Reset();
 	UniCore::BindWebTexture(nullptr);   // D-164: after everything that samples it on the CPU
 	WebTexture.Reset();
-	for (int32 S = 0; S < 3; ++S) { UniCore::BindGalaxyTexture(S, nullptr); GalaxyTextures[S].Reset(); }   // D-179
+	for (int32 S = 0; S < 4; ++S) { UniCore::BindGalaxyTexture(S, nullptr); GalaxyTextures[S].Reset(); }   // D-179, D-249 (D-259: slot 2's unbinds galaxy_shape)
 }
 
 void UUniSubsystem::SetupGalaxyTextures(UniCore::FUniverseDef& Def)
@@ -365,8 +422,25 @@ void UUniSubsystem::SetupGalaxyTextures(UniCore::FUniverseDef& Def)
 	// D-179: the galaxy textures, all three or none. Missing (or uu.GalaxyTextures 0), galaxies keep
 	// their untextured field (the terms stay off: the definition never asks for a texture it does not
 	// have), with an error naming the files when they were wanted.
-	for (int32 S = 0; S < 3; ++S) { UniCore::BindGalaxyTexture(S, nullptr); GalaxyTextures[S].Reset(); FUniRenderer::Get().SetGalaxyTexture_GameThread(S, 0u, {}); }
+	for (int32 S = 0; S < 4; ++S) { UniCore::BindGalaxyTexture(S, nullptr); GalaxyTextures[S].Reset(); FUniRenderer::Get().SetGalaxyTexture_GameThread(S, 0u, {}); }
+	FUniRenderer::Get().SetGalaxyTexture_GameThread(4, 0u, {});   // D-259: galaxy_shape (unbound with slot 2)
+	// D-258 / D-259: the shaping (UNI_GAL_SHAPE: the CPU cores' and, as UniGalShapeTune, the shaders'),
+	// and galaxy_shape's powers (baked when galaxy_detail binds). A power 0 turns its term off.
+	{
+		const float KnotPow = FMath::Max(CVarUniGalaxyKnotPower.GetValueOnGameThread(), 0.0f);
+		const float DustPow = FMath::Max(CVarUniGalaxyDustStructure.GetValueOnGameThread(), 0.0f);
+		const float LightPow = FMath::Max(CVarUniGalaxyLightStructure.GetValueOnGameThread(), 0.0f);
+		const float Knots = KnotPow > 0.0f ? FMath::Max(CVarUniGalaxyKnots.GetValueOnGameThread(), 0.0f) : 0.0f;
+		const float Freq = FMath::Max(CVarUniGalaxyStructureFreq.GetValueOnGameThread(), 0.0f);
+		UniCore::FGalaxyShapePowers& Pw = UniCore::GalaxyShapePowers();
+		Pw.Dust = DustPow; Pw.Light = LightPow; Pw.Knot = KnotPow;
+		UniHlsl::GGalShape = UniHlsl::float4(Knots, DustPow > 0.0f ? 1.0f : 0.0f, LightPow > 0.0f ? 1.0f : 0.0f, (DustPow > 0.0f || LightPow > 0.0f) ? Freq : 0.0f);
+		FUniRenderer::Get().SetGalaxyShapeTune_GameThread(FVector4f(UniHlsl::GGalShape.x, UniHlsl::GGalShape.y, UniHlsl::GGalShape.z, UniHlsl::GGalShape.w));
+	}
 	if (CVarUniGalaxyTextures.GetValueOnGameThread() == 0) { return; }
+	// D-249: the files by console variable (the defaults are the delivered names).
+	const FString Names[4] = { CVarUniGalTexWarpFine.GetValueOnGameThread().TrimStartAndEnd(), CVarUniGalTexWarpLarge.GetValueOnGameThread().TrimStartAndEnd(),
+		CVarUniGalTexDetail.GetValueOnGameThread().TrimStartAndEnd(), CVarUniGalTexNebulaDetail.GetValueOnGameThread().TrimStartAndEnd() };
 	const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("UnifiedUniverse"));
 	const FString Dir = FPaths::ConvertRelativePathToFull((Plugin.IsValid() ? Plugin->GetBaseDir() : FPaths::ProjectPluginsDir() / TEXT("UnifiedUniverse")) / TEXT("Data") / TEXT("Noise"));
 	const double T0 = FPlatformTime::Seconds();
@@ -375,10 +449,10 @@ void UUniSubsystem::SetupGalaxyTextures(UniCore::FUniverseDef& Def)
 	{
 		T[S] = MakeUnique<UniCore::FWebTexture>();
 		std::string Err;
-		if (!UniCore::FWebTexture::LoadDelivered(TCHAR_TO_UTF8(*Dir), UniCore::GalaxyTextureName(S), *T[S], &Err))
+		if (!UniCore::FWebTexture::LoadDelivered(TCHAR_TO_UTF8(*Dir), TCHAR_TO_UTF8(*Names[S]), *T[S], &Err))
 		{
-			UE_LOG(LogUnifiedUniverse, Error, TEXT("UnifiedUniverse: galaxy texture '%s' not loaded (%s). Galaxies use their untextured field: regenerate it with the noise project into %s, or set uu.GalaxyTextures 0."),
-				UTF8_TO_TCHAR(UniCore::GalaxyTextureName(S)), UTF8_TO_TCHAR(Err.c_str()), *Dir);
+			UE_LOG(LogUnifiedUniverse, Error, TEXT("UnifiedUniverse: galaxy texture '%s' (%s) not loaded (%s). Galaxies use their untextured field: regenerate it with the noise project into %s, or set uu.GalaxyTextures 0."),
+				*Names[S], UTF8_TO_TCHAR(UniCore::GalaxyTextureName(S)), UTF8_TO_TCHAR(Err.c_str()), *Dir);
 			return;
 		}
 	}
@@ -398,11 +472,49 @@ void UUniSubsystem::SetupGalaxyTextures(UniCore::FUniverseDef& Def)
 		}
 		FUniRenderer::Get().SetGalaxyTexture_GameThread(S, T[S]->Size, MoveTemp(Mips));
 		GalaxyTextures[S] = MoveTemp(T[S]);
-		UniCore::BindGalaxyTexture(S, GalaxyTextures[S].Get());
+		UniCore::BindGalaxyTexture(S, GalaxyTextures[S].Get());   // D-259: slot 2 derives and binds galaxy_shape (slot 4)
+	}
+	// D-259: galaxy_shape (derived from galaxy_detail with the powers above) to the GPU.
+	if (const UniCore::FWebTexture* Gs = UniCore::BoundGalaxyShapeTexture())
+	{
+		TArray<TArray<FUintVector2>> Mips;
+		for (uint32 M = 0; M < Gs->NumMips(); ++M)
+		{
+			TArray<FUintVector2>& A = Mips.AddDefaulted_GetRef();
+			A.SetNumUninitialized(int32(Gs->TexelCount(M)));
+			FMemory::Memcpy(A.GetData(), Gs->Mips[M].data(), Gs->Mips[M].size() * sizeof(uint16));
+		}
+		FUniRenderer::Get().SetGalaxyTexture_GameThread(4, Gs->Size, MoveTemp(Mips));
 	}
 	const int32 N = UniScenes::UseGalaxyTextures(Def, GalaxyTextures[0]->Size);
-	UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: galaxy textures warp_fine, warp_large, galaxy_detail %u^3 loaded (%.2f s); %d galaxy emitters and anchors textured (D-179)"),
-		GalaxyTextures[0]->Size, FPlatformTime::Seconds() - T0, N);
+	UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: galaxy textures %s, %s, %s %u^3 loaded (%.2f s); %d galaxy emitters and anchors textured (D-179, D-249)"),
+		*Names[0], *Names[1], *Names[2], GalaxyTextures[0]->Size, FPlatformTime::Seconds() - T0, N);
+	// D-249: the nebulae's detail texture, render only: its own file when one is named (any size: the
+	// reads are in its periods), otherwise galaxy_detail's (slot 3 left empty). A file that fails to
+	// load leaves the nebulae on galaxy_detail, with an error.
+	if (!Names[3].IsEmpty() && Names[3] != Names[2])
+	{
+		TUniquePtr<UniCore::FWebTexture> Tn = MakeUnique<UniCore::FWebTexture>();
+		std::string Err;
+		if (!UniCore::FWebTexture::LoadDelivered(TCHAR_TO_UTF8(*Dir), TCHAR_TO_UTF8(*Names[3]), *Tn, &Err))
+		{
+			UE_LOG(LogUnifiedUniverse, Error, TEXT("UnifiedUniverse: nebula detail texture '%s' not loaded (%s); the nebulae keep %s (D-249)."), *Names[3], UTF8_TO_TCHAR(Err.c_str()), *Names[2]);
+		}
+		else
+		{
+			TArray<TArray<FUintVector2>> Mips;
+			for (uint32 M = 0; M < Tn->NumMips(); ++M)
+			{
+				TArray<FUintVector2>& A = Mips.AddDefaulted_GetRef();
+				A.SetNumUninitialized(int32(Tn->TexelCount(M)));
+				FMemory::Memcpy(A.GetData(), Tn->Mips[M].data(), Tn->Mips[M].size() * sizeof(uint16));
+			}
+			FUniRenderer::Get().SetGalaxyTexture_GameThread(3, Tn->Size, MoveTemp(Mips));
+			GalaxyTextures[3] = MoveTemp(Tn);
+			UniCore::BindGalaxyTexture(3, GalaxyTextures[3].Get());
+			UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: nebula detail texture %s %u^3 loaded (D-249)"), *Names[3], GalaxyTextures[3]->Size);
+		}
+	}
 }
 
 void UUniSubsystem::SetupWebTexture(UniCore::FUniverseDef& Def)
@@ -496,6 +608,28 @@ void UUniSubsystem::SetupWebTexture(UniCore::FUniverseDef& Def)
 	WebTexture = MoveTemp(T);
 	UniCore::BindWebTexture(WebTexture.Get());
 	UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: %d web emitter(s) use the web texture (uu.WebSource 0: procedural)"), Switched);
+}
+
+void UUniSubsystem::ReloadTextures()
+{
+	// D-249: the textures load at enable (before the model, which bakes the definition's
+	// parameters), so a reload re-enables the scene and puts the camera and its motion back.
+	if (!bEnabled)
+	{
+		UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: not enabled; the textures load at uu.Enable."));
+		return;
+	}
+	const FUniCoord Cam = Camera;
+	const EUniMotionMode Mode = MotionMode;
+	const FVector Vel = Velocity;
+	const bool bFly = bFreeFly;
+	EnableUniverse(SceneName);
+	if (!bEnabled) { return; }
+	Teleport(Cam);
+	MotionMode = Mode;
+	Velocity = Vel;
+	if (bFly) { SetFreeFly(true); }
+	UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: textures reloaded (D-249)."));
 }
 
 void UUniSubsystem::SetCamera(const FUniCoord& Coord)
@@ -634,6 +768,12 @@ void UUniSubsystem::StartFlythrough(float Seconds)
 void UUniSubsystem::Tick(float DeltaTime)
 {
 	if (!bEnabled || !Streamer) { return; }
+	if (GUniReenableAt > 0.0 && FPlatformTime::Seconds() >= GUniReenableAt)   // D-261: the tuning page
+	{
+		GUniReenableAt = 0.0;
+		ReloadTextures();
+		return;
+	}
 	if (bAutoFlyPending)   // D-216
 	{
 		const APlayerController* PC = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr;
@@ -951,6 +1091,29 @@ void UUniSubsystem::LogPerf()
 			CVarFar ? CVarFar->GetInt() : -1, CVarFarStart ? CVarFarStart->GetFloat() : -1.0f, R.FarFaceSize.load(), UTF8_TO_TCHAR(UniCore::FarReasonName(UniCore::EFarReason(R.FarReason.load()))), R.FarMotion.load(),
 			R.FarFramesOn.load(), R.FarSwitches.load(), R.FarFacesFilled.load(), R.FarSceneChanges.load(), R.FarHistoryDrops.load());
 	}
+	// D-252: the nebula grid.
+	{
+		const uint32 Nl = R.NebGridLevels.load();
+		if (Nl == 0u)
+		{
+			UE_LOG(LogUnifiedUniverse, Log, TEXT("  nebula grid (uu.Nebula.Grid %d): off (or no spiral with nebulae about the camera)"), CVarUniNebulaGrid.GetValueOnGameThread());
+		}
+		else
+		{
+			FString Lv;
+			uint32 Used = 0, Slots = 0, Over = 0;
+			for (uint32 K = 0; K < Nl && K < uint32(FUniRenderStats::MaxNebGridLevels); ++K)
+			{
+				const uint32 Sk = R.NebGridSlots[K].load(), Fk = FMath::Min(R.NebGridFree[K].load(), Sk), Ok = R.NebGridOverflow[K].load();
+				Lv += FString::Printf(TEXT("%s%u/%u%s"), K ? TEXT(", ") : TEXT(""), Sk - Fk, Sk, Ok ? *FString::Printf(TEXT(" (+%u overflow)"), Ok) : TEXT(""));
+				Used += Sk - Fk; Slots += Sk; Over += Ok;
+			}
+			UE_LOG(LogUnifiedUniverse, Log, TEXT("  nebula grid (uu.Nebula.GridCells %d, samples %d, budget %d): %u levels, %.1f MB; slots used by level %s; %u bricks waiting, %u processed last frame, %llu in all, %llu level resets%s"),
+				CVarUniNebulaGridCells.GetValueOnGameThread(), CVarUniNebulaGridSamples.GetValueOnGameThread(), CVarUniNebulaGridBudget.GetValueOnGameThread(), Nl, double(R.NebGridPoolKiB.load()) / 1024.0, *Lv,
+				R.NebGridPending.load(), R.NebGridProcessed.load(), (unsigned long long)R.NebGridProcessedTotal.load(), (unsigned long long)R.NebGridLevelResets.load(),
+				Over ? TEXT(" (overflow: raise uu.Nebula.GridPool)") : TEXT(""));
+		}
+	}
 	uint32 Sl[FUniRenderStats::NumSliceCounts];
 	for (int32 I = 0; I < FUniRenderStats::NumSliceCounts; ++I) { Sl[I] = FUniRenderer::Get().Stats.VolumeSliceCounts[I].exchange(0u); }   // R is const
 	UE_LOG(LogUnifiedUniverse, Log, TEXT("  volume slicing since the last uu.Perf: 1/16 %u, 1/9 %u, 1/4 %u frames; not sliced %u (temporal off or a debug view %u, no history %u, march size changed %u, camera jump %u, same frame rendered again %u, frames skipped %u)"),
@@ -1034,6 +1197,18 @@ void UUniSubsystem::PushFrame()
 	}
 	F.bCameraStepValid = bCameraStepValid;
 	{
+		// D-246: the blue-noise tile the volume's draws read (FastBlueNoise_scalar_128x128x8, the
+		// texture CloudAtmosphere binds); loaded once, held here, its resource handed on (null
+		// until the engine has created it: the hashed draws meanwhile).
+		if (!VolumeBlueNoise && !bVolumeBlueNoiseTried)
+		{
+			bVolumeBlueNoiseTried = true;
+			VolumeBlueNoise = LoadObject<UTexture2D>(nullptr, TEXT("/Engine/EngineMaterials/FastBlueNoise_scalar_128x128x8.FastBlueNoise_scalar_128x128x8"));
+			if (!VolumeBlueNoise) { UE_LOG(LogUnifiedUniverse, Warning, TEXT("UnifiedUniverse: FastBlueNoise_scalar_128x128x8 not found: the volume's draws stay hashed (D-246).")); }
+		}
+		F.BlueNoiseResource = VolumeBlueNoise ? VolumeBlueNoise->GetResource() : nullptr;
+	}
+	{
 		// D-192: the warp motes' lattice around the camera.
 		const UniCore::FMoteLattice Ml = UniCore::MoteLattice(Camera.ToCore(), UniCore::FVec3f{ CameraFraction.X, CameraFraction.Y, CameraFraction.Z }, MoteScale.Log2Cm,
 			F.WarpAmount * FMath::Clamp(CVarUniWarpMotes.GetValueOnGameThread(), 0.0f, 1.0f));
@@ -1073,6 +1248,7 @@ void UUniSubsystem::PushFrame()
 		Settings.MaxSubsamples = UniCore::u32(FMath::Clamp(CVarUniVolumeMaxSubsamples.GetValueOnGameThread(), 1, 8));
 		Settings.bPrefilter = CVarUniVolumePrefilter.GetValueOnGameThread() != 0;
 		Settings.bLutStart = CVarUniVolumeLutStart.GetValueOnGameThread() != 0;
+		{ const UniCore::FVolumeSettings D0; const float Dg = FMath::Max(CVarUniVolumeDustGain.GetValueOnGameThread(), 0.0f); for (int32 K = 0; K < 3; ++K) { Settings.DustSigmaRgb[K] = D0.DustSigmaRgb[K] * Dg; } }   // D-261
 		{
 			// D-189: the web in the sky.
 			const int32 SkyMode = CVarUniSkyWeb.GetValueOnGameThread();
@@ -1081,6 +1257,30 @@ void UUniSubsystem::PushFrame()
 			Settings.NebulaGain = FMath::Max(CVarUniNebula.GetValueOnGameThread(), 0.0f);            // D-234
 			Settings.NebulaReflect = FMath::Max(CVarUniNebulaReflect.GetValueOnGameThread(), 0.0f);
 			Settings.NebulaNearCm = float(double(FMath::Max(CVarUniNebulaNearKpc.GetValueOnGameThread(), 0.0f)) * 3.0856775814913673e21);
+			Settings.NebulaFineGain = FMath::Clamp(CVarUniNebulaFine.GetValueOnGameThread(), 0.0f, 2.0f);   // D-237
+			{ const float Dk = CVarUniNebulaDark.GetValueOnGameThread(); Settings.NebulaDark = Dk < 0.0f ? -1.0f : FMath::Min(Dk, 1.0f); }   // D-242
+			Settings.NebulaRefine = uint32(FMath::Clamp(CVarUniNebulaRefine.GetValueOnGameThread(), 0, 16));   // D-244
+			Settings.NebulaFineReachCm = float(double(FMath::Max(CVarUniNebulaFineReachKpc.GetValueOnGameThread(), 0.0f)) * 3.0856775814913673e21);
+			Settings.NebulaScale = CVarUniNebulaScale.GetValueOnGameThread();             // D-248 (UniCore::NebulaTune clamps)
+			{
+				// D-250: the diffuse dust.
+				const double Lo = double(FMath::Clamp(CVarUniGalaxyDustReachMinKpc.GetValueOnGameThread(), 0.01f, 1000.0f));
+				const double Hi = FMath::Max(double(FMath::Clamp(CVarUniGalaxyDustReachMaxKpc.GetValueOnGameThread(), 0.01f, 1000.0f)), Lo);
+				Settings.DiffuseDustReachLoCm = float(Lo * 3.0856775814913673e21);
+				Settings.DiffuseDustReachHiCm = float(Hi * 3.0856775814913673e21);
+				Settings.DiffuseDustGain = FMath::Clamp(CVarUniGalaxyDiffuseDust.GetValueOnGameThread(), 0.0f, 100.0f);
+				Settings.DiffuseDustHeight = FMath::Clamp(CVarUniGalaxyDiffuseDustHeight.GetValueOnGameThread(), 0.05f, 20.0f);
+			}
+			Settings.StepFoot = FMath::Clamp(CVarUniVolumeStepFoot.GetValueOnGameThread(), 0.0f, 4.0f);   // D-255
+			Settings.SegmentTaps = UniCore::u32(FMath::Clamp(CVarUniVolumeSegmentTaps.GetValueOnGameThread(), 1, 16));   // D-262
+			Settings.OpaqueCutoff = FMath::Clamp(CVarUniVolumeOpaqueCutoff.GetValueOnGameThread(), 1.0e-6f, 0.5f);   // D-262
+			Settings.NebulaPrevalence = CVarUniNebulaPrevalence.GetValueOnGameThread();
+			Settings.NebulaFineScale = CVarUniNebulaFineScale.GetValueOnGameThread();
+			Settings.NebulaFineOctave = CVarUniNebulaFineOctave.GetValueOnGameThread();
+			Settings.NebulaFineLodBias = CVarUniNebulaFineLodBias.GetValueOnGameThread();
+			Settings.NebulaFineStepLod = CVarUniNebulaFineStepLod.GetValueOnGameThread();   // D-251
+			Settings.NebulaStepRatio = FMath::Max(CVarUniNebulaStepRatio.GetValueOnGameThread(), 0.0f);
+			Settings.NebulaPeak = FMath::Max(CVarUniNebulaPeak.GetValueOnGameThread(), 0.0f);   // D-253
 			Settings.TailDim = (SkyMode & 2) ? 1.0f - FMath::Clamp(CVarUniSkyWebTail.GetValueOnGameThread(), 0.0f, 1.0f) : 0.0f;
 		}
 		{
@@ -1114,6 +1314,21 @@ void UUniSubsystem::PushFrame()
 		F.VolumeLut.Reserve(int32(Sc.Lut.size()));
 		for (const UniHlsl::float4& L : Sc.Lut) { F.VolumeLut.Add(FVector4f(L.x, L.y, L.z, L.w)); }
 		F.VolumeView = Sc.View;
+		{
+			// D-248: the nebulae's tuning, to the GPU passes and (when it changes) the C++ cores'
+			// globals, which the sky light's worker march reads (written here only on a change: the
+			// worker reads them while a job runs).
+			const UniCore::FNebulaTune Nt = UniCore::NebulaTune(Settings);
+			F.NebTune = FVector4f(Nt.T[0], Nt.T[1], Nt.T[2], Nt.T[3]);
+			F.NebTune2 = FVector4f(Nt.T2[0], Nt.T2[1], Nt.T2[2], Nt.T2[3]);
+			F.NebTune3 = FVector4f(Nt.T3[0], Nt.T3[1], Nt.T3[2], Nt.T3[3]);   // D-251
+			if (UniHlsl::GNebTune.x != Nt.T[0] || UniHlsl::GNebTune.y != Nt.T[1] || UniHlsl::GNebTune.z != Nt.T[2] || UniHlsl::GNebTune.w != Nt.T[3]
+				|| UniHlsl::GNebTune2.x != Nt.T2[0] || UniHlsl::GNebTune2.y != Nt.T2[1] || UniHlsl::GNebTune2.z != Nt.T2[2] || UniHlsl::GNebTune2.w != Nt.T2[3]
+				|| UniHlsl::GNebTune3.x != Nt.T3[0] || UniHlsl::GNebTune3.y != Nt.T3[1])
+			{
+				UniCore::ApplyNebulaTune(Nt);
+			}
+		}
 		// D-212 / D-214: the camera's galaxy's map (its whole map, dust too) from the cache; published
 		// once baked. The cache's pending bakes (generation's too) ride every frame until done.
 		{
@@ -1128,6 +1343,77 @@ void UUniSubsystem::PushFrame()
 					GalaxyMapVolumeSlot = Slot;
 					UniCore::PublishGalaxyMap(F.VolumeView, Sc.Home.Carrier, GalaxyMaps.MapSize(), uint32(Slot));
 					F.GalMapVolumeEpoch = GalaxyMaps.Entry(uint32(Slot)).Epoch;
+				}
+			}
+		}
+		{
+			// D-252: the nebula grid, for the camera's spiral with its nebulae on: its shape in the
+			// spiral's field units (the handles are physical lengths), what its bake reads (a change rebakes),
+			// the camera and the layer's mid-plane.
+			// D-254 (owner: "the level where i go from no nebulae to populated nebulae ... pops in some
+			// middling distance from the galaxy"): not only the galaxy the camera is in (D-211's home: the
+			// grid switched on at its sphere, its nebulae appearing with it) but the nearest spiral whose
+			// disc is within the grid's reach, from outside too: the grid takes over where its coarsest
+			// levels and the field's distance level of detail both show the nebulae's mean.
+			F.NebGrid = FUniFrameData::FNebGridFrame();
+			const double ReachCm = double(FMath::Max(CVarUniNebulaGridReachKpc.GetValueOnGameThread(), 0.1f)) * 3.0856775814913673e21;
+			const UniCore::FCarrierGPU* Home = UniCore::HomeCarrierOf(Sc);
+			const UniCore::FCarrierGPU* Pick = nullptr;
+			double PickR = 0.0;
+			if (CVarUniNebulaGrid.GetValueOnGameThread() != 0 && Settings.NebulaGain > 0.0f)
+			{
+				for (const UniCore::FCarrierGPU& Cg : Sc.Carriers)
+				{
+					if ((Cg.Flags & UniHlsl::UNI_CARRIER_PERIODIC) != 0u || Cg.FieldId != UniHlsl::UNI_FIELD_GALAXY || !(Cg.Weight > 0.0f) || !(Cg.NebulaHide < 1.0f) || Cg.ParamIndex >= Sc.Params.size()) { continue; }
+					UniHlsl::FUniFieldParams Pq;
+					std::memcpy(static_cast<void*>(&Pq), &Sc.Params[Cg.ParamIndex], sizeof(Pq));
+					if (!(Pq.H.y > 0.0f) || UniHlsl::Uni_GalaxyEarlyNebula(Pq) > 0.0f) { continue; }
+					// The camera's distance from the galaxy's centre in its radii; the disc within reach.
+					const double Rc = std::sqrt(double(Cg.CamLocal[0]) * Cg.CamLocal[0] + double(Cg.CamLocal[1]) * Cg.CamLocal[1] + double(Cg.CamLocal[2]) * Cg.CamLocal[2]);
+					const double RadCm = 1.0 / double(FMath::Max(Cg.InvRadius, 1.0e-30f));
+					if ((Rc - 1.0) * RadCm > ReachCm) { continue; }
+					if (!Pick || Rc < PickR || (&Cg == Home)) { Pick = &Cg; PickR = Rc; }
+					if (&Cg == Home) { break; }
+				}
+			}
+			if (Pick)
+			{
+				UniHlsl::FUniFieldParams Par;
+				std::memcpy(static_cast<void*>(&Par), &Sc.Params[Pick->ParamIndex], sizeof(Par));
+				{
+					const double RadiusCm = 1.0 / double(FMath::Max(Pick->InvRadius, 1.0e-30f));
+					const double Pc = 3.0856775814913673e18;
+					const UniCore::u32 GridCells = CVarUniNebulaGridCells.GetValueOnGameThread() >= 256 ? 256u : 128u;
+					UniCore::FNebGridConfig Cfg;
+					Cfg.Cells = GridCells;
+					Cfg.Cell0 = double(FMath::Clamp(CVarUniNebulaGridCellPc.GetValueOnGameThread(), 0.5f, 64.0f)) * Pc / RadiusCm;
+					Cfg.LayerHalf = double(FMath::Clamp(CVarUniNebulaGridLayer.GetValueOnGameThread(), 0.5f, 8.0f)) * double(UNI_NEBULA_HEIGHT) * double(Par.A.y) + 50.0 * Pc / RadiusCm;
+					Cfg.KnotTexel = double(UniHlsl::Uni_GalaxyNebulaKnotTexel(Par));
+					Cfg.Levels = UniCore::NebGridLevelsFor(ReachCm / RadiusCm, GridCells, Cfg.Cell0);
+					Cfg.PoolScale = double(FMath::Clamp(CVarUniNebulaGridPool.GetValueOnGameThread(), 0.1f, 8.0f));
+					Cfg.Samples = CVarUniNebulaGridSamples.GetValueOnGameThread() >= 8 ? 8u : 1u;
+					// What the bake reads: the galaxy (its parameters, its seeds among them), the nebulae's
+					// tuning, detail and dark share, the textures (each enable).
+					uint64 Key = 0x6A09E667F3BCC909ull;
+					auto Mix = [&Key](uint64 InBits) { Key = (Key ^ InBits) * 0x100000001B3ull; Key ^= Key >> 29; };
+					auto MixF = [&Mix](float InValue) { uint32 Bits; std::memcpy(&Bits, &InValue, 4); Mix(uint64(Bits)); };
+					for (int32 Word = 0; Word < int32(sizeof(Par) / 4); ++Word) { uint32 Bits; std::memcpy(&Bits, reinterpret_cast<const uint8*>(&Par) + 4 * Word, 4); Mix(uint64(Bits) + uint64(Word) * 0x9E3779B97F4A7C15ull); }
+					MixF(F.NebTune.X); MixF(F.NebTune.Y); MixF(F.NebTune.Z); MixF(F.NebTune.W);
+					MixF(F.NebTune2.X); MixF(F.NebTune2.Y); MixF(F.NebTune2.Z); MixF(F.NebTune2.W);
+					MixF(F.NebTune3.Y);   // D-253: the peak
+					MixF(Settings.NebulaFineGain); MixF(Settings.NebulaDark);
+					Mix(uint64(NebGridEpoch));
+					F.NebGrid.bOn = true;
+					F.NebGrid.ParamIndex = Pick->ParamIndex;
+					// The camera in its field units: the home's in double (D-211), another's from its carrier.
+					for (int32 Axis = 0; Axis < 3; ++Axis) { F.NebGrid.CamField[Axis] = (Pick == Home) ? Sc.Home.CamField[Axis] : double(Pick->CamLocal[Axis]); }
+					float Zc = 0.0f, Fl = 1.0f;
+					UniHlsl::Uni_GalaxyLayerMid(UniHlsl::float3(float(F.NebGrid.CamField[0]), float(F.NebGrid.CamField[1]), float(F.NebGrid.CamField[2])), Par, UniHlsl::Uni_GalaxyConstOf(Par).Hp, Zc, Fl);
+					F.NebGrid.MidZ = double(Zc);
+					F.NebGrid.Config = Cfg;
+					F.NebGrid.Key = Key;
+					F.NebGrid.Budget = UniCore::u32(FMath::Clamp(CVarUniNebulaGridBudget.GetValueOnGameThread(), 1, 65535));
+					F.NebGrid.FetchMax = FMath::Clamp(CVarUniNebulaGridFetches.GetValueOnGameThread(), 1.0f, 128.0f);
 				}
 			}
 		}
@@ -2137,6 +2423,62 @@ namespace
 		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
 		{
 			if (UUniSubsystem* S = Sub(World)) { S->EnableUniverse(Args.Num() ? Args[0] : FString()); }
+		}));
+
+	FAutoConsoleCommandWithWorldAndArgs CmdReloadTextures(TEXT("uu.ReloadTextures"), TEXT("D-249: reload the volume textures (uu.GalaxyTexture.*, uu.WebTexture) by re-enabling the current scene where the camera is (the galaxies' and the web's stars reroll when their textures change)."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>&, UWorld* World)
+		{
+			if (UUniSubsystem* S = Sub(World)) { S->ReloadTextures(); }
+		}));
+
+	// D-261: the tuning page (Project Settings > Plugins > Unified Universe Tuning).
+	FAutoConsoleCommandWithWorldAndArgs CmdTuningImport(TEXT("uu.Tuning.Import"), TEXT("D-261: the uu.* console variables' current values into the tuning page (after trying values at the console)."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>&, UWorld*)
+		{
+			GetMutableDefault<UUniTuningSettings>()->ImportAll();
+			UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: tuning page imported from the console variables (uu.Tuning.Save to keep them)."));
+		}));
+
+	FAutoConsoleCommandWithWorldAndArgs CmdTuningSave(TEXT("uu.Tuning.Save"), TEXT("D-261: the tuning page's values to DefaultGame.ini (applied when play begins)."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>&, UWorld*)
+		{
+			UUniTuningSettings* T = GetMutableDefault<UUniTuningSettings>();
+			const bool bOk = T->TryUpdateDefaultConfigFile();
+			UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: tuning page %s DefaultGame.ini."), bOk ? TEXT("saved to") : TEXT("NOT saved to (is it writable?)"));
+		}));
+
+	FAutoConsoleCommandWithWorldAndArgs CmdTuningSavePreset(TEXT("uu.Tuning.SavePreset"), TEXT("D-261: uu.Tuning.SavePreset <name>: every tuning variable's current value to Saved/UniTuningPresets/<name>.txt (A/B configurations)."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld*)
+		{
+			const bool bOk = Args.Num() > 0 && UUniTuningSettings::SavePreset(Args[0]);
+			UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: preset %s %s (%s)."), Args.Num() ? *Args[0] : TEXT("(no name)"), bOk ? TEXT("saved") : TEXT("NOT saved"), *UUniTuningSettings::PresetDir());
+		}));
+
+	FAutoConsoleCommandWithWorldAndArgs CmdTuningLoadPreset(TEXT("uu.Tuning.LoadPreset"), TEXT("D-261: uu.Tuning.LoadPreset <name>: a saved preset's values (the page follows; the scene re-enables if a value needs it)."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld*)
+		{
+			const bool bOk = Args.Num() > 0 && UUniTuningSettings::LoadPreset(Args[0]);
+			UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: preset %s %s."), Args.Num() ? *Args[0] : TEXT("(no name)"), bOk ? TEXT("loaded") : TEXT("NOT found"));
+		}));
+
+	FAutoConsoleCommandWithWorldAndArgs CmdTuningReset(TEXT("uu.Tuning.Reset"), TEXT("D-264: uu.Tuning.Reset [filter]: the tuning variables back to their defaults (as the module loaded them), all or those whose name starts with the filter (uu.Volume) or whose page category contains it (Nebulae, March|Steps). The page follows; the scene re-enables if a value needs it. DefaultGame.ini is untouched (uu.Tuning.Save keeps the reset)."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld*)
+		{
+			const FString Filter = FString::Join(Args, TEXT(" "));
+			const int32 N = UUniTuningSettings::ResetToDefaults(Filter);
+			UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: %d tuning variables%s reset to their defaults (uu.Tuning.Save keeps it)."), N, Filter.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" matching '%s'"), *Filter));
+		}));
+
+	FAutoConsoleCommandWithWorldAndArgs CmdTuningPresets(TEXT("uu.Tuning.Presets"), TEXT("D-261: list the saved tuning presets."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>&, UWorld*)
+		{
+			UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: presets in %s: %s"), *UUniTuningSettings::PresetDir(), *FString::Join(UUniTuningSettings::ListPresets(), TEXT(", ")));
+		}));
+
+	FAutoConsoleCommandWithWorldAndArgs CmdTuningReenable(TEXT("uu.Tuning.Reenable"), TEXT("D-261: re-enable the scene where the camera is (textures, shaping, populations: the settings that apply at enable)."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>&, UWorld* World)
+		{
+			if (UUniSubsystem* S = Sub(World)) { S->ReloadTextures(); }
 		}));
 
 	FAutoConsoleCommandWithWorldAndArgs CmdVolume(TEXT("uu.Volume"), TEXT("uu.Volume <0|1>: the volume pass (unresolved glow, dust, background)."),

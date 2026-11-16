@@ -13,7 +13,10 @@
 
 #include "UniTest.h"
 #include "UniVerifyCommon.h"
+#include "UniWebTexture.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -78,6 +81,18 @@ int main(int Argc, char** Argv)
 		return 2;
 	}
 	const std::string Cmd = Argv[1];
+	// D-259 (explorations only; the gate never sets it): UNI_GALSHAPE="knots dust light freq" sets
+	// UNI_GAL_SHAPE and galaxy_shape's powers (dust and light 0 / 1 switch the structure at the
+	// bake's powers 4 and 3; knots 0 the linear knots), to tell a check's change by its term.
+	if (const char* E = std::getenv("UNI_GALSHAPE"))
+	{
+		float A = 1, B = 1, C = 1, D = 0.25f;
+		if (std::sscanf(E, "%f %f %f %f", &A, &B, &C, &D) == 4)
+		{
+			UniHlsl::GGalShape = UniHlsl::float4(A, B, C, D);
+			std::printf("UNI_GALSHAPE: knots %g, dust %g, light %g, structure frequency %g\n", double(A), double(B), double(C), double(D));
+		}
+	}
 	if (Cmd == "test") { return RunTests(Argc, Argv); }
 	if (Cmd == "list")
 	{

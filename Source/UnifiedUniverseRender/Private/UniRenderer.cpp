@@ -14,6 +14,7 @@
 #include "ScreenPass.h"
 #include "CommonRenderResources.h"
 #include "RHIStaticStates.h"
+#include "TextureResource.h"   // D-246: the blue noise
 #include "HAL/IConsoleManager.h"
 #include "Misc/EngineVersionComparison.h"
 #include "HAL/PlatformProcess.h"
@@ -68,9 +69,17 @@ static TAutoConsoleVariable<float> CVarUniVolumeTemporalTightPx(TEXT("uu.VolumeT
 static TAutoConsoleVariable<float> CVarUniVolumeTemporalMaxPx(TEXT("uu.VolumeTemporal.MaxMotionPx"), 8.0f, TEXT("D-194: beyond this motion (march pixels per frame) history is not used: the fresh neighbours are (blur instead of trails)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniVolumeInterleave(TEXT("uu.VolumeInterleave"), 4, TEXT("D-208: most pixels per side of the temporal slicing's block: 4 marches 1 pixel in 16 a frame while the image is near still (under 0.1 march pixels a frame), 3 one in 9 under 0.5, otherwise 2 x 2 (one in 4, D-184). 2: always 2 x 2."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniVolumeTemporal(TEXT("uu.VolumeTemporal"), 1, TEXT("D-184: temporal slicing of the volume march: each frame marches one pixel of every 2 x 2 block and reprojects the rest from the previous frame (about a quarter of the march's cost). 0: march every pixel every frame. Off in the debug views."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<int32> CVarUniVolumeJitter(TEXT("uu.VolumeJitter"), 1, TEXT("D-240: the volume march's steps are jittered (each ray its own lattice phase, each sample a jittered point of its step, moving with each sample a pixel takes) and the temporal pass accumulates them, so structure finer than a step converges instead of showing the steps as slices about the camera. 0: every ray on the same unjittered steps (D-130)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniVolumeAccumulate(TEXT("uu.VolumeAccumulate"), 16.0f, TEXT("D-240: with uu.VolumeJitter, a fresh pixel blends into its clamped history over this many samples (the first ones evenly; a clamp that moves the history restarts it). 1: a fresh pixel replaces its history (D-184)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<float> CVarUniVolumeTravelPixelScale(TEXT("uu.VolumeTravelPixelScale"), 0.35f, TEXT("D-198: the volume march's pixel budget (uu.VolumeMaxMarchPixels) at full travel speed (10 Mpc/s), as a fraction; it falls smoothly from 1 at 100 kpc/s. 1: no change with speed."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniVolumeMaxMarchPixels(TEXT("uu.VolumeMaxMarchPixels"), 262144, TEXT("D-196: the volume march is at most this many pixels (before temporal slicing): past it the march resolution drops below output / uu.VolumeDivisor, aspect kept. 0: no limit (half resolution on any viewport)."), ECVF_RenderThreadSafe);
-static TAutoConsoleVariable<int32> CVarUniVolumeDivisor(TEXT("uu.VolumeDivisor"), 2, TEXT("Volume march resolution divisor (1 = full, 2 = half, 4 = quarter)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<int32> CVarUniVolumeDivisor(TEXT("uu.VolumeDivisor"), 2, TEXT("Volume march resolution divisor (1 = full, 2 = half, 4 = quarter). D-246: with uu.VolumeResolve, uu.VolumeResolveDivisor instead."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<int32> CVarUniVolumeResolve(TEXT("uu.VolumeResolve"), 1, TEXT("D-246: CloudAtmosphere's resolve for the sliced march: every pixel blends the bilinear fill of the 4 x 4 fresh samples about it into its history, clamped to their mean +- gamma sigma (compressed radiance), with two ages; the march at uu.VolumeResolveDivisor (full resolution), its pixel budget x4. 0: D-240's reconstruct (min/max box, history between a pixel's own samples) at uu.VolumeDivisor."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<int32> CVarUniVolumeResolveDivisor(TEXT("uu.VolumeResolveDivisor"), 1, TEXT("D-246: with uu.VolumeResolve, the march resolution divisor (1 = full resolution, as CloudAtmosphere: one pixel in N x N marched a frame)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<int32> CVarUniVolumeBeforeTSR(TEXT("uu.VolumeBeforeTSR"), 1, TEXT("D-246: the volume is composited before TSR (the BeforeDOF callback, ahead of CloudAtmosphere's: a higher view-extension priority), at the internal resolution, its rays on the view's jitter; TSR then accumulates it with the scene. The stars stay after TSR. 0: after TSR with the stars (D-124)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<int32> CVarUniVolumeDenoise(TEXT("uu.VolumeDenoise"), 0, TEXT("D-251: with uu.VolumeResolve, a-trous passes over the resolved volume before the composite (SVGF's: each pixel's variance from its own samples, edges kept by luminance over that noise and by scene depth; steps 1, 2, 4, ...). The history keeps the unfiltered resolve. 0: off (measured: with uu.Nebula.StepRatio it adds little in nebulae and softens the disc; 1 at most)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniVolumeDenoiseSigma(TEXT("uu.VolumeDenoiseSigma"), 4.0f, TEXT("D-251: the denoise's edge stop: a neighbour this many standard deviations of the pixel's noise brighter or darker is mostly left out (larger: smoother, softer edges)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<int32> CVarUniVolumeBlueNoise(TEXT("uu.VolumeBlueNoise"), 1, TEXT("D-246: the march's jitter draws come from the engine's blue-noise tile (FastBlueNoise_scalar_128x128x8, as CloudAtmosphere), moved per draw by the R2 sequence. 0: D-240's hashed draws."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniBackgroundSize(TEXT("uu.BackgroundSize"), 256, TEXT("Background direction-map face size (texels)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarUniVolumeDebug(TEXT("uu.VolumeDebug"), 0, TEXT("Volume debug view (lesson #37): 0 off, 1 steps per ray (magenta = truncated), 2 coverage (R carriers, G supersampling, B truncated), 3 emission (log10 heat), 4 dust transmittance."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<float> CVarUniVolumeDebugLogLo(TEXT("uu.VolumeDebugLogLo"), 0.0f, TEXT("uu.VolumeDebug 3: log10 radiance mapped to the bottom of the heat ramp (the ramp spans 6 decades)."), ECVF_RenderThreadSafe);
@@ -123,6 +132,13 @@ namespace
 // =============================================================================================
 // FUniRenderer
 // =============================================================================================
+
+/** D-252: the nebula grid's counters read back (free slots and overflows per level, uu.Perf). */
+struct FUniRenderer::FNebGridReadbackRT
+{
+	TUniquePtr<FRHIGPUBufferReadback> Counters;
+	bool bPending = false;
+};
 
 struct FUniRenderer::FPromoteReadback
 {
@@ -496,6 +512,12 @@ void FUniRenderer::SetGalaxyTexture_GameThread(int32 Slot, uint32 Size, TArray<T
 	});
 }
 
+void FUniRenderer::SetGalaxyShapeTune_GameThread(const FVector4f& Tune)
+{
+	check(IsInGameThread());
+	ENQUEUE_RENDER_COMMAND(UniSetGalaxyShapeTune)([Tune](FRHICommandListImmediate&) { FUniRenderer::Get().GalShapeTuneRT = Tune; });
+}
+
 void FUniRenderer::QueueGalaxyMap_RenderThread(const FUniFrameData& F)
 {
 	check(IsInRenderingThread());
@@ -609,7 +631,7 @@ FRDGTextureRef FUniRenderer::RegisterGalaxyTexture_RenderThread(FRDGBuilder& Gra
 {
 	check(IsInRenderingThread());
 	if (Slot < 0 || Slot >= GalaxyTextureSlots) { return RegisterNanDummy_RenderThread(GraphBuilder); }
-	static const TCHAR* Names[GalaxyTextureSlots] = { TEXT("UniGalWarpFine"), TEXT("UniGalWarpLarge"), TEXT("UniGalDetail") };
+	static const TCHAR* Names[GalaxyTextureSlots] = { TEXT("UniGalWarpFine"), TEXT("UniGalWarpLarge"), TEXT("UniGalDetail"), TEXT("UniNebDetail"), TEXT("UniGalShape") };
 	if (bGalDirty[Slot])
 	{
 		bGalDirty[Slot] = false;
@@ -700,10 +722,15 @@ void FUniRenderer::Release_RenderThread()
 	}
 	for (TRefCountPtr<IPooledRenderTarget>& M : BackgroundMaps) { M.SafeRelease(); }
 	FarMapTexture.SafeRelease(); FarMapSlices.SafeRelease(); FarMapSize = 0;   // D-228
+	NebGridTableBuf.SafeRelease(); NebGridFreeBuf.SafeRelease(); NebGridCounterBuf.SafeRelease(); NebGridPool.SafeRelease();   // D-252
+	NebGridPlanner = UniCore::FNebGridPlanner();
+	NebGridReadback.Reset();
+	NebGridLastFrame = ~0ull;
 	FarCtl = UniCore::FFarCacheControl();
 	bFarHaveKey = false;
-	TemporalVolume.SafeRelease(); TemporalSlices.SafeRelease(); TemporalDepth.SafeRelease();   // D-184
+	TemporalVolume.SafeRelease(); TemporalSlices.SafeRelease(); TemporalDepth.SafeRelease(); TemporalAge.SafeRelease(); TemporalMoments.SafeRelease();   // D-184, D-240, D-251
 	bTemporalHave = false;
+	PreSlices = nullptr; PreBuilder = nullptr; PreView = nullptr; PreFrameRT = ~0ull;   // D-246
 	bBgHaveCur = bBgFilling = false;
 	BgFillMask = 0u;
 	BgFilledVersion = ~0u;
@@ -713,16 +740,24 @@ void FUniRenderer::Release_RenderThread()
 }
 
 void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& View, const FScreenPassRenderTarget& Output,
-	FRDGTextureRef SceneDepth, const FIntRect& DepthViewRect, float PreExposure, FRDGTextureRef& OutSlices, FIntPoint& OutMarchSize)
+	FRDGTextureRef SceneDepth, const FIntRect& DepthViewRect, float PreExposure, FRDGTextureRef& OutSlices, FIntPoint& OutMarchSize,
+	bool bBeforeTSR, FVector2f JitterPx)
 {
 	const FUniFrameData& F = RenderFrame;
 	TRACE_CPUPROFILER_EVENT_SCOPE(Uni_RenderVolume);
 	RDG_EVENT_SCOPE(GraphBuilder, "Uni.Volume");
 	const FIntRect OutRect = Output.ViewRect;
-	const FMatrix Proj = View.ViewMatrices.ComputeProjectionNoAAMatrix();   // post-TSR: unjittered (W2)
+	// Post-TSR: unjittered (W2). D-246: before TSR too: the pixels (and the history) are the
+	// unjittered centres, and only the march's rays take the jitter (RayJitterPx), as CloudAtmosphere's.
+	const FMatrix Proj = View.ViewMatrices.ComputeProjectionNoAAMatrix();
 	const float TanX = 1.0f / float(Proj.M[0][0]);
 	const float TanY = 1.0f / float(Proj.M[1][1]);
-	const int32 Div = FMath::Clamp(CVarUniVolumeDivisor.GetValueOnRenderThread(), 1, 8);
+	// D-246: CloudAtmosphere's resolve marches at full resolution (one pixel in N x N a frame):
+	// its own divisor, and four times the pixel budget (the rays a frame as D-240's half
+	// resolution sliced 2 x 2 at most).
+	const bool bCloudResolve = CVarUniVolumeResolve.GetValueOnRenderThread() != 0;
+	const int32 Div = FMath::Clamp(bCloudResolve ? CVarUniVolumeResolveDivisor.GetValueOnRenderThread() : CVarUniVolumeDivisor.GetValueOnRenderThread(), 1, 8);
+	const double PixelBudget = double(FMath::Max(CVarUniVolumeMaxMarchPixels.GetValueOnRenderThread(), 0)) * (bCloudResolve ? 4.0 : 1.0);
 	FIntPoint MarchSize(1, 1);
 	// D-196: a pixel budget; D-198: it falls with speed (the travel curve) to uu.VolumeTravelPixelScale
 	// of itself at 10 Mpc/s: past ~8 march pixels of motion a frame the history is dropped and the
@@ -732,7 +767,7 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 	const double TravelScale = FMath::Lerp(1.0, double(FMath::Clamp(CVarUniVolumeTravelPixelScale.GetValueOnRenderThread(), 0.05f, 1.0f)), SpeedQ);
 	// D-200: the auto budget (the GPU frame time) can take it lower still; the smaller wins.
 	const double BudgetScale = FMath::Min(TravelScale, double(FMath::Clamp(F.VolumeBudgetScale, 0.05f, 1.0f)));
-	UniCore::VolumeMarchSize(OutRect.Width(), OutRect.Height(), Div, double(FMath::Max(CVarUniVolumeMaxMarchPixels.GetValueOnRenderThread(), 0)) * BudgetScale, MarchSize.X, MarchSize.Y);
+	UniCore::VolumeMarchSize(OutRect.Width(), OutRect.Height(), Div, PixelBudget * BudgetScale, MarchSize.X, MarchSize.Y);
 	OutMarchSize = MarchSize;
 
 	// Shared inputs. The view's ThetaPixel is the march texel's, so prefiltering and
@@ -747,6 +782,26 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 	FRHISamplerState* WebSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Wrap>::GetRHI();
 	FRDGTextureRef MapTex = RegisterGalaxyMap_RenderThread(GraphBuilder);   // D-212
 	if (!GalaxyMapComplete_RenderThread(VV.MapSlot, F.GalMapVolumeEpoch)) { VV.MapCarrier = 0u; }   // D-214: only the slot's bake of this frame's epoch
+	// D-246: the blue-noise tile, at its full size (CloudAtmosphere reads the whole texture); the
+	// engine's black dummy and size 0 x 0 (the hashed draws) without it.
+	FRHITexture* NoiseRHI = nullptr;
+	if (CVarUniVolumeBlueNoise.GetValueOnRenderThread() != 0 && F.BlueNoiseResource && F.BlueNoiseResource->TextureRHI.IsValid()) { NoiseRHI = F.BlueNoiseResource->TextureRHI.GetReference(); }
+	const FIntVector NoiseSize = NoiseRHI ? NoiseRHI->GetSizeXYZ() : FIntVector(0, 0, 0);
+	const FUintVector2 BlueNoiseSize = NoiseRHI && NoiseSize.X > 0 && NoiseSize.Y > 0 ? FUintVector2(uint32(NoiseSize.X), uint32(NoiseSize.Y)) : FUintVector2(0u, 0u);
+	FRHITexture* BlueNoiseTex = BlueNoiseSize.X > 0u ? NoiseRHI : GBlackTexture->TextureRHI.GetReference();
+	// D-252: the nebula grid's bindings: one-element dummies (no levels: never read) until the grid's
+	// update below binds its own.
+	FRDGBufferRef NebHeaderRDG = nullptr, NebTableRDG = nullptr;
+	FRDGTextureRef NebPoolRDG = nullptr;
+	uint32 NebGridLevelsNow = 0u;
+	{
+		TArray<FVector4f> H0; H0.Add(FVector4f(0.0f, 0.0f, 0.0f, 0.0f));
+		NebHeaderRDG = UploadStructured(GraphBuilder, TEXT("UniNebGridHeaderDummy"), H0);
+		NebTableRDG = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), 1u), TEXT("UniNebGridTableDummy"));
+		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(NebTableRDG, PF_R32_UINT), UniHlsl::UNI_NEB_GRID_UNBAKED);
+		NebPoolRDG = GraphBuilder.CreateTexture(FRDGTextureDesc::Create3D(FIntVector(1, 1, 1), PF_FloatRGBA, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV, 1), TEXT("UniNebGridPoolDummy"));
+		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(NebPoolRDG), FLinearColor(0.0f, 0.0f, 1.0f, 1.0f));
+	}
 	auto FillCommonWith = [&](FUniVolumeCommonParameters& C, const TArray<UniCore::FCarrierGPU>& Carriers, const UniCore::FVolumeViewGPU& V, FRDGBufferRef InParamBuf, FRDGBufferRef InLutBuf)
 	{
 		C.UniWebTexture = WebTex;
@@ -754,9 +809,23 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		C.UniGalWarpFine = GalTex[0];   // D-179
 		C.UniGalWarpLarge = GalTex[1];
 		C.UniGalDetail = GalTex[2];
+		C.UniGalShape = GalTex[4];      // D-259
+		C.UniGalShapeTune = GalShapeTuneRT;
 		C.UniGalMap = MapTex;           // D-212
+		C.UniNebDetail = GalSizeRT[3] > 0u ? GalTex[3] : GalTex[2];   // D-249: galaxy_detail unless one is configured
+		C.UniBlueNoise = BlueNoiseTex;  // D-246
+		C.UniBlueNoiseSize = BlueNoiseSize;
+		C.UniNebTune = F.NebTune;       // D-248
+		C.UniNebTune2 = F.NebTune2;
+		C.UniNebTune3 = F.NebTune3;   // D-251
+		C.UniNebGridHeader = GraphBuilder.CreateSRV(NebHeaderRDG);   // D-252
+		C.UniNebGridTable = GraphBuilder.CreateSRV(NebTableRDG, PF_R32_UINT);
+		C.UniNebGridPool = NebPoolRDG;
+		C.UniNebGridSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
 		TArray<UniCore::FVolumeViewGPU> One; One.Add(V);
 		One[0].NumCarriers = uint32(Carriers.Num());
+		// D-252: the grid as it is this frame (a snapshot's view keeps its spiral's index; off without levels).
+		One[0].NebGridCount = V.NebGridCount > 0u ? NebGridLevelsNow : 0u;
 		C.InCarriers = GraphBuilder.CreateSRV(UploadStructured(GraphBuilder, TEXT("UniVolumeCarriers"), Carriers));
 		C.InParams = GraphBuilder.CreateSRV(InParamBuf);
 		C.InLut = GraphBuilder.CreateSRV(InLutBuf);
@@ -776,6 +845,160 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 	{
 		FillCommonWith(C, Carriers, V, ParamBuf, LutBuf);
 	};
+	// D-252: the nebula grid. Planned once a game frame (UniCore::FNebGridPlanner: the levels' boxes
+	// about the camera, the bricks released and processed), its update passes (pass 7: reset,
+	// release, classify + allocate, bake), then the marches read it (VV, every view's Common).
+	{
+		RDG_EVENT_SCOPE(GraphBuilder, "Uni.NebulaGrid");
+		const FUniFrameData::FNebGridFrame& Ng = F.NebGrid;
+		if (!Ng.bOn || !UniShadersEnabled())
+		{
+			if (NebGridPlanner.IsConfigured() || NebGridPool.IsValid())
+			{
+				NebGridPlanner = UniCore::FNebGridPlanner();
+				NebGridTableBuf.SafeRelease(); NebGridFreeBuf.SafeRelease(); NebGridCounterBuf.SafeRelease(); NebGridPool.SafeRelease();
+				NebGridReadback.Reset();
+				NebGridLastFrame = ~0ull;
+			}
+			Stats.NebGridLevels = 0u;
+			Stats.NebGridPoolKiB = 0u;
+			Stats.NebGridPending = 0u;
+		}
+		else
+		{
+			const bool bLayout = NebGridPlanner.Configure(Ng.Config, Ng.Key);
+			const UniCore::FNebGridLayout& L = NebGridPlanner.Layout();
+			FRDGBufferRef TableB, FreeB, CountB;
+			FRDGTextureRef PoolT;
+			if (bLayout || !NebGridTableBuf.IsValid() || !NebGridFreeBuf.IsValid() || !NebGridCounterBuf.IsValid() || !NebGridPool.IsValid())
+			{
+				TableB = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), FMath::Max(L.TableSize, 1u)), TEXT("UniNebGridTable"));
+				FreeB = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), FMath::Max(L.Slots, 1u)), TEXT("UniNebGridFree"));
+				CountB = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), 2u * UniHlsl::UNI_NEB_GRID_MAX_LEVELS), TEXT("UniNebGridCounters"));
+				PoolT = GraphBuilder.CreateTexture(FRDGTextureDesc::Create3D(FIntVector(int32(L.TexX()), int32(L.TexY()), int32(L.TexZ())), PF_FloatRGBA, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV, 1), TEXT("UniNebGridPool"));
+				AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(TableB, PF_R32_UINT), UniHlsl::UNI_NEB_GRID_UNBAKED);
+				AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FreeB, PF_R32_UINT), 0u);
+				AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(CountB, PF_R32_UINT), 0u);
+				AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(PoolT), FLinearColor(0.0f, 0.0f, 1.0f, 1.0f));
+				NebGridTableBuf = GraphBuilder.ConvertToExternalBuffer(TableB);
+				NebGridFreeBuf = GraphBuilder.ConvertToExternalBuffer(FreeB);
+				NebGridCounterBuf = GraphBuilder.ConvertToExternalBuffer(CountB);
+				NebGridPool = GraphBuilder.ConvertToExternalTexture(PoolT);
+				NebGridReadback.Reset();
+			}
+			else
+			{
+				TableB = GraphBuilder.RegisterExternalBuffer(NebGridTableBuf);
+				FreeB = GraphBuilder.RegisterExternalBuffer(NebGridFreeBuf);
+				CountB = GraphBuilder.RegisterExternalBuffer(NebGridCounterBuf);
+				PoolT = GraphBuilder.RegisterExternalTexture(NebGridPool, TEXT("UniNebGridPool"));
+			}
+			// The plan, once a game frame (a second view this frame reads the same boxes).
+			const bool bPlan = F.FrameNumber != NebGridLastFrame;
+			if (bPlan)
+			{
+				NebGridPlanner.Update(Ng.CamField, Ng.MidZ, FMath::Max(Ng.Budget, 1u), NebGridOps);
+				NebGridLastFrame = F.FrameNumber;
+			}
+			else { NebGridOps.ResetMask = 0u; NebGridOps.Release.clear(); NebGridOps.Process.clear(); }
+			TArray<FVector4f> Hdr;
+			Hdr.Reserve(int32(NebGridOps.Headers.size()));
+			for (const UniHlsl::float4& Hv : NebGridOps.Headers) { Hdr.Add(FVector4f(Hv.x, Hv.y, Hv.z, Hv.w)); }
+			NebHeaderRDG = UploadStructured(GraphBuilder, TEXT("UniNebGridHeader"), Hdr);
+			// The update passes: the table and pool written there, so their read bindings in this
+			// struct stay the dummies.
+			const TArray<UniCore::FCarrierGPU> NoCarriers;
+			auto UpdateParams = [&](FRDGBufferRef InOps, FRDGBufferRef InOpSlot, uint32 InCount) -> FUniNebGridUpdateParameters*
+			{
+				FUniNebGridUpdateParameters* P = GraphBuilder.AllocParameters<FUniNebGridUpdateParameters>();
+				FillCommonWith(P->Common, NoCarriers, VV, ParamBuf, LutBuf);
+				P->UniNebGridOps = GraphBuilder.CreateSRV(InOps);
+				P->UniNebGridOpSlot = GraphBuilder.CreateUAV(InOpSlot);
+				P->UniNebGridTableRW = GraphBuilder.CreateUAV(TableB, PF_R32_UINT);
+				P->UniNebGridFree = GraphBuilder.CreateUAV(FreeB, PF_R32_UINT);
+				P->UniNebGridCounters = GraphBuilder.CreateUAV(CountB, PF_R32_UINT);
+				P->UniNebGridPoolRW = GraphBuilder.CreateUAV(PoolT);
+				P->NebGridOpCount = InCount;
+				P->NebGridLevel = 0u;
+				P->NebGridResetCount = 0u;
+				P->NebGridParam = Ng.ParamIndex;
+				return P;
+			};
+			TArray<UniCore::FNebGridOpGPU> NoOps;
+			FRDGBufferRef DummyOps = UploadStructured(GraphBuilder, TEXT("UniNebGridOpsDummy"), NoOps);
+			FRDGBufferRef DummySlot = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), 1u), TEXT("UniNebGridOpSlotDummy"));
+			FGlobalShaderMap* Sm = GetGlobalShaderMap(View.GetFeatureLevel());
+			for (int32 K = 0; K < int32(L.Levels.size()); ++K)
+			{
+				if (!(NebGridOps.ResetMask & (1u << uint32(K)))) { continue; }
+				const uint32 N = FMath::Max(L.Levels[K].SlotCount, L.Levels[K].Entries);
+				FUniNebGridUpdateParameters* P = UpdateParams(DummyOps, DummySlot, 0u);
+				P->NebGridLevel = uint32(K);
+				P->NebGridResetCount = N;
+				TShaderMapRef<FUniNebGridResetCS> CS(Sm);
+				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.NebulaGrid.Reset level %d", K), CS, P, FIntVector(FMath::DivideAndRoundUp(int32(N), 64), 1, 1));
+			}
+			if (NebGridOps.Release.size() > 0)
+			{
+				TArray<UniCore::FNebGridOpGPU> Rel(NebGridOps.Release.data(), int32(NebGridOps.Release.size()));
+				FUniNebGridUpdateParameters* P = UpdateParams(UploadStructured(GraphBuilder, TEXT("UniNebGridRelease"), Rel), DummySlot, uint32(Rel.Num()));
+				TShaderMapRef<FUniNebGridReleaseCS> CS(Sm);
+				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.NebulaGrid.Release %d", Rel.Num()), CS, P, FIntVector(FMath::DivideAndRoundUp(Rel.Num(), 64), 1, 1));
+			}
+			const int32 NumProc = int32(NebGridOps.Process.size());
+			if (NumProc > 0)
+			{
+				TArray<UniCore::FNebGridOpGPU> Proc(NebGridOps.Process.data(), NumProc);
+				FRDGBufferRef OpsB = UploadStructured(GraphBuilder, TEXT("UniNebGridProcess"), Proc);
+				FRDGBufferRef SlotB = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), uint32(NumProc)), TEXT("UniNebGridOpSlot"));
+				const FIntVector Groups(FMath::Min(NumProc, 65535), FMath::DivideAndRoundUp(NumProc, 65535), 1);
+				{
+					FUniNebGridUpdateParameters* P = UpdateParams(OpsB, SlotB, uint32(NumProc));
+					TShaderMapRef<FUniNebGridAllocCS> CS(Sm);
+					FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.NebulaGrid.Classify %d", NumProc), CS, P, Groups);
+				}
+				{
+					FUniNebGridUpdateParameters* P = UpdateParams(OpsB, SlotB, uint32(NumProc));
+					TShaderMapRef<FUniNebGridBakeCS> CS(Sm);
+					FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.NebulaGrid.Bake %d", NumProc), CS, P, Groups);
+				}
+			}
+			// The counters read back a few frames late (uu.Perf: free slots, overflows).
+			if (!NebGridReadback.IsValid()) { NebGridReadback = MakeShared<FNebGridReadbackRT>(); NebGridReadback->Counters = MakeUnique<FRHIGPUBufferReadback>(TEXT("UniNebGridCountersReadback")); }
+			if (NebGridReadback->bPending && NebGridReadback->Counters->IsReady())
+			{
+				const uint32* C = static_cast<const uint32*>(NebGridReadback->Counters->Lock(2u * UniHlsl::UNI_NEB_GRID_MAX_LEVELS * sizeof(uint32)));
+				for (int32 K = 0; K < FUniRenderStats::MaxNebGridLevels; ++K)
+				{
+					Stats.NebGridFree[K] = C[K];
+					Stats.NebGridOverflow[K] = C[UniHlsl::UNI_NEB_GRID_MAX_LEVELS + uint32(K)];
+				}
+				NebGridReadback->Counters->Unlock();
+				NebGridReadback->bPending = false;
+			}
+			if (!NebGridReadback->bPending)
+			{
+				AddEnqueueCopyPass(GraphBuilder, NebGridReadback->Counters.Get(), CountB, 2u * UniHlsl::UNI_NEB_GRID_MAX_LEVELS * sizeof(uint32));
+				NebGridReadback->bPending = true;
+			}
+			NebTableRDG = TableB;
+			NebPoolRDG = PoolT;
+			NebGridLevelsNow = uint32(L.Levels.size());
+			Stats.NebGridLevels = NebGridLevelsNow;
+			Stats.NebGridPoolKiB = uint32(FMath::Min<uint64>((L.PoolBytes() + L.TableBytes()) / 1024ull, 0xFFFFFFFFull));
+			Stats.NebGridPending = uint32(NebGridPlanner.Pending());
+			if (bPlan)
+			{
+				Stats.NebGridProcessed = uint32(NumProc);
+				Stats.NebGridProcessedTotal += uint64(NumProc);
+				Stats.NebGridLevelResets = NebGridPlanner.LevelResets;
+			}
+			for (int32 K = 0; K < FUniRenderStats::MaxNebGridLevels; ++K) { Stats.NebGridSlots[K] = K < int32(L.Levels.size()) ? L.Levels[K].SlotCount : 0u; }
+		}
+		VV.NebGridCount = NebGridLevelsNow;
+		VV.NebGridParam = Ng.ParamIndex;
+		VV.NebGridFetchMax = Ng.FetchMax;
+	}
 	FRHISamplerState* PointClamp = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
 	const FIntPoint DepthExtent = SceneDepth->Desc.Extent;
 	// March pixel p (0..MarchSize) -> depth UV; output pixel (absolute) -> depth UV.
@@ -818,7 +1041,7 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		// D-224: the march's pixels before the auto budget (D-200) took them down. Measured on the
 		// shrunk march, a slow GPU made per-pixel background look cheaper, which made the GPU slower.
 		int32 RefX = 1, RefY = 1;
-		UniCore::VolumeMarchSize(OutRect.Width(), OutRect.Height(), Div, double(FMath::Max(CVarUniVolumeMaxMarchPixels.GetValueOnRenderThread(), 0)) * TravelScale, RefX, RefY);
+		UniCore::VolumeMarchSize(OutRect.Width(), OutRect.Height(), Div, PixelBudget * TravelScale, RefX, RefY);
 		const double PixelRays = FMath::Max(double(RefX) * double(RefY) * 0.25, 1.0);
 		// D-224: inside a galaxy the background stays on its map (UniCore::CameraInsideLocalCarrier).
 		const bool bInsideLocal = CVarUniBackgroundPerPixelInside.GetValueOnRenderThread() == 0
@@ -947,8 +1170,11 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 	{
 		// A face spans 90 degrees: as fine as the march at the view's centre (its size before the
 		// auto budget, D-200, so the map is not re-created whenever the budget changes level).
+		// D-246: D-240's march (uu.VolumeDivisor, its budget), not the resolve's full resolution:
+		// the light past the split is smooth, and a finer map would refresh twice as often for
+		// the same parallax and cost four times as much a face.
 		int32 Fx = 1, Fy = 1;
-		UniCore::VolumeMarchSize(OutRect.Width(), OutRect.Height(), Div, double(FMath::Max(CVarUniVolumeMaxMarchPixels.GetValueOnRenderThread(), 0)), Fx, Fy);
+		UniCore::VolumeMarchSize(OutRect.Width(), OutRect.Height(), FMath::Clamp(CVarUniVolumeDivisor.GetValueOnRenderThread(), 1, 8), double(FMath::Max(CVarUniVolumeMaxMarchPixels.GetValueOnRenderThread(), 0)), Fx, Fy);
 		const int32 Want = CVarUniVolumeFarSize.GetValueOnRenderThread();
 		FarS.FaceSize = Want > 0 ? FMath::Clamp(Want, 32, 2048) : FMath::Clamp(FMath::DivideAndRoundUp(int32(FMath::CeilToFloat(float(Fx) / FMath::Max(TanX, 0.05f))), 64) * 64, 128, 1024);
 	}
@@ -1104,6 +1330,12 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 	FRDGTextureRef VolumeTex = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(MarchSize, PF_A32B32G32R32F, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV), TEXT("UniVolume"));   // float32: see the cube
 	FRDGTextureRef Slices = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(MarchSize, PF_R16F, FClearValueBinding::White, TexCreate_ShaderResource | TexCreate_UAV, UniGpuLayout::VolumeSlices), TEXT("UniVolumeSlices"));
 	FRDGTextureRef DepthTex = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(MarchSize, PF_G32R32F, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV), TEXT("UniVolumeDepth"));
+	FRDGTextureRef AgeTex = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(MarchSize, PF_G16R16F, FClearValueBinding::White, TexCreate_ShaderResource | TexCreate_UAV), TEXT("UniVolumeAge"));   // D-240; D-246: (all, own)
+	FRDGTextureRef MomTex = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(MarchSize, PF_G32R32F, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV), TEXT("UniVolumeMoments"));   // D-251
+	FRDGTextureRef VarTex = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(MarchSize, PF_R32_FLOAT, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV), TEXT("UniVolumeVariance"));   // D-251
+	// D-251 / D-246: the resolve's compression knee at the displayed brightness: radiance x the output
+	// pixel's solid angle at the centre (1 / FocalPx^2) x scene colour's scale and pre-exposure.
+	const float ResolveExp = FMath::Max(F.SceneColourScale * PreExposure, 1.0e-30f) / FMath::Max(FMath::Square(float(OutRect.Width()) * 0.5f / TanX), 1.0e-30f);
 
 	// D-184: temporal slicing. With a usable history (same march size, consecutive frames, no
 	// camera jump) the march marches one pixel of every 2 x 2 block into the fresh textures and
@@ -1111,7 +1343,9 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 	// Without it every pixel is marched straight into the frame's volume (which becomes the
 	// history). Debug views march every pixel.
 	const bool bTemporalOn = CVarUniVolumeTemporal.GetValueOnRenderThread() != 0 && VolDebugMode == 0u && MarchSize.X >= 4 && MarchSize.Y >= 4;
-	const bool bHistory = bTemporalHave && TemporalVolume.IsValid() && TemporalSlices.IsValid() && TemporalDepth.IsValid();
+	const bool bHistory = bTemporalHave && TemporalVolume.IsValid() && TemporalSlices.IsValid() && TemporalDepth.IsValid() && TemporalAge.IsValid() && TemporalMoments.IsValid()   // D-251
+		&& TemporalAge->GetDesc().Format == PF_G16R16F   // D-246: two ages
+		&& TemporalBeforeTSR == bBeforeTSR;              // D-246: the placement changed (the CVar): the history's view rect is another's
 	// D-215: a new march size (the auto budget's level, D-200) keeps the history, reprojected at
 	// its own size, within 2x either way: re-marching every pixel there (16x the rays at 1/16)
 	// made the frame the auto budget changed level a 100+ ms spike.
@@ -1133,6 +1367,19 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		Interleave = UniHlsl::Uni_TemporalInterleave(MotionPx, uint32(FMath::Clamp(CVarUniVolumeInterleave.GetValueOnRenderThread(), 2, 4)));
 	}
 	const uint32 Phase = bSlice ? UniHlsl::Uni_TemporalPack(++TemporalStep, Interleave) : 0u;
+	// D-240: the march's view jittered (not VV: the far cache snapshots it, and its texels are
+	// kept without accumulation), its shift moving by the golden ratio with each sample a pixel
+	// takes (one per N x N sliced frames, one a frame otherwise); the reconstruct accumulates.
+	UniCore::FVolumeViewGPU VM = VV;
+	const bool bJitter = CVarUniVolumeJitter.GetValueOnRenderThread() != 0 && VolDebugMode == 0u;
+	if (bJitter)
+	{
+		const uint64 Nn = bSlice ? uint64(Interleave) : 1u;
+		const uint64 Kj = bSlice ? uint64(TemporalStep) / (Nn * Nn) : uint64(F.FrameNumber);
+		VM.MarchFlags |= UniHlsl::UNI_VOL_JITTER_FLAG;
+		VM.JitterShift = float(FMath::Fmod(double(Kj) * 0.6180339887498949, 1.0));
+	}
+	const float MaxSamples = bJitter ? FMath::Max(CVarUniVolumeAccumulate.GetValueOnRenderThread(), 1.0f) : 1.0f;
 	const UniHlsl::uint2 SliceOff = UniHlsl::Uni_TemporalOffset(Phase);
 	const FUintVector2 SliceOffset(SliceOff.x, SliceOff.y);
 	FRDGTextureRef MarchVol = VolumeTex, MarchSlices = Slices, MarchDepth = DepthTex;
@@ -1144,7 +1391,7 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 	}
 	{
 		FUniVolumeMarchCS::FParameters* P = GraphBuilder.AllocParameters<FUniVolumeMarchCS::FParameters>();
-		FillCommon(P->Common, MarchCarriers, VV);
+		FillCommon(P->Common, MarchCarriers, VM);   // D-240: jittered
 		P->InvDeviceZToWorldZTransform = FVector4f(View.InvDeviceZToWorldZTransform);
 		P->MarchToDepthUV = MarchToDepthUV;
 		P->SceneDepthTexture = SceneDepth;
@@ -1158,6 +1405,15 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		P->WebDebugOpacity = FMath::Max(CVarUniWebDebugOpacity.GetValueOnRenderThread(), 0.0f);
 		P->bSliceMarch = bSlice ? Interleave : 0u;   // D-208: N (2..4)
 		P->SliceOffset = SliceOffset;
+		P->TemporalPhaseMarch = Phase;   // D-247
+		// D-246: before TSR the rays take the view's jitter, so they land where the jittered depth
+		// is (render pixels, then march pixels; the jitter moves content by +J: the ray of pixel p
+		// is the unjittered one at p - J). The stored pixel stays its centre's.
+		P->RayJitterPx = bBeforeTSR ? FVector2f(-JitterPx.X * float(MarchSize.X) / float(FMath::Max(OutRect.Width(), 1)), -JitterPx.Y * float(MarchSize.Y) / float(FMath::Max(OutRect.Height(), 1))) : FVector2f::ZeroVector;
+		// D-251: a frame marched in full starts the luminance moments (sliced, the reconstruct writes them).
+		P->bWriteMoments = bSlice ? 0u : 1u;
+		P->MarchExposure = ResolveExp;
+		P->OutMoments = GraphBuilder.CreateUAV(MomTex);
 		FillFar(P->Far);   // D-228
 		P->OutVolume = GraphBuilder.CreateUAV(MarchVol);
 		P->OutSlices = GraphBuilder.CreateUAV(MarchSlices);
@@ -1177,7 +1433,7 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 	if (bSlice)
 	{
 		FUniVolumeReconstructCS::FParameters* P = GraphBuilder.AllocParameters<FUniVolumeReconstructCS::FParameters>();
-		FillCommon(P->Common, MarchCarriers, VV);
+		FillCommon(P->Common, MarchCarriers, VM);
 		P->InvDeviceZToWorldZTransform = FVector4f(View.InvDeviceZToWorldZTransform);
 		P->MarchToDepthUV = MarchToDepthUV;
 		P->SceneDepthTexture = SceneDepth;
@@ -1191,25 +1447,40 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		P->PrevWarpVelBeta = TemporalPrevWarp;   // D-190
 		P->TemporalClamp = FVector4f(CVarUniVolumeTemporalClamp.GetValueOnRenderThread() != 0 ? 1.0f : 0.0f,
 			FMath::Max(CVarUniVolumeTemporalTightPx.GetValueOnRenderThread(), 0.01f), FMath::Max(CVarUniVolumeTemporalMaxPx.GetValueOnRenderThread(), 0.0f), 0.0f);   // D-194
+		P->MaxSamples = MaxSamples;   // D-240
+		// D-246: the resolve's compression knee at the displayed brightness: radiance x the
+		// output pixel's solid angle at the centre (1 / FocalPx^2) x scene colour's scale and
+		// pre-exposure, its brightest channel (Uni_ResolveCompress).
+		P->bCloudResolve = bCloudResolve ? 1u : 0u;
+		P->ResolveExposure = ResolveExp;
 		P->HistFarSign = int32(FarD.HistSign);   // D-228: the history converted once at a switch
 		FillFar(P->Far);
 		P->FreshVolume = MarchVol; P->FreshSlices = MarchSlices; P->FreshDepth = MarchDepth;
 		P->HistVolume = GraphBuilder.RegisterExternalTexture(TemporalVolume, TEXT("UniVolumeHistory"));
 		P->HistSlices = GraphBuilder.RegisterExternalTexture(TemporalSlices, TEXT("UniVolumeHistorySlices"));
 		P->HistDepth = GraphBuilder.RegisterExternalTexture(TemporalDepth, TEXT("UniVolumeHistoryDepth"));
+		P->HistAge = GraphBuilder.RegisterExternalTexture(TemporalAge, TEXT("UniVolumeHistoryAge"));   // D-240
 		P->OutVolume = GraphBuilder.CreateUAV(VolumeTex);
 		P->OutSlices = GraphBuilder.CreateUAV(Slices);
 		P->OutDepth = GraphBuilder.CreateUAV(DepthTex);
+		P->OutAge = GraphBuilder.CreateUAV(AgeTex);
+		P->HistMoments = GraphBuilder.RegisterExternalTexture(TemporalMoments, TEXT("UniVolumeHistoryMoments"));   // D-251
+		P->OutMoments = GraphBuilder.CreateUAV(MomTex);
+		P->OutVariance = GraphBuilder.CreateUAV(VarTex);
 		TShaderMapRef<FUniVolumeReconstructCS> CS(GetGlobalShaderMap(View.GetFeatureLevel()));
 		RDG_EVENT_SCOPE(GraphBuilder, "Uni.Volume.Reconstruct");   // D-196
 		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Volume.Reconstruct %dx%d", MarchSize.X, MarchSize.Y), CS, P, FComputeShaderUtils::GetGroupCount(MarchSize, 8));
 	}
+	// D-240: a frame marched in full holds one sample a pixel (the reconstruct writes the age otherwise).
+	if (!bSlice) { AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(AgeTex), FLinearColor(1.0f, 1.0f, 1.0f, 1.0f)); }
 	// D-184: this frame's volume is the next frame's history.
 	if (bTemporalOn)
 	{
 		GraphBuilder.QueueTextureExtraction(VolumeTex, &TemporalVolume);
 		GraphBuilder.QueueTextureExtraction(Slices, &TemporalSlices);
 		GraphBuilder.QueueTextureExtraction(DepthTex, &TemporalDepth);
+		GraphBuilder.QueueTextureExtraction(AgeTex, &TemporalAge);   // D-240
+		GraphBuilder.QueueTextureExtraction(MomTex, &TemporalMoments);   // D-251
 		TemporalSize = MarchSize;
 		TemporalPrevForward = FVector3f(View.GetViewDirection());
 		TemporalPrevRight = FVector3f(View.GetViewRight());
@@ -1219,11 +1490,41 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		TemporalLastFrame = F.FrameNumber;
 		TemporalPrevWarp = WarpVelBetaOf(F);   // D-190
 		TemporalPhase = Phase;
+		TemporalBeforeTSR = bBeforeTSR;   // D-246
 		bTemporalHave = true;
 	}
 	else
 	{
 		bTemporalHave = false;
+	}
+
+	// D-251: the resolved volume denoised for the composite (the history keeps the resolve's): a-trous
+	// passes at steps 1, 2, 4, ..., ping-ponged, each pixel's variance from the resolve.
+	FRDGTextureRef ShownVolume = VolumeTex;
+	const int32 DenoiseIters = (bCloudResolve && bSlice) ? FMath::Clamp(CVarUniVolumeDenoise.GetValueOnRenderThread(), 0, 5) : 0;
+	if (DenoiseIters > 0)
+	{
+		RDG_EVENT_SCOPE(GraphBuilder, "Uni.Volume.Denoise");
+		FRDGTextureRef CIn = VolumeTex, VIn = VarTex;
+		TShaderMapRef<FUniVolumeDenoiseCS> CS(GetGlobalShaderMap(View.GetFeatureLevel()));
+		for (int32 It = 0; It < DenoiseIters; ++It)
+		{
+			FRDGTextureRef COut = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(MarchSize, PF_A32B32G32R32F, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV), TEXT("UniVolumeDenoised"));
+			FRDGTextureRef VOut = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(MarchSize, PF_R32_FLOAT, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV), TEXT("UniVolumeDenoisedVariance"));
+			FUniVolumeDenoiseCS::FParameters* P = GraphBuilder.AllocParameters<FUniVolumeDenoiseCS::FParameters>();
+			P->MarchSize = FUintVector2(uint32(MarchSize.X), uint32(MarchSize.Y));
+			P->DenoiseStep = 1u << uint32(It);
+			P->DenoiseSigma = FMath::Max(CVarUniVolumeDenoiseSigma.GetValueOnRenderThread(), 0.01f);
+			P->DenoiseExposure = ResolveExp;
+			P->DenoiseIn = CIn;
+			P->DenoiseVarIn = VIn;
+			P->DenoiseDepth = DepthTex;
+			P->DenoiseOut = GraphBuilder.CreateUAV(COut);
+			P->DenoiseVarOut = GraphBuilder.CreateUAV(VOut);
+			FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Volume.Denoise step %d", 1 << It), CS, P, FComputeShaderUtils::GetGroupCount(MarchSize, 8));
+			CIn = COut; VIn = VOut;
+		}
+		ShownVolume = CIn;
 	}
 
 	// 3. Composite: upsample + background, additive into the output (before the sprites).
@@ -1246,7 +1547,7 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		C.BackgroundBlend = BackgroundBlend;   // D-159
 		C.DebugMode = VolDebugMode;
 		C.DebugScale = 1.0f / FMath::Max(PreExposure, 1.0e-6f);
-		C.VolumeTexture = VolumeTex;
+		C.VolumeTexture = ShownVolume;   // D-251: denoised when on
 		C.CubeTexture = Cube;
 		C.CubePrevTexture = CubePrev;
 		C.LinearClampSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
@@ -1276,6 +1577,33 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 	}
 	OutSlices = Slices;
 	Stats.VolumeCarriersLastFrame = uint32(F.VolumeCarriers.Num());
+}
+
+bool FUniRenderer::VolumeBeforeTSR_RenderThread()
+{
+	return CVarUniVolumeBeforeTSR.GetValueOnRenderThread() != 0;
+}
+
+bool FUniRenderer::RenderVolumeBeforeTSR_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& View, const FScreenPassRenderTarget& Output,
+	FRDGTextureRef SceneDepth, const FIntRect& DepthViewRect, float PreExposure, FVector2f JitterPx)
+{
+	check(IsInRenderingThread());
+	const FUniFrameData& F = RenderFrame;
+	PreSlices = nullptr; PreBuilder = nullptr; PreView = nullptr;
+	// RenderBackdrop's conditions, and the volume on.
+	if (!VolumeBeforeTSR_RenderThread() || !UniShadersEnabled() || !F.bEnabled || F.Cells.Num() == 0 || !F.bVolume || !Output.IsValid() || !SceneDepth) { return false; }
+	TRACE_CPUPROFILER_EVENT_SCOPE(Uni_RenderVolumeBeforeTSR);
+	RDG_EVENT_SCOPE(GraphBuilder, "UnifiedUniverse (before TSR)");
+	FRDGTextureRef Slices = nullptr;
+	FIntPoint MarchSize(1, 1);
+	RenderVolume_RenderThread(GraphBuilder, View, Output, SceneDepth, DepthViewRect, PreExposure, Slices, MarchSize, true, JitterPx);
+	if (!Slices) { return false; }
+	PreSlices = Slices;
+	PreMarchSize = MarchSize;
+	PreBuilder = &GraphBuilder;
+	PreView = &View;
+	PreFrameRT = GFrameCounterRenderThread;
+	return true;
 }
 
 void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& View, const FScreenPassRenderTarget& SceneColor,
@@ -1563,10 +1891,14 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 		AddQuery_RenderThread(GraphBuilder, F, View.GetFeatureLevel(), CellBuf, PoolBuf);
 	}
 
-	// Volume (D-128..D-136): drawn first so sprites can read its transmittance slices.
+	// Volume (D-128..D-136): drawn first so sprites can read its transmittance slices. D-246: or
+	// already drawn before TSR for this view in this graph (RenderVolumeBeforeTSR): its slices.
 	FRDGTextureRef VolumeSlices = nullptr;
 	FIntPoint MarchSize(1, 1);
-	if (F.bVolume) { RenderVolume_RenderThread(GraphBuilder, View, SceneColor, SceneDepth, DepthViewRect, PreExposure, VolumeSlices, MarchSize); }
+	const bool bPre = PreSlices != nullptr && PreBuilder == &GraphBuilder && PreView == &View && PreFrameRT == GFrameCounterRenderThread;
+	if (bPre) { VolumeSlices = PreSlices; MarchSize = PreMarchSize; }
+	else if (F.bVolume) { RenderVolume_RenderThread(GraphBuilder, View, SceneColor, SceneDepth, DepthViewRect, PreExposure, VolumeSlices, MarchSize); }
+	PreSlices = nullptr; PreBuilder = nullptr; PreView = nullptr;   // once (the graph's references die with it)
 	if (!VolumeSlices)
 	{
 		VolumeSlices = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(FIntPoint(1, 1), PF_R16F, FClearValueBinding::White, TexCreate_ShaderResource | TexCreate_UAV, UniGpuLayout::VolumeSlices), TEXT("UniVolumeSlicesDummy"));
@@ -1860,6 +2192,8 @@ namespace
 		P->UniGalWarpFine = R.RegisterGalaxyTexture_RenderThread(GraphBuilder, 0);   // D-179
 		P->UniGalWarpLarge = R.RegisterGalaxyTexture_RenderThread(GraphBuilder, 1);
 		P->UniGalDetail = R.RegisterGalaxyTexture_RenderThread(GraphBuilder, 2);
+		P->UniGalShape = R.RegisterGalaxyTexture_RenderThread(GraphBuilder, 4);   // D-259
+		P->UniGalShapeTune = R.GalaxyShapeTune_RenderThread();
 		P->UniGalMap = R.RegisterGalaxyMap_RenderThread(GraphBuilder);   // D-214: galaxies place from their maps
 	}
 

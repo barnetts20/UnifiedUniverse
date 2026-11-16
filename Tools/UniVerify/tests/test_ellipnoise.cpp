@@ -100,6 +100,14 @@ namespace
 
 	FFieldParams NoiseOff(FFieldParams P) { P.V[13] = 0.0f; return P; }
 
+	/** D-238: the spheroid without its globular clusters (their own check is T2.galaxy.globulars;
+	 *  noise off also halves an early type's count, so they would differ in the core). */
+	float SphField(const H::float3& InP, const H::FUniFieldParams& InPar, float InFoot)
+	{
+		const u32 Hgc = H::Uni_SeedMix(H::Uni_GalaxyConstOf(InPar).Hs, 15u);
+		return H::UniField_GalaxyFiltered(InP, InPar, InFoot) - H::Uni_GalaxyGcDensity(InP, InPar, Hgc, InFoot, 0.0f) * (H::dot(InP, InP) < InPar.D.x * InPar.D.x ? std::min(std::max((InPar.D.x - std::sqrt(H::dot(InP, InP))) / (0.05f * InPar.D.x), 0.0f), 1.0f) : 0.0f);
+	}
+
 	double Unit(u32 S, u32 K) { return double(H::Uni_DrawUnit(S, 0xE11u, K)); }
 
 	/** Stratified Monte Carlo integral of the field over the unit ball's cube. */
@@ -110,7 +118,7 @@ namespace
 		{
 			const u32 K = u32((X * G + Y) * G + Z);
 			const H::float3 Pt(float(-1.0 + 2.0 * (X + Unit(Seed, 3 * K)) / G), float(-1.0 + 2.0 * (Y + Unit(Seed, 3 * K + 1)) / G), float(-1.0 + 2.0 * (Z + Unit(Seed, 3 * K + 2)) / G));
-			Sum += double(H::UniField_GalaxyFiltered(Pt, P, 0.0f));
+			Sum += double(SphField(Pt, P, 0.0f));
 		}
 		return Sum * 8.0 / double(G) / double(G) / double(G);
 	}
@@ -147,7 +155,7 @@ namespace
 			const H::float3 Pt(float(O[0] + T * Vw.Dv[0]), float(O[1] + T * Vw.Dv[1]), float(O[2] + T * Vw.Dv[2]));
 			const double S = double(H::Uni_GalaxyStepHintFilteredK(Pt, Dir, P, Foot, K.Hp));
 			const H::float3 Pm(float(O[0] + (T + 0.5 * S) * Vw.Dv[0]), float(O[1] + (T + 0.5 * S) * Vw.Dv[1]), float(O[2] + (T + 0.5 * S) * Vw.Dv[2]));
-			if (H::dot(Pm, Pm) < 1.0f) { Sum += double(H::UniField_GalaxyFiltered(Pm, P, Foot)) * S; }
+			if (H::dot(Pm, Pm) < 1.0f) { Sum += double(SphField(Pm, P, Foot)) * S; }
 			T += S;
 			++Steps;
 		}
@@ -166,7 +174,7 @@ namespace
 		{
 			const double T = (S + 0.5) * Dt;
 			const H::float3 Pt(float(O[0] + T * Vw.Dv[0]), float(O[1] + T * Vw.Dv[1]), float(O[2] + T * Vw.Dv[2]));
-			if (H::dot(Pt, Pt) < 1.0f) { Sum += double(H::UniField_GalaxyFiltered(Pt, P, Foot)) * Dt; }
+			if (H::dot(Pt, Pt) < 1.0f) { Sum += double(SphField(Pt, P, Foot)) * Dt; }
 		}
 		return Sum;
 	}
@@ -203,7 +211,7 @@ namespace
 			for (int Z = 0; Z < Nz; ++Z)
 			{
 				const H::float3 Pt(float(U), float(V), float(-1.0 + (Z + 0.5) * Dz));
-				S += double(H::UniField_GalaxyFiltered(Pt, P, 0.0f)) * Dz;
+				S += double(SphField(Pt, P, 0.0f)) * Dz;
 			}
 			L[size_t(Y) * Px + X] = S;
 		}
@@ -312,9 +320,10 @@ UNI_TEST(galaxy, spheroid_noise)
 			H::Uni_GalaxyTexTerms(Pt, P, H::Uni_GalaxyConstOf(P), 0.0f, H::Uni_GalaxyDiscSlab(P), true, false, Pd, Pb, Dt, bDt, Fn, Sm, Nk);
 			const double Rs = std::sqrt(double(Pb.x) * Pb.x + double(Pb.y) * Pb.y + double(Pb.z / P.B.x) * (Pb.z / P.B.x));
 			if (Rs >= 0.2 * Re) { continue; }
-			const float A = H::UniField_GalaxyFiltered(Pt, P, 0.0f), B = H::UniField_GalaxyFiltered(Pt, Pn, 0.0f);
+			const float A = SphField(Pt, P, 0.0f), B = SphField(Pt, Pn, 0.0f);
 			++CoreN;
-			if (A != B || Sm != 1.0f) { ++CoreBad; }
+			// D-238: the globulars taken out (SphField) leave a rounding (a few ulp) where one sits.
+			if (std::abs(double(A) - double(B)) > 1.0e-6 * std::max(std::abs(double(A)), 1e-30) || Sm != 1.0f) { ++CoreBad; }
 		}
 		const double Ion = Integral(P, 56, 0x77u + Gi), Ioff = Integral(Pn, 56, 0x77u + Gi);
 		WorstLight = std::max(WorstLight, std::abs(Ion / std::max(Ioff, 1e-300) - 1.0));

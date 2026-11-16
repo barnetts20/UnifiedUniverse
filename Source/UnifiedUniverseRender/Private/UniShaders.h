@@ -23,7 +23,7 @@ namespace UniGpuLayout
 {
 	inline constexpr uint32 ObjectBytes = sizeof(UniCore::FObjectGPU);          // 32
 	inline constexpr uint32 TaskBytes = sizeof(UniCore::FGenTaskGPU);           // 272 (D-153 sampling box, D-178 field params 128)
-	inline constexpr uint32 TaskCountBytes = sizeof(UniCore::FTaskCountGPU);    // 48 (D-214)
+	inline constexpr uint32 TaskCountBytes = sizeof(UniCore::FTaskCountGPU);    // 160 (D-214; D-238; D-239)
 	inline constexpr uint32 SliceBytes = sizeof(UniCore::FSliceGPU);            // 64
 	inline constexpr uint32 CellBytes = sizeof(UniCore::FCellGPU);              // 64
 	inline constexpr uint32 SpriteBytes = 64;                                   // FUniSprite in UniProject.ush (D-156: + halo)
@@ -38,7 +38,7 @@ namespace UniGpuLayout
 	inline constexpr uint32 PickResultWords = 16;                               // D-193: UniQuery.usf OutPickResult
 	inline constexpr uint32 GenThreads = 64;
 	inline constexpr double ReadbackTimeoutSeconds = 2.0;                       // lesson #24 safety valve
-	inline constexpr uint32 CarrierBytes = sizeof(UniCore::FCarrierGPU);        // 112
+	inline constexpr uint32 CarrierBytes = sizeof(UniCore::FCarrierGPU);        // 128 (D-245)
 	inline constexpr uint32 VolumeViewBytes = sizeof(UniCore::FVolumeViewGPU);  // 48
 	inline constexpr uint32 FieldParamsBytes = sizeof(UniCore::FFieldParamsGPU); // 128 (D-178)
 	inline constexpr uint32 VolumeSlices = 8;                                   // UNI_VOL_SLICES (UniVolume.ush)
@@ -82,6 +82,8 @@ public:
 		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalWarpFine)    // D-179 (UniWebTexture.ush)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalWarpLarge)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalDetail)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalShape)   // D-259: galaxy_shape (UniWebTexture.ush)
+		SHADER_PARAMETER(FVector4f, UniGalShapeTune)                   // D-259: UNI_GAL_SHAPE
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float4>, UniGalMap)   // D-214: galaxies place from their maps
 	END_SHADER_PARAMETER_STRUCT()
 
@@ -116,6 +118,8 @@ public:
 		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalWarpFine)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalWarpLarge)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalDetail)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalShape)   // D-259: galaxy_shape (UniWebTexture.ush)
+		SHADER_PARAMETER(FVector4f, UniGalShapeTune)                   // D-259: UNI_GAL_SHAPE
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float4>, UniGalMap)
 	END_SHADER_PARAMETER_STRUCT()
 
@@ -178,6 +182,8 @@ public:
 		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalWarpFine)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalWarpLarge)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalDetail)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalShape)   // D-259: galaxy_shape (UniWebTexture.ush)
+		SHADER_PARAMETER(FVector4f, UniGalShapeTune)                   // D-259: UNI_GAL_SHAPE
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float4>, UniGalMap)
 	END_SHADER_PARAMETER_STRUCT()
 
@@ -382,8 +388,102 @@ BEGIN_SHADER_PARAMETER_STRUCT(FUniVolumeCommonParameters, )
 	SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalWarpFine)    // D-179
 	SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalWarpLarge)
 	SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalDetail)
+	SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalShape)   // D-259: galaxy_shape (UniWebTexture.ush)
+	SHADER_PARAMETER(FVector4f, UniGalShapeTune)                   // D-259: UNI_GAL_SHAPE
 	SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float4>, UniGalMap)  // D-212; D-214: one slot per galaxy
+	SHADER_PARAMETER_TEXTURE(Texture2D<float>, UniBlueNoise)         // D-246: the march's draws (FastBlueNoise_scalar_128x128x8, as CloudAtmosphere binds it)
+	SHADER_PARAMETER(FUintVector2, UniBlueNoiseSize)                 // D-246: its size; 0 x 0: D-240's hashed draws
+	SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniNebDetail)   // D-249: the nebulae's detail texture (galaxy_detail's unless configured)
+	SHADER_PARAMETER(FVector4f, UniNebTune)                          // D-248: the nebulae's tuning (UniCore::NebulaTune)
+	SHADER_PARAMETER(FVector4f, UniNebTune2)
+	SHADER_PARAMETER(FVector4f, UniNebTune3)                         // D-251: (the gas layer's step ratio, 0, 0, 0)
+	// D-252: the nebula grid (UniVolume.ush THE NEBULA GRID): headers, the bricks' table and the pool
+	// (the update pass binds dummies for the table and pool here: it writes them).
+	SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, UniNebGridHeader)
+	SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, UniNebGridTable)
+	SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniNebGridPool)
+	SHADER_PARAMETER_SAMPLER(SamplerState, UniNebGridSampler)
 END_SHADER_PARAMETER_STRUCT()
+
+/** D-252: the nebula grid's update (UNI_VOL_PASS 7; UniCore/UniNebGrid.h): one parameter struct
+ *  for its four kernels (each reads what it needs). */
+BEGIN_SHADER_PARAMETER_STRUCT(FUniNebGridUpdateParameters, )
+	SHADER_PARAMETER_STRUCT_INCLUDE(FUniVolumeCommonParameters, Common)
+	SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FUniNebGridOp>, UniNebGridOps)
+	SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, UniNebGridOpSlot)
+	SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, UniNebGridTableRW)
+	SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, UniNebGridFree)
+	SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, UniNebGridCounters)
+	SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture3D<float4>, UniNebGridPoolRW)
+	SHADER_PARAMETER(uint32, NebGridOpCount)
+	SHADER_PARAMETER(uint32, NebGridLevel)
+	SHADER_PARAMETER(uint32, NebGridResetCount)
+	SHADER_PARAMETER(uint32, NebGridParam)
+END_SHADER_PARAMETER_STRUCT()
+
+/** D-252: a level's reset (UNI_VOL_PASS 7). */
+class FUniNebGridResetCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FUniNebGridResetCS);
+	SHADER_USE_PARAMETER_STRUCT(FUniNebGridResetCS, FGlobalShader);
+	using FParameters = FUniNebGridUpdateParameters;
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& P, FShaderCompilerEnvironment& Env)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(P, Env);
+		Env.SetDefine(TEXT("UNI_VOL_PASS"), 7);
+	}
+};
+
+/** D-252: the changed entries released (UNI_VOL_PASS 7). */
+class FUniNebGridReleaseCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FUniNebGridReleaseCS);
+	SHADER_USE_PARAMETER_STRUCT(FUniNebGridReleaseCS, FGlobalShader);
+	using FParameters = FUniNebGridUpdateParameters;
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& P, FShaderCompilerEnvironment& Env)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(P, Env);
+		Env.SetDefine(TEXT("UNI_VOL_PASS"), 7);
+	}
+};
+
+/** D-252: the entries classified and allocated (UNI_VOL_PASS 7). */
+class FUniNebGridAllocCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FUniNebGridAllocCS);
+	SHADER_USE_PARAMETER_STRUCT(FUniNebGridAllocCS, FGlobalShader);
+	using FParameters = FUniNebGridUpdateParameters;
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& P, FShaderCompilerEnvironment& Env)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(P, Env);
+		Env.SetDefine(TEXT("UNI_VOL_PASS"), 7);
+	}
+};
+
+/** D-252: the allocated bricks baked (UNI_VOL_PASS 7). */
+class FUniNebGridBakeCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FUniNebGridBakeCS);
+	SHADER_USE_PARAMETER_STRUCT(FUniNebGridBakeCS, FGlobalShader);
+	using FParameters = FUniNebGridUpdateParameters;
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& P, FShaderCompilerEnvironment& Env)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(P, Env);
+		Env.SetDefine(TEXT("UNI_VOL_PASS"), 7);
+	}
+};
 
 /** D-212: the galaxy map's GPU bake (UNI_VOL_PASS 5): rows of mip 0, then 2 x 2 mip means. */
 class FUniGalMapBakeCS : public FGlobalShader
@@ -431,6 +531,33 @@ public:
 	}
 };
 
+/** D-251: one a-trous pass of the resolved volume's denoise (UNI_VOL_PASS 6). */
+class FUniVolumeDenoiseCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FUniVolumeDenoiseCS);
+	SHADER_USE_PARAMETER_STRUCT(FUniVolumeDenoiseCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER(FUintVector2, MarchSize)
+		SHADER_PARAMETER(uint32, DenoiseStep)
+		SHADER_PARAMETER(float, DenoiseSigma)
+		SHADER_PARAMETER(float, DenoiseExposure)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float4>, DenoiseIn)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float>, DenoiseVarIn)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float2>, DenoiseDepth)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, DenoiseOut)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float>, DenoiseVarOut)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& P, FShaderCompilerEnvironment& Env)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(P, Env);
+		Env.SetDefine(TEXT("UNI_VOL_PASS"), 6);
+	}
+};
+
 /** D-228: the far cache's map, read by the march (slices), the reconstruct (the history at a
  *  switch) and the composite (UniVolume.usf; UniCore/UniFarCache.h). */
 BEGIN_SHADER_PARAMETER_STRUCT(FUniVolumeFarParameters, )
@@ -464,6 +591,11 @@ public:
 		SHADER_PARAMETER(float, WebDebugOpacity)
 		SHADER_PARAMETER(uint32, bSliceMarch)         // D-184
 		SHADER_PARAMETER(FUintVector2, SliceOffset)
+		SHADER_PARAMETER(uint32, TemporalPhaseMarch)   // D-247: the packed phase (the noise offset's rank)
+		SHADER_PARAMETER(FVector2f, RayJitterPx)
+		SHADER_PARAMETER(uint32, bWriteMoments)        // D-251: a frame marched in full starts the luminance moments
+		SHADER_PARAMETER(float, MarchExposure)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float2>, OutMoments)       // D-246: before TSR, each ray moved by the view's jitter (march pixels): it lands where the jittered depth is
 		SHADER_PARAMETER_STRUCT_INCLUDE(FUniVolumeFarParameters, Far)   // D-228
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutVolume)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float>, OutSlices)
@@ -503,6 +635,9 @@ public:
 		SHADER_PARAMETER(uint32, bHistory)
 		SHADER_PARAMETER(FVector4f, PrevWarpVelBeta)   // D-190
 		SHADER_PARAMETER(FVector4f, TemporalClamp)     // D-194: (on, tight px, max motion px, 0)
+		SHADER_PARAMETER(float, MaxSamples)            // D-240: a fresh pixel blends into its history over this many samples (1: replaces it)
+		SHADER_PARAMETER(uint32, bCloudResolve)        // D-246: CloudAtmosphere's resolve (every pixel)
+		SHADER_PARAMETER(float, ResolveExposure)       // D-246: radiance to displayed brightness (the compression's knee)
 		SHADER_PARAMETER(int32, HistFarSign)           // D-228
 		SHADER_PARAMETER_STRUCT_INCLUDE(FUniVolumeFarParameters, Far)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float4>, FreshVolume)
@@ -511,9 +646,14 @@ public:
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float4>, HistVolume)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float>, HistSlices)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float2>, HistDepth)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float2>, HistAge)  // D-240: samples each history pixel holds; D-246: its own (y)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutVolume)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float>, OutSlices)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float2>, OutDepth)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float2>, OutAge)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float2>, HistMoments)   // D-251: the own samples' luminance moments
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float2>, OutMoments)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float>, OutVariance)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }

@@ -1,0 +1,176 @@
+// grain_d251.cpp.txt (archived exploration; was tests/test_zz_grain.cpp, --group zz.grain): D-251 step level of detail, a-trous denoise (sigma, passes, spatial variance fallback) and step ratios (global and the gas layer), 250 pc from a nebula and along the disc.
+// 250 pc from the Milky Way's brightest disc nebula (T2.galaxy.nebula_detail's march view), the
+// engine's path (cloud resolve, blue noise, 4 x 4 slicing, 64 frames, the detail to 7 kpc): the
+// converged image against the fine reference, and its frame-to-frame change (the grain one sees),
+// for the step level of detail and an a-trous denoise of the result.
+#include "../src/UniTest.h"
+#include "../src/UniRenderRef.h"
+#include "../src/UniVerifyCommon.h"
+#include "../src/UniVolumeRef.h"
+#include "../src/UniBlueNoise.h"
+#include "../scenes/UniScenes.h"
+#include "UniVolume.h"
+#include "UniWebTexture.h"
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
+using namespace UniCore;
+using namespace UniRender;
+namespace H = UniHlsl;
+
+namespace
+{
+	float GStepRatio = 0.32f;
+	float GNebStep = 0.0f;
+	double Gl(const H::float4& V) { return 0.2126 * V.x + 0.7152 * V.y + 0.0722 * V.z; }
+
+	/** A-trous (B3 spline, 5 x 5 taps at 2^i), edge-stopped by luminance against sigma x the
+	 *  standard deviation the variance gives (SVGF), the variance filtered alongside. */
+	std::vector<H::float4> Atrous(const std::vector<H::float4>& In, const std::vector<double>& VarIn, int W, int Ht, int Iters, double Sigma)
+	{
+		std::vector<H::float4> C = In;
+		std::vector<double> V = VarIn;
+		const double K[5] = { 1.0 / 16, 1.0 / 4, 3.0 / 8, 1.0 / 4, 1.0 / 16 };
+		for (int It = 0; It < Iters; ++It)
+		{
+			const int St = 1 << It;
+			std::vector<H::float4> C2(C.size());
+			std::vector<double> V2(V.size());
+			for (int Y = 0; Y < Ht; ++Y) for (int X = 0; X < W; ++X)
+			{
+				const size_t I = size_t(Y) * W + X;
+				const double Lp = Gl(C[I]);
+				// The variance blurred 3 x 3 for the edge stop (SVGF).
+				double Vb = 0.0, Wb = 0.0;
+				for (int Dy = -1; Dy <= 1; ++Dy) for (int Dx = -1; Dx <= 1; ++Dx)
+				{
+					const int Xq = std::clamp(X + Dx, 0, W - 1), Yq = std::clamp(Y + Dy, 0, Ht - 1);
+					const double Wk = (Dx == 0 ? 0.5 : 0.25) * (Dy == 0 ? 0.5 : 0.25);
+					Vb += Wk * V[size_t(Yq) * W + Xq]; Wb += Wk;
+				}
+				const double Den = Sigma * std::sqrt(std::max(Vb / Wb, 0.0)) + 1e-30;
+				double Sw = 0.0, Sw2 = 0.0; H::float4 Acc(0, 0, 0, 0); double Va = 0.0;
+				for (int Ky = -2; Ky <= 2; ++Ky) for (int Kx = -2; Kx <= 2; ++Kx)
+				{
+					const int Xq = X + Kx * St, Yq = Y + Ky * St;
+					if (Xq < 0 || Yq < 0 || Xq >= W || Yq >= Ht) { continue; }
+					const size_t Q = size_t(Yq) * W + Xq;
+					const double Wl = std::exp(-std::abs(Gl(C[Q]) - Lp) / Den);
+					const double Wq = K[Kx + 2] * K[Ky + 2] * Wl;
+					Acc = Acc + C[Q] * float(Wq); Sw += Wq; Va += Wq * Wq * V[Q]; Sw2 += Wq;
+				}
+				C2[I] = Acc * float(1.0 / Sw);
+				V2[I] = Va / (Sw2 * Sw2);
+			}
+			C = C2; V = V2;
+		}
+		return C;
+	}
+}
+
+UNI_TEST(zz, grain)
+{
+	FWebTexture T[3];
+	for (int S = 0; S < 3; ++S) { std::string E; if (!FWebTexture::LoadDelivered("Data/Noise", GalaxyTextureName(S), T[S], &E)) { std::printf("tex fail\n"); return; } }
+	for (int I = 0; I < 3; ++I) { BindGalaxyTexture(I, &T[I]); }
+	FUniverseDef D = UniScenes::Flythrough();
+	UniScenes::UseGalaxyTextures(D, T[0].Size);
+	UniScenes::UseGalaxyPalettes(D);
+	const FFieldParams* Mw = nullptr;
+	for (const FAnchor& A : D.Anchors) { if (!A.EmitterParams.empty()) { Mw = &A.EmitterParams[0]; } }
+	const H::FUniFieldParams P = Mw->ToHlsl();
+	const H::FUniGalaxyConst K = H::Uni_GalaxyConstOf(P);
+	double Hx = 0.0, Hy = 0.0, Hb = -1.0;
+	for (int I = 0; I < 60000; ++I)
+	{
+		const double R = 0.3 + 0.4 * H::Uni_DrawUnit(0xF374u, 2u, u32(2 * I)), Ph = 6.2831853 * H::Uni_DrawUnit(0xF374u, 2u, u32(2 * I + 1));
+		const H::float3 Pt{ float(R * std::cos(Ph)), float(R * std::sin(Ph)), 0.0f };
+		H::float4 C(0, 0, 0, 0), Nv(0, 0, 0, 0);
+		const float Rho = H::UniField_GalaxyFilteredCKN(Pt, P, K, 1e-5f, C, Nv);
+		const double Sc = double(H::Uni_GalaxyNebulaX(Nv, P)) * double(H::Uni_GalaxyNebulaDensity(Nv, P, 1e-5f)) / std::max(double(Rho), 1e-30);
+		if (Sc > Hb) { Hb = Sc; Hx = Pt.x; Hy = Pt.y; }
+	}
+	FUniverseModel Mo(D);
+	FRefGenerator G(Mo);
+	FVolumeBuilder VB(Mo, G);
+	double Radius = 0.0;
+	auto CamAt = [](const FVec3d& Pc) { FCoord C = FCoord::Origin(); FVec3f F; AddDisplacement(C, F, Pc); return C; };
+	auto Build = [&](const FCoord& Cam, const FCamera& Cm, float StepLod)
+	{
+		FRefPipeline Pp(G); Pp.bVelocityLod = false; Pp.Update(Cam, FVec3f{});
+		FVolumeSettings Sv; Sv.NebulaGain = 1.0f; Sv.NebulaReflect = 6.0f; Sv.NebulaFineReachCm = float(7.0 * Units::Kpc); Sv.NebulaFineStepLod = StepLod; Sv.StepRatio = GStepRatio; Sv.NebulaStepRatio = GNebStep; if (std::getenv("UNI_DEV_MAXSTEPS")) { Sv.MaxSteps = u32(std::atoi(std::getenv("UNI_DEV_MAXSTEPS"))); }
+		ApplyNebulaTune(NebulaTune(Sv));
+		FVolumeScene Sc = VB.Build(Pp, Cam, FVec3f{}, Cm.View(), Sv).Subset(false);
+		for (const FCarrierGPU& Cg : Sc.Carriers)
+		{
+			const double Rl = std::sqrt(double(Cg.CamLocal[0]) * Cg.CamLocal[0] + double(Cg.CamLocal[1]) * Cg.CamLocal[1] + double(Cg.CamLocal[2]) * Cg.CamLocal[2]);
+			if (Cg.FieldId == H::UNI_FIELD_GALAXY && Rl < 1.0) { Radius = 1.0 / double(Cg.InvRadius); }
+		}
+		return Sc;
+	};
+	{ FCamera Cm; Cm.Coord = CamAt({ 8.0 * Units::Kpc, 0.0, 0.0 }); Cm.Width = 4; Cm.Height = 4; Cm.LookAlong({ 0.0, 1.0, 0.0 }); Build(Cm.Coord, Cm, 0.0f); }
+	const int W = 96, Ht = 54;
+	FCamera Cm; Cm.Coord = CamAt({ Hx * Radius, Hy * Radius - 250.0 * Units::Pc, 5.0 * Units::Pc }); Cm.Width = W; Cm.Height = Ht; Cm.LookAlong({ 0.3, 1.0, 0.05 });
+	if (std::getenv("UNI_DEV_DISC")) { Cm.Coord = CamAt({ -8.0 * Units::Kpc, 0.0, 20.0 * Units::Pc }); Cm.LookAlong({ 1.0, 0.25, -0.02 }); }
+	// The fine reference: full detail, an eighth of the steps, unjittered.
+	std::vector<H::float4> Ref;
+	{
+		FVolumeScene Sf = Build(Cm.Coord, Cm, 0.0f);
+		Sf.View.MarchFlags |= 2u; Sf.View.MaxSteps = 16384u;
+		const auto Cb = Sf.CarrierBuf(); const auto Pb = Sf.ParamBuf(); const auto Lb = Sf.LutBuf();
+		const auto V = ToHlsl(Sf.View);
+		Ref.resize(size_t(W) * Ht);
+		for (int Y = 0; Y < Ht; ++Y) for (int X = 0; X < W; ++X)
+		{
+			bool bS = false;
+			const H::FUniVolumeResult R = MarchPixel(Cb, Pb, Lb, V, Cm, W, Ht, X, Y, 3.0e38f, bS);
+			Ref[size_t(Y) * W + X] = H::float4(R.Radiance.x, R.Radiance.y, R.Radiance.z, 0.0f);
+		}
+	}
+	double M = 0.0; for (const H::float4& V : Ref) { M += Gl(V) / Ref.size(); }
+	auto Err = [&](const std::vector<H::float4>& A) { double E = 0.0; for (size_t I = 0; I < A.size(); ++I) { E += std::abs(Gl(A[I]) - Gl(Ref[I])) / M / A.size(); } return E; };
+	UniVerify::FBlueNoiseBind Bn(true);
+	for (float Kn : { 0.0f, 0.16f, 0.08f, 0.04f })
+	{
+		H::GKnobDnSpatial = 0.0f; GStepRatio = 0.32f; GNebStep = Kn;
+		const float Sl = 0.0f;
+		FVolumeScene Sc = Build(Cm.Coord, Cm, Sl);
+		Sc.View.MarchFlags |= H::UNI_VOL_JITTER_FLAG;
+		FTemporalVolume Tv;
+		Tv.MaxSamples = 16.0f; Tv.bCloud = true; Tv.Interleave = 4;
+		std::vector<std::vector<H::float4>> Last;
+		for (int F = 0; F < 64; ++F)
+		{
+			Tv.Step(Sc, Cm, FV3{ 0, 0, 0 }, true, true, 2);
+			if (F >= 48) { std::vector<H::float4> O(Tv.Vol.size()); for (size_t I = 0; I < O.size(); ++I) { O[I] = H::float4(Tv.Vol[I].x, Tv.Vol[I].y, Tv.Vol[I].z, 0.0f); } Last.push_back(O); }
+		}
+		// Frame to frame and the temporal variance per pixel over the last 16 frames.
+		double Flick = 0.0;
+		std::vector<double> Var(size_t(W) * Ht, 0.0);
+		for (size_t I = 0; I < Var.size(); ++I)
+		{
+			double S1 = 0, S2 = 0;
+			for (size_t F = 0; F < Last.size(); ++F) { const double L = Gl(Last[F][I]) / M; S1 += L; S2 += L * L; if (F > 0) { Flick += std::abs(Gl(Last[F][I]) - Gl(Last[F - 1][I])) / M; } }
+			S1 /= Last.size(); Var[I] = std::max(S2 / Last.size() - S1 * S1, 0.0) * M * M;
+		}
+		Flick /= double(Var.size()) * double(Last.size() - 1);
+		const std::vector<H::float4>& Fin = Last.back();
+		std::printf("nebula stepratio %.2f (%.1f steps a ray) steplod %.2f: error %.2f%%, frame change %.3f%%", Kn, double(Tv.Steps) / double(std::max<size_t>(Tv.Marched, 1)), Sl, 100.0 * Err(Fin), 100.0 * Flick);
+		for (float Sg : { 4.0f, 8.0f })
+		{
+			for (int It : { 1, 2 })
+			{
+				const std::vector<H::float4> Dr = DenoiseVolume(Tv.Vol, Tv.Var, Tv.Depth, W, Ht, Tv.LastExp, It, Sg);
+				std::printf("; sigma %.0f x%d: %.2f%%", Sg, It, 100.0 * Err(Dr));
+			}
+		}
+		std::printf("\n");
+		std::fflush(stdout);
+		std::printf("\n");
+	}
+	for (int I = 0; I < 3; ++I) { BindGalaxyTexture(I, nullptr); }
+	ApplyNebulaTune(FNebulaTune{});
+}

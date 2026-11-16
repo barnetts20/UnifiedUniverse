@@ -16,6 +16,8 @@
 #include "UniSeed.h"
 #include "UniStreamer.h"
 #include "UniWindow.h"
+#include "UniVolume.h"
+#include "UniNebGrid.h"
 
 #if WITH_DEV_AUTOMATION_TESTS
 
@@ -172,7 +174,9 @@ bool FUniLayoutTest::RunTest(const FString&)
 	TestEqual(TEXT("FCellGPU"), int32(sizeof(UniCore::FCellGPU)), 64);
 	TestEqual(TEXT("FGenTaskGPU"), int32(sizeof(UniCore::FGenTaskGPU)), 272);   // D-178
 	TestEqual(TEXT("FSliceGPU"), int32(sizeof(UniCore::FSliceGPU)), 64);
-	TestEqual(TEXT("FTaskCountGPU"), int32(sizeof(UniCore::FTaskCountGPU)), 48);   // D-214
+	TestEqual(TEXT("FTaskCountGPU"), int32(sizeof(UniCore::FTaskCountGPU)), 160);   // D-214; D-238: the clusters a small box holds; D-239: a larger box's open-cluster lattice
+	TestEqual(TEXT("FVolumeViewGPU"), int32(sizeof(UniCore::FVolumeViewGPU)), 208);   // D-252: the nebula grid's fields
+	TestEqual(TEXT("FNebGridOpGPU"), int32(sizeof(UniCore::FNebGridOpGPU)), 16);      // D-252
 	return true;
 }
 

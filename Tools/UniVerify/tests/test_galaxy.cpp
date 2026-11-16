@@ -144,7 +144,9 @@ namespace
 			// Concentrated in z: the disc is thin, so sample z on [-0.25, 0.25] (the bulge's light
 			// beyond it is the same with and without modes) and x, y on [-1, 1].
 			const H::float3 Pt(float(-1.0 + 2.0 * (X + Unit(Seed, 3 * K)) / G), float(-1.0 + 2.0 * (Y + Unit(Seed, 3 * K + 1)) / G), float(-0.25 + 0.5 * (Z + Unit(Seed, 3 * K + 2)) / G));
-			Sum += double(H::UniField_GalaxyFiltered(Pt, P, Foot));
+			// D-239: unwidened, the field for integrals by sampling (the open clusters' and globulars'
+			// peaks are far below a sample's spacing: their mean in place, as ComputeIntegral does).
+			Sum += Foot > 0.0f ? double(H::UniField_GalaxyFiltered(Pt, P, Foot)) : double(H::Uni_GalaxyIntegrand(Pt, P));
 		}
 		return Sum * (4.0 * 0.5) / double(G * G * G);
 	}
@@ -420,7 +422,7 @@ UNI_TEST(galaxy, textures)
 		for (int Y = 0; Y < 96; ++Y) for (int X = 0; X < 96; ++X)
 		{
 			const H::float3 Pt(float(-0.5 + (X + 0.5) / 96.0), float(-0.5 + (Y + 0.5) / 96.0), 0.0f);
-			const double A = H::UniField_GalaxyFiltered(Pt, P, 0.0f), B = H::UniField_GalaxyFiltered(Pt, Pp, 0.0f);
+			const double A = H::Uni_GalaxyIntegrand(Pt, P), B = H::Uni_GalaxyIntegrand(Pt, Pp);   // D-239: the clusters' mean in place
 			Sa += A; Sb += B; Saa += A * A; Sbb += B * B; Sab += A * B; ++N;
 		}
 		const double Ca = Saa / N - (Sa / N) * (Sa / N), Cb = Sbb / N - (Sb / N) * (Sb / N);
@@ -442,9 +444,14 @@ UNI_TEST(galaxy, textures)
 	// Stars of the textured Milky Way (galaxy-to-star scene from the solar camera): placed, every
 	// one finite, at the untextured scene's count within 10% (the textures move stars, the
 	// normalising integral keeps their number).
-	size_t StarsTex = 0, StarsPlain = 0, NonFinite = 0;
-	for (int Tex = 0; Tex < 2; ++Tex)
+	// D-262: the textured count with D-258's structure read off (its few cells a disc make the
+	// camera's neighbourhood denser or sparser than the disc's mean: the solar camera's x1.45,
+	// reported): the normalising integral's check.
+	size_t StarsTex = 0, StarsPlain = 0, StarsShaped = 0, NonFinite = 0;
+	for (int Tex = 0; Tex < 3; ++Tex)
 	{
+		const H::float4 SavedShape = H::GGalShape;
+		if (Tex == 1) { H::GGalShape.w = 0.0f; }
 		FUniverseDef Dg = UniScenes::GalaxyToStar();
 		if (Tex) { UniScenes::UseGalaxyTextures(Dg, G.T[0].Size); }
 		FUniverseModel M(Dg);
@@ -459,9 +466,10 @@ UNI_TEST(galaxy, textures)
 				if ((O.A[3] & 0xFFFFu) != UniScenes::kStar) { continue; }
 				const float Mg = H::Uni_ObjectAbsMag(ToHlsl(O));
 				if (!std::isfinite(Mg)) { ++NonFinite; }
-				++(Tex ? StarsTex : StarsPlain);
+				++(Tex == 0 ? StarsPlain : (Tex == 1 ? StarsTex : StarsShaped));
 			}
 		}
+		H::GGalShape = SavedShape;
 	}
 	const double StarRatio = StarsPlain ? double(StarsTex) / double(StarsPlain) : 0.0;
 	// Contact sheet: the nine galaxies of T2.galaxy.shape with the textures on.
@@ -513,18 +521,18 @@ UNI_TEST(galaxy, textures)
 		WriteFrame(Img, "still_galaxy_textured", { "D-179: the nine galaxies of still_galaxy_modes_on with the galaxy textures (warp_fine, warp_large, galaxy_detail)",
 			"emission and dust (D-132), each tile normalised to its peak" });
 	}
-	Uni::Check(2, "T2.galaxy.textures", "D-179 galaxy textures: warp_fine, warp_large (RGBA16F) and galaxy_detail (RGBA8 as halves of k/255) load with full mips; a textured galaxy reads NaN with them unbound (fail closed); bound, the prefiltered field keeps its light (2%), the textures change its total light by under 15% and its shape (disc-plane correlation with the untextured field under 0.97); the normalising integral costs under 3 s on the reference; the textured Milky Way's stars placed, finite, at the untextured count within 10%")
+	Uni::Check(2, "T2.galaxy.textures", "D-179 galaxy textures: warp_fine, warp_large (RGBA16F) and galaxy_detail (RGBA8 as halves of k/255) load with full mips; a textured galaxy reads NaN with them unbound (fail closed); bound, the prefiltered field keeps its light (5%: D-258's structure, 2% before it), the textures change its total light by under 45% (D-258's structure has a few cells a disc, so one galaxy's total moves; the normalising integral keeps its luminosity; 15% before it) and its shape (disc-plane correlation with the untextured field under 0.97); the normalising integral costs under 3 s on the reference; the textured Milky Way's stars placed, finite, at the untextured count within 10% (D-258's structure read off: it makes the camera's neighbourhood denser or sparser than the disc's mean; with it reported)")
 		.Metric("format_bad", double(Bad)).Metric("filter_worst", WorstFilter).Metric("light_change_worst", WorstLight).Metric("shape_corr_mean", MeanCorr).Metric("integral_ms", IntegralMs).Metric("star_ratio", StarRatio)
-		.Pass(Bad == 0 && Checked > 100 && bSizes && bNaN && WorstFilter < 0.02 && WorstLight < 0.15 && MeanCorr < 0.97 && IntegralMs > 0.0 && IntegralMs < 3000.0 && StarsTex > 1000 && NonFinite == 0 && std::abs(StarRatio - 1.0) < 0.1,
-			Uni::Fmt("%u^3 textures, %u mips each, %zu texels checked against the raw files (%zu wrong); unbound reads %s; 6 rolled galaxies: prefiltered (0.03) light within %.2f%%, light with vs without the textures within %.1f%%, disc-plane correlation with the untextured field %.3f; normalising integral %.0f ms; textured Milky Way from the solar camera: %zu stars (%zu untextured, %.3fx), %zu non-finite",
-				G.T[0].Size, G.T[0].NumMips(), Checked, Bad, bNaN ? "NaN" : "a VALUE", 100.0 * WorstFilter, 100.0 * WorstLight, MeanCorr, IntegralMs, StarsTex, StarsPlain, StarRatio, NonFinite));
+		.Pass(Bad == 0 && Checked > 100 && bSizes && bNaN && WorstFilter < 0.05 && WorstLight < 0.45 && MeanCorr < 0.97 && IntegralMs > 0.0 && IntegralMs < 3000.0 && StarsTex > 1000 && NonFinite == 0 && std::abs(StarRatio - 1.0) < 0.1,
+			Uni::Fmt("%u^3 textures, %u mips each, %zu texels checked against the raw files (%zu wrong); unbound reads %s; 6 rolled galaxies: prefiltered (0.03) light within %.2f%%, light with vs without the textures within %.1f%%, disc-plane correlation with the untextured field %.3f; normalising integral %.0f ms; textured Milky Way from the solar camera (D-258's structure off): %zu stars (%zu untextured, %.3fx; with the structure %zu, %.3fx), %zu non-finite",
+				G.T[0].Size, G.T[0].NumMips(), Checked, Bad, bNaN ? "NaN" : "a VALUE", 100.0 * WorstFilter, 100.0 * WorstLight, MeanCorr, IntegralMs, StarsTex, StarsPlain, StarRatio, StarsShaped, StarsPlain ? double(StarsShaped) / double(StarsPlain) : 0.0, NonFinite));
 }
 
 UNI_TEST(galaxy, dust)
 {
 	// D-180 (render only): a textured galaxy's dust is cloud-like, ridged lanes and superbubble
 	// holes from galaxy_detail. Its emission field is untouched (the dust terms live on the dust
-	// carrier's parameters only); the dust's face-on column keeps its mean within 25% and gains
+	// carrier's parameters only); the dust's face-on column keeps its mean within 40% (25% before D-258's dust structure) and gains
 	// structure (spread across the disc at least 1.5x the smooth dust's); stills face-on and
 	// inclined, with the cloud terms off and on.
 	const FGalTex& G = GalaxyTextures();
@@ -642,9 +650,9 @@ UNI_TEST(galaxy, dust)
 				"one textured galaxy at 25 and 68 deg inclination, each tile normalised to its peak" });
 		}
 	}
-	Uni::Check(2, "T2.galaxy.dust", "D-180 cloud dust (render only), D-181 pair evaluation: emission parameters carry no dust terms; the march's emission + dust pair equals the two separate evaluations bit for bit; a textured galaxy's face-on dust column keeps its mean within 25% of the smooth dust's and the column over the smooth one varies across the disc by at least 25% (rms); stills smooth / cloud")
+	Uni::Check(2, "T2.galaxy.dust", "D-180 cloud dust (render only), D-181 pair evaluation: emission parameters carry no dust terms; the march's emission + dust pair equals the two separate evaluations bit for bit; a textured galaxy's face-on dust column keeps its mean within 40% of the smooth dust's (D-258's dust structure: a few cells a disc; 25% before it) and the column over the smooth one varies across the disc by at least 25% (rms); stills smooth / cloud")
 		.Metric("mean_change_worst", MeanRatioWorst).Metric("cloud_spread_min", SpreadGainMin)
-		.Pass(EmissionDiffer == 0 && PairChecked > 0 && PairDiffer == 0 && MeanRatioWorst < 0.25 && SpreadGainMin > 0.25,
+		.Pass(EmissionDiffer == 0 && PairChecked > 0 && PairDiffer == 0 && MeanRatioWorst < 0.40 && SpreadGainMin > 0.25,
 			Uni::Fmt("4 rolled galaxies: dust column mean within %.1f%% of the smooth dust's, cloud / smooth column varying by %.0f%% rms at least; %zu emission parameter sets with dust terms; pair vs separate: %zu of %zu samples differ", 100.0 * MeanRatioWorst, 100.0 * SpreadGainMin, EmissionDiffer, PairDiffer, PairChecked));
 }
 

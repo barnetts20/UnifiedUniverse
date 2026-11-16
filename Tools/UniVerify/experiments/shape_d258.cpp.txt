@@ -1,0 +1,136 @@
+// shape_d258.cpp.txt (archived exploration; was tests/test_zz_shape.cpp, --group zz.shape): D-258 GAMER-style noise shaping. Stills of the Milky Way and rolled galaxies over the knots' power, the dust's and the light's and the structure read's frequency (UNI_SHAPE_KNOT / DUST / LIGHT / FREQ); the defaults (8, 4, 3, 1/4) chosen from these.
+// test_zz_shape.cpp (exploration, --group zz.shape): D-258 GAMER-style noise shaping. Stills of the
+// textured Milky Way (face-on, inclined) and four rolled galaxies with palettes and cloud dust
+// (UNI_SHAPE_OUT), the knots' and the dust lanes' powers from UNI_SHAPE_KNOT / UNI_SHAPE_DUST
+// (0: D-179's linear terms), their means by mip measured from galaxy_detail's mips here.
+#include "../src/UniTest.h"
+#include "../src/UniRenderRef.h"
+#include "../src/UniVerifyCommon.h"
+#include "../scenes/UniScenes.h"
+#include "UniVolume.h"
+#include "UniWebTexture.h"
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <thread>
+#include <vector>
+
+using namespace UniCore;
+using namespace UniRender;
+namespace H = UniHlsl;
+
+UNI_TEST(zz, shape)
+{
+	FWebTexture T[3];
+	for (int S = 0; S < 3; ++S) { std::string E; if (!FWebTexture::LoadDelivered("Data/Noise", GalaxyTextureName(S), T[S], &E)) { Uni::Check(2, "zz.shape", "x").Pass(false, E); return; } }
+	for (int I = 0; I < 3; ++I) { BindGalaxyTexture(I, &T[I]); }
+	auto EnvF = [](const char* N, double D) { const char* V = std::getenv(N); return V ? std::atof(V) : D; };
+	const float Pk = float(EnvF("UNI_SHAPE_KNOT", 0.0)), Pdu = float(EnvF("UNI_SHAPE_DUST", 0.0)), Pli = float(EnvF("UNI_SHAPE_LIGHT", 0.0)), Fq = float(EnvF("UNI_SHAPE_FREQ", 0.0));
+	// galaxy_detail (texture 2): the shaped channels' means by mip.
+	const FWebTexture& Dt = T[2];
+	for (int C = 0; C < 3; ++C)
+	{
+		const float Pw = C == 0 ? Pk : (C == 1 ? Pdu : Pli);
+		const int Ch = C == 0 ? 1 : (C == 1 ? 0 : 2);   // knots: G; dust lanes: R; light: B
+		for (int M = 0; M < 9; ++M)
+		{
+			const u32 Mi = std::min<u32>(u32(M), Dt.NumMips() - 1u);
+			double Sum = 0.0;
+			const size_t N = Dt.TexelCount(Mi);
+			for (size_t I = 0; I < N; ++I) { const H::float4 V = Dt.TexelAt(Mi, I); const float X = Ch == 0 ? V.x : (Ch == 1 ? V.y : V.z); Sum += Pw > 0.0f ? std::pow(std::max(double(X), 0.0), double(Pw)) : 1.0; }
+			H::GGalShapeMean[C][M] = float(Sum / double(N));
+		}
+		std::printf("  shape mean %s (power %.1f): %.4g %.4g %.4g %.4g %.4g %.4g\n", C == 0 ? "knots" : (C == 1 ? "dust" : "light"), Pw, H::GGalShapeMean[C][0], H::GGalShapeMean[C][1], H::GGalShapeMean[C][2], H::GGalShapeMean[C][3], H::GGalShapeMean[C][4], H::GGalShapeMean[C][5]);
+	}
+	H::GGalShape = H::float4(Pk, Pdu, Pli, Fq);
+	H::bGalShapeMeanOverride = true;
+	FUniverseDef D = UniScenes::Base();
+	UniScenes::UseGalaxyTextures(D, T[0].Size);
+	UniScenes::UseGalaxyPalettes(D);
+	const FUniEmitter& E = D.Arch(UniScenes::kGalaxy).Emitters.at(0);
+	const FVolumeProfile& Prof = D.Arch(UniScenes::kGalaxy).Volume;
+	FFieldParams Mw = E.Exemplar;
+	{
+		FUniverseDef F = UniScenes::Flythrough();
+		UniScenes::UseGalaxyTextures(F, T[0].Size);
+		UniScenes::UseGalaxyPalettes(F);
+		for (const FAnchor& A : F.Anchors) { if (!A.EmitterParams.empty()) { Mw = A.EmitterParams[0]; } }
+	}
+	struct FTile { FFieldParams P; double Inc, Az; };
+	std::vector<FTile> Tiles = { { Mw, 12.0, 0.3 }, { Mw, 62.0, 0.9 } };
+	for (int G = 0; G < 4; ++G)
+	{
+		FFieldParams P = E.Exemplar;
+		const u32 Seed = H::Uni_SeedMix(0x5A9Eu, u32(G));
+		for (const FParamRange& R : E.Ranges) { P.V[R.Slot] = H::Uni_RollRange(Seed, ChannelIdUpper(R.Name), R.Min, R.Max, R.Bias, R.Quantize); }
+		P.V[23] = float(H::Uni_PaletteSeed(Seed));
+		Tiles.push_back({ P, 18.0 + 8.0 * G, 0.5 * G });
+	}
+	const int Tile = int(EnvF("UNI_SHAPE_TILE", 200)), Gx = 3, Gy = 2;
+	FImage Img(Tile * Gx, Tile * Gy);
+	const H::float3 Base = H::Uni_TemperatureColour(5500.0f);
+	std::atomic<int> Next{ 0 };
+	auto Work = [&]()
+	{
+		for (int Gi = Next++; Gi < int(Tiles.size()); Gi = Next++)
+		{
+			const FFieldParams& Pf = Tiles[size_t(Gi)].P;
+			const H::FUniFieldParams P = Pf.ToHlsl();
+			const H::FUniFieldParams Pd = DustFrom(Pf, Prof).ToHlsl();
+			const H::FUniGalaxyPalette Pal = H::Uni_GalaxyPalette(u32(std::max(Pf.V[23], 0.0f)));
+			const double Inc = Tiles[size_t(Gi)].Inc * 3.14159265358979 / 180.0, Az = Tiles[size_t(Gi)].Az;
+			const double Dv[3] = { std::sin(Inc) * std::cos(Az), std::sin(Inc) * std::sin(Az), -std::cos(Inc) };
+			const double Rt[3] = { -std::sin(Az), std::cos(Az), 0.0 };
+			const double Up[3] = { Dv[1] * Rt[2] - Dv[2] * Rt[1], Dv[2] * Rt[0] - Dv[0] * Rt[2], Dv[0] * Rt[1] - Dv[1] * Rt[0] };
+			std::vector<float> L(size_t(Tile) * Tile * 3, 0.0f);
+			float Peak = 0.0f;
+			const double Half = 0.62, Px = 2.0 * Half / Tile;
+			const int Steps = 320;
+			const double Dts = 2.0 / Steps;
+			std::vector<float> Lum;
+			for (int Y = 0; Y < Tile; ++Y) for (int X = 0; X < Tile; ++X)
+			{
+				const double U = -Half + (X + 0.5) * Px, V = Half - (Y + 0.5) * Px;
+				double O[3];
+				for (int Ax = 0; Ax < 3; ++Ax) { O[Ax] = U * Rt[Ax] + V * Up[Ax] - 1.0 * Dv[Ax]; }
+				double Col[3] = { 0, 0, 0 }, Tau[3] = { 0, 0, 0 };
+				const double Sig[3] = { 0.8, 1.0, 1.3 };
+				const float Foot = float(Px);
+				for (int S = 0; S < Steps; ++S)
+				{
+					const double Tt = (S + 0.5) * Dts;
+					const H::float3 Pt(float(O[0] + Tt * Dv[0]), float(O[1] + Tt * Dv[1]), float(O[2] + Tt * Dv[2]));
+					if (H::dot(Pt, Pt) >= 1.0f) { continue; }
+					float Re = 0.0f, Rd = 0.0f;
+					H::float4 Comp(0, 0, 0, 0);
+					H::UniField_GalaxyPairC(Pt, P, Pd, Foot, Re, Rd, Comp);
+					const H::float3 Lc = H::Uni_TintKeepLuminance(Base, H::Uni_GalaxyTint(Pal, Comp, 0.0f));
+					const double Em = double(Re) * Dts, Du = double(Pd.D.y) * double(Rd) * Dts;
+					const double Lv[3] = { Lc.x, Lc.y, Lc.z };
+					for (int C = 0; C < 3; ++C) { Col[C] += Em * Lv[C] * std::exp(-Tau[C]); Tau[C] += Sig[C] * Du; }
+				}
+				for (int C = 0; C < 3; ++C) { L[(size_t(Y) * Tile + X) * 3 + C] = float(Col[C]); }
+				Lum.push_back(float(Col[1]));
+			}
+			std::sort(Lum.begin(), Lum.end());
+			Peak = Lum[size_t(0.995 * double(Lum.size() - 1))];
+			const int Ox = (Gi % Gx) * Tile, Oy = (Gi / Gx) * Tile;
+			const float Gain = Peak > 0.0f ? 2.5f / Peak : 0.0f;
+			for (int Y = 0; Y < Tile; ++Y) for (int X = 0; X < Tile; ++X)
+			{
+				const float* C = &L[(size_t(Y) * Tile + X) * 3];
+				Img.Add(Ox + X, Oy + Y, C[0] * Gain, C[1] * Gain, C[2] * Gain);
+			}
+		}
+	};
+	std::thread T1(Work); Work(); T1.join();
+	H::GGalShape = H::float4(8.0f, 4.0f, 3.0f, 0.25f);
+	H::bGalShapeMeanOverride = false;
+	for (int I = 0; I < 3; ++I) { BindGalaxyTexture(I, nullptr); }
+	const char* Out = std::getenv("UNI_SHAPE_OUT");
+	Img.WritePpm(Out ? Out : "shape.ppm");
+	Uni::Check(2, "zz.shape", "D-258 stills").Pass(true, "see the image");
+}

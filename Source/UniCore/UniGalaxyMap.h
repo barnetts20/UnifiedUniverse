@@ -128,7 +128,6 @@ namespace UniCore
 		View.MapCarrier = InCarrier >= 0 && InSize > 0u ? u32(InCarrier) + 1u : 0u;
 		View.MapSize = InSize;
 		View.MapSlot = InSlot;
-		View.MapPad1 = 0u;
 	}
 
 	/** D-214: the offline host of a map cache: bakes a slot the moment it is requested (the

@@ -25,10 +25,19 @@ SamplerState UniWebSampler;
 Texture3D<float4> UniGalWarpFine;
 Texture3D<float4> UniGalWarpLarge;
 Texture3D<float4> UniGalDetail;
+// D-259: galaxy_shape, derived from galaxy_detail when it loads (UniCore::BuildGalaxyShapeTexture):
+// R ridged^4, G fBm^3, B knots^8, each over its mean, shaped before the mips were taken.
+Texture3D<float4> UniGalShape;
 
 #define UNI_GAL_WARP_FINE(P, Mip) UniGalWarpFine.SampleLevel(UniWebSampler, (P), (Mip))
 #define UNI_GAL_WARP_LARGE(P, Mip) UniGalWarpLarge.SampleLevel(UniWebSampler, (P), (Mip))
 #define UNI_GAL_DETAIL(P, Mip) UniGalDetail.SampleLevel(UniWebSampler, (P), (Mip))
+#define UNI_GAL_SHAPED(P, Mip) UniGalShape.SampleLevel(UniWebSampler, (P), (Mip))
+// D-259: the shaping's switches (UniFields.ush's UNI_GAL_SHAPE: knots' amplitude, dust and light
+// structure on, the structure's frequency), from uu.Galaxy.Knots / .DustStructure / .LightStructure /
+// .StructureFreq (FUniRenderer::SetGalaxyShapeTune_GameThread).
+float4 UniGalShapeTune;
+#define UNI_GAL_SHAPE UniGalShapeTune
 
 // D-212: the galaxy map (UniFields.ush, Uni_GalaxyMapEval): RGBA16F 2D with mips over the field's
 // x, y in [-1, 1]; the same wrap / trilinear sampler (its border is zero: outside the cut).

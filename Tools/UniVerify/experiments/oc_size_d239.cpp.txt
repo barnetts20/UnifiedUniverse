@@ -1,0 +1,113 @@
+// test_zz_ocsize.cpp: D-239 exploration (not part of the gate; run with --group zz.ocsize).
+// The Milky Way's open clusters as the D-239 draft sizes them: their total stars (all levels),
+// the share of the disc's stars they hold; and the texture warps' displacement (Pd - P) and its
+// change over a few distances, which decide where a cluster's centre is defined.
+
+#include "../src/UniTest.h"
+#include "../src/UniVerifyCommon.h"
+#include "../scenes/UniScenes.h"
+#include "UniGalaxyMap.h"
+#include "UniGenRef.h"
+#include "UniWebTexture.h"
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <string>
+#include <vector>
+
+using namespace UniCore;
+namespace H = UniHlsl;
+
+UNI_TEST(zz, ocsize)
+{
+	FWebTexture T[3];
+	for (int S = 0; S < 3; ++S) { std::string E; if (!FWebTexture::LoadDelivered("Data/Noise", GalaxyTextureName(S), T[S], &E)) { std::printf("tex fail\n"); return; } }
+	for (int I = 0; I < 3; ++I) { BindGalaxyTexture(I, &T[I]); }
+	FUniverseDef D = UniScenes::Flythrough();
+	UniScenes::UseGalaxyTextures(D, T[0].Size);
+	UniScenes::UseGalaxyPalettes(D);
+	FUniverseModel M(D);
+	FRefGenerator G(M);
+	FRefPipeline Pp(G);
+	Pp.bVelocityLod = false;
+	Pp.Update(UniScenes::SolarCamera(), FVec3f{});
+	const FContributor* Mw = nullptr;
+	for (const auto& KV : Pp.Contributors())
+	{
+		if (KV.second.Emitter && KV.second.Emitter->FieldId == H::UNI_FIELD_GALAXY && KV.second.InfluenceCm > 1.0e21 && KV.second.Emitter->ChildArchetypeId == UniScenes::kStar) { Mw = &KV.second; break; }
+	}
+	if (!Mw) { std::printf("no MW\n"); return; }
+	const FContributor& Ct = *Mw;
+	const H::FUniFieldParams P = Ct.Params.ToHlsl();
+	const H::FUniGalaxyConst K = H::Uni_GalaxyConstOf(P);
+	const double PcU = Ct.InfluenceCm / 3.0857e18;
+	const double StarsPerMass = Ct.NTotal * Ct.Keep / G.IntegralAll(Ct);
+	std::printf("MW: NTotal %.3g keep %.3g integral %.4g -> stars per unit mass %.4g; unit %.0f pc; A.x %.4f (%.0f pc) A.y %.5f (%.0f pc) E.x %.4f E.w %.3f D.x %.3f C.x %.3f H.y %.3f\n",
+		Ct.NTotal, Ct.Keep, G.IntegralAll(Ct), StarsPerMass, PcU, P.A.x, P.A.x * PcU, P.A.y, P.A.y * PcU, P.E.x, P.E.w, P.D.x, P.C.x, P.H.y);
+	// Young light's share of the disc light (a disc annulus 0.2-0.6 of the cut, z +- 10 h).
+	{
+		double Yt = 0.0, Tt = 0.0;
+		const int N = 200000;
+		for (int I = 0; I < N; ++I)
+		{
+			const double R = P.D.x * std::sqrt(0.04 + 0.32 * H::Uni_DrawUnit(0x77u, 1u, 3 * I)), Th = 6.2831853 * H::Uni_DrawUnit(0x77u, 1u, 3 * I + 1);
+			const double Z = (2.0 * H::Uni_DrawUnit(0x77u, 1u, 3 * I + 2) - 1.0) * 10.0 * P.A.y;
+			const H::float3 Q{ float(R * std::cos(Th)), float(R * std::sin(Th)), float(Z) };
+			H::float4 Comp(0, 0, 0, 0); H::float2 Oc(0.0f, 0.0f);
+			const double Rho = H::UniField_GalaxyO(Q, P, K, Comp, Oc);
+			Yt += Oc.x; Tt += Rho - Oc.y + H::UNI_OC_FRAC * Oc.x;
+		}
+		std::printf("young share of the annulus' light %.3f -> clusters hold frac x that = %.4f of it\n", Yt / Tt, H::UNI_OC_FRAC * Yt / Tt);
+	}
+	// Clusters' total stars in a 60 x 60 cell patch at 0.3 of the cut.
+	{
+		const float L = H::Uni_GalaxyOcLattice(P);
+		const u32 Hoc = H::Uni_SeedMix(K.Hs, 16u);
+		std::vector<double> Ns;
+		const int Cx = int(std::floor(0.3 * P.D.x * std::cos(0.6) / L)) - 30, Cy = int(std::floor(0.3 * P.D.x * std::sin(0.6) / L)) - 30;
+		for (int Y = Cy; Y < Cy + 60; ++Y) for (int X = Cx; X < Cx + 60; ++X)
+		{
+			const H::FUniOc O = H::Uni_GalaxyOcAt(H::int2(X, Y), P, Hoc, K.Hp, L);
+			if (!(O.Wm > 0.0f)) { continue; }
+			H::float4 Comp(0, 0, 0, 0); H::float2 Oc(0.0f, 0.0f);
+			H::UniField_GalaxyO(O.C, P, K, Comp, Oc);
+			Ns.push_back(StarsPerMass * O.Wm * Oc.x);
+		}
+		std::sort(Ns.begin(), Ns.end());
+		auto Q = [&](double F) { return Ns.empty() ? 0.0 : Ns[size_t(F * (Ns.size() - 1))]; };
+		std::printf("lattice %.0f pc: %zu clusters, total stars p10 %.3g median %.3g p90 %.3g p99 %.3g max %.3g\n", L * PcU, Ns.size(), Q(0.1), Q(0.5), Q(0.9), Q(0.99), Q(1.0));
+	}
+	// Warp displacement Pd - P and its change over distances.
+	{
+		double Dxy = 0.0, Dz = 0.0, Mxy = 0.0, Mz = 0.0;
+		const double Steps[4] = { 2.0, 10.0, 50.0, 200.0 };   // pc
+		double Ch[4] = { 0, 0, 0, 0 }, ChM[4] = { 0, 0, 0, 0 };
+		const int N = 3000;
+		auto Disp = [&](const H::float3& X)
+		{
+			H::float3 Pd, Pb, Nk; H::float4 Dt; u32 bDt = 0; float Fn = 0.0f, Sm = 1.0f;
+			H::Uni_GalaxyTexTerms(X, P, K, 0.0f, H::Uni_GalaxyDiscSlab(P), true, false, Pd, Pb, Dt, bDt, Fn, Sm, Nk);
+			return Pd - X;
+		};
+		for (int I = 0; I < N; ++I)
+		{
+			const double R = P.D.x * std::sqrt(0.04 + 0.32 * H::Uni_DrawUnit(0x78u, 1u, 3 * I)), Th = 6.2831853 * H::Uni_DrawUnit(0x78u, 1u, 3 * I + 1);
+			const double Z = (2.0 * H::Uni_DrawUnit(0x78u, 1u, 3 * I + 2) - 1.0) * 1.0 * P.A.y;
+			const H::float3 Q{ float(R * std::cos(Th)), float(R * std::sin(Th)), float(Z) };
+			const H::float3 D0 = Disp(Q);
+			const double Hxy = std::sqrt(double(D0.x) * D0.x + double(D0.y) * D0.y) * PcU, Hz = std::abs(D0.z) * PcU;
+			Dxy += Hxy / N; Dz += Hz / N; Mxy = std::max(Mxy, Hxy); Mz = std::max(Mz, Hz);
+			for (int S = 0; S < 4; ++S)
+			{
+				const double St = Steps[S] / PcU;
+				const H::float3 D1 = Disp(Q + H::float3{ float(St * 0.577), float(St * 0.577), float(St * 0.577) });
+				const H::float3 Dd = D1 - D0;
+				const double C = std::sqrt(double(H::dot(Dd, Dd))) * PcU;
+				Ch[S] += C / N; ChM[S] = std::max(ChM[S], C);
+			}
+		}
+		std::printf("warp displacement: xy mean %.1f pc max %.1f pc, z mean %.2f pc max %.2f pc; change over 2/10/50/200 pc: mean %.3f/%.3f/%.3f/%.3f pc, max %.3f/%.3f/%.3f/%.3f pc\n",
+			Dxy, Mxy, Dz, Mz, Ch[0], Ch[1], Ch[2], Ch[3], ChM[0], ChM[1], ChM[2], ChM[3]);
+	}
+	for (int I = 0; I < 3; ++I) { BindGalaxyTexture(I, nullptr); }
+}

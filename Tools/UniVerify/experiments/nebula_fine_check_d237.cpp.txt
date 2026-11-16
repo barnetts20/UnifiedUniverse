@@ -1,0 +1,269 @@
+// test_nebfine.cpp
+// D-237 (B-034, owner 2026-11-13: "lets do the nebula follow up layer first"): the nebulae's
+// fly-into layer (Uni_GalaxyNebulaFine; the march's finer steps inside a nebula near the camera;
+// the knots' teal cores; the dust's complement):
+//  - the pattern: mean 1 (filaments, mixed, shells), the dust's complement mean 1, both exactly 1
+//    once blended (footprint or step), and 1 for early types;
+//  - from inside a nebula in the Milky Way (the brightest knot of its disc), the real march:
+//    the layer's slide across step phases within 1.5% of the same march without it (its finer
+//    steps alone), no ray truncated, the steps x 2.2 at most; its light against its steps alone
+//    within 30% (a sparse mean-1 pattern over a few walls);
+//  - beyond the reach (3 kpc above the disc) the frame is the frame without it, bit for bit;
+//  - stills: inside and 250 pc out, without and with the layer.
+
+#include "../src/UniTest.h"
+#include "../src/UniRenderRef.h"
+#include "../src/UniVerifyCommon.h"
+#include "../src/UniVolumeRef.h"
+#include "../scenes/UniScenes.h"
+#include "UniVolume.h"
+#include "UniWebTexture.h"
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <string>
+#include <sys/stat.h>
+#include <vector>
+
+using namespace UniCore;
+using namespace UniRender;
+namespace H = UniHlsl;
+
+namespace
+{
+	struct FNfTex
+	{
+		FWebTexture T[3];
+		bool bOk = true;
+		std::string Err;
+		FNfTex()
+		{
+			for (int S = 0; S < 3; ++S)
+			{
+				std::string E;
+				if (!FWebTexture::LoadDelivered("Data/Noise", GalaxyTextureName(S), T[S], &E)) { bOk = false; Err += E + "; "; }
+			}
+		}
+	};
+
+	struct FNfBind
+	{
+		explicit FNfBind(const FNfTex& S) { for (int I = 0; I < 3; ++I) { BindGalaxyTexture(I, &S.T[I]); } }
+		~FNfBind() { for (int I = 0; I < 3; ++I) { BindGalaxyTexture(I, nullptr); } }
+	};
+
+	FCoord NfCamAt(const FVec3d& P) { FCoord C = FCoord::Origin(); FVec3f F; AddDisplacement(C, F, P); return C; }
+
+	struct FNfFrame { std::vector<float> Rgb; double Steps = 0.0; int Truncated = 0; };
+
+	/** The real march over a W x H frame; TStartScale scales every carrier's start (the log steps'
+	 *  phase: the march's sequence from it). */
+	FNfFrame NfMarch(const FVolumeScene& Sc, const FCamera& Cm, double TStartScale = 1.0)
+	{
+		FVolumeScene Sk = Sc;
+		for (FCarrierGPU& Cg : Sk.Carriers) { Cg.TStart = float(double(Cg.TStart) * TStartScale); }
+		const auto V = ToHlsl(Sk.View);
+		const auto Cb = Sk.CarrierBuf(); const auto Pb = Sk.ParamBuf(); const auto Lb = Sk.LutBuf();
+		FNfFrame F;
+		F.Rgb.assign(size_t(Cm.Width) * Cm.Height * 3, 0.0f);
+		for (int Y = 0; Y < Cm.Height; ++Y) for (int X = 0; X < Cm.Width; ++X)
+		{
+			bool bS = false;
+			const H::FUniVolumeResult R = MarchPixel(Cb, Pb, Lb, V, Cm, Cm.Width, Cm.Height, X, Y, 3.0e38f, bS);
+			const size_t I = (size_t(Y) * Cm.Width + X) * 3;
+			F.Rgb[I] = R.Radiance.x; F.Rgb[I + 1] = R.Radiance.y; F.Rgb[I + 2] = R.Radiance.z;
+			F.Steps += R.Steps;
+			F.Truncated += int(R.Truncated);
+		}
+		F.Steps /= double(Cm.Width * Cm.Height);
+		return F;
+	}
+
+	double NfLum(const FNfFrame& F, size_t I) { return 0.2126 * F.Rgb[3 * I] + 0.7152 * F.Rgb[3 * I + 1] + 0.0722 * F.Rgb[3 * I + 2]; }
+
+	std::string NfRenderDir()
+	{
+		const std::string D = UniVerify::Options().OutDir + "/render";
+		::mkdir(UniVerify::Options().OutDir.c_str(), 0755);
+		::mkdir(D.c_str(), 0755);
+		return D;
+	}
+}
+
+UNI_TEST(galaxy, nebula_fine)
+{
+	const FNfTex Tx;
+	if (!Tx.bOk) { Uni::Check(2, "T2.galaxy.nebula_fine", "D-237 the nebulae's fly-into layer").Pass(false, "textures not loaded: " + Tx.Err); return; }
+	const FNfBind Bind(Tx);
+	FUniverseDef D = UniScenes::Flythrough();
+	UniScenes::UseGalaxyTextures(D, Tx.T[0].Size);
+	UniScenes::UseGalaxyPalettes(D);
+	const FFieldParams* Mw = nullptr;
+	for (const FAnchor& A : D.Anchors) { if (!A.EmitterParams.empty()) { Mw = &A.EmitterParams[0]; } }
+	if (!Mw) { Uni::Check(2, "T2.galaxy.nebula_fine", "D-237").Pass(false, "no anchor"); return; }
+	const H::FUniFieldParams P = Mw->ToHlsl();
+	const H::FUniGalaxyConst K = H::Uni_GalaxyConstOf(P);
+
+	// The pattern: means over the unit cube at the three mixes, blended exactly 1, early types 1.
+	double MeanWorst = 0.0, DustWorst = 0.0;
+	std::string MeanText;
+	for (float Mix : { 0.396f, 0.526f, 0.656f })
+	{
+		double Sm = 0.0, Sd = 0.0;
+		const int N = 200000;
+		for (int I = 0; I < N; ++I)
+		{
+			const H::float3 Pt{ H::Uni_DrawUnit(0xF371u, 2u, u32(3 * I)) - 0.5f, H::Uni_DrawUnit(0xF371u, 2u, u32(3 * I + 1)) - 0.5f, H::Uni_DrawUnit(0xF371u, 2u, u32(3 * I + 2)) - 0.5f };
+			float Md = 1.0f;
+			Sm += double(H::Uni_GalaxyNebulaFine(Pt, P, Mix, 0.0f, 0.0f, Md)) / N;
+			Sd += double(Md) / N;
+		}
+		MeanWorst = std::max(MeanWorst, std::abs(Sm - 1.0));
+		DustWorst = std::max(DustWorst, std::abs(Sd - 1.0));
+		MeanText += Uni::Fmt("%s%.3f/%.3f", MeanText.empty() ? "" : ", ", Sm, Sd);
+	}
+	size_t BlendBad = 0;
+	{
+		for (int I = 0; I < 64; ++I)
+		{
+			const H::float3 Pt{ H::Uni_DrawUnit(0xF372u, 2u, u32(3 * I)) - 0.5f, H::Uni_DrawUnit(0xF372u, 2u, u32(3 * I + 1)) - 0.5f, 0.001f };
+			float Md = 0.0f;
+			const float Te0 = H::Uni_GalaxyNebulaFineTexel(P, 0.0f);
+			BlendBad += (H::Uni_GalaxyNebulaFine(Pt, P, 0.5f, 2.0f * UNI_NEBULA_FOOT * Te0, 0.0f, Md) != 1.0f || Md != 1.0f) ? 1 : 0;
+			BlendBad += (H::Uni_GalaxyNebulaFine(Pt, P, 0.5f, 0.0f, 4.0f * UNI_NEB_FINE_RES * Te0, Md) != 1.0f || Md != 1.0f) ? 1 : 0;
+		}
+		const FUniEmitter& E = D.Arch(UniScenes::kGalaxy).Emitters.at(0);
+		for (u32 I = 0; I < 32u; ++I)
+		{
+			FFieldParams Pf = E.EarlyExemplar;
+			for (const FParamRange& R : E.EarlyRanges) { Pf.V[R.Slot] = H::Uni_RollRange(H::Uni_SeedMix(0xF373u, I), ChannelIdUpper(R.Name), R.Min, R.Max, R.Bias, R.Quantize); }
+			Pf.V[20] = 1.0f;
+			const H::FUniFieldParams Pq = Pf.ToHlsl();
+			float Md = 0.0f;
+			BlendBad += (H::Uni_GalaxyNebulaFine(H::float3{ 0.01f, 0.02f, 0.0f }, Pq, 0.5f, 0.0f, 0.0f, Md) != 1.0f || Md != 1.0f) ? 1 : 0;
+		}
+	}
+
+	// The brightest knot of the disc (mid-plane, a sweep of 60,000 points).
+	double Hx = 0.0, Hy = 0.0, Hbest = -1.0;
+	for (int I = 0; I < 60000; ++I)
+	{
+		const double R = 0.3 + 0.4 * H::Uni_DrawUnit(0xF374u, 2u, u32(2 * I)), Ph = 6.2831853 * H::Uni_DrawUnit(0xF374u, 2u, u32(2 * I + 1));
+		const H::float3 Pt{ float(R * std::cos(Ph)), float(R * std::sin(Ph)), 0.0f };
+		H::float4 C(0, 0, 0, 0), Nv(0, 0, 0, 0);
+		const float Rho = H::UniField_GalaxyFilteredCKN(Pt, P, K, 1e-5f, C, Nv);
+		const double Score = double(H::Uni_GalaxyNebulaX(Nv, P)) * double(H::Uni_GalaxyNebulaDensity(Nv, P, 1e-5f, 0.0f)) / std::max(double(Rho), 1e-30);
+		if (Score > Hbest) { Hbest = Score; Hx = Pt.x; Hy = Pt.y; }
+	}
+
+	FUniverseModel Mo(D);
+	FRefGenerator G(Mo);
+	FVolumeBuilder VB(Mo, G);
+	double Radius = 0.0;
+	auto Build = [&](const FCoord& Cam, const FCamera& Cm, float FineGain, float FineRatio)
+	{
+		FRefPipeline Pp(G);
+		Pp.bVelocityLod = false;
+		Pp.Update(Cam, FVec3f{});
+		FVolumeSettings S;
+		S.NebulaGain = 1.0f; S.NebulaReflect = 6.0f; S.NebulaFineGain = FineGain; S.NebulaFineRatio = FineRatio;
+		FVolumeScene Sc = VB.Build(Pp, Cam, FVec3f{}, Cm.View(), S).Subset(false);
+		for (const FCarrierGPU& Cg : Sc.Carriers)
+		{
+			const double Rl = std::sqrt(double(Cg.CamLocal[0]) * Cg.CamLocal[0] + double(Cg.CamLocal[1]) * Cg.CamLocal[1] + double(Cg.CamLocal[2]) * Cg.CamLocal[2]);
+			if (Cg.FieldId == H::UNI_FIELD_GALAXY && Rl < 1.0) { Radius = 1.0 / double(Cg.InvRadius); }
+		}
+		return Sc;
+	};
+	// The galaxy's radius (the carrier's), then the knot in cm.
+	{
+		FCamera Cm; Cm.Coord = NfCamAt({ 8.0 * Units::Kpc, 0.0, 0.0 }); Cm.Width = 4; Cm.Height = 4; Cm.LookAlong({ 0.0, 1.0, 0.0 });
+		Build(Cm.Coord, Cm, 1.0f, 0.04f);
+	}
+	const FVec3d Knot{ Hx * Radius, Hy * Radius, 5.0 * Units::Pc };
+
+	// Inside the knot: slide (four phases of the carriers' start: x 1.32^(k/4)), steps, light.
+	const int Ws = 64, Hs = 36;
+	double SlideOn = 0.0, SlideSteps = 0.0, StepsBase = 0.0, StepsOn = 0.0, LightRatio = 0.0;
+	int Trunc = 0;
+	{
+		FCamera Cm; Cm.Coord = NfCamAt(Knot); Cm.Width = Ws; Cm.Height = Hs; Cm.LookAlong({ 0.3, 1.0, 0.05 });
+		const FVolumeScene Base = Build(Cm.Coord, Cm, 0.0f, 0.0f);
+		const FVolumeScene StepsOnly = Build(Cm.Coord, Cm, 1.0e-4f, 0.04f);
+		const FVolumeScene On = Build(Cm.Coord, Cm, 1.0f, 0.04f);
+		auto Spread = [&](const FVolumeScene& Sc, double& OutSteps, int& OutTrunc, double& OutLight)
+		{
+			std::vector<FNfFrame> Fr;
+			for (int Ph = 0; Ph < 4; ++Ph) { Fr.push_back(NfMarch(Sc, Cm, std::pow(1.32, 0.25 * Ph))); }
+			double W = 0.0, Dsp = 0.0;
+			for (size_t I = 0; I < size_t(Ws) * Hs; ++I)
+			{
+				double Lo = 1e300, Hi = -1e300, Mn = 0.0;
+				for (const FNfFrame& F : Fr) { const double L = NfLum(F, I); Lo = std::min(Lo, L); Hi = std::max(Hi, L); Mn += 0.25 * L; }
+				W += Mn; Dsp += Hi - Lo;
+			}
+			OutSteps = Fr[0].Steps;
+			OutTrunc = 0; for (const FNfFrame& F : Fr) { OutTrunc += F.Truncated; }
+			OutLight = W;
+			return Dsp / std::max(W, 1e-300);
+		};
+		double Lb = 0.0, Ls = 0.0, Lo = 0.0, Sb = 0.0;
+		int Tb = 0, Ts = 0, To = 0;
+		Spread(Base, StepsBase, Tb, Lb);
+		SlideSteps = Spread(StepsOnly, Sb, Ts, Ls);
+		SlideOn = Spread(On, StepsOn, To, Lo);
+		Trunc = Tb + Ts + To;
+		LightRatio = Lo / std::max(Ls, 1e-300);
+	}
+
+	// Beyond the reach: 3 kpc above the disc, the frame without the layer bit for bit.
+	size_t FarDiff = 0;
+	{
+		FCamera Cm; Cm.Coord = NfCamAt({ Knot.X, Knot.Y, 3.0 * Units::Kpc }); Cm.Width = 48; Cm.Height = 27; Cm.LookAlong({ 0.2, 0.3, -1.0 });
+		const FNfFrame A = NfMarch(Build(Cm.Coord, Cm, 0.0f, 0.0f), Cm), B = NfMarch(Build(Cm.Coord, Cm, 1.0f, 0.04f), Cm);
+		for (size_t I = 0; I < A.Rgb.size(); ++I) { FarDiff += A.Rgb[I] != B.Rgb[I] ? 1 : 0; }
+	}
+
+	// Stills: inside and 250 pc back along the view, without and with the layer (each frame's
+	// 99.5th percentile at 1, a soft shoulder).
+	{
+		const int W = 320, Ht = 180;
+		FImage Img(W * 2, Ht * 2);
+		for (int Vi = 0; Vi < 2; ++Vi)
+		{
+			FCamera Cm; Cm.Coord = NfCamAt({ Knot.X, Knot.Y - (Vi == 0 ? 0.0 : 250.0) * Units::Pc, Knot.Z }); Cm.Width = W; Cm.Height = Ht; Cm.LookAlong({ 0.3, 1.0, 0.05 });
+			double Top = 0.0;
+			for (int Fi = 0; Fi < 2; ++Fi)
+			{
+				const FNfFrame F = NfMarch(Build(Cm.Coord, Cm, float(Fi), Fi ? 0.04f : 0.0f), Cm);
+				if (Fi == 0)
+				{
+					std::vector<double> L; for (size_t I = 0; I < size_t(W) * Ht; ++I) { L.push_back(NfLum(F, I)); }
+					std::sort(L.begin(), L.end()); Top = L[size_t(0.995 * (L.size() - 1))];
+				}
+				for (int Y = 0; Y < Ht; ++Y) for (int X = 0; X < W; ++X)
+				{
+					const size_t I = size_t(Y) * W + X;
+					const double L = NfLum(F, I) / std::max(Top, 1e-300);
+					const double S = L > 0.0 ? (L / (1.0 + 0.25 * L)) / L / std::max(Top, 1e-300) : 0.0;
+					Img.Add(Fi * W + X, Vi * Ht + Y, float(F.Rgb[3 * I] * S), float(F.Rgb[3 * I + 1] * S), float(F.Rgb[3 * I + 2] * S));
+				}
+			}
+		}
+		const std::string Base = NfRenderDir() + "/still_nebula_fine";
+		Img.WritePpm(Base + ".ppm");
+		if (FILE* Fh = std::fopen((Base + ".hud.json").c_str(), "wb"))
+		{
+			std::fprintf(Fh, "{\"lines\":[\"D-237: inside the Milky Way's brightest disc nebula (top) and 250 pc back (bottom), without (left) and with (right) the fly-into layer\",\"the real march; each row's 99.5th percentile (without) at 1, soft shoulder\"]}\n");
+			std::fclose(Fh);
+		}
+	}
+
+	const bool bPass = MeanWorst < 0.05 && DustWorst < 0.03 && BlendBad == 0 && Hbest > 0.0
+		&& SlideOn < SlideSteps + 0.015 && Trunc == 0 && StepsOn < 2.2 * StepsBase && std::abs(LightRatio - 1.0) < 0.3 && FarDiff == 0;
+	Uni::Check(2, "T2.galaxy.nebula_fine", "D-237 the nebulae's fly-into layer: the pattern's mean 1 (5%) and the dust's complement's (3%) at the filament, mixed and shell mixes, exactly 1 once blended (footprint or step) and for early types; from inside the Milky Way's brightest disc nebula (the real march, 64 x 36, four step phases): the layer's slide within 1.5% of its finer steps alone, no ray truncated, steps x 2.2 at most, its light within 30% of the steps alone; 3 kpc above the disc (beyond the reach) the frame without it bit for bit; still_nebula_fine")
+		.Metric("mean_worst", MeanWorst).Metric("dust_worst", DustWorst).Metric("slide_on", SlideOn).Metric("slide_steps", SlideSteps)
+		.Metric("steps_base", StepsBase).Metric("steps_on", StepsOn).Metric("light_ratio", LightRatio)
+		.Pass(bPass, Uni::Fmt("pattern/dust means %s; %zu not 1 when blended or early; knot at (%.4f, %.4f) score %.2f; inside: slide %.2f%% (its steps alone %.2f%%), steps %.1f -> %.1f a pixel, %d truncated, light x %.3f of the steps alone; beyond the reach %zu of %d values differ",
+			MeanText.c_str(), BlendBad, Hx, Hy, Hbest, 100.0 * SlideOn, 100.0 * SlideSteps, StepsBase, StepsOn, Trunc, LightRatio, FarDiff, 48 * 27 * 3));
+}

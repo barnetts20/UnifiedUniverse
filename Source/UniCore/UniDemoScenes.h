@@ -88,6 +88,11 @@ namespace UniScenes
 		 *  engine does at uu.Enable); 1 and 2.2: the D-132 / D-180 dust. */
 		double DustScale = 2.0;
 		double DustLanes = 3.0;
+		/** D-263 (owner: a control for how fast the dust falls off from the plane): every dusty
+		 *  archetype's dust scale height (FVolumeProfile::DustHeightRatio) x this. The face-on
+		 *  optical depth is kept (DustFrom), so a thinner layer is denser in the plane: darker
+		 *  edge-on and along the plane, unchanged face-on. Render-only. 1: as before. */
+		double DustHeight = 1.0;
 	};
 
 	/** The galaxy number density over the galaxy luminosity function (the D-012 placeholder). */
@@ -159,7 +164,10 @@ namespace UniScenes
 			{ "Disc.ScaleLength", 0, 0.10f, 0.18f, 1.0f, 0.0f },
 			{ "Bulge.Weight", 5, 0.2f, 1.5f, 1.5f, 0.0f },
 			{ "Arms.Count", 6, 2.0f, 4.0f, 1.5f, 1.0f },
-			{ "Arms.TanPitch", 7, 0.15f, 0.45f, 1.0f, 0.0f },
+			// D-256: Ringermacher & Mead arms (GAMER's Fig. 7): the total winding (radians) and the
+			// openness (small: a long bar, the arms wound outside it; a third below 0.2), replacing the
+			// log spiral's pitch and D-178's tightening.
+			{ "Arms.Winding", 7, 1.5f, 8.0f, 1.0f, 0.0f },
 			{ "Arms.Amplitude", 8, 0.3f, 0.8f, 1.0f, 0.0f },
 			{ "Arms.Phase", 10, 0.0f, 6.2831853f, 1.0f, 0.0f },
 			// D-178: disc-level modes and per-arm asymmetry (UltraLargeScale's ideas), so no two
@@ -171,7 +179,7 @@ namespace UniScenes
 			{ "Disc.Lopsided", 18, 0.0f, 0.35f, 1.6f, 0.0f },
 			{ "Disc.Flare", 19, 0.0f, 1.2f, 1.0f, 0.0f },
 			{ "Arms.Asymmetry", 20, 0.1f, 0.7f, 1.0f, 0.0f },
-			{ "Arms.Tightening", 21, 0.0f, 0.5f, 1.3f, 0.0f },
+			{ "Arms.Openness", 21, 0.05f, 1.0f, 1.6f, 0.0f },
 			{ "Disc.ShapeSeed", 22, 0.0f, 16777215.0f, 1.0f, 1.0f },
 		};
 		// D-172: early types (cluster members drawn as such): a dominant, rounder, larger
@@ -716,14 +724,16 @@ namespace UniScenes
 		for (FArchetype& A : D.Archetypes) { for (FUniEmitter& E : A.Emitters) { Apply(E, A.Id); } }
 	}
 
-	/** D-198: every dusty archetype's dust x DustScale, its textured lanes' contrast DustLanes. */
-	inline void UseDustTuning(FUniverseDef& D, double DustScale, double DustLanes)
+	/** D-198: every dusty archetype's dust x DustScale, its textured lanes' contrast DustLanes.
+	 *  D-263: its dust scale height x DustHeight (face-on optical depth kept). */
+	inline void UseDustTuning(FUniverseDef& D, double DustScale, double DustLanes, double DustHeight = 1.0)
 	{
 		for (FArchetype& A : D.Archetypes)
 		{
 			if (!A.Volume.bDust || !(A.Volume.DustTau > 0.0f)) { continue; }
 			A.Volume.DustTau = float(double(A.Volume.DustTau) * std::clamp(DustScale, 0.0, 10.0));
 			A.Volume.DustLanes = float(std::clamp(DustLanes, 0.0, 10.0));
+			A.Volume.DustHeightRatio = float(double(A.Volume.DustHeightRatio) * std::clamp(DustHeight, 0.05, 4.0));   // D-263
 		}
 	}
 
@@ -759,7 +769,8 @@ namespace UniScenes
 		P.V[18] = 0.08f;        // lopsidedness
 		P.V[19] = 0.5f;         // flare
 		P.V[20] = 0.2f;         // arm asymmetry
-		P.V[21] = 0.15f;        // pitch tightening
+		P.V[7] = 4.0f;          // D-256: the arms' total winding, radians (Ringermacher & Mead)
+		P.V[21] = 0.15f;        // D-256: their openness B: the Milky Way's bar
 		P.V[22] = 5313203.0f;   // shape seed
 		A.EmitterParams = { P };
 		A.bFixedOrientation = true;

@@ -26,6 +26,7 @@ public class UnifiedUniverse : ModuleRules
 			"InputCore",            // EKeys for the free-flight test controls
 			"UnifiedUniverseCore",
 			"UnifiedUniverseRender",
+			"DeveloperSettings",    // D-261: UUniTuningSettings (Project Settings > Plugins > Unified Universe Tuning)
 		});
 
 		PrivateDependencyModuleNames.AddRange(new string[]

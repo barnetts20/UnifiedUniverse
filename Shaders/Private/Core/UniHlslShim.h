@@ -19,7 +19,7 @@
 //    error. That is the point: a build break, never a silent divergence.
 //
 // Differences from the galaxy shim, both needed by 128-bit coordinate maths:
-//   - Integer vectors (uint2/3/4, int3) exist, with member access only.
+//   - Integer vectors (uint2/3/4, int2/3) exist, with member access only.
 //   - asuint / asfloat / firstbithigh are provided, bit-exact.
 //
 // PRECISION: float32 throughout, matching the shader. Compile with -ffp-contract=off
@@ -38,6 +38,8 @@
 // filter over the CPU copy of the same texels (UniCore::FWebTexture binds it). Unbound, it
 // returns NaN, never a neutral value (lesson #1): placement then accepts nothing.
 
+#include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -123,6 +125,13 @@ namespace UniHlsl
 		uint x, y, z, w;
 		uint4() : x(0u), y(0u), z(0u), w(0u) {}
 		uint4(uint InX, uint InY, uint InZ, uint InW) : x(InX), y(InY), z(InZ), w(InW) {}
+	};
+
+	struct int2
+	{
+		int x, y;
+		int2() : x(0), y(0) {}
+		int2(int InX, int InY) : x(InX), y(InY) {}
 	};
 
 	struct int3
@@ -227,6 +236,7 @@ namespace UniHlsl
 		return T * T * (3.0f - 2.0f * T);
 	}
 
+	inline float dot(const float2& A, const float2& B) { return A.x * B.x + A.y * B.y; }
 	inline float dot(const float3& A, const float3& B) { return A.x * B.x + A.y * B.y + A.z * B.z; }
 	inline float dot(const float4& A, const float4& B) { return A.x * B.x + A.y * B.y + A.z * B.z + A.w * B.w; }
 	inline float length(const float3& A) { return sqrt(dot(A, A)); }
@@ -340,9 +350,11 @@ namespace UniHlsl
 		return float4(UniHalfToFloat(H[0]), UniHalfToFloat(H[1]), UniHalfToFloat(H[2]), UniHalfToFloat(H[3]));
 	}
 
-	/** D-179: the galaxy textures (slots: warp_fine, warp_large, galaxy_detail), bound by
-	 *  UniCore::BindGalaxyTexture; the same filter as the web texture. Unbound: NaN. */
-	static const int UNI_GAL_TEX_COUNT = 3;
+	/** D-179: the galaxy textures (slots: warp_fine, warp_large, galaxy_detail; D-249: 3, the
+	 *  nebulae's detail, render only, galaxy_detail while unbound; D-259: 4, galaxy_shape, derived
+	 *  from 2 when it is bound), bound by UniCore::BindGalaxyTexture; the same filter as the web
+	 *  texture. Unbound: NaN. */
+	static const int UNI_GAL_TEX_COUNT = 5;
 	inline FWebTexView UniGalaxyTextureViews[UNI_GAL_TEX_COUNT];
 
 	inline float4 UniGalaxyTexSample(int Slot, const float3& P, float Mip)
@@ -404,6 +416,107 @@ namespace UniHlsl
 } // namespace UniHlsl
 
 #define UNI_GAL_MAP(UV, Slot, Mip) UniGalMapSample(UV, uint(Slot), Mip)
+namespace UniHlsl
+{
+	// D-246: the volume's blue-noise tile (Uni_VolumeDraw), bound by the harness (UniBindBlueNoise:
+	// a generated void-and-cluster tile standing in for the engine's FastBlueNoise_scalar_128x128x8);
+	// unbound (0 x 0): D-240's draws.
+	inline const float* GBlueNoise = nullptr;
+	inline uint GBlueNoiseW = 0u, GBlueNoiseH = 0u;
+	inline float UniBlueNoiseAt(uint X, uint Y) { return GBlueNoise[size_t(Y) * GBlueNoiseW + X]; }
+}
+namespace UniHlsl
+{
+	// D-248: the nebulae's runtime tuning (UNI_NEB_TUNE, UNI_NEB_TUNE2 in UniFields.ush), set by
+	// the harness from UniCore::NebulaTune; the defaults are D-241..D-247's constants.
+	inline float4 GNebTune = float4(1.0f, 0.0f, 0.01122f, 0.00168205f);
+	inline float4 GNebTune2 = float4(1.0f, 4.0f, 0.0f, 0.0f);
+	inline float4 GNebTune3 = float4(0.0f, 0.0f, 0.0f, 0.0f);   // D-251
+}
+#define UNI_NEB_TUNE (::UniHlsl::GNebTune)
+#define UNI_NEB_TUNE2 (::UniHlsl::GNebTune2)
+#define UNI_NEB_TUNE3 (::UniHlsl::GNebTune3)
+namespace UniHlsl
+{
+	// D-258 / D-259: the galaxy noise shaping's switches (UniFields.ush's UNI_GAL_SHAPE: knots'
+	// amplitude, dust and light structure on, the structure's frequency); the engine sets them
+	// from uu.Galaxy.Knots / .DustStructure / .LightStructure / .StructureFreq (its shaders take
+	// the uniform UniGalShapeTune). The powers are galaxy_shape's (UniCore::GalaxyShapePowers).
+	inline float4 GGalShape = float4(1.0f, 1.0f, 1.0f, 0.25f);   // UniFields.ush's defaults
+}
+#define UNI_GAL_SHAPE (::UniHlsl::GGalShape)
+namespace UniHlsl
+{
+	// D-252: the nebula grid's resources (UniVolume.ush THE NEBULA GRID), bound by the checks'
+	// emulation (Tools/UniVerify/src/UniNebGridRef.h); unbound: no headers (the march never reads
+	// the grid without levels) and every table entry unbaked. The pool's read is the GPU's
+	// trilinear filter with clamped addressing (texel centres at (i + 0.5) / size).
+	struct FNebGridShim
+	{
+		const float4* Header = nullptr;
+		uint HeaderCount = 0u;
+		uint* Table = nullptr;
+		uint TableCount = 0u;
+		float4* Pool = nullptr;
+		uint PoolX = 0u, PoolY = 0u, PoolZ = 0u;
+		uint* Free = nullptr;
+		uint FreeCount = 0u;
+		uint Counters[32] = {};
+	};
+	inline FNebGridShim GNebGrid;
+	inline std::atomic<unsigned long long> GNebGridReads{ 0ull };   // the march's pool reads (the checks' cost)
+	inline float4 UniNebGridHeaderAt(uint I) { return (GNebGrid.Header && I < GNebGrid.HeaderCount) ? GNebGrid.Header[I] : float4(0.0f, 0.0f, 0.0f, 0.0f); }
+	inline uint UniNebGridTableAt(uint I) { return (GNebGrid.Table && I < GNebGrid.TableCount) ? GNebGrid.Table[I] : 0xFFFFFFFFu; }
+	inline void UniNebGridTableSet(uint I, uint V) { if (GNebGrid.Table && I < GNebGrid.TableCount) { GNebGrid.Table[I] = V; } }
+	inline uint UniNebGridFreeAt(uint I) { return (GNebGrid.Free && I < GNebGrid.FreeCount) ? GNebGrid.Free[I] : 0u; }
+	inline void UniNebGridFreeSet(uint I, uint V) { if (GNebGrid.Free && I < GNebGrid.FreeCount) { GNebGrid.Free[I] = V; } }
+	inline void UniNebGridCounterAdd(uint I, uint V, uint& Orig) { Orig = GNebGrid.Counters[I & 31u]; GNebGrid.Counters[I & 31u] = Orig + V; }
+	inline void UniNebGridPoolSet(uint X, uint Y, uint Z, const float4& V)
+	{
+		if (GNebGrid.Pool && X < GNebGrid.PoolX && Y < GNebGrid.PoolY && Z < GNebGrid.PoolZ) { GNebGrid.Pool[(size_t(Z) * GNebGrid.PoolY + Y) * GNebGrid.PoolX + X] = V; }
+	}
+	inline float4 UniNebGridPoolSample(const float3& Uvw)
+	{
+		if (!GNebGrid.Pool || GNebGrid.PoolX == 0u) { return float4(0.0f, 0.0f, 1.0f, 1.0f); }
+		GNebGridReads.fetch_add(1ull, std::memory_order_relaxed);
+		const uint Nd[3] = { GNebGrid.PoolX, GNebGrid.PoolY, GNebGrid.PoolZ };
+		const float U[3] = { Uvw.x, Uvw.y, Uvw.z };
+		int I0[3]; float Fr[3];
+		for (int A = 0; A < 3; ++A)
+		{
+			const float T = U[A] * float(Nd[A]) - 0.5f;
+			const float Fl = std::floor(T);
+			I0[A] = int(Fl);
+			Fr[A] = T - Fl;
+		}
+		float4 R(0.0f, 0.0f, 0.0f, 0.0f);
+		for (int C = 0; C < 8; ++C)
+		{
+			int Ix[3]; float W = 1.0f;
+			for (int A = 0; A < 3; ++A)
+			{
+				const int D = (C >> A) & 1;
+				Ix[A] = std::min(std::max(I0[A] + D, 0), int(Nd[A]) - 1);
+				W *= D ? Fr[A] : 1.0f - Fr[A];
+			}
+			if (W > 0.0f) { R = R + GNebGrid.Pool[(size_t(Ix[2]) * Nd[1] + size_t(Ix[1])) * Nd[0] + size_t(Ix[0])] * W; }
+		}
+		return R;
+	}
+}
+#define UNI_NEB_GRID_HEADER(I) (::UniHlsl::UniNebGridHeaderAt(I))
+#define UNI_NEB_GRID_TABLE(I) (::UniHlsl::UniNebGridTableAt(I))
+#define UNI_NEB_GRID_POOL(Uvw) (::UniHlsl::UniNebGridPoolSample(Uvw))
+#define UNI_NEB_GRID_TABLE_LOAD(I) (::UniHlsl::UniNebGridTableAt(I))
+#define UNI_NEB_GRID_TABLE_STORE(I, V) (::UniHlsl::UniNebGridTableSet((I), (V)))
+#define UNI_NEB_GRID_FREE_LOAD(I) (::UniHlsl::UniNebGridFreeAt(I))
+#define UNI_NEB_GRID_FREE_STORE(I, V) (::UniHlsl::UniNebGridFreeSet((I), (V)))
+#define UNI_NEB_GRID_COUNTER_ADD(I, V, Orig) (::UniHlsl::UniNebGridCounterAdd((I), (V), (Orig)))
+#define UNI_NEB_GRID_COUNTER_STORE(I, V) (::UniHlsl::GNebGrid.Counters[(I) & 31u] = (V))
+#define UNI_NEB_GRID_POOL_STORE(X, Y, Z, V) (::UniHlsl::UniNebGridPoolSet((X), (Y), (Z), (V)))
+#define UNI_VOL_NOISE(X, Y) (::UniHlsl::UniBlueNoiseAt((X), (Y)))
+#define UNI_VOL_NOISE_W (::UniHlsl::GBlueNoiseW)
+#define UNI_VOL_NOISE_H (::UniHlsl::GBlueNoiseH)
 #define UNI_WEB_TEX_SAMPLE(P, Mip) UniWebTexSample(P, Mip)
 namespace UniHlsl
 {
@@ -417,13 +530,43 @@ namespace UniHlsl
 	// D-232: the spheroid noise's mip floor (experiments/ellipnoise_explore_d232 swept it; T2.galaxy.spheroid_noise
 	// checks the default equals the shaders' value).
 	inline float GKnobSphMipFloor = 3.0f;
-	// D-235: the nebulae's read mip, its knot stretch and the blend's resolution (the nebula slide
+	// D-235: the nebulae's read mip, its knot stretch, the step cap and the footprint blend (the nebula slide
 	// exploration sweeps them; T2.galaxy.nebulae checks the defaults equal the shaders').
 	inline float GKnobNebMip = 1.0f;
 	inline float GKnobNebStretch = 1.0694f;
-	inline float GKnobNebRes = 0.25f;
 	inline float GKnobNebStep = 0.25f;
+	inline float GKnobNebLod = 2.0f;     // D-241: the knots' distance level of detail (read texels per half nominal step)
 	inline float GKnobNebFoot = 3.0f;
+	// D-241: the nebulae's detail erosion and warp (experiments/nebula_cloud_d241 sweeps them;
+	// T2.galaxy.nebula_detail checks the defaults equal the shaders').
+	inline float GKnobNebErosion1 = 0.75f;
+	inline float GKnobNebErosion2 = 0.5f;
+	inline float GKnobNebWarp1 = 1.5f;
+	inline float GKnobNebWarp2 = 1.0f;
+	inline float GKnobNebFm1 = 0.38699f;
+	inline float GKnobNebFm2 = 0.38945f;
+	inline float GKnobNebLaneMean = 0.12465f;
+	inline float GKnobNebShapeMean2 = 0.00168205f;
+	inline float GKnobNebCore = 0.8f;
+	inline float GKnobNebFreq = 6.0f;
+	inline float GKnobNebOctave = 4.0f;
+	// D-242: the nebulae's dark share (experiments/nebula_dark_d242 sweeps them; T2.galaxy.nebula_dark
+	// checks the defaults equal the shaders' and measures the normalisations).
+	inline float GKnobNebDarkMean0 = 0.35f;
+	inline float GKnobNebDarkSpread = 1.0f;
+	inline float GKnobNebDarkC = 1.5f;
+	inline float GKnobNebDarkDust = 100.0f;
+	inline float GKnobNebDarkEmit = 0.85f;
+	inline float GKnobNebDarkVps = 0.06425f;
+	inline float GKnobNebDarkVms = 0.26380f;
+	inline float GKnobNebSubTexels = 1.0f;   // D-244: knot texels between a refined step's sub-samples
+	inline float GKnobNebFrontW = 0.08f;   // D-243: the ionisation fronts
+	inline float GKnobNebRimW = 0.05f;
+	inline float GKnobNebRim = 1.0f;
+	inline float GKnobNebLsplit = 0.77069f;
+	inline float GKnobNebRsplit = 0.63853f;
+	inline float GKnobNebDarkVpr = 0.27445f;
+	inline float GKnobNebDarkVmr = 0.24135f;
 }
 #define UNI_GAL_WARP_MIP_FLOOR (::UniHlsl::GKnobWarpMipFloor)
 #define UNI_GAL_FINE_FREQ (::UniHlsl::GKnobFineFreq)
@@ -432,9 +575,37 @@ namespace UniHlsl
 #define UNI_GAL_SPH_MIP_FLOOR (::UniHlsl::GKnobSphMipFloor)
 #define UNI_NEBULA_MIP (::UniHlsl::GKnobNebMip)
 #define UNI_NEBULA_STRETCH (::UniHlsl::GKnobNebStretch)
-#define UNI_NEBULA_RES (::UniHlsl::GKnobNebRes)
 #define UNI_NEBULA_STEP (::UniHlsl::GKnobNebStep)
+#define UNI_NEBULA_LOD (::UniHlsl::GKnobNebLod)
 #define UNI_NEBULA_FOOT (::UniHlsl::GKnobNebFoot)
+#define UNI_NEB_EROSION1 (::UniHlsl::GKnobNebErosion1)
+#define UNI_NEB_EROSION2 (::UniHlsl::GKnobNebErosion2)
+#define UNI_NEB_WARP1 (::UniHlsl::GKnobNebWarp1)
+#define UNI_NEB_WARP2 (::UniHlsl::GKnobNebWarp2)
+#define UNI_NEB_FM1 (::UniHlsl::GKnobNebFm1)
+#define UNI_NEB_FM2 (::UniHlsl::GKnobNebFm2)
+#define UNI_NEB_LANE_MEAN (::UniHlsl::GKnobNebLaneMean)
+#define UNI_NEB_SHAPE_MEAN2 (::UniHlsl::GKnobNebShapeMean2)
+#define UNI_NEB_CORE (::UniHlsl::GKnobNebCore)
+#define UNI_NEB_FINE_FREQ (::UniHlsl::GKnobNebFreq)
+#define UNI_NEB_FINE_OCTAVE (::UniHlsl::GKnobNebOctave)
+#define UNI_NEB_DARK_MEAN0 (::UniHlsl::GKnobNebDarkMean0)
+#define UNI_NEB_DARK_SPREAD (::UniHlsl::GKnobNebDarkSpread)
+#define UNI_NEB_DARK_C (::UniHlsl::GKnobNebDarkC)
+#define UNI_NEB_DARK_DUST (::UniHlsl::GKnobNebDarkDust)
+#define UNI_NEB_DARK_VPS (::UniHlsl::GKnobNebDarkVps)
+#define UNI_NEB_DARK_VMS (::UniHlsl::GKnobNebDarkVms)
+#define UNI_NEB_DARK_VPR (::UniHlsl::GKnobNebDarkVpr)
+#define UNI_NEB_FRONT_W (::UniHlsl::GKnobNebFrontW)
+#define UNI_NEB_SUB_TEXELS (::UniHlsl::GKnobNebSubTexels)
+#define UNI_NEB_RIM_W (::UniHlsl::GKnobNebRimW)
+#define UNI_NEB_RIM (::UniHlsl::GKnobNebRim)
+#define UNI_NEB_LSPLIT (::UniHlsl::GKnobNebLsplit)
+#define UNI_NEB_RSPLIT (::UniHlsl::GKnobNebRsplit)
+#define UNI_NEB_DARK_VMR (::UniHlsl::GKnobNebDarkVmr)
+#define UNI_NEB_DARK_EMIT (::UniHlsl::GKnobNebDarkEmit)
 #define UNI_GAL_WARP_FINE(P, Mip) UniGalaxyTexSample(0, P, Mip)
 #define UNI_GAL_WARP_LARGE(P, Mip) UniGalaxyTexSample(1, P, Mip)
 #define UNI_GAL_DETAIL(P, Mip) UniGalaxyTexSample(2, P, Mip)
+#define UNI_NEB_DETAIL(P, Mip) UniGalaxyTexSample(::UniHlsl::UniGalaxyTextureViews[3].Mips ? 3 : 2, P, Mip)   // D-249
+#define UNI_GAL_SHAPED(P, Mip) UniGalaxyTexSample(4, P, Mip)   // D-259

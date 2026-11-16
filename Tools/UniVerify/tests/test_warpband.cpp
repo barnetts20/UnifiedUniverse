@@ -101,7 +101,8 @@ namespace
 				const H::FUniGalaxyShared S = H::Uni_GalaxySharedK(H::float3(X, Y, 0.0f), Par, K, 0.0f, Slab, false, false);
 				const float Half = 6.0f * Hs * S.Flare;
 				double Sum = 0.0;
-				for (int Z = 0; Z < 24; ++Z) { Sum += double(H::UniField_Galaxy(H::float3(X, Y, S.WarpZ - Half + 2.0f * Half * (float(Z) + 0.5f) / 24.0f), Par)); }
+				// D-239: the open clusters (and globulars) as their means: a few-pc peak hit by one sample is noise at this pixel.
+				for (int Z = 0; Z < 24; ++Z) { Sum += double(H::Uni_GalaxyIntegrand(H::float3(X, Y, S.WarpZ - Half + 2.0f * Half * (float(Z) + 0.5f) / 24.0f), Par)); }
 				L[size_t(J) * N + I] = Sum;
 				R[size_t(J) * N + I] = std::sqrt(double(X) * X + double(Y) * Y);
 			}

@@ -78,6 +78,7 @@
 #include "UniSubsystem.generated.h"
 
 class UTextureCube;
+class UTexture2D;
 class ASkyLight;
 struct FUniFrameData;
 
@@ -123,6 +124,13 @@ public:
 	/** Start a demo universe: "galaxy" (default), "web" or "flythrough". */
 	UFUNCTION(BlueprintCallable, Category = "Universe")
 	void EnableUniverse(const FString& Scene);
+	/** D-249: reload the volume textures (uu.GalaxyTexture.*, uu.WebTexture): re-enable the
+	 *  current scene, keeping the camera and its motion. */
+	void ReloadTextures();
+
+	/** D-261: re-enable the scene where the camera is (ReloadTextures) half a second after the last
+	 *  call: Project Settings > Unified Universe Tuning calls it when a setting that needs it changes. */
+	static void RequestReenable();
 
 	UFUNCTION(BlueprintCallable, Category = "Universe")
 	void DisableUniverse();
@@ -276,7 +284,7 @@ private:
 	TUniquePtr<UniCore::FWebTexture> WebTexture;
 	/** D-179: the galaxy textures (warp_fine, warp_large, galaxy_detail), bound to the CPU sampler
 	 *  like the web texture and released with it. */
-	TUniquePtr<UniCore::FWebTexture> GalaxyTextures[3];
+	TUniquePtr<UniCore::FWebTexture> GalaxyTextures[4];   // D-249: 3, the nebulae's detail (empty: galaxy_detail's)
 	TUniquePtr<UniCore::FUniverseModel> Model;
 	TUniquePtr<UniCore::FRefGenerator> Generator;
 	TUniquePtr<UniCore::IGenBackend> Backend;
@@ -299,6 +307,7 @@ private:
 	// stars from its map, the volume marches the camera's galaxy from it (uu.GalaxyMap).
 	UniCore::FGalaxyMapCache GalaxyMaps;
 	int32 GalaxyMapVolumeSlot = -1;          // the camera's galaxy's slot last frame (-1: none)
+	uint32 NebGridEpoch = 0;                 // D-252: counts enables (the textures the grid's bake reads may change)
 	uint64 GalaxyMapBakesSeen = 0;           // maps baked (MarkBaked accepted), for uu.Perf
 	uint32 GalaxyMapEpochSeen[16] = {};
 	UniCore::FMoteScale MoteScale;      // D-192: the warp motes' lattice scale (follows the speed)
@@ -363,6 +372,10 @@ private:
 	TObjectPtr<UTextureCube> SkyCubePrev;
 	UPROPERTY(Transient)
 	TObjectPtr<UTextureCube> SkyCubeCur;
+	// D-246: the volume march's blue noise, the engine's (as CloudAtmosphere's), loaded once.
+	UPROPERTY(Transient)
+	TObjectPtr<UTexture2D> VolumeBlueNoise;
+	bool bVolumeBlueNoiseTried = false;
 	TFuture<UniCore::FSkyCube> SkyJob;
 	bool bSkyJob = false;
 	bool bSkyBlending = false;

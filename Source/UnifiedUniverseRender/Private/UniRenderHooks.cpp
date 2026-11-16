@@ -17,6 +17,16 @@
 //     include path (UnifiedUniverseRender.Build.cs adds it).
 //   - The draw goes into a copy of scene colour (or OverrideOutput), never into the input
 //     (UE review R1), and uses the unjittered projection (W2, in UniRenderer.cpp).
+//
+// D-246 (owner 2026-11-14: "composite before tsr ... this should render before the atmosphere
+// shader"): with uu.VolumeBeforeTSR the volume is drawn in the BeforeDOF callback, as
+// CloudAtmosphere composites its clouds, so TSR accumulates it with the scene at the internal
+// resolution; the stars stay after MotionBlur (sub-pixel points under TSR would shimmer) and
+// read the volume's slices kept from the earlier callback. The engine calls the extensions in
+// descending GetPriority() order (FSceneViewExtensions sorts them; CloudAtmosphere keeps the
+// default 0), so ours is above it: the space behind the atmosphere is in scene colour before
+// the atmosphere's composite attenuates and in-scatters over it. Translucency is merged at
+// depth of field, after both. CHECK (UE-74): the order in a frame with both plugins.
 
 #include "UniRenderHooks.h"
 
@@ -45,6 +55,9 @@ namespace
 		virtual void SetupView(FSceneViewFamily& InViewFamily, FSceneView& InView) override {}
 		virtual void BeginRenderViewFamily(FSceneViewFamily& InViewFamily) override {}
 
+		/** D-246: ahead of CloudAtmosphere (0) in every pass both use. */
+		virtual int32 GetPriority() const override { return 100; }
+
 #if UE_VERSION_NEWER_THAN(5, 4, 99)
 		virtual void SubscribeToPostProcessingPass(EPostProcessingPass Pass, const FSceneView& InView, FAfterPassCallbackDelegateArray& InOutPassCallbacks, bool bIsPassEnabled) override
 #else
@@ -55,6 +68,10 @@ namespace
 			{
 				InOutPassCallbacks.Add(FAfterPassCallbackDelegate::CreateRaw(this, &FUniSceneViewExtension::AfterMotionBlur_RenderThread));
 			}
+			else if (Pass == EPostProcessingPass::BeforeDOF)
+			{
+				InOutPassCallbacks.Add(FAfterPassCallbackDelegate::CreateRaw(this, &FUniSceneViewExtension::BeforeDOF_RenderThread));   // D-246
+			}
 		}
 
 	protected:
@@ -64,6 +81,44 @@ namespace
 		}
 
 	private:
+		/** D-246: the volume before TSR (internal resolution, the view's jitter), into a copy of
+		 *  scene colour; scene colour untouched when it is off or not drawn. */
+		FScreenPassTexture BeforeDOF_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& View, const FPostProcessMaterialInputs& Inputs)
+		{
+#if UE_VERSION_NEWER_THAN(5, 2, 99)
+			FScreenPassTexture SceneColor = FScreenPassTexture::CopyFromSlice(GraphBuilder, Inputs.GetInput(EPostProcessMaterialInput::SceneColor));
+#else
+			FScreenPassTexture SceneColor = Inputs.GetInput(EPostProcessMaterialInput::SceneColor);
+#endif
+			const FViewInfo& ViewInfo = static_cast<const FViewInfo&>(View);
+			FRDGTextureRef SceneDepth = nullptr;
+			if (Inputs.SceneTextures.SceneTextures)
+			{
+				SceneDepth = Inputs.SceneTextures.SceneTextures->GetParameters()->SceneDepthTexture;
+			}
+			const bool bDraw = FUniRenderer::VolumeBeforeTSR_RenderThread() && SceneColor.IsValid() && SceneDepth
+				&& !View.bIsSceneCapture && !View.bIsReflectionCapture && View.bIsGameView;
+			if (!bDraw)
+			{
+				if (Inputs.OverrideOutput.IsValid())
+				{
+					AddDrawTexturePass(GraphBuilder, ViewInfo, SceneColor, Inputs.OverrideOutput);
+					return Inputs.OverrideOutput;
+				}
+				return SceneColor;
+			}
+			// R1, as after MotionBlur: into a copy (BeforeDOF is not last in the chain, so the
+			// override output is not expected; honoured when set).
+			FScreenPassRenderTarget Output = Inputs.OverrideOutput.IsValid()
+				? Inputs.OverrideOutput
+				: FScreenPassRenderTarget::CreateFromInput(GraphBuilder, SceneColor, ERenderTargetLoadAction::ENoAction, TEXT("UniSceneColorBeforeTSR"));
+			AddDrawTexturePass(GraphBuilder, ViewInfo, SceneColor, Output);
+			const float PreExposure = ViewInfo.PreExposure > 0.0f ? ViewInfo.PreExposure : 1.0f;   // W3
+			const FVector2f JitterPx(float(ViewInfo.TemporalJitterPixels.X), float(ViewInfo.TemporalJitterPixels.Y));
+			FUniRenderer::Get().RenderVolumeBeforeTSR_RenderThread(GraphBuilder, View, Output, SceneDepth, ViewInfo.ViewRect, PreExposure, JitterPx);
+			return MoveTemp(Output);
+		}
+
 		FScreenPassTexture AfterMotionBlur_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& View, const FPostProcessMaterialInputs& Inputs)
 		{
 #if UE_VERSION_NEWER_THAN(5, 2, 99)
@@ -117,7 +172,7 @@ namespace UniRenderHooks
 		if (!GUniExtension.IsValid())
 		{
 			GUniExtension = FSceneViewExtensions::NewExtension<FUniSceneViewExtension>();
-			UE_LOG(LogUniRender, Log, TEXT("UnifiedUniverse: scene view extension registered (backdrop after MotionBlur)."));
+			UE_LOG(LogUniRender, Log, TEXT("UnifiedUniverse: scene view extension registered (volume before DOF with uu.VolumeBeforeTSR, stars after MotionBlur; priority 100)."));
 		}
 	}
 

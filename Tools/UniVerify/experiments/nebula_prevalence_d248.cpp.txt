@@ -1,0 +1,86 @@
+// nebula_prevalence_d248.cpp.txt (archived exploration; was tests/test_zz_nebprev.cpp, --group zz.nebprev): the source of UniCore kNebulaPrevalence and kNebulaErodeByScale. Re-run 2026-11-15 after D-256 / D-258 moved the Milky Way's knots (both tables remeasured; see D-259).
+// Over the Milky Way's gas layer (an annulus, as T2.galaxy.nebula_detail): the knot thresholds'
+// shift d against the nebulae's coverage (X > 0), the knot shape's mean E[X^2 J] and the eroded
+// shape's mean at full detail E[D2^2 J].
+#include "../src/UniTest.h"
+#include "../src/UniVerifyCommon.h"
+#include "../scenes/UniScenes.h"
+#include "UniVolume.h"
+#include "UniWebTexture.h"
+#include <cmath>
+#include <cstdio>
+#include <string>
+#include <vector>
+using namespace UniCore;
+namespace H = UniHlsl;
+UNI_TEST(zz, nebprev)
+{
+	FWebTexture T[3];
+	for (int S = 0; S < 3; ++S) { std::string E; if (!FWebTexture::LoadDelivered("Data/Noise", GalaxyTextureName(S), T[S], &E)) { std::printf("tex fail\n"); return; } }
+	for (int I = 0; I < 3; ++I) { BindGalaxyTexture(I, &T[I]); }
+	FUniverseDef D = UniScenes::Flythrough();
+	UniScenes::UseGalaxyTextures(D, T[0].Size);
+	UniScenes::UseGalaxyPalettes(D);
+	const FFieldParams* Mw = nullptr;
+	for (const FAnchor& A : D.Anchors) { if (!A.EmitterParams.empty()) { Mw = &A.EmitterParams[0]; } }
+	const H::FUniFieldParams P = Mw->ToHlsl();
+	const H::FUniGalaxyConst K = H::Uni_GalaxyConstOf(P);
+	struct FS { H::float3 P; H::float4 Neb; };
+	std::vector<FS> Pts;
+	const int N = 240000;
+	for (int I = 0; I < N; ++I)
+	{
+		const double R = 0.2 + 0.5 * H::Uni_DrawUnit(0xA11u, 2u, u32(3 * I)), Ph = 6.2831853 * H::Uni_DrawUnit(0xA11u, 2u, u32(3 * I + 1));
+		const double Z = (2.0 * H::Uni_DrawUnit(0xA11u, 2u, u32(3 * I + 2)) - 1.0) * 0.5 * double(P.A.y);
+		const H::float3 Pt{ float(R * std::cos(Ph)), float(R * std::sin(Ph)), float(Z) };
+		H::float4 C(0, 0, 0, 0), Nv(0, 0, 0, 0);
+		H::UniField_GalaxyFilteredCKN(Pt, P, K, 1e-6f, C, Nv);
+		Pts.push_back({ Pt, Nv });
+	}
+	const H::float4 Save = H::GNebTune;
+	for (int Kd = -12; Kd <= 12; ++Kd)
+	{
+		const float Dd = 0.025f * float(Kd);
+		double Cov = 0, M1 = 0, M2 = 0;
+		for (const FS& S : Pts)
+		{
+			H::GNebTune = H::float4(1.0f, Dd, 1.0f, 1.0f);
+			const float X = H::Uni_GalaxyNebulaX(S.Neb, P);
+			if (!(X > 0.0f)) { continue; }
+			const float J = H::clamp(1.0f + 2.0f * (S.Neb.w - 0.493f), 0.2f, 1.8f);
+			Cov += 1.0; M1 += double(X) * X * J;
+			float Xo, Du;
+			M2 += H::Uni_GalaxyNebulaShapeAt(S.P, S.Neb, P, 0.0f, 1.0f, Xo, Du);
+		}
+		std::printf("d %+.3f cover %.6f mean %.7f mean2 %.8f\n", Dd, Cov / N, M1 / N, M2 / N);
+	}
+	// The erosion's share of the light against the nebulae's scale (the knot read's frequency; the
+	// detail's fixed): E[eroded] / E[X^2 J], over 0xA11's and 0xA13's samples.
+	for (int Ks = -6; Ks <= 6; ++Ks)
+	{
+		const float Sc = std::exp2(0.5f * float(Ks));
+		double Rs[2] = {};
+		for (int Sd = 0; Sd < 2; ++Sd)
+		{
+			H::GNebTune = H::float4(1.0f / Sc, 0.0f, 1.0f, 1.0f);
+			double Near = 0, Str = 0;
+			for (int I = 0; I < N; ++I)
+			{
+				const u32 Seed = Sd == 0 ? 0xA11u : 0xA13u;
+				const double R = 0.2 + 0.5 * H::Uni_DrawUnit(Seed, 2u, u32(3 * I)), Ph = 6.2831853 * H::Uni_DrawUnit(Seed, 2u, u32(3 * I + 1));
+				const double Z = (2.0 * H::Uni_DrawUnit(Seed, 2u, u32(3 * I + 2)) - 1.0) * 0.5 * double(P.A.y);
+				const H::float3 Pt{ float(R * std::cos(Ph)), float(R * std::sin(Ph)), float(Z) };
+				H::float4 C(0, 0, 0, 0), Nv(0, 0, 0, 0);
+				H::UniField_GalaxyFilteredCKN(Pt, P, K, 1e-6f, C, Nv);
+				float Xo, Du;
+				Near += H::Uni_GalaxyNebulaShapeAt(Pt, Nv, P, 0.0f, 1.0f, Xo, Du);
+				const float X = H::Uni_GalaxyNebulaX(Nv, P);
+				Str += double(X) * X * H::clamp(1.0f + 2.0f * (Nv.w - 0.493f), 0.2f, 1.8f);
+			}
+			Rs[Sd] = Near / Str;
+		}
+		std::printf("s %.4f erode %.6f %.6f\n", Sc, Rs[0], Rs[1]);
+	}
+	H::GNebTune = Save;
+	for (int I = 0; I < 3; ++I) { BindGalaxyTexture(I, nullptr); }
+}

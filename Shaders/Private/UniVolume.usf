@@ -20,6 +20,11 @@
 //                   pixel of every 2 x 2 block (SliceOffset); this pass fills the others from
 //                   the previous frame's output, reprojected (Catmull-Rom where it can), or from
 //                   the fresh neighbours. Its output is the frame's volume and next frame's history.
+//   UNI_VOL_PASS 6  DENOISE (compute, D-251): a-trous passes over the resolved volume, guided by
+//                   each pixel's variance and the scene depth; the composite reads the result, the
+//                   history keeps the resolve's.
+//   UNI_VOL_PASS 7  NEBULA GRID (compute, D-252): the grid's update each frame (UniCore/UniNebGrid.h):
+//                   levels reset, bricks released, classified and allocated, baked into the pool.
 //
 // D-228 the far cache (UniCore/UniFarCache.h): while on, the local carriers stop at R (TEnd), the
 // march's slices take the far map's transmittance, the composite adds T_near x the far map, and
@@ -38,6 +43,58 @@
 
 #include "/Engine/Public/Platform.ush"
 #include "UniWebTexture.ush"   // D-164: before any core (UniFields.ush samples it)
+
+// D-246: the blue-noise tile the march draws from (Uni_VolumeDraw): the engine's
+// FastBlueNoise_scalar_128x128x8, as CloudAtmosphere's; size 0 x 0 when absent (D-240's draws).
+Texture2D<float> UniBlueNoise;
+uint2 UniBlueNoiseSize;
+#define UNI_VOL_NOISE(X, Y) UniBlueNoise.Load(int3((int)(X), (int)(Y), 0))
+#define UNI_VOL_NOISE_W UniBlueNoiseSize.x
+#define UNI_VOL_NOISE_H UniBlueNoiseSize.y
+
+// D-248: the nebulae's runtime tuning (UniFields.ush UNI_NEB_TUNE; UniCore::NebulaTune). Not in
+// the galaxy map's bake (pass 5): a map is cached by its galaxy, not by the tuning, so it bakes
+// with the defaults (it holds no nebula light).
+#if UNI_VOL_PASS != 5
+// D-249: the nebulae's detail texture (galaxy_detail's unless one is configured: the renderer binds it).
+Texture3D<float4> UniNebDetail;
+#define UNI_NEB_DETAIL(P, Mip) UniNebDetail.SampleLevel(UniWebSampler, (P), (Mip))
+float4 UniNebTune;
+float4 UniNebTune2;
+float4 UniNebTune3;   // D-251
+#define UNI_NEB_TUNE UniNebTune
+#define UNI_NEB_TUNE2 UniNebTune2
+#define UNI_NEB_TUNE3 UniNebTune3
+#endif
+
+// D-252: the nebula grid (Core/UniVolume.ush THE NEBULA GRID): its headers (the levels' boxes,
+// the pool's shape), the bricks' table and the pool, read by the marches (passes 0, 1); pass 7
+// updates them (the table, the free lists, the counters and the pool writable there).
+#if UNI_VOL_PASS == 0 || UNI_VOL_PASS == 1 || UNI_VOL_PASS == 7
+StructuredBuffer<float4> UniNebGridHeader;
+#define UNI_NEB_GRID_HEADER(I) UniNebGridHeader[(I)]
+#endif
+#if UNI_VOL_PASS == 0 || UNI_VOL_PASS == 1
+Buffer<uint> UniNebGridTable;
+Texture3D<float4> UniNebGridPool;
+SamplerState UniNebGridSampler;
+#define UNI_NEB_GRID_TABLE(I) UniNebGridTable[(I)]
+#define UNI_NEB_GRID_POOL(Uvw) UniNebGridPool.SampleLevel(UniNebGridSampler, (Uvw), 0)
+#endif
+#if UNI_VOL_PASS == 7
+RWBuffer<uint> UniNebGridTableRW;
+RWBuffer<uint> UniNebGridFree;
+RWBuffer<uint> UniNebGridCounters;   // [K] level K's free slots, [UNI_NEB_GRID_MAX_LEVELS + K] its overflows
+RWTexture3D<float4> UniNebGridPoolRW;
+#define UNI_NEB_GRID_TABLE_LOAD(I) UniNebGridTableRW[(I)]
+#define UNI_NEB_GRID_TABLE_STORE(I, V) UniNebGridTableRW[(I)] = (V)
+#define UNI_NEB_GRID_FREE_LOAD(I) UniNebGridFree[(I)]
+#define UNI_NEB_GRID_FREE_STORE(I, V) UniNebGridFree[(I)] = (V)
+#define UNI_NEB_GRID_COUNTER_ADD(I, V, Orig) InterlockedAdd(UniNebGridCounters[(I)], (V), Orig)
+#define UNI_NEB_GRID_COUNTER_STORE(I, V) UniNebGridCounters[(I)] = (V)
+#define UNI_NEB_GRID_POOL_STORE(X, Y, Z, V) UniNebGridPoolRW[uint3((X), (Y), (Z))] = (V)
+#endif
+
 #include "Core/UniVolume.ush"
 
 #ifndef UNI_VOL_PASS
@@ -151,9 +208,14 @@ float WebDebugThreshold;    // x the mean
 float WebDebugOpacity;      // per texel at full strength
 uint bSliceMarch;            // D-184: march one pixel of every N x N block, at SliceOffset; D-208: N (1 is read as 2; 0: every pixel)
 uint2 SliceOffset;
+uint TemporalPhaseMarch;     // D-247: the packed phase (its rank picks the noise offset)
+float2 RayJitterPx;          // D-246: before TSR, the view's jitter in march pixels (the ray's, not the pixel's: the history stays at pixel centres)
 RWTexture2D<float4> OutVolume;
 RWTexture2DArray<float> OutSlices;
 RWTexture2D<float2> OutDepth;   // D-184: ln depth of the light, ln scene distance (the reconstruction's)
+uint bWriteMoments;          // D-251: a frame marched in full starts each pixel's luminance moments (the resolve's denoise)
+float MarchExposure;         // D-251: its compression (as ResolveExposure)
+RWTexture2D<float2> OutMoments;
 
 [numthreads(8, 8, 1)]
 void MarchCS(uint3 DispatchId : SV_DispatchThreadID)
@@ -165,7 +227,7 @@ void MarchCS(uint3 DispatchId : SV_DispatchThreadID)
 	if (Id.x >= MarchSize.x || Id.y >= MarchSize.y) { return; }
 	const FUniVolumeView V = InVolumeView[0];
 	const float2 Size = float2((float)MarchSize.x, (float)MarchSize.y);
-	const float2 Px = float2((float)Id.x + 0.5f, (float)Id.y + 0.5f);
+	const float2 Px = float2((float)Id.x + 0.5f + RayJitterPx.x, (float)Id.y + 0.5f + RayJitterPx.y);   // D-246
 	const float3 ApDir = PixelDir(Px, Size);
 	const float TScene = SceneDistanceAtUV(Px * MarchToDepthUV.xy + MarchToDepthUV.zw, dot(ApDir, ViewForward));
 	const float LnScene = log(max(TScene, 1.0f));
@@ -180,6 +242,11 @@ void MarchCS(uint3 DispatchId : SV_DispatchThreadID)
 		for (uint K5 = 0u; K5 < UNI_VOL_SLICES; ++K5) { OutSlices[uint3(Id.x, Id.y, K5)] = 1.0f; }
 		return;
 	}
+
+	// D-247: sliced, with the blue-noise tile: the noise coordinate is the cell's (DispatchId)
+	// moved per rank (Uni_VolumeNoiseCell); otherwise the pixel's.
+	uint2 NoisePx = Id.xy;
+	if (Sn != 0u && UniBlueNoiseSize.x > 0u) { NoisePx = Uni_VolumeNoiseCell(DispatchId.xy, Uni_TemporalRank(TemporalPhaseMarch)); }
 
 	uint SS = 1u;
 	for (uint C = 0u; C < V.NumCarriers; ++C)
@@ -203,8 +270,10 @@ void MarchCS(uint3 DispatchId : SV_DispatchThreadID)
 		[loop]
 		for (uint I = 0u; I < SS; ++I)
 		{
-			const float2 Sub = float2((float)Id.x + ((float)I + 0.5f) / (float)SS, (float)Id.y + ((float)J + 0.5f) / (float)SS);
-			const FUniVolumeResult R = Uni_VolumeMarch(SS == 1u ? Dir : TrueDir(PixelDir(Sub, Size)), TScene, InCarriers, InParams, InLut, V);
+			const float2 Sub = float2((float)Id.x + ((float)I + 0.5f) / (float)SS + RayJitterPx.x, (float)Id.y + ((float)J + 0.5f) / (float)SS + RayJitterPx.y);
+			// D-240: jittered with MarchFlags bit 3 (the pixel's noise coordinate; a sub-ray's its own).
+			const float3 Jit = SS == 1u ? float3((float)NoisePx.x, (float)NoisePx.y, 1.0f) : float3((float)(NoisePx.x * SS + I), (float)(NoisePx.y * SS + J), 1.0f);
+			const FUniVolumeResult R = Uni_VolumeMarchJ(SS == 1u ? Dir : TrueDir(PixelDir(Sub, Size)), TScene, InCarriers, InParams, InLut, V, Jit);
 			B += R.Radiance;
 			T += R.Transmittance;
 			StepSum += R.Steps;
@@ -238,6 +307,13 @@ void MarchCS(uint3 DispatchId : SV_DispatchThreadID)
 	}
 	OutVolume[Id.xy] = Out;
 	OutDepth[Id.xy] = float2(DepthW > 0.0f && DepthWL > 0.0f ? Uni_LightLnDepthFromInv(DepthWL / DepthW) : UNI_VOL_LN_DEPTH_NONE, LnScene);   // D-194: harmonic
+	if (bWriteMoments != 0u)
+	{
+		// D-251: the pixel's one sample starts its moments.
+		const float4 Oc = Uni_ResolveCompress(Out, max(MarchExposure, 1.0e-30f));
+		const float Lo = Uni_Luminance(Oc.rgb);
+		OutMoments[Id.xy] = float2(Lo, Lo * Lo);
+	}
 	// D-228: with the far cache the march stops at R; past it the slices take the far map's
 	// transmittance (a product: past R the near slices hold the near part's).
 	const bool bFarSlices = bFar != 0u && DebugMode == 0u && TScene > FarStartCm;
@@ -346,30 +422,222 @@ uint bHistory;
 float4 PrevWarpVelBeta;     // D-190: the previous frame's warp optics
 int HistFarSign;            // D-228: the far cache switched: +1 the history is the near part (make it whole), -1 the reverse
 float4 TemporalClamp;       // D-194: x 1: clamp the history into the fresh range (0: the D-184 band); y the motion (px) at which it is tight; z beyond which history is not used
+float MaxSamples;           // D-240: a fresh pixel blends into its history over this many samples (1: it replaces it)
+uint bCloudResolve;         // D-246: CloudAtmosphere's resolve (every pixel: fill, variance clamp, two ages)
+float ResolveExposure;      // D-246: radiance to displayed brightness (the compression's knee at 1)
 Texture2D<float4> FreshVolume;
 Texture2DArray<float> FreshSlices;
 Texture2D<float2> FreshDepth;
 Texture2D<float4> HistVolume;
 Texture2DArray<float> HistSlices;
 Texture2D<float2> HistDepth;
+Texture2D<float2> HistAge;  // D-240: samples each history pixel holds; D-246: and its own (y)
 RWTexture2D<float4> OutVolume;
 RWTexture2DArray<float> OutSlices;
 RWTexture2D<float2> OutDepth;
+RWTexture2D<float2> OutAge;
+Texture2D<float2> HistMoments;   // D-251: each pixel's own samples' compressed luminance moments (E[l], E[l^2])
+RWTexture2D<float2> OutMoments;
+RWTexture2D<float> OutVariance;  // D-251: the variance of each pixel's value (the denoise's guide)
 
 float LumOf(float4 InV) { return Uni_Luminance(InV.rgb); }
+
+/** The history reprojected to pixel Px (direction Dir) at the light's ln depth LnD: bilinear on
+ *  this pixel's surface, Catmull-Rom where all 16 texels are on it, D-228's conversion at a far
+ *  switch; its taps (Ht, Wn: normalised), light depth, the least samples a tap holds (D-240)
+ *  and the motion in this frame's pixels. False: none. */
+bool ReprojectHistory(uint2 Px, float3 Dir, float LnD, float LnTp, FUniTemporalView TV, float2 Size,
+	out float4 Hv, out float HDep, out float HAge, out float HOwn, out FUniTemporalTaps Ht, out float4 Wn, out float Mo)
+{
+	Hv = float4(0.0f, 0.0f, 0.0f, 0.0f); HDep = 0.0f; HAge = 0.0f; HOwn = 0.0f; Mo = 0.0f;
+	Wn = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	Ht = Uni_TemporalHistTaps(float2(0.0f, 0.0f), HistSize);
+	float2 Pp = float2(0.0f, 0.0f);
+	const float2 HSize = float2((float)HistSize.x, (float)HistSize.y);
+	if (bHistory == 0u || !Uni_TemporalPrevPixel(Dir, LnD, TV, HSize, Pp)) { return false; }
+	Ht = Uni_TemporalHistTaps(Pp, HistSize);
+	const float2 H0 = HistDepth.Load(int3(int2(Ht.Q0), 0)), H1 = HistDepth.Load(int3(int2(Ht.Q1), 0)), H2 = HistDepth.Load(int3(int2(Ht.Q2), 0)), H3 = HistDepth.Load(int3(int2(Ht.Q3), 0));
+	const float4 Wh = Uni_TemporalHistW(Ht.W, LnTp, float4(H0.y, H1.y, H2.y, H3.y));
+	const float Shw = Wh.x + Wh.y + Wh.z + Wh.w;
+	if (!(Shw >= 0.5f)) { return false; }
+	Wn = Wh / Shw;
+	Hv = HistVolume.Load(int3(int2(Ht.Q0), 0)) * Wn.x + HistVolume.Load(int3(int2(Ht.Q1), 0)) * Wn.y + HistVolume.Load(int3(int2(Ht.Q2), 0)) * Wn.z + HistVolume.Load(int3(int2(Ht.Q3), 0)) * Wn.w;
+	HDep = H0.x * Wn.x + H1.x * Wn.y + H2.x * Wn.z + H3.x * Wn.w;
+	// D-240: the least samples a weighted tap holds.
+	HAge = 3.0e38f;
+	HOwn = 3.0e38f;
+	if (Wh.x > 0.0f) { const float2 A = HistAge.Load(int3(int2(Ht.Q0), 0)); HAge = min(HAge, A.x); HOwn = min(HOwn, A.y); }
+	if (Wh.y > 0.0f) { const float2 A = HistAge.Load(int3(int2(Ht.Q1), 0)); HAge = min(HAge, A.x); HOwn = min(HOwn, A.y); }
+	if (Wh.z > 0.0f) { const float2 A = HistAge.Load(int3(int2(Ht.Q2), 0)); HAge = min(HAge, A.x); HOwn = min(HOwn, A.y); }
+	if (Wh.w > 0.0f) { const float2 A = HistAge.Load(int3(int2(Ht.Q3), 0)); HAge = min(HAge, A.x); HOwn = min(HOwn, A.y); }
+	HAge = HAge < 1.0e30f ? HAge : 0.0f;
+	HOwn = HOwn < 1.0e30f ? HOwn : 0.0f;
+	// Catmull-Rom where all 16 texels are on the grid and on this pixel's surface.
+	const float Fx = Pp.x - 0.5f, Fy = Pp.y - 0.5f;
+	const int X0 = (int)floor(Fx), Y0 = (int)floor(Fy);
+	if (X0 - 1 >= 0 && Y0 - 1 >= 0 && X0 + 2 < (int)HistSize.x && Y0 + 2 < (int)HistSize.y)
+	{
+		const float4 Cx = Uni_CatmullRomWeights(Fx - (float)X0);
+		const float4 Cy = Uni_CatmullRomWeights(Fy - (float)Y0);
+		float4 Cr = float4(0.0f, 0.0f, 0.0f, 0.0f);
+		bool bSame = true;
+		UNI_UNROLL
+		for (int J = 0; J < 4; ++J)
+		{
+			const float Wy = J == 0 ? Cy.x : (J == 1 ? Cy.y : (J == 2 ? Cy.z : Cy.w));
+			UNI_UNROLL
+			for (int K = 0; K < 4; ++K)
+			{
+				const float Wx = K == 0 ? Cx.x : (K == 1 ? Cx.y : (K == 2 ? Cx.z : Cx.w));
+				const int3 Qc = int3(X0 - 1 + K, Y0 - 1 + J, 0);
+				bSame = bSame && Uni_TemporalDepthWeight(LnTp, HistDepth.Load(Qc).y) > 0.9f;
+				Cr += HistVolume.Load(Qc) * (Wx * Wy);
+			}
+		}
+		if (bSame) { Hv = float4(max(Cr.xyz, float3(0.0f, 0.0f, 0.0f)), saturate(Cr.w)); }
+	}
+	// D-228: once, at a far-cache switch, the history is made what this frame marches.
+	if (HistFarSign != 0) { Hv = Uni_FarHistoryConvert(Hv, FarAt(Dir), (float)HistFarSign); }
+	Mo = Uni_TemporalMotionPx(Uni_TemporalToGrid(Pp, HSize, Size), Px);   // D-215: in this frame's pixels
+	return true;
+}
+
+float HistSliceAt(FUniTemporalTaps Ht, float4 Wn, uint K)
+{
+	return HistSlices.Load(int4(int2(Ht.Q0), (int)K, 0)) * Wn.x + HistSlices.Load(int4(int2(Ht.Q1), (int)K, 0)) * Wn.y
+		+ HistSlices.Load(int4(int2(Ht.Q2), (int)K, 0)) * Wn.z + HistSlices.Load(int4(int2(Ht.Q3), (int)K, 0)) * Wn.w;
+}
+
+/** D-246: CloudAtmosphere's resolve (AtmosphereTemporal.usf MainResolveCS) at pixel Px: the
+ *  4 x 4 fresh samples about it (one per N x N cell, at K N + the phase's offset), weighted by
+ *  scene-depth agreement; their bilinear fill and tent-weighted moments on compressed radiance;
+ *  the history clamped to mean +- gamma sigma (gamma 4 at rest, 1 by 2 px of motion); a marched
+ *  pixel blends its sample in at max(1 / (age + 1), 1 / MaxSamples), the rest blend in the fill
+ *  (a little at rest until the pixel holds a sample of its own, half once moving); without
+ *  history: the fill. Ages: x all the samples a pixel holds, y its own. As UniVolumeRef.h's bCloud. */
+void CloudResolve(uint2 Px, float3 Dir, float LnTp, FUniTemporalView TV, float2 Size)
+{
+	const int Nn = (int)Uni_TemporalN(TemporalPhase);
+	const uint2 Oo = Uni_TemporalOffset(TemporalPhase);
+	const int Ox = (int)Oo.x, Oy = (int)Oo.y;
+	const int W = (int)MarchSize.x, Hh = (int)MarchSize.y;
+	const int LastX = (W - 1 - Ox) / Nn, LastY = (Hh - 1 - Oy) / Nn;
+	const int Rx = (int)Px.x - Ox, Ry = (int)Px.y - Oy;
+	const int Bx = (Rx + Nn) / Nn - 1, By = (Ry + Nn) / Nn - 1;
+	const int Mx = Rx - Bx * Nn, My = Ry - By * Nn;
+	const float Fx = (float)Mx / (float)Nn, Fy = (float)My / (float)Nn;
+	const bool bFresh = Mx == 0 && My == 0 && Bx >= 0 && By >= 0 && Bx <= LastX && By <= LastY;
+	const float Exp = max(ResolveExposure, 1.0e-30f);
+	float4 Fill = float4(0.0f, 0.0f, 0.0f, 0.0f), Own = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	float4 M1 = float4(0.0f, 0.0f, 0.0f, 0.0f), M2 = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	float FillSl[UNI_VOL_SLICES];
+	UNI_UNROLL
+	for (uint S0 = 0u; S0 < UNI_VOL_SLICES; ++S0) { FillSl[S0] = 0.0f; }
+	float FillTot = 0.0f, MomTot = 0.0f, BestW = 0.0f, BestDepth = UNI_VOL_LN_DEPTH_NONE;
+	float2 OwnDep = float2(UNI_VOL_LN_DEPTH_NONE, LnTp);
+	int2 OwnQ = int2(Px);
+	UNI_UNROLL
+	for (int Tap = 0; Tap < 16; ++Tap)
+	{
+		const int Dx = (Tap & 3) - 1, Dy = (Tap >> 2) - 1;
+		const int Kx = clamp(Bx + Dx, 0, LastX), Ky = clamp(By + Dy, 0, LastY);
+		const int2 Q = int2(Kx * Nn + Ox, Ky * Nn + Oy);
+		const bool bUsable = Q.x < W && Q.y < Hh && Kx == Bx + Dx && Ky == By + Dy;
+		const float2 Fd = FreshDepth.Load(int3(Q, 0));
+		const float Guide = bUsable ? Uni_TemporalDepthWeight(LnTp, Fd.y) + 1.0e-3f : 0.0f;
+		const float4 C = FreshVolume.Load(int3(Q, 0));
+		if (Tap == 5) { Own = C; OwnQ = Q; OwnDep = Fd; }
+		const float Ddx = (float)Dx - Fx, Ddy = (float)Dy - Fy;
+		const float Fw = Uni_ResolveFillW(Ddx, Ddy) * Guide;
+		Fill += C * Fw;
+		UNI_UNROLL
+		for (uint S1 = 0u; S1 < UNI_VOL_SLICES; ++S1) { FillSl[S1] += FreshSlices.Load(int4(Q, (int)S1, 0)) * Fw; }
+		FillTot += Fw;
+		if (Fw > BestW) { BestW = Fw; BestDepth = Fd.x; }
+		const float Mw = Uni_ResolveMomentW(Ddx, Ddy) * Guide;
+		const float4 Cc = Uni_ResolveCompress(C, Exp);
+		M1 += Cc * Mw;
+		M2 += Cc * Cc * Mw;
+		MomTot += Mw;
+	}
+	const float InvF = 1.0f / max(FillTot, 1.0e-6f), InvM = 1.0f / max(MomTot, 1.0e-6f);
+	Fill *= InvF;
+	M1 *= InvM;
+	const float4 Sig = sqrt(max(M2 * InvM - M1 * M1, float4(0.0f, 0.0f, 0.0f, 0.0f)));
+	const float LnD = bFresh ? OwnDep.x : BestDepth;
+	float4 Hv; float HDep, HAge, HOwn, Mo;
+	FUniTemporalTaps Ht;
+	float4 Wn;
+	bool bValid = ReprojectHistory(Px, Dir, LnD, LnTp, TV, Size, Hv, HDep, HAge, HOwn, Ht, Wn, Mo);
+	if (bValid && Mo > TemporalClamp.z) { bValid = false; }
+	const float Motion = Uni_ResolveMotion(Mo);
+	const float Gamma = Uni_ResolveGamma(Motion);
+	float4 Hist = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	float AgeH = 0.0f, OwnH = 0.0f, Rej = 1.0f;
+	if (bValid)
+	{
+		const float4 Hc = Uni_ResolveCompress(Hv, Exp);
+		const float4 Cl = Uni_ResolveClamp(Hc, M1, Sig, Gamma);
+		Rej = Uni_ResolveReject(Hc, Cl, Sig, Gamma);
+		Hist = any(Cl != Hc) ? Uni_ResolveExpand(Cl, Exp) : Hv;
+		AgeH = HAge * (1.0f - Rej);
+		OwnH = HOwn * (1.0f - Rej);
+	}
+	// D-251: the own samples' moments, bilinear with the history's taps.
+	const float2 HMom = bValid ? HistMoments.Load(int3(int2(Ht.Q0), 0)) * Wn.x + HistMoments.Load(int3(int2(Ht.Q1), 0)) * Wn.y
+		+ HistMoments.Load(int3(int2(Ht.Q2), 0)) * Wn.z + HistMoments.Load(int3(int2(Ht.Q3), 0)) * Wn.w : float2(0.0f, 0.0f);
+	const float MaxS = max(MaxSamples, 1.0f);
+	if (bFresh)
+	{
+		const float Al = bValid ? max(1.0f / (AgeH + 1.0f), 1.0f / MaxS) : 1.0f;
+		OutVolume[Px] = Hist * (1.0f - Al) + Own * Al;
+		OutDepth[Px] = OwnDep;
+		const float2 Ag = float2(min(AgeH + 1.0f, MaxS), min(OwnH + 1.0f, MaxS));
+		OutAge[Px] = Ag;
+		const float Lo = Uni_Luminance(Uni_ResolveCompress(Own, Exp).rgb);
+		const float Am = bValid ? max(1.0f / (OwnH + 1.0f), 1.0f / MaxS) : 1.0f;
+		const float2 Mm = HMom * (1.0f - Am) + float2(Lo, Lo * Lo) * Am;
+		OutMoments[Px] = Mm;
+		OutVariance[Px] = Uni_DenoiseVariance(Mm, Ag.y, Ag.x);
+		UNI_UNROLL
+		for (uint S2 = 0u; S2 < UNI_VOL_SLICES; ++S2)
+		{
+			const float Hs = bValid ? HistSliceAt(Ht, Wn, S2) : 0.0f;
+			OutSlices[uint3(Px, S2)] = Hs + (FreshSlices.Load(int4(OwnQ, (int)S2, 0)) - Hs) * Al;
+		}
+	}
+	else if (bValid)
+	{
+		const float Share = Uni_ResolveFillShare(Motion, OwnH);
+		OutVolume[Px] = Hist * (1.0f - Share) + Fill * Share;
+		OutDepth[Px] = float2(HDep, LnTp);
+		OutAge[Px] = float2(min(AgeH + Share, MaxS), OwnH);
+		OutMoments[Px] = HMom;   // D-251
+		OutVariance[Px] = Uni_DenoiseVariance(HMom, OwnH, min(AgeH + Share, MaxS));
+		UNI_UNROLL
+		for (uint S3 = 0u; S3 < UNI_VOL_SLICES; ++S3)
+		{
+			const float Hs = HistSliceAt(Ht, Wn, S3);
+			OutSlices[uint3(Px, S3)] = Hs + (FillSl[S3] * InvF - Hs) * Share;
+		}
+	}
+	else
+	{
+		OutVolume[Px] = Fill;
+		OutDepth[Px] = float2(BestDepth, LnTp);
+		OutAge[Px] = float2(0.0f, 0.0f);
+		OutMoments[Px] = float2(0.0f, 0.0f);   // D-251
+		OutVariance[Px] = Uni_DenoiseVariance(float2(0.0f, 0.0f), 0.0f, 0.0f);
+		UNI_UNROLL
+		for (uint S4 = 0u; S4 < UNI_VOL_SLICES; ++S4) { OutSlices[uint3(Px, S4)] = FillSl[S4] * InvF; }
+	}
+}
 
 [numthreads(8, 8, 1)]
 void ReconstructCS(uint3 Id : SV_DispatchThreadID)
 {
 	if (Id.x >= MarchSize.x || Id.y >= MarchSize.y) { return; }
 	const uint2 Px = Id.xy;
-	if (Uni_TemporalFresh(Px, TemporalPhase))
-	{
-		OutVolume[Px] = FreshVolume.Load(int3(int2(Px), 0));
-		OutDepth[Px] = FreshDepth.Load(int3(int2(Px), 0));
-		for (uint K0 = 0u; K0 < UNI_VOL_SLICES; ++K0) { OutSlices[uint3(Px, K0)] = FreshSlices.Load(int4(int2(Px), (int)K0, 0)); }
-		return;
-	}
 	FUniTemporalView TV;
 	TV.PrevForward = PrevForward; TV.PrevTanX = PrevTanX;
 	TV.PrevRight = PrevRight; TV.PrevTanY = PrevTanY;
@@ -381,6 +649,58 @@ void ReconstructCS(uint3 Id : SV_DispatchThreadID)
 	const float3 ApDir = PixelDir(Pc, Size);
 	const float LnTp = log(max(SceneDistanceAtUV(Pc * MarchToDepthUV.xy + MarchToDepthUV.zw, dot(ApDir, ViewForward)), 1.0f));
 	const float3 Dir = TrueDir(ApDir);   // D-190
+	if (bCloudResolve != 0u)
+	{
+		CloudResolve(Px, Dir, LnTp, TV, Size);   // D-246
+		return;
+	}
+	if (Uni_TemporalFresh(Px, TemporalPhase))
+	{
+		const float4 Fv = FreshVolume.Load(int3(int2(Px), 0));
+		const float2 Fd = FreshDepth.Load(int3(int2(Px), 0));
+		OutVolume[Px] = Fv;
+		OutDepth[Px] = Fd;
+		OutAge[Px] = float2(1.0f, 1.0f);
+		bool bBlend = false;
+		float4 Hc = Fv;
+		FUniTemporalTaps Ht = Uni_TemporalHistTaps(float2(0.0f, 0.0f), HistSize);   // read by both arms of the slices' select below
+		float4 Wn = float4(0.0f, 0.0f, 0.0f, 0.0f);
+		float Al = 1.0f;
+		if (MaxSamples > 1.0f)
+		{
+			// D-240: the fresh sample into its history, clamped into the box of it and its fresh
+			// neighbours N away.
+			const FUniTemporalTaps Rg = Uni_TemporalRing(Px, TemporalPhase, MarchSize);
+			float4 Lo4 = Fv, Hi4 = Fv;
+			if (Rg.W.x > 0.0f) { const float4 G = FreshVolume.Load(int3(int2(Rg.Q0), 0)); Lo4 = min(Lo4, G); Hi4 = max(Hi4, G); }
+			if (Rg.W.y > 0.0f) { const float4 G = FreshVolume.Load(int3(int2(Rg.Q1), 0)); Lo4 = min(Lo4, G); Hi4 = max(Hi4, G); }
+			if (Rg.W.z > 0.0f) { const float4 G = FreshVolume.Load(int3(int2(Rg.Q2), 0)); Lo4 = min(Lo4, G); Hi4 = max(Hi4, G); }
+			if (Rg.W.w > 0.0f) { const float4 G = FreshVolume.Load(int3(int2(Rg.Q3), 0)); Lo4 = min(Lo4, G); Hi4 = max(Hi4, G); }
+			float4 Hv; float HDep, HAge, HOwn, Mo;
+			if (ReprojectHistory(Px, Dir, Fd.x, LnTp, TV, Size, Hv, HDep, HAge, HOwn, Ht, Wn, Mo) && (TemporalClamp.x == 0.0f || Mo <= TemporalClamp.z))
+			{
+				float Rej = 0.0f;
+				Hc = Hv;
+				if (TemporalClamp.x != 0.0f)
+				{
+					const float Kc = Uni_TemporalClampK(Mo, TemporalClamp.y);
+					Hc = Uni_TemporalClamp(Hv, Lo4, Hi4, Kc);
+					Rej = Uni_TemporalReject(Hv, Hc, Lo4, Hi4, Kc);
+				}
+				else if (!Uni_TemporalAccept(LumOf(Hv), LumOf(Lo4), LumOf(Hi4))) { Rej = 1.0f; }
+				Al = Uni_TemporalAlpha(HAge * (1.0f - Rej), MaxSamples);
+				OutVolume[Px] = Hc + (Fv - Hc) * Al;
+				OutAge[Px] = Uni_TemporalAgeFresh(HAge, Rej, MaxSamples).xx;
+				bBlend = true;
+			}
+		}
+		for (uint K0 = 0u; K0 < UNI_VOL_SLICES; ++K0)
+		{
+			const float Fs = FreshSlices.Load(int4(int2(Px), (int)K0, 0));
+			OutSlices[uint3(Px, K0)] = bBlend ? lerp(HistSliceAt(Ht, Wn, K0), Fs, Al) : Fs;
+		}
+		return;
+	}
 
 	// The fresh neighbours.
 	const FUniTemporalTaps Tp = Uni_TemporalTaps(Px, TemporalPhase, MarchSize);
@@ -399,77 +719,186 @@ void ReconstructCS(uint3 Id : SV_DispatchThreadID)
 
 	// The history, reprojected.
 	bool bHist = false;
-	float4 Hv = float4(0.0f, 0.0f, 0.0f, 0.0f);
-	float HDep = 0.0f;
-	FUniTemporalTaps Ht = Tp;
-	float4 Wn = float4(0.0f, 0.0f, 0.0f, 0.0f);
-	float2 Pp = float2(0.0f, 0.0f);
-	const float2 HSize = float2((float)HistSize.x, (float)HistSize.y);
-	if (bHistory != 0u && Uni_TemporalPrevPixel(Dir, LnD, TV, HSize, Pp))
+	float4 Hv; float HDep, HAge, HOwn, Mo;
+	FUniTemporalTaps Ht;
+	float4 Wn;
+	float Rej = 0.0f;
+	if (ReprojectHistory(Px, Dir, LnD, LnTp, TV, Size, Hv, HDep, HAge, HOwn, Ht, Wn, Mo))
 	{
-		Ht = Uni_TemporalHistTaps(Pp, HistSize);
-		const float2 H0 = HistDepth.Load(int3(int2(Ht.Q0), 0)), H1 = HistDepth.Load(int3(int2(Ht.Q1), 0)), H2 = HistDepth.Load(int3(int2(Ht.Q2), 0)), H3 = HistDepth.Load(int3(int2(Ht.Q3), 0));
-		const float4 Wh = Uni_TemporalHistW(Ht.W, LnTp, float4(H0.y, H1.y, H2.y, H3.y));
-		const float Shw = Wh.x + Wh.y + Wh.z + Wh.w;
-		if (Shw >= 0.5f)
+		if (TemporalClamp.x != 0.0f)
 		{
-			Wn = Wh / Shw;
-			Hv = HistVolume.Load(int3(int2(Ht.Q0), 0)) * Wn.x + HistVolume.Load(int3(int2(Ht.Q1), 0)) * Wn.y + HistVolume.Load(int3(int2(Ht.Q2), 0)) * Wn.z + HistVolume.Load(int3(int2(Ht.Q3), 0)) * Wn.w;
-			HDep = H0.x * Wn.x + H1.x * Wn.y + H2.x * Wn.z + H3.x * Wn.w;
-			// Catmull-Rom where all 16 texels are on the grid and on this pixel's surface.
-			const float Fx = Pp.x - 0.5f, Fy = Pp.y - 0.5f;
-			const int X0 = (int)floor(Fx), Y0 = (int)floor(Fy);
-			if (X0 - 1 >= 0 && Y0 - 1 >= 0 && X0 + 2 < (int)HistSize.x && Y0 + 2 < (int)HistSize.y)
+			// D-194: clamp into the fresh range (tight once moving); moving too fast: not used.
+			if (Mo <= TemporalClamp.z)
 			{
-				const float4 Cx = Uni_CatmullRomWeights(Fx - (float)X0);
-				const float4 Cy = Uni_CatmullRomWeights(Fy - (float)Y0);
-				float4 Cr = float4(0.0f, 0.0f, 0.0f, 0.0f);
-				bool bSame = true;
-				UNI_UNROLL
-				for (int J = 0; J < 4; ++J)
-				{
-					const float Wy = J == 0 ? Cy.x : (J == 1 ? Cy.y : (J == 2 ? Cy.z : Cy.w));
-					UNI_UNROLL
-					for (int K = 0; K < 4; ++K)
-					{
-						const float Wx = K == 0 ? Cx.x : (K == 1 ? Cx.y : (K == 2 ? Cx.z : Cx.w));
-						const int3 Qc = int3(X0 - 1 + K, Y0 - 1 + J, 0);
-						bSame = bSame && Uni_TemporalDepthWeight(LnTp, HistDepth.Load(Qc).y) > 0.9f;
-						Cr += HistVolume.Load(Qc) * (Wx * Wy);
-					}
-				}
-				if (bSame) { Hv = float4(max(Cr.xyz, float3(0.0f, 0.0f, 0.0f)), saturate(Cr.w)); }
+				const float Kc = Uni_TemporalClampK(Mo, TemporalClamp.y);
+				const float4 Hc = Uni_TemporalClamp(Hv, Lo4, Hi4, Kc);
+				Rej = Uni_TemporalReject(Hv, Hc, Lo4, Hi4, Kc);   // D-240
+				Hv = Hc;
+				bHist = true;
 			}
-			// D-228: once, at a far-cache switch, the history is made what this frame marches.
-			if (HistFarSign != 0) { Hv = Uni_FarHistoryConvert(Hv, FarAt(Dir), (float)HistFarSign); }
-			if (TemporalClamp.x != 0.0f)
-			{
-				// D-194: clamp into the fresh range (tight once moving); moving too fast: not used.
-				const float Mo = Uni_TemporalMotionPx(Uni_TemporalToGrid(Pp, HSize, Size), Px);   // D-215: in this frame's pixels
-				if (Mo <= TemporalClamp.z) { Hv = Uni_TemporalClamp(Hv, Lo4, Hi4, Uni_TemporalClampK(Mo, TemporalClamp.y)); bHist = true; }
-			}
-			else { bHist = Uni_TemporalAccept(LumOf(Hv), Lo, Hi); }
 		}
+		else { bHist = Uni_TemporalAccept(LumOf(Hv), Lo, Hi); }
 	}
 	if (bHist)
 	{
 		OutVolume[Px] = Hv;
 		OutDepth[Px] = float2(HDep, LnTp);
-		for (uint K1 = 0u; K1 < UNI_VOL_SLICES; ++K1)
-		{
-			OutSlices[uint3(Px, K1)] = HistSlices.Load(int4(int2(Ht.Q0), (int)K1, 0)) * Wn.x + HistSlices.Load(int4(int2(Ht.Q1), (int)K1, 0)) * Wn.y
-				+ HistSlices.Load(int4(int2(Ht.Q2), (int)K1, 0)) * Wn.z + HistSlices.Load(int4(int2(Ht.Q3), (int)K1, 0)) * Wn.w;
-		}
+		OutAge[Px] = (HAge * (1.0f - Rej)).xx;   // D-240: no sample taken here
+		for (uint K1 = 0u; K1 < UNI_VOL_SLICES; ++K1) { OutSlices[uint3(Px, K1)] = HistSliceAt(Ht, Wn, K1); }
 	}
 	else
 	{
 		OutVolume[Px] = Sp;
 		OutDepth[Px] = float2(LnD, LnTp);
+		OutAge[Px] = float2(0.0f, 0.0f);
 		for (uint K2 = 0u; K2 < UNI_VOL_SLICES; ++K2)
 		{
 			OutSlices[uint3(Px, K2)] = (FreshSlices.Load(int4(int2(Tp.Q0), (int)K2, 0)) * Ws.x + FreshSlices.Load(int4(int2(Tp.Q1), (int)K2, 0)) * Ws.y
 				+ FreshSlices.Load(int4(int2(Tp.Q2), (int)K2, 0)) * Ws.z + FreshSlices.Load(int4(int2(Tp.Q3), (int)K2, 0)) * Ws.w) / Sw;
 		}
+	}
+}
+
+#elif UNI_VOL_PASS == 6
+
+// D-251: the resolved volume's a-trous denoise (Uni_Denoise*; UniVolumeRef.h DenoiseVolume): one
+// pass at DenoiseStep (1, 2, 4, ...), the light filtered (transmittance kept), the variance with it.
+uint2 MarchSize;
+uint DenoiseStep;
+float DenoiseSigma;
+float DenoiseExposure;      // the compression (the resolve's)
+Texture2D<float4> DenoiseIn;
+Texture2D<float> DenoiseVarIn;
+Texture2D<float2> DenoiseDepth;   // the resolve's (ln light depth, ln scene distance)
+RWTexture2D<float4> DenoiseOut;
+RWTexture2D<float> DenoiseVarOut;
+
+float DenoiseLum(float4 InC) { return Uni_Luminance(Uni_ResolveCompress(InC, DenoiseExposure).rgb); }
+
+[numthreads(8, 8, 1)]
+void DenoiseCS(uint3 Id : SV_DispatchThreadID)
+{
+	if (Id.x >= MarchSize.x || Id.y >= MarchSize.y) { return; }
+	const int2 Px = int2(Id.xy);
+	const int2 Mx = int2(MarchSize) - int2(1, 1);
+	const float4 Cp = DenoiseIn.Load(int3(Px, 0));
+	const float Lp = DenoiseLum(Cp);
+	const float Dp = DenoiseDepth.Load(int3(Px, 0)).y;
+	// The variance blurred 3 x 3 for the edge stop (SVGF).
+	float Vb = 0.0f, Wb = 0.0f;
+	UNI_UNROLL
+	for (int Dy = -1; Dy <= 1; ++Dy)
+	{
+		UNI_UNROLL
+		for (int Dx = -1; Dx <= 1; ++Dx)
+		{
+			const float Wk = (Dx == 0 ? 0.5f : 0.25f) * (Dy == 0 ? 0.5f : 0.25f);
+			Vb += Wk * DenoiseVarIn.Load(int3(clamp(Px + int2(Dx, Dy), int2(0, 0), Mx), 0));
+			Wb += Wk;
+		}
+	}
+	const float Den = DenoiseSigma * sqrt(max(Vb / Wb, 0.0f));
+	float Sw = 0.0f, Va = 0.0f;
+	float3 Acc = float3(0.0f, 0.0f, 0.0f);
+	const int St = (int)DenoiseStep;
+	UNI_UNROLL
+	for (int Ky = -2; Ky <= 2; ++Ky)
+	{
+		UNI_UNROLL
+		for (int Kx = -2; Kx <= 2; ++Kx)
+		{
+			const int2 Q = Px + int2(Kx, Ky) * St;
+			if (any(Q < int2(0, 0)) || any(Q > Mx)) { continue; }
+			const float4 Cq = DenoiseIn.Load(int3(Q, 0));
+			const float Wq = Uni_DenoiseKernel(Kx) * Uni_DenoiseKernel(Ky) * Uni_TemporalDepthWeight(Dp, DenoiseDepth.Load(int3(Q, 0)).y)
+				* Uni_DenoiseLumWeight(Lp, DenoiseLum(Cq), Den);
+			Acc += Cq.rgb * Wq;
+			Sw += Wq;
+			Va += Wq * Wq * DenoiseVarIn.Load(int3(Q, 0));
+		}
+	}
+	const float Inv = 1.0f / max(Sw, 1.0e-20f);
+	DenoiseOut[Px] = float4(Acc * Inv, Cp.w);
+	DenoiseVarOut[Px] = Va * Inv * Inv;
+}
+
+#elif UNI_VOL_PASS == 7
+
+// D-252: the nebula grid's update (UniCore/UniNebGrid.h's plan, in this order each frame): a level's
+// reset (NebGridResetCS), the entries whose world brick changed released (NebGridReleaseCS), the
+// entries to process classified and allocated (NebGridAllocCS: a group an entry, its threads the
+// classify samples) and baked (NebGridBakeCS: a group an entry, its threads the slot's points).
+StructuredBuffer<FUniNebGridOp> UniNebGridOps;
+RWStructuredBuffer<uint> UniNebGridOpSlot;   // each processed entry's slot (or empty / unbaked)
+uint NebGridOpCount;
+uint NebGridLevel;        // the reset's level
+uint NebGridResetCount;   // the reset's threads (its slots or entries, the more)
+uint NebGridParam;        // the spiral's parameter index
+
+[numthreads(64, 1, 1)]
+void NebGridResetCS(uint3 Id : SV_DispatchThreadID)
+{
+	if (Id.x < NebGridResetCount) { Uni_NebGridResetThread(NebGridLevel, Id.x); }
+}
+
+[numthreads(64, 1, 1)]
+void NebGridReleaseCS(uint3 Id : SV_DispatchThreadID)
+{
+	if (Id.x < NebGridOpCount) { Uni_NebGridReleaseThread(UniNebGridOps[Id.x]); }
+}
+
+/** The galaxy's per-object hashes, as the march reads them. */
+FUniGalaxyConst NebGridConst(FUniFieldParams InPar)
+{
+	const FUniVolumeView V = InVolumeView[0];
+	if (V.GalaxyConstBase != 0u) { return Uni_GalaxyConstUnpack(InParams[V.GalaxyConstBase + NebGridParam]); }
+	return Uni_GalaxyConstOf(InPar);
+}
+
+groupshared uint GNebGridOcc;
+
+[numthreads(64, 1, 1)]
+void NebGridAllocCS(uint3 Group : SV_GroupID, uint Thread : SV_GroupIndex)
+{
+	const uint Op = Group.x + Group.y * 65535u;
+	if (Thread == 0u) { GNebGridOcc = 0u; }
+	GroupMemoryBarrierWithGroupSync();
+	const bool bOp = Op < NebGridOpCount;
+	FUniNebGridOp O = UniNebGridOps[min(Op, max(NebGridOpCount, 1u) - 1u)];
+	const uint K = O.LevelEntry >> 24u;
+	const float4 Ha = UNI_NEB_GRID_HEADER(UNI_NEB_GRID_HEADERS + 3u * K);
+	const uint N = (uint)UNI_NEB_GRID_HEADER(UNI_NEB_GRID_HEADERS + 3u * K + 2u).y;
+	if (bOp && N > 0u)
+	{
+		const FUniFieldParams Par = InParams[NebGridParam];
+		const FUniGalaxyConst Gk = NebGridConst(Par);
+		[loop]
+		for (uint I = Thread; I < N * N * N; I += 64u)
+		{
+			if (GNebGridOcc != 0u) { break; }
+			if (Uni_NebGridClassifySample(Ha.x, O.Wx, O.Wy, O.Wz, I, N, Par, Gk)) { InterlockedOr(GNebGridOcc, 1u); }
+		}
+	}
+	GroupMemoryBarrierWithGroupSync();
+	if (Thread == 0u && bOp) { UniNebGridOpSlot[Op] = Uni_NebGridAllocThread(O, N == 0u || GNebGridOcc != 0u); }
+}
+
+[numthreads(64, 1, 1)]
+void NebGridBakeCS(uint3 Group : SV_GroupID, uint Thread : SV_GroupIndex)
+{
+	// No group-shared memory and no barriers here: the group's early return is safe.
+	const uint Op = Group.x + Group.y * 65535u;
+	if (Op >= NebGridOpCount) { return; }
+	const uint Slot = UniNebGridOpSlot[Op];
+	if (Slot >= UNI_NEB_GRID_EMPTY) { return; }
+	const FUniNebGridOp O = UniNebGridOps[Op];
+	const FUniFieldParams Par = InParams[NebGridParam];
+	const FUniGalaxyConst Gk = NebGridConst(Par);
+	const FUniVolumeView V = InVolumeView[0];
+	[loop]
+	for (uint I = Thread; I < UNI_NEB_GRID_SLOT * UNI_NEB_GRID_SLOT * UNI_NEB_GRID_SLOT; I += 64u)
+	{
+		Uni_NebGridBakeThread(O, Slot, I, Par, Gk, V.NebulaFineGain, V.NebulaDark);
 	}
 }
 

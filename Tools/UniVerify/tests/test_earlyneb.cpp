@@ -124,12 +124,13 @@ namespace
 			const H::float3 Pm{ float(O[0] + Tm * Dir[0]), float(O[1] + Tm * Dir[1]), float(O[2] + Tm * Dir[2]) };
 			H::float4 C(0, 0, 0, 0), Nv(0, 0, 0, 0);
 			const float Fm = float(ThetaPx * Tm);
-			const float Rho = H::UniField_GalaxyFilteredCKN(Pm, P, K, Fm, C, Nv);
-			const float Nd = H::Uni_GalaxyNebulaDensity(Nv, P, Fm, float(S));
-			const H::float3 Cn = H::Uni_GalaxyNebulaColour(P, K.Hs, Nv.z, H::Uni_GalaxyNebulaBlend(P, Fm, float(S)));
+			H::FUniGalaxyConst Ks = K; Ks.Step = float(S);   // D-238: as the engine's march (the globulars widen over the step)
+			const float Rho = H::UniField_GalaxyFilteredCKN(Pm, P, Ks, Fm, C, Nv);
+			const float Nd = H::Uni_GalaxyNebulaDensity(Nv, P, Fm);
+			const H::float3 Cn = H::Uni_GalaxyNebulaColour(P, K.Hs, Nv.z, H::Uni_GalaxyNebulaBlend(P, Fm, 0.0f));
 			R.Stars += double(Rho) * S;
 			R.Neb += double(Nd) * S;
-			R.NebM += double(H::Uni_GalaxyNebulaDensity(Nv, P, 1.0f, float(S))) * S;
+			R.NebM += double(H::Uni_GalaxyNebulaDensity(Nv, P, 1.0f)) * S;
 			R.Src += double(Nv.x) * S;
 			R.Col[0] += (double(Rho) * Base.x + double(Nd * Cn.x)) * S;
 			R.Col[1] += (double(Rho) * Base.y + double(Nd * Cn.y)) * S;

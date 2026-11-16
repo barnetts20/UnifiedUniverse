@@ -9,6 +9,7 @@
 #include "../src/UniRenderRef.h"
 #include "../src/UniVerifyCommon.h"
 #include "../src/UniVolumeRef.h"
+#include "../src/UniBlueNoise.h"
 #include "../scenes/UniScenes.h"
 #include "UniVolume.h"
 #include <algorithm>
@@ -59,7 +60,8 @@ namespace
 	/** Fly a path: per frame the camera moves by Step (cm) and turns by Turn (rad) about Axis;
 	 *  the volume is rebuilt for every frame's camera (as the engine does). Frames from the
 	 *  fifth on are compared (the first four fill the history). */
-	FPathStats FlyPath(const FUniverseDef& D, FCoord Cam0, FV3 Look, FV3 StepCm, FV3 Axis, double Turn, int Frames, int W, int Ht, bool bClamp = true, u32 MaxN = 2, int ResizeEvery = 0, bool bKeepAcrossResize = true)
+	FPathStats FlyPath(const FUniverseDef& D, FCoord Cam0, FV3 Look, FV3 StepCm, FV3 Axis, double Turn, int Frames, int W, int Ht, bool bClamp = true, u32 MaxN = 2, int ResizeEvery = 0, bool bKeepAcrossResize = true,
+		bool bJitter = false, float MaxSamples = 1.0f, bool bFineRef = false, bool bCloud = false)
 	{
 		FUniverseModel M(D);
 		FRefGenerator G(M);
@@ -69,6 +71,8 @@ namespace
 		FTemporalVolume Tv;
 		Tv.bClamp = bClamp;   // D-194
 		Tv.bKeepAcrossResize = bKeepAcrossResize;   // D-215
+		Tv.MaxSamples = MaxSamples;   // D-240
+		Tv.bCloud = bCloud;           // D-246
 		FPathStats St;
 		FCoord Cam = Cam0;
 		FV3 Fwd = Norm(Look);
@@ -100,9 +104,18 @@ namespace
 			}
 			const size_t H0 = Tv.FromHistory, R0 = Tv.FromHistory + Tv.FromFresh, M0 = Tv.Marched;
 			const auto T0 = std::chrono::steady_clock::now();
-			Tv.Step(Sc, Cm, F > 0 ? StepCm : FV3{ 0, 0, 0 }, F > 0, true, 2);
+			if (bJitter)
+			{
+				// D-240: the march jittered; the full march compared against is not.
+				FVolumeScene Sj = Sc;
+				Sj.View.MarchFlags |= H::UNI_VOL_JITTER_FLAG;
+				Tv.Step(Sj, Cm, F > 0 ? StepCm : FV3{ 0, 0, 0 }, F > 0, true, 2);
+			}
+			else { Tv.Step(Sc, Cm, F > 0 ? StepCm : FV3{ 0, 0, 0 }, F > 0, true, 2); }
 			const auto T1 = std::chrono::steady_clock::now();
-			const std::vector<H::float4> Ref = FullMarch(Sc, Cm);
+			FVolumeScene Sf = Sc;
+			if (bFineRef) { Sf.View.MarchFlags |= 2u; Sf.View.MaxSteps = 16384u; }   // D-240: an eighth of the steps (the integral)
+			const std::vector<H::float4> Ref = FullMarch(Sf, Cm);
 			const auto T2 = std::chrono::steady_clock::now();
 			if (F < 4) { continue; }
 			St.MeanN += double(Tv.Interleave);
@@ -335,3 +348,176 @@ UNI_TEST(volume, temporal_resize)
 				100.0 * Fixed.MeanP95, 100.0 * Kept.MeanP95, 100.0 * Old.MeanP95, 100.0 * Kept.HistoryShare, 100.0 * Fixed.HistoryShare));
 }
 
+
+UNI_TEST(volume, accumulate)
+{
+	// D-240 (owner 2026-11-14: slices in the nebulae's detail; CloudAtmosphere's jittered march and
+	// accumulating resolve): the march jittered and each fresh pixel blended into its history over
+	// 16 samples, on D-194's warp-speed passes of the Milky Way and inside it at rest and turning,
+	// against a fine march every frame (an eighth of the steps: the integral; the unjittered march
+	// is 4.4% off it approaching the galaxy at 3 kpc a frame, the jittered one's mean is not):
+	// every frame's light within 3% of it (over the path's mean) and within 1.5x the unjittered,
+	// unaccumulated D-194 run's error (no ghost the clamp lets through), the at-rest frames'
+	// light within 1%. (Shortening the accumulation with the pixel's motion, 16 at rest to 1 at
+	// uu.VolumeTemporal.TightPx, changed none of these by more than 0.15 points: not adopted,
+	// the clamp and its reject keep the trails out, and a moving view keeps its averaging.)
+	const double Kpc = Units::Kpc;
+	const FUniverseDef D = UniScenes::GalaxyToStar();
+	const FCoord Solar = UniScenes::SolarCamera();
+	FCoord Far = Solar;
+	{ FVec3f Fr{}; AddDisplacement(Far, Fr, FVec3d{ 0.0, -40.0 * Kpc, 45.0 * Kpc }); }
+	FCoord Wide = Solar;
+	{ FVec3f Fr{}; AddDisplacement(Wide, Fr, FVec3d{ -8.0 * Kpc - 54.0 * Kpc, -100.0 * Kpc, 112.0 * Kpc }); }
+	struct FCase { const char* Name; FCoord Cam; FV3 Look; FV3 Step; FV3 Axis; double Turn; int W, Ht; };
+	const FCase Cases[] = {
+		{ "inside, at rest", Solar, { -1, -0.12, -0.02 }, { 0, 0, 0 }, { 0, 0, 1 }, 0.0, 160, 100 },
+		{ "inside, turning 1 deg/frame", Solar, { -1, -0.12, -0.02 }, { 0, 0, 0 }, { 0, 0, 1 }, 0.017453, 160, 100 },
+		{ "3 kpc/frame toward and across", Far, { 0.0, 40.0, -45.0 }, { 0.0, 2.0 * Kpc, -2.2 * Kpc }, { 0, 0, 1 }, 0.0, 320, 200 },
+		{ "3 kpc/frame, turning 0.5 deg/frame", Far, { 0.0, 40.0, -45.0 }, { 2.0 * Kpc, 1.0 * Kpc, -2.0 * Kpc }, { 0.3, 0.2, 1 }, 0.0087, 320, 200 },
+		{ "12 kpc/frame sideways at 150 kpc", Wide, { 0.0, 100.0, -112.0 }, { 12.0 * Kpc, 0.0, 0.0 }, { 0, 0, 1 }, 0.0, 320, 200 },
+	};
+	std::string Detail;
+	double WorstLight = 0.0, WorstRatio = 0.0, RestLight = 0.0, WorstExcess = 0.0;
+	bool bOk = true;
+	for (const FCase& C : Cases)
+	{
+		const FPathStats O = FlyPath(D, C.Cam, C.Look, C.Step, C.Axis, C.Turn, 16, C.W, C.Ht, true, 2, 0, true, false, 1.0f, true);
+		const FPathStats S = FlyPath(D, C.Cam, C.Look, C.Step, C.Axis, C.Turn, 16, C.W, C.Ht, true, 2, 0, true, true, 16.0f, true);
+		const bool bRest = C.Turn == 0.0 && C.Step.X == 0.0 && C.Step.Y == 0.0 && C.Step.Z == 0.0;
+		if (bRest) { RestLight = S.WorstLightPath; }
+		WorstLight = std::max(WorstLight, S.WorstLightPath);
+		WorstRatio = std::max(WorstRatio, S.WorstLightPath / std::max(O.WorstLightPath, 0.002));
+		WorstExcess = std::max(WorstExcess, S.MeanExcess);
+		bOk = bOk && S.Frames == 12;
+		Detail += Uni::Fmt("%s[%s] light %.2f%% (D-194 %.2f%%), excess %.2f%% (%.2f%%), p95 %.1f%% (%.1f%%)", Detail.empty() ? "" : "; ", C.Name,
+			100.0 * S.WorstLightPath, 100.0 * O.WorstLightPath, 100.0 * S.MeanExcess, 100.0 * O.MeanExcess, 100.0 * S.MeanP95, 100.0 * O.MeanP95);
+	}
+	Uni::Check(2, "T2.vol.accumulate", "D-240 the jittered march accumulated over 16 samples (the fresh pixel blended into its clamped history): on D-194's warp-speed passes and inside the Milky Way at rest and turning, every frame's light within 3% of a fine march (an eighth of the steps; over the path's mean) and within 1.5x the unjittered, unaccumulated run's (D-194: 0.2% floor), at rest within 1%")
+		.Metric("worst_light", WorstLight).Metric("worst_ratio", WorstRatio).Metric("rest_light", RestLight).Metric("worst_excess", WorstExcess)
+		.Pass(bOk && WorstLight < 0.03 && WorstRatio < 1.5 && RestLight < 0.01, Detail);
+}
+
+UNI_TEST(volume, resolve)
+{
+	// D-246 (owner 2026-11-14: grainy against CloudAtmosphere; "our resolve should follow the clouds
+	// template - full output resolution 2x2, 3x3, or 4x4, variance clamp, pixel averaging"):
+	// CloudAtmosphere's resolve on the jittered march with blue-noise draws.
+	//  - D-194's passes and inside the Milky Way at rest and turning, against a fine march (as
+	//    T2.vol.accumulate): every frame's light within 3% (over the path's mean), within 1.5x the
+	//    unjittered D-194 run's error (0.2% floor), at rest within 1%; excess light reported;
+	//  - a still camera inside the Milky Way's textured disc, 4 x 4 slicing, 64 frames: per pixel
+	//    and over 4 x 4 blocks against an eighth of the steps, under D-240's accumulation (its
+	//    min/max box, no fill between a pixel's own samples, hashed draws).
+	UniVerify::FBlueNoiseBind Bn(true);
+	const double Kpc = Units::Kpc;
+	const FUniverseDef D = UniScenes::GalaxyToStar();
+	const FCoord Solar = UniScenes::SolarCamera();
+	FCoord Far = Solar;
+	{ FVec3f Fr{}; AddDisplacement(Far, Fr, FVec3d{ 0.0, -40.0 * Kpc, 45.0 * Kpc }); }
+	FCoord Wide = Solar;
+	{ FVec3f Fr{}; AddDisplacement(Wide, Fr, FVec3d{ -8.0 * Kpc - 54.0 * Kpc, -100.0 * Kpc, 112.0 * Kpc }); }
+	struct FCase { const char* Name; FCoord Cam; FV3 Look; FV3 Step; FV3 Axis; double Turn; int W, Ht; };
+	const FCase Cases[] = {
+		{ "inside, at rest", Solar, { -1, -0.12, -0.02 }, { 0, 0, 0 }, { 0, 0, 1 }, 0.0, 160, 100 },
+		{ "inside, turning 1 deg/frame", Solar, { -1, -0.12, -0.02 }, { 0, 0, 0 }, { 0, 0, 1 }, 0.017453, 160, 100 },
+		{ "3 kpc/frame toward and across", Far, { 0.0, 40.0, -45.0 }, { 0.0, 2.0 * Kpc, -2.2 * Kpc }, { 0, 0, 1 }, 0.0, 320, 200 },
+		{ "3 kpc/frame, turning 0.5 deg/frame", Far, { 0.0, 40.0, -45.0 }, { 2.0 * Kpc, 1.0 * Kpc, -2.0 * Kpc }, { 0.3, 0.2, 1 }, 0.0087, 320, 200 },
+		{ "12 kpc/frame sideways at 150 kpc", Wide, { 0.0, 100.0, -112.0 }, { 12.0 * Kpc, 0.0, 0.0 }, { 0, 0, 1 }, 0.0, 320, 200 },
+	};
+	std::string Detail;
+	double WorstLight = 0.0, WorstRatio = 0.0, RestLight = 0.0, WorstExcess = 0.0;
+	bool bOk = true;
+	for (const FCase& C : Cases)
+	{
+		const FPathStats O = FlyPath(D, C.Cam, C.Look, C.Step, C.Axis, C.Turn, 16, C.W, C.Ht, true, 2, 0, true, false, 1.0f, true);
+		const FPathStats S = FlyPath(D, C.Cam, C.Look, C.Step, C.Axis, C.Turn, 16, C.W, C.Ht, true, 2, 0, true, true, 16.0f, true, true);
+		const bool bRest = C.Turn == 0.0 && C.Step.X == 0.0 && C.Step.Y == 0.0 && C.Step.Z == 0.0;
+		if (bRest) { RestLight = S.WorstLightPath; }
+		WorstLight = std::max(WorstLight, S.WorstLightPath);
+		WorstRatio = std::max(WorstRatio, S.WorstLightPath / std::max(O.WorstLightPath, 0.002));
+		WorstExcess = std::max(WorstExcess, S.MeanExcess);
+		bOk = bOk && S.Frames == 12;
+		Detail += Uni::Fmt("%s[%s] light %.2f%% (D-194 %.2f%%), excess %.2f%% (%.2f%%), p95 %.1f%% (%.1f%%)", Detail.empty() ? "" : "; ", C.Name,
+			100.0 * S.WorstLightPath, 100.0 * O.WorstLightPath, 100.0 * S.MeanExcess, 100.0 * O.MeanExcess, 100.0 * S.MeanP95, 100.0 * O.MeanP95);
+	}
+	// The still camera inside the textured disc.
+	double ErrOld = 0, ErrNew = 0, BlkOld = 0, BlkNew = 0, ErrPix = 0, BlkPix = 0, CrawlOld = 0, CrawlPix = 0, CrawlNew = 0;
+	{
+		FWebTexture Tx[3];
+		bool bTex = true;
+		for (int S = 0; S < 3; ++S) { std::string E; if (!FWebTexture::LoadDelivered("Data/Noise", GalaxyTextureName(S), Tx[S], &E)) { bTex = false; } }
+		if (!bTex) { Uni::Check(2, "T2.vol.resolve", "D-246 resolve").Pass(false, "textures not loaded"); return; }
+		for (int I = 0; I < 3; ++I) { BindGalaxyTexture(I, &Tx[I]); }
+		FUniverseDef Dt = UniScenes::Flythrough();
+		UniScenes::UseGalaxyTextures(Dt, Tx[0].Size);
+		UniScenes::UseGalaxyPalettes(Dt);
+		FUniverseModel Mo(Dt);
+		FRefGenerator G(Mo);
+		FVolumeBuilder VB(Mo, G);
+		const int W = 128, Ht = 72;
+		FCamera Cm; { FCoord C = FCoord::Origin(); FVec3f Fr; AddDisplacement(C, Fr, FVec3d{ -8.0 * Units::Kpc, 0.0, 20.0 * Units::Pc }); Cm.Coord = C; }
+		Cm.Width = W; Cm.Height = Ht; Cm.LookAlong({ 1.0, 0.25, -0.02 });
+		FRefPipeline Pp(G); Pp.bVelocityLod = false; Pp.Update(Cm.Coord, FVec3f{});
+		FVolumeSettings Sv; Sv.NebulaGain = 1.0f; Sv.NebulaReflect = 6.0f;
+		FVolumeScene Sc = VB.Build(Pp, Cm.Coord, FVec3f{}, Cm.View(), Sv).Subset(false);
+		std::vector<H::float4> Ref;
+		{ FVolumeScene Sf = Sc; Sf.View.MarchFlags |= 2u; Sf.View.MaxSteps = 16384u; Ref = FullMarch(Sf, Cm); }
+		Sc.View.MarchFlags |= H::UNI_VOL_JITTER_FLAG;
+		auto Lm = [](const H::float4& V) { return 0.2126 * V.x + 0.7152 * V.y + 0.0722 * V.z; };
+		double RefMean = 0.0; for (const H::float4& V : Ref) { RefMean += Lm(V) / Ref.size(); }
+		// D-247: the crawl, frame to frame over the last 16 frames: 4 x 4 block means' change.
+		auto Blocks = [&](const std::vector<H::float4>& A)
+		{
+			std::vector<double> B;
+			for (int By = 0; By + 4 <= Ht; By += 4) for (int Bx = 0; Bx + 4 <= W; Bx += 4)
+			{
+				double S = 0; for (int Y = By; Y < By + 4; ++Y) for (int X = Bx; X < Bx + 4; ++X) { S += Lm(A[size_t(Y) * W + X]) / 16.0; }
+				B.push_back(S);
+			}
+			return B;
+		};
+		auto Run = [&](bool bCloud, bool bBlue, bool bCell, double& OutCrawl)
+		{
+			UniVerify::FBlueNoiseBind B2(bBlue);
+			FTemporalVolume Tv;
+			Tv.MaxSamples = 16.0f; Tv.bCloud = bCloud; Tv.Interleave = 4; Tv.bCellNoise = bCell;
+			std::vector<double> Last;
+			OutCrawl = 0.0; int Nc = 0;
+			for (int F = 0; F < 64; ++F)
+			{
+				Tv.Step(Sc, Cm, FV3{ 0, 0, 0 }, true, true, 2);
+				if (F >= 47)
+				{
+					std::vector<double> B = Blocks(Tv.Vol);
+					if (!Last.empty()) { for (size_t I = 0; I < B.size(); ++I) { OutCrawl += std::abs(B[I] - Last[I]) / std::max(RefMean, 1e-300); ++Nc; } }
+					Last = B;
+				}
+			}
+			OutCrawl /= std::max(Nc, 1);
+			return Tv.Vol;
+		};
+		auto Errs = [&](const std::vector<H::float4>& A, double& OutPix, double& OutBlk)
+		{
+			const double M = RefMean;
+			OutPix = 0.0; for (size_t I = 0; I < A.size(); ++I) { OutPix += std::abs(Lm(A[I]) - Lm(Ref[I])) / std::max(M, 1e-300) / A.size(); }
+			OutBlk = 0.0; int Nb = 0;
+			for (int By = 0; By + 4 <= Ht; By += 4) for (int Bx = 0; Bx + 4 <= W; Bx += 4)
+			{
+				double Sa = 0, Sr = 0;
+				for (int Y = By; Y < By + 4; ++Y) for (int X = Bx; X < Bx + 4; ++X) { Sa += Lm(A[size_t(Y) * W + X]) / 16.0; Sr += Lm(Ref[size_t(Y) * W + X]) / 16.0; }
+				OutBlk += std::abs(Sa - Sr) / std::max(M, 1e-300); ++Nb;
+			}
+			OutBlk /= std::max(Nb, 1);
+		};
+		Errs(Run(false, false, false, CrawlOld), ErrOld, BlkOld);
+		Errs(Run(true, true, false, CrawlPix), ErrPix, BlkPix);   // D-246: noise per pixel
+		Errs(Run(true, true, true, CrawlNew), ErrNew, BlkNew);    // D-247: per cell
+		for (int I = 0; I < 3; ++I) { BindGalaxyTexture(I, nullptr); }
+	}
+	Uni::Check(2, "T2.vol.resolve", "D-246 CloudAtmosphere's resolve (bilinear fill of the 4 x 4 fresh samples, variance clamp on compressed radiance, the fill blended into every pixel each frame, two ages) on the jittered march with blue-noise draws: on D-194's passes and inside the Milky Way at rest and turning, every frame's light within 3% of a fine march, within 1.5x the unjittered D-194 run's (0.2% floor), at rest within 1%; a still camera in the Milky Way's textured disc (4 x 4 slicing, 64 frames) nearer an eighth of the steps than D-240's accumulation, per pixel")
+		.Metric("worst_light", WorstLight).Metric("worst_ratio", WorstRatio).Metric("rest_light", RestLight).Metric("worst_excess", WorstExcess)
+		.Metric("still_err_d240", ErrOld).Metric("still_err_d246", ErrNew).Metric("still_block_d240", BlkOld).Metric("still_block_d246", BlkNew)
+		.Pass(bOk && WorstLight < 0.03 && WorstRatio < 1.5 && RestLight < 0.01 && ErrNew < ErrOld,
+			Uni::Fmt("%s; still, 64 frames, vs an eighth of the steps: per pixel D-240 %.2f%%, D-246 %.2f%%, D-247 %.2f%%; 4 x 4 blocks %.2f%%, %.2f%%, %.2f%%; their crawl a frame %.3f%%, %.3f%%, %.3f%%",
+				Detail.c_str(), 100.0 * ErrOld, 100.0 * ErrPix, 100.0 * ErrNew, 100.0 * BlkOld, 100.0 * BlkPix, 100.0 * BlkNew, 100.0 * CrawlOld, 100.0 * CrawlPix, 100.0 * CrawlNew));
+}

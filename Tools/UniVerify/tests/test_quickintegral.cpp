@@ -181,7 +181,7 @@ UNI_TEST(stream, quick_integral)
 	}
 	Mean /= double(std::max<size_t>(N, 1));
 	const double Speed = ExactMs / std::max(QuickMs, 1e-9);
-	Uni::Check(2, "T2.stream.quick_integral", "D-229 a galaxy's quick integral (4096 importance samples: ball, thin disc, core) against the exact one on a rich cluster's galaxies: mean within 3%, worst within 8%, over 100x faster, the same value every time")
+	Uni::Check(2, "T2.stream.quick_integral", "D-229 a galaxy's quick integral (8192 importance samples since D-262: ball, thin disc, core) against the exact one on a rich cluster's galaxies: mean within 3%, worst within 8%, over 100x faster, the same value every time")
 		.Metric("mean_err", Mean).Metric("worst_err", Worst).Metric("speedup", Speed)
 		.Pass(N >= 20 && Mean < 0.03 && Worst < 0.08 && Speed > 100.0 && bSame,
 			Uni::Fmt("%zu galaxies: mean %.2f%%, worst %.2f%%; %.2f ms against %.0f ms (%.0fx)", N, 100.0 * Mean, 100.0 * Worst, QuickMs / double(N), ExactMs / double(N), Speed));

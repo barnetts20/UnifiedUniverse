@@ -246,6 +246,8 @@ FOLDED = {
     ("FUniGalMapBakeCS", "UniGalWarpFine"): "Uni_GalaxyMapTexel calls Uni_GalaxySharedK with InTex = false (D-212)",
     ("FUniGalMapBakeCS", "UniGalWarpLarge"): "Uni_GalaxyMapTexel calls Uni_GalaxySharedK with InTex = false (D-212)",
     ("FUniGalMapBakeCS", "UniGalDetail"): "Uni_GalaxyMapTexel calls Uni_GalaxySharedK with InTex = false (D-212)",
+    ("FUniGalMapBakeCS", "UniGalShape"): "Uni_GalaxyMapTexel calls Uni_GalaxySharedK with InTex = false (D-212; D-259 galaxy_shape is read beside galaxy_detail)",
+    ("FUniGalMapBakeCS", "UniGalShapeTune"): "Uni_GalaxyMapTexel calls Uni_GalaxySharedK with InTex = false: UNI_GAL_SHAPE is read only under the detail read and S.bDetail, both 0 there (D-259)",
 }
 
 

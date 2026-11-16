@@ -91,7 +91,8 @@ A **carrier** is one marched volume: a contributor (the object that owns an emit
    - Start: local carriers start at max(chord entry, 1 pc). The background starts at 0.1 Mpc: nearer galaxies are resolved, and log steps from 1 pc cost about 350 per ray for about 2e-5 of the light.
    - Tail: the background marches to 0.5 periods (50 Mpc for the demo web), then adds an analytic tail ∫ ℓ D dt with mean density, which is a per-frame cumulative LUT. Marching 2 periods instead changes the all-sky light by < 0.01% (measured).
 6. **Budget.** An explicit step budget (256 for the near layer). A march that hits it sets a truncation flag that the debug view shows and the stats count. A truncated march must never look finished (lesson #35).
-7. **No jitter in v1.** The pass runs after TSR (§8), so nothing would denoise it. Banding is measured offline, and if it is visible, v1.1 adds the volume's own temporal accumulation (the volumetric-cloud technique).
+7. **Jitter and accumulation (D-240; superseded "no jitter in v1").** Each ray starts its log lattice at its own phase (its first step x 1 - a draw), and each sample sits at a drawn point of its step instead of the midpoint. The draws are interleaved gradient noise of the ray's pixel, shifted by the golden ratio with every sample the pixel takes (`Uni_VolumeDraw`). The temporal pass blends a fresh pixel into its history, clamped to the box of its fresh neighbours, over up to `uu.VolumeAccumulate` samples; a clamp that moves the history shortens the age (`Uni_TemporalAlpha` / `Uni_TemporalReject`). Structure finer than a step then converges instead of slicing about the camera. The cube passes (background, far cache) stay unjittered.
+8. **Blue noise, CloudAtmosphere's resolve, before TSR (D-246).** The draws read the engine's FastBlueNoise_scalar_128x128x8 at the pixel, the lookup moved by the R2 sequence per draw (`uu.VolumeBlueNoise`). With `uu.VolumeResolve` the march runs at full resolution (`uu.VolumeResolveDivisor`, 4x the pixel budget) sliced N x N, and every pixel blends the bilinear fill of the 4 x 4 fresh samples about it into its history, clamped to their mean +- gamma sigma on compressed radiance (gamma 4 at rest, 1 in motion), with two ages (all, own). With `uu.VolumeBeforeTSR` the whole volume is composited in the BeforeDOF callback (priority 100, ahead of CloudAtmosphere), its rays on the view's jitter; the stars stay after TSR and read its slices.
 
 ## 7. Extinction and sprites (D-132)
 
@@ -163,6 +164,21 @@ Every hook stays in the existing post-MotionBlur callback (`UniRenderHooks.cpp`)
 | D-134 | The carrier normalising integral: a 64k-sample estimate until D-123's full integral is cached (about 1% flux noise at most) | None |
 | D-135 | Sprite colour normalised by luminance (Rec. 709), not by its brightest channel, so light sums conserve | None |
 | D-136 | Background marched into a direction map from 0.1 Mpc; composite B_near + T_near × B_map | None |
+| D-240 | The local march jittered (per-ray lattice phase, jittered samples) and accumulated by the temporal pass; supersedes D-130's "no jitter in v1" | None (render only) |
+| D-241 | The nebulae rebuilt as structure eroded by warped detail layers (cloud style), level of detail by footprint, no step terms | None (render only) |
+| D-242 | Each nebula's dark share: emission x (1 - 0.85 a), dark dust added to its structure up close (gone once unresolved) | None (render only) |
+| D-243 | Ionisation fronts: the dark share splits a nebula into glowing and dark parts with bright fronts | None (render only) |
+| D-244 | Fine steps inside the gas layer (whole-field sub-samples), behind uu.Nebula.Refine, off | None (render only) |
+| D-245 | A galaxy's nebulae fade in past the handoff (6x, log size); FUniCarrier 128 bytes | None (render only) |
+| D-247 | The sliced march's blue noise per cell plus a rank offset (CloudAtmosphere's NoiseOffset) | None (render only) |
+| D-248 | Nebula handles (scale, prevalence, detail scale, octave, mip bias; normalised by measured tables); the detail to 7 kpc | None (render only) |
+| D-249 | The galaxy textures by console variable; the nebulae's own detail texture slot; uu.ReloadTextures | The three galaxy textures when changed |
+| D-250 | Diffuse dust in dusty galaxies: smooth disc, reach log-uniform 0.75..10 kpc per galaxy, faded in past the handoff; view 192 bytes | None (render only) |
+| D-251 | The grain: finer steps through the gas layer within the detail's reach (uu.Nebula.StepRatio 0.08); a-trous denoise and a step level of detail as handles, off | None (render only) |
+| D-252 | The nebula grid: the camera's spiral's nebulae baked into sparse, nested, galaxy-local cells (each its cell's average), read along each step; 128 or 256 cells across | None (render only) |
+| D-253 | Nebulae kept to 32 kpc (the grid's reach), the grid's dark dust fading with its light, the peak held softly (uu.Nebula.Peak 200) | None (render only) |
+| D-254 | The nebula grid follows the nearest spiral within 64 kpc, from outside too (up to 12 levels): no pop at the galaxy's edge | None (render only) |
+| D-246 | Blue-noise draws (the engine's tile), CloudAtmosphere's resolve at full resolution (fill, variance clamp, two ages), the volume composited before TSR ahead of the atmosphere | None (render only) |
 
 ## 11. Build plan
 
@@ -204,6 +220,10 @@ The march's cost is rays x steps per ray x cost per step. These are the console 
 | `uu.Nebula` | 1 | D-234: emission nebulae (H II regions) on galaxies' star-forming knots, in a gas layer as thin as the dust; D-235: two colours a galaxy, a fixed-mip pattern, blended to their mean where unresolved, a step cap through the gas layer for rays crossing it. 0: off (and no cap) | D-234, D-235 |
 | `uu.Nebula.Reflect` | 6 | D-234: reflection nebulae: dust near the knots lit blue. 0: off | D-234 |
 | `uu.Nebula.NearKpc` | 0 | D-234: nebulae fade in from here to 3x; D-235: off by default (they were lost up close) | D-234, D-235 |
+| `uu.Nebula.Fine` | 1 | D-241: the nebulae's detail layers: the knot structure eroded by warped walls (~42 pc in the Milky Way) and texture (~10 pc), dark lanes in the dust; each layer's level of detail by the pixel's footprint. 0: off (their mean) | D-237, D-241 |
+| `uu.Nebula.FineReachKpc` | 1 | D-241: the detail out to here, faded over the second half by each sample's own distance | D-237, D-241 |
+| `uu.Nebula.Dark` | 0.35 | D-242: the nebulae's mean dark share: each spiral nebula balances glow against dark dust (opaque in its core, glowing at its rims) around it. 0: all glow (+14% light), 1: all dust; below 0: off (D-241) | D-242 |
+| `uu.Nebula.Refine` | 1 | D-244: inside a spiral's gas layer, a long step split into up to this many sub-samples (each the whole field): far knots sharp N x farther, ~2.5x the galaxy work along the disc at 4. 1: off | D-244 |
 | `uu.MotionWeb` | 0.01 | the motion web: the web's filaments and nodes glow faintly while travelling; a galaxy disc's surface brightness per Mpc at full strength. 0: off | D-230 |
 | `uu.MotionWeb.Threshold` / `Near` / `Depth` | 3 / 4 / 50 | above this multiple of the filament + node mean; faded in over the first Near Mpc, out over the second half of Depth Mpc | D-230 |
 | `uu.Shift` / `uu.Shift.Colour` | 0.5 / 1.0 | the travel shift: ahead blue, behind red, luminance kept, on the volume and every sprite (ln of the factor ahead; the tint's strength). 0: off | D-230 |
@@ -237,6 +257,31 @@ The march's cost is rays x steps per ray x cost per step. These are the console 
 | `uu.GalaxyMap.Slots` | 8 | galaxy maps on the GPU at once (a texture array): every galaxy stars are placed in (D-214: placement reads the map too) and the camera's own; a galaxy past them waits as glow until a slot is unused for 64 frames | D-214 |
 | `uu.CellFadeFrames` | 8 | frames a Ready cell's sprites take to fade in (its glow fades out by the same amount) | D-203 |
 | `uu.StreamBuildBudget` | 96 | cells built per frame over every level, those needed soonest first; the rest wait as glow. 0: D-173's per-level rule | D-203 |
+| `uu.VolumeJitter` | 1 | D-240: jittered lattice phase and samples (§6.7). 0: D-130's unjittered steps (the slices come back) | D-240 |
+| `uu.VolumeAccumulate` | 16 | D-240: a fresh pixel's history blend, in samples (with the jitter). 1: a fresh pixel replaces its history (D-184) | D-240 |
+| `uu.VolumeBlueNoise` | 1 | D-246: the draws from the engine's blue-noise tile (§6.8). 0: D-240's hashed draws | D-246 |
+| `uu.VolumeResolve` | 1 | D-246: CloudAtmosphere's resolve on the sliced march, at `uu.VolumeResolveDivisor` with 4x `uu.VolumeMaxMarchPixels`. 0: D-240's reconstruct at `uu.VolumeDivisor` | D-246 |
+| `uu.VolumeResolveDivisor` | 1 | D-246: the march's divisor with the resolve (1: full resolution) | D-246 |
+| `uu.Nebula.Scale` | 1 | D-248: the nebulae's size (0.25..4) | D-248 |
+| `uu.Nebula.Prevalence` | 1 | D-248: their coverage over the default's (x0.05..x5.6; light grows with it) | D-248 |
+| `uu.Nebula.FineScale` / `.FineOctave` / `.FineLodBias` | 1 / 4 / 0 | D-248: the detail layers' size, the texture over the walls, mips added by footprint | D-248 |
+| `uu.Nebula.FineReachKpc` | 7 | D-237, D-241; D-248: 1 -> 7 | D-248 |
+| `uu.Galaxy.DiffuseDust` | 1 | D-250: dusty galaxies' diffuse dust opacity (0: off) | D-250 |
+| `uu.Galaxy.DustReachMinKpc` / `MaxKpc` | 0.75 / 10 | D-250: the range each galaxy's reach is rolled in (log-uniform) | D-250 |
+| `uu.Galaxy.DiffuseDustHeight` | 1.5 | D-250: its scale height over the dust layer's | D-250 |
+| `uu.Nebula.StepRatio` | 0.08 | D-251: the step ratio through a spiral's gas layer within the detail's reach (0: the carrier's) | D-251 |
+| `uu.VolumeDenoise` / `uu.VolumeDenoiseSigma` | 0 / 4 | D-251: a-trous passes over the resolve (SVGF; off) and their edge stop | D-251 |
+| `uu.Nebula.FineStepLod` | 0 | D-251: the detail prefiltered over this x the step (off) | D-251 |
+| `uu.Nebula.Grid` | 1 | D-252: the nebula grid (0: D-251's march) | D-252 |
+| `uu.Nebula.GridCells` | 128 | D-252: cells across a level, 128 or 256 (~45 / ~171 MB at the 64 kpc reach) | D-252 |
+| `uu.Nebula.GridSamples` | 1 | D-252: the bake's samples a grid point (1 or 8) | D-252 |
+| `uu.Nebula.GridBudget` | 128 | D-252: bricks (8^3 cells) classified and baked a frame at most | D-252 |
+| `uu.Nebula.GridFetches` | 32 | D-252: a step's grid reads at most (a longer step reads a coarser level); D-255: the cells a step's walk crosses | D-252, D-255 |
+| `uu.Volume.StepFoot` | 0.5 | D-255: the camera's galaxy's map read over at least this x the step along the disc (the cone rule; 0: the pixel's footprint) | D-255 |
+| `uu.Nebula.GridCellPc` / `GridReachKpc` | 4 / 64 | D-252: the finest cell; the levels' reach (D-253: 8 -> 32; D-254: 64, the nearest spiral within it) | D-252..D-254 |
+| `uu.Nebula.Peak` | 200 | D-253: the nebulae's shape held softly under this x its mean (0: off) | D-253 |
+| `uu.Nebula.GridPool` / `GridLayer` | 1.25 / 3 | D-252: pool slots over the expected occupancy; the gas layer's scale heights covered | D-252 |
+| `uu.VolumeBeforeTSR` | 1 | D-246: the volume composited before TSR (BeforeDOF, ahead of CloudAtmosphere); stars after TSR. 0: all after TSR (D-124) | D-246 |
 | `uu.VolumeInterleave` | 4 | most pixels per side of the temporal slicing's block: 4 x 4 below 0.1 march px of motion a frame, 3 x 3 below 0.5, else 2 x 2 | D-208 |
 | `uu.TravelExposure` | 1.5 | magnitudes everything is brightened by at full travel speed (render only; windows unchanged) | D-205 |
 

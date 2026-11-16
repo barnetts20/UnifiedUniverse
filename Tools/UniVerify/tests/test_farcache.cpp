@@ -294,6 +294,7 @@ UNI_TEST(volume, far_flight)
 
 UNI_TEST(volume, far_split_nebulae)
 {
+	const UniVerify::FGalShapeOff ShapeOff;   // D-262 (B-041)
 	// D-235 (owner, D-235 in the engine: "the nebula are not getting rendered consistently in all
 	// clipmap bands... a nebula that is straddling bands and half of it is cut off"): the far map's
 	// texels are coarser than the screen's pixels, and the nebulae blended to their mean at its
@@ -360,6 +361,6 @@ UNI_TEST(volume, far_split_nebulae)
 			Detail += Uni::Fmt("%s%s, map 1/%d: nebulae's light %+.1f%%", Detail.empty() ? "" : "; ", Sh.Name, Div, 100.0 * (Lc / std::max(Lw, 1e-300) - 1.0));
 		}
 	}
-	Uni::Check(2, "T2.vol.far_split_nebulae", "D-235 the textured Milky Way's nebulae across the far cache's split (R 2 kpc, the map at a half and a quarter of the view's resolution), two views: the nebulae's added light (on - off) in near + far map within 5% of the whole march's")
+	Uni::Check(2, "T2.vol.far_split_nebulae", "D-235 (D-262: with D-258's galaxy shaping off, B-041) the textured Milky Way's nebulae across the far cache's split (R 2 kpc, the map at a half and a quarter of the view's resolution), two views: the nebulae's added light (on - off) in near + far map within 5% of the whole march's")
 		.Metric("worst", Worst).Pass(Worst < 0.05, Detail);
 }

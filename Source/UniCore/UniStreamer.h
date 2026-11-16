@@ -97,6 +97,9 @@ namespace UniCore
 		H.Count = C.Count; H.CandidateBudget = C.CandidateBudget; H.Mean = C.Mean; H.Envelope = C.Envelope;
 		H.OctLo = UniHlsl::float4(C.Oct[0], C.Oct[1], C.Oct[2], C.Oct[3]);
 		H.OctHi = UniHlsl::float4(C.Oct[4], C.Oct[5], C.Oct[6], C.Oct[7]);
+		H.GcHead = UniHlsl::float4(C.Gc[0], C.Gc[1], C.Gc[2], C.Gc[3]);   // D-238: the globulars' share of the candidates
+		H.GcIdx0 = H.GcIdx1 = H.GcMass0 = H.GcMass1 = H.OcRange = UniHlsl::float4(0.0f, 0.0f, 0.0f, 0.0f);
+		H.OcHead = UniHlsl::float4(C.Gc[20], C.Gc[21], C.Gc[22], C.Gc[23]);   // D-239
 		return UniHlsl::Uni_PlanCandidates(InCap, H);
 	}
 

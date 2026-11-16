@@ -54,7 +54,7 @@ static const uint UNI_CARRIER_PREFILTER = 8u;       // D-160: sample the field p
 static const uint UNI_CARRIER_PALETTE = 16u;        // D-182: a galaxy with a palette (PaletteIndex)
 static const uint UNI_CARRIER_ICL = 32u;            // D-191: a rich cluster's intracluster light (a second LUT block, PaletteIndex, x IclRatio)
 
-/** One marched volume. 112 bytes (UniCore::FCarrierGPU, static_assert). */
+/** One marched volume. 128 bytes (UniCore::FCarrierGPU, static_assert). */
 struct FUniCarrier
 {
 	float3 CamLocal;        // camera in field units (periodic: in [0, 1))
@@ -77,6 +77,10 @@ struct FUniCarrier
 	float StepRatio;        // D-164: this carrier's log step ratio (0: the view's); a step takes the smallest of the active carriers'
 	uint PaletteIndex;      // D-182: its palette's parameter block (A..D bulge, disc, arms, knots; E whole body), with UNI_CARRIER_PALETTE; D-191: a cluster's total-light LUT block, with UNI_CARRIER_ICL
 	float IclRatio;         // D-191: intracluster light / members' light, with UNI_CARRIER_ICL
+	float NebulaHide;       // D-245: a galaxy's nebulae hidden (1) to shown (0) past the handoff (Uni_CarrierNebulaFade); 0 by default
+	float CarrierPad0;
+	float CarrierPad1;
+	float CarrierPad2;
 };
 
 struct FUniVolumeView
@@ -101,13 +105,13 @@ struct FUniVolumeView
 	uint4 GlowMask;
 	uint GlowBase;          // float4 index of the first grid header in the LUT buffer
 	uint GlowLevels;        // set bits in GlowMask (0: no cell glow)
-	uint MarchFlags;        // D-206: bit 0: no shared web texel reads (checks only); D-219: bit 1: every step an eighth (the checks' fine reference); D-231: bit 2: with bit 1, the motion web's detail blurred over the unrefined step (checks only)
+	uint MarchFlags;        // D-206: bit 0: no shared web texel reads (checks only); D-219: bit 1: every step an eighth (the checks' fine reference); D-231: bit 2: with bit 1, the motion web's detail blurred over the unrefined step (checks only); D-240: bit 3: jittered steps (Uni_VolumeMarchJ)
 	uint GalaxyConstBase;   // D-210: params index of the galaxy constant blocks (one per parameter block, Uni_GalaxyConstPack); 0: hash inline
 	// D-212: the galaxy map (Uni_GalaxyMapEval): the camera's own galaxy from its baked 2D map.
 	uint MapCarrier;        // the mapped carrier's index + 1 (0: none)
 	uint MapSize;           // texels a side of its mip 0
 	uint MapSlot;           // D-214: its slot in the map array
-	uint MapPad1;
+	uint NebulaRefine;      // D-244: the most sub-samples of a step inside a spiral's gas layer, each with the whole field (uu.Nebula.Refine; 0, 1: none)
 	// D-230: the motion web (uu.MotionWeb; render-only art choice, 0 = off): the textured web's
 	// filaments and nodes as a faint glow while travelling (Uni_MotionWebEmission).
 	float MotionWebGain;     // radiance per cm at full strength
@@ -125,6 +129,27 @@ struct FUniVolumeView
 	float NebulaReflect;
 	float NebulaNearCm;      // D-234: faded in from here to 3x (render only): up close the field has no structure yet
 	float NebulaThetaPixel;  // D-235: the screen's rad per pixel for the nebulae's blend in the cube passes (far cache, background), whose ThetaPixel is their texel's; 0: ThetaPixel
+	// D-237, D-241: the nebulae's detail layers (Uni_GalaxyNebulaShapeAt; render only).
+	float NebulaFineGain;    // their strength: 0 off (the fade means), 1 full
+	float NebulaDark;        // D-242: the nebulae's mean dark share (uu.Nebula.Dark, 0..1; below 0: none, D-241's)
+	float NebulaFineReachCm; // the detail out to here, faded over its second half (per sample, at its jittered distance)
+	float JitterShift;       // D-240: this sample's shift of every jitter draw (golden ratio x the pixel's sample count; Uni_VolumeDraw)
+	// D-250: the galaxies' diffuse dust (render only; Uni_GalaxyDiffuseDust): each dusty galaxy's
+	// reach along its mid-plane at the reference radius, log-uniform in [lo, hi] by its seed
+	// (DIFFUSEDUST), x 1 / gain (0: off), its scale height x the dust set's.
+	float DiffuseDustReachLoCm;
+	float DiffuseDustReachHiCm;
+	float DiffuseDustGain;
+	float DiffuseDustHeight;
+	// D-252: the nebula grid (Uni_NebGridSegment; the renderer's, render only).
+	uint NebGridCount;       // its levels (0: off, the field as D-251)
+	uint NebGridParam;       // the parameter index of the spiral it holds (the camera's)
+	float NebGridFetchMax;   // a step's reads at most this many (the level's cell grows to fit a longer step)
+	float StepFoot;          // D-255: the camera's galaxy's map read over at least this x the step along the disc (the cone rule; 0: the pixel's alone)
+	uint SegmentTaps;        // D-262: the camera's galaxy's step read at up to this many points along its run in the plane (paradigm C; 0, 1: one, D-255's)
+	float OpaqueCutoff;      // D-262: a ray stops when its transmittance is under this in every channel (0: 1e-3, the old constant)
+	uint SegPad1;
+	uint SegPad2;
 };
 
 struct FUniVolumeResult
@@ -299,50 +324,6 @@ UNI_FN bool Uni_CarrierInterval(FUniCarrier InC, float3 InLocalDir, float InTSce
 	return T1 > T0;
 }
 
-/** D-210: one active carrier's step limit at InT (cm; 3e38 when it sets none): its field's step
- *  hint, loosened (D-195, D-202), over its inverse radius. The march computes it for the next
- *  step inside the sample pass, where the carrier and its parameters are already loaded (the
- *  same point and arithmetic as at the next step's start: the march is unchanged bit for bit). */
-UNI_FN float Uni_CarrierStepLimit(FUniCarrier InCa, FUniFieldParams InPar, float3 InLd, float InT, bool InCluster,
-	float3 InC0, float3 InC1, float3 InC2, float3 InC3, StructuredBuffer<FUniFieldParams> InParams, FUniVolumeView InView)
-{
-	if (InCa.FeatureScale > 0.0f)
-	{
-		// Prefiltered fields need no hint once the pixel footprint is past the blend.
-		if (!(InT * InView.ThetaPixel * InCa.InvRadius < 4.0f * InCa.FeatureScale)) { return 3.0e38f; }
-	}
-	const float3 P = Uni_CarrierPoint(InCa, InLd, InT);
-	const float FootH = (InCa.Flags & UNI_CARRIER_PREFILTER) != 0u ? InT * InView.ThetaPixel * InCa.InvRadius : 0.0f;   // D-160
-	float H;
-	float Neb = 3.0e38f;   // D-235: the nebulae's gas layer cap
-	if (InCluster) { H = Uni_ClusterStepHintC(P, InPar, InC0, InC1, InC2, InC3); }
-	else if (InCa.FieldId == UNI_FIELD_GALAXY)
-	{
-		// D-210: the mode phase hash from the builder's constant block.
-		uint Hp;
-		if (InView.GalaxyConstBase != 0u) { const float4 Kb = InParams[InView.GalaxyConstBase + InCa.ParamIndex].B; Hp = Uni_GalaxyConstJoin(Kb.x, Kb.y); }
-		else { Hp = Uni_GalaxyConstOf(InPar).Hp; }
-		H = Uni_GalaxyStepHintFilteredK(P, InLd, InPar, FootH, Hp);
-		if (InView.NebulaGain > 0.0f)
-		{
-			// D-236: the screen's footprint (as the march's nebula blend), so a cube pass caps as the per-pixel march.
-			const float FootNb = (InCa.Flags & UNI_CARRIER_PREFILTER) != 0u ? InT * (InView.NebulaThetaPixel > 0.0f ? InView.NebulaThetaPixel : InView.ThetaPixel) * InCa.InvRadius : 0.0f;
-			Neb = Uni_GalaxyNebulaStepCap(P, InLd, InPar, Hp, FootNb);
-		}
-	}
-	else { H = Uni_FieldStepHintFoot(InCa.FieldId, P, InLd, InPar, FootH); }
-	// D-195: from inside a carrier (the camera within its bounds) rays run along its structure
-	// and the hints can be looser (HintScale); from outside a ray crosses a disc steeply and
-	// keeps them as written (T3.vol.march: 5% per ray at x 2).
-	const bool bInside = (InCa.Flags & UNI_CARRIER_PERIODIC) == 0u && dot(InCa.CamLocal, InCa.CamLocal) < 1.0f;
-	// D-202: the background web's hints loosen with travel speed (WebHintScale): it is marched
-	// per pixel only then, and the glow is the fresh quarter alone there anyway.
-	const bool bPeriodic = (InCa.Flags & UNI_CARRIER_PERIODIC) != 0u;
-	const float Loose = bInside && InView.HintScale > 0.0f ? InView.HintScale : (bPeriodic && InView.WebHintScale > 0.0f ? InView.WebHintScale : 1.0f);
-	// D-235: the nebulae's gas layer, where a crossing can afford to sample them (not loosened).
-	return min(Loose * H, Neb) / InCa.InvRadius;
-}
-
 /** D-230: the motion web's emission per cm at distance InT, from the textured web's channels
  *  (filaments y, nodes z): 0 at the threshold, full two decades above it (log), faded in near the
  *  camera and out with distance, in a cool white the travel shift (Uni_TravelShift) colours.
@@ -355,6 +336,10 @@ static const float3 UNI_MOTION_WEB_COLOUR = float3(0.82f, 0.9f, 1.0f);
 // D-234: the reflection nebulae's colour at luminance 1 (scattered young light). D-235: the
 // emission nebulae's two colours a galaxy are Uni_GalaxyNebulaColour's.
 static const float3 UNI_NEBULA_REFLECT_COLOUR = float3(0.6822f, 1.0233f, 1.7054f);
+// D-237: the brightest part of each nebula toward [O III] teal (hue UNI_NEBULA_CORE_HUE,
+// saturation 0.8, luminance 1: Uni_PaletteColour), up to this share at the knot's peak.
+static const float UNI_NEBULA_CORE_HUE = 175.0f;
+static const float UNI_NEBULA_CORE_SHARE = 0.45f;
 
 /** D-236: a nebula colour family's hue (degrees) for draws InF (which family) and InU (where in
  *  it): spiral nebulae (H II regions): H-alpha red 30%, pink 18%, magenta-violet 14%, blue 8%,
@@ -472,9 +457,553 @@ UNI_FN float3 Uni_MotionWebEmission(float4 InCh, float3 InP, float InFoot, float
 	return UNI_MOTION_WEB_COLOUR * (InView.MotionWebGain * X * Fade * M);
 }
 
-UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
+// ------------------------------------------------------------------------------------------
+// D-240: jittered steps (the volumetric-cloud technique: CloudAtmosphere's camera lattice and
+// sample jitter). Without it every ray stepped on the same log-uniform shells from its carrier's
+// start and sampled each step at its middle, so structure finer than a step (nebulae, lanes, the
+// disc's detail) showed as the shells themselves: slices about the camera, the same on every
+// frame. Each ray now takes its own phase on its first step (the whole log lattice shifts by a
+// per-pixel factor, so neighbours share no step boundary; again after any gap between
+// carriers) and each sample sits at a jittered point within its step; the jitter shift moves by
+// the golden ratio with each sample the pixel takes, and the temporal pass accumulates them
+// (Uni_TemporalAlpha), so the image converges to the integral instead of showing the lattice.
+// The lattice phase is interleaved gradient noise (Jimenez 2014): neighbouring rays' phases far
+// apart. The steps' draws are a hash of the pixel and the step (moving IGN's lookup with the
+// index only adds a constant to its value, so consecutive steps were tied, r -0.43; moving the
+// value gives every step one pattern: rings about the view centre).
+// ------------------------------------------------------------------------------------------
+static const uint UNI_VOL_JITTER_FLAG = 8u;          // MarchFlags bit 3
+static const uint UNI_VOL_DRAW_PHASE = 1021u;        // the lattice phase's draw index (steps use their own index)
+
+/** D-240: draw InIndex for noise pixel (InX, InY), shifted by InShift: in [0, 1). The phase
+ *  (UNI_VOL_DRAW_PHASE): interleaved gradient noise; a step's: a hash of the pixel and the step.
+ *  D-246 (owner 2026-11-14: grainy against CloudAtmosphere; "we want to use the same blue noise as
+ *  the atmosphere"): with a blue-noise tile bound (UNI_VOL_NOISE, its size UNI_VOL_NOISE_W x
+ *  UNI_VOL_NOISE_H; the engine's FastBlueNoise_scalar_128x128x8, as CloudAtmosphere's), every
+ *  draw is the tile's texel at the pixel shifted by the R2 sequence in the index (Atmo_TextureJitter:
+ *  the lookup moves, not the value), so each step's draws are blue across the screen and apart
+ *  from the next step's: the grain sits at the highest frequencies, where the resolve, the
+ *  upscaler and the eye remove it. Without the tile: D-240's draws. */
+UNI_FN float Uni_VolumeDraw(float InX, float InY, uint InIndex, float InShift)
+{
+#ifdef UNI_VOL_NOISE
+	if (UNI_VOL_NOISE_W > 0u && UNI_VOL_NOISE_H > 0u)
+	{
+		const float Sx = frac((float)InIndex * 0.75487766f) * (float)UNI_VOL_NOISE_W;
+		const float Sy = frac((float)InIndex * 0.56984029f) * (float)UNI_VOL_NOISE_H;
+		const uint Tx = ((uint)InX + (uint)Sx) % UNI_VOL_NOISE_W;
+		const uint Ty = ((uint)InY + (uint)Sy) % UNI_VOL_NOISE_H;
+		return frac(UNI_VOL_NOISE(Tx, Ty) + InShift);
+	}
+#endif
+	if (InIndex == UNI_VOL_DRAW_PHASE)
+	{
+		return frac(frac(52.9829189f * frac(0.06711056f * InX + 0.00583715f * InY)) + InShift);
+	}
+	uint H = (uint)InX * 0x8da6b343u + (uint)InY * 0xd8163841u + InIndex * 0xcb1ab31fu;
+	H = H ^ (H >> 16u);
+	H = H * 0x7feb352du;
+	H = H ^ (H >> 15u);
+	H = H * 0x846ca68bu;
+	H = H ^ (H >> 16u);
+	return frac((float)(H >> 8u) * (1.0f / 16777216.0f) + InShift);
+}
+
+// ------------------------------------------------------------------------------------------
+// D-252 (owner 2026-11-15: "some paradigm to force the march into explicit non camera dependent
+// based sample positions ... cells could be adaptively sized for lod, but the sample falling in a
+// given cell would always return the same ... sample for that cell regardless of where the camera
+// is"; "we would rather resolve at a lower resolution/frequency than to resolve at a frequency
+// that will cause static grain"; "sparse storage ... with the ability to swap between 128/256"):
+// THE NEBULA GRID. The camera's spiral's nebulae on nested galaxy-local lattices: level K's cell is
+// the first's x 2^K (field units), its lattice point (i, j, k) at (i, j, k) x the cell, the same
+// value from any camera. A point holds its cell's average (Uni_NebGridBakePoint: the field at
+// stratified points of the cell, the detail's reads prefiltered to it): the emission density, its
+// core-tinted share, and the dust's and the reflection's multipliers (D-255: their averages). Each
+// level is a box of bricks (UNI_NEB_GRID_BRICK cells a side) about the camera, snapped to its
+// bricks; a toroidal table maps a brick to a pool slot (UNI_NEB_GRID_SLOT texels a side: lattice
+// points 0..8, the last row the next brick's first, so a trilinear read never leaves its slot), to
+// UNI_NEB_GRID_EMPTY (no nebula: the empty value, no slot) or to UNI_NEB_GRID_UNBAKED (not yet:
+// the next level reads instead). The march reads a step's segment (Uni_NebGridSegment: D-255's
+// walk over the cells it crosses) at the coarsest of the level holding the segment, the level
+// whose cell fits the step in the view's fetch budget, and the pixel's footprint; the light and
+// (D-255) the dust's and the reflection's multipliers from the grid, each the walk's average over
+// the step (D-252 took the multipliers from the knot shape at the step's one jittered point x the
+// grid's ratios: sharp, but a long step's whole extinction from that point was the grain left at
+// 1 kpc). Render only.
+//
+// Headers (float4, UNI_NEB_GRID_HEADER): [0] the pool's slots a side (x, y, z) and the levels;
+// [1] 1 / the pool's texels a side (x, y, z) and the bake's samples a point; level K from
+// UNI_NEB_GRID_HEADERS + 3 K: (cell, table base, slot base, slots), (the box's first brick x, y, z,
+// bricks a side across), (bricks a side up, classify samples a side (0: kept unread), 0, 0).
+// ------------------------------------------------------------------------------------------
+static const uint UNI_NEB_GRID_BRICK = 8u;
+static const uint UNI_NEB_GRID_SLOT = 9u;
+static const uint UNI_NEB_GRID_UNBAKED = 0xFFFFFFFFu;
+static const uint UNI_NEB_GRID_EMPTY = 0xFFFFFFFEu;
+static const uint UNI_NEB_GRID_MAX_LEVELS = 12u;   // D-254: 8 -> 12 (the grid from outside a galaxy)
+static const uint UNI_NEB_GRID_HEADERS = 2u;
+static const float UNI_NEB_GRID_BAND = 0.75f;        // a box's outer share blends to the next level
+static const float UNI_NEB_GRID_SLACK = 0.15f;       // classify: kept where the knot shape before its clamp is above -this (the worst occupied brick needed 0.07: experiments/nebula_grid_d252)
+static const uint UNI_NEB_GRID_CLASSIFY_MAX = 8u;    // classify: at most this many samples a side (coarser: kept unread)
+
+/** D-252: one brick to update: its world brick and level << 24 | its table entry (in the level). */
+struct FUniNebGridOp
+{
+	int Wx;
+	int Wy;
+	int Wz;
+	uint LevelEntry;
+};
+
+#ifndef UNI_NEB_GRID_HEADER
+#define UNI_NEB_GRID_HEADER(I) float4(0.0f, 0.0f, 0.0f, 0.0f)
+#endif
+#ifndef UNI_NEB_GRID_TABLE
+#define UNI_NEB_GRID_TABLE(I) UNI_NEB_GRID_UNBAKED
+#endif
+#ifndef UNI_NEB_GRID_POOL
+#define UNI_NEB_GRID_POOL(Uvw) float4(0.0f, 0.0f, 1.0f, 1.0f)
+#endif
+
+/** D-252: a lattice point's value: the cell of size InCell about InP (field units) averaged at
+ *  InSamples points (8: 2 x 2 x 2 strata; otherwise uniform), jittered by InHash, the footprint the
+ *  cell (the detail's reads prefiltered to it), the detail at InDetail, the dark share InDark:
+ *  (the emission density, its core-tinted share (UNI_NEBULA_CORE_SHARE x the knot's peak), the dust
+ *  multiplier's average (D-255; D-252 its ratio to the same without the detail), the reflection
+ *  multiplier's average over its value without knots (Uni_GalaxyNebulaReflectBase: the dark share's
+ *  dimming, smooth; the march multiplies it back). Without knots at any point (no nebula): (0, 0, 1,
+ *  1) exactly. */
+UNI_FN float4 Uni_NebGridBakePoint(float3 InP, float InCell, FUniFieldParams InPar, FUniGalaxyConst InK, float InDetail, float InDark, uint InHash, uint InSamples)
+{
+	const uint Ns = max(InSamples, 1u);
+	float Sn = 0.0f, Sc = 0.0f, Sd = 0.0f, Sr = 0.0f, Srb = 0.0f;
+	const float Bn = Uni_GalaxyNebulaBlend(InPar, InCell, 0.0f);
+	for (uint I = 0u; I < Ns; ++I)
+	{
+		const uint Hh = Uni_Avalanche(InHash + I * 0x9E3779B9u);
+		const float3 Jt = float3((float)(Hh & 1023u) * (1.0f / 1024.0f), (float)((Hh >> 10u) & 1023u) * (1.0f / 1024.0f), (float)((Hh >> 20u) & 1023u) * (1.0f / 1024.0f));
+		const float3 St = float3((float)(I & 1u), (float)((I >> 1u) & 1u), (float)((I >> 2u) & 1u));
+		const float3 Pt = InP + (Ns == 8u ? (St + Jt) * 0.5f - float3(0.5f, 0.5f, 0.5f) : Jt - float3(0.5f, 0.5f, 0.5f)) * InCell;
+		float4 Comp = float4(0.0f, 0.0f, 0.0f, 0.0f), Neb = float4(0.0f, -1.0f, 0.5f, 0.0f);
+		UniField_GalaxyFilteredCKN(Pt, InPar, InK, InCell, Comp, Neb);
+		float X = 0.0f, Md = 1.0f, Mr = 1.0f;
+		const float Nd = Uni_GalaxyNebulaDensityAtF(Pt, Neb, InPar, InCell, InCell, 0.0f, InDetail, InDark, X, Md, Mr);
+		Sn += Nd;
+		Sc += Nd * UNI_NEBULA_CORE_SHARE * smoothstep(0.55f, 1.0f, X) * (1.0f - Bn);
+		Sd += Md; Sr += Mr;
+		Srb += Uni_GalaxyNebulaReflectBase(Neb, InPar, InCell, 0.0f, InDark);
+	}
+	const float Inv = 1.0f / (float)Ns;
+	return float4(Sn * Inv, Sc * Inv, Sd * Inv, Srb > 0.0f ? min(Sr / Srb, 8.0f) : 1.0f);
+}
+
+/** D-252: a lattice point's bake jitter: level InK, world lattice index (InI, InJ, InL). */
+UNI_FN uint Uni_NebGridHash(uint InK, int InI, int InJ, int InL)
+{
+	return Uni_HashCombine(Uni_HashCombine(Uni_HashCombine(InK * 0x632BE5ABu + 0x2545F491u, (uint)InI), (uint)InJ), (uint)InL);
+}
+
+/** D-252: classify sample InI of InN^3 over brick (InWx, InWy, InWz) of level InK (cell InCell): the
+ *  lattice region its points' bakes reach (one cell either side), the knot field at the cell's
+ *  footprint: may it hold a nebula? */
+UNI_FN bool Uni_NebGridClassifySample(float InCell, int InWx, int InWy, int InWz, uint InI, uint InN, FUniFieldParams InPar, FUniGalaxyConst InK)
+{
+	const uint N = max(InN, 2u);
+	const float Sp = 10.0f / (float)(N - 1u);
+	const float Fx = (float)(InWx * (int)UNI_NEB_GRID_BRICK) - 1.0f + Sp * (float)(InI % N);
+	const float Fy = (float)(InWy * (int)UNI_NEB_GRID_BRICK) - 1.0f + Sp * (float)((InI / N) % N);
+	const float Fz = (float)(InWz * (int)UNI_NEB_GRID_BRICK) - 1.0f + Sp * (float)(InI / (N * N));
+	float4 Comp = float4(0.0f, 0.0f, 0.0f, 0.0f), Neb = float4(0.0f, -1.0f, 0.5f, 0.0f);
+	UniField_GalaxyFilteredCKN(float3(Fx, Fy, Fz) * InCell, InPar, InK, InCell, Comp, Neb);
+	return Neb.x > 0.0f && Uni_GalaxyNebulaXRaw(Neb) > -UNI_NEB_GRID_SLACK;
+}
+
+/** D-252: level InK's trilinear read at InP (field units): false where the level has not the point
+ *  (outside its box, or its brick not yet baked); OutV the value ((0, 0, 1, 1) in an empty brick). */
+UNI_FN bool Uni_NebGridFetch(uint InK, float3 InP, UNI_OUT(float4) OutV)
+{
+	OutV = float4(0.0f, 0.0f, 1.0f, 1.0f);
+	const float4 Ha = UNI_NEB_GRID_HEADER(UNI_NEB_GRID_HEADERS + 3u * InK);
+	const float4 Hb = UNI_NEB_GRID_HEADER(UNI_NEB_GRID_HEADERS + 3u * InK + 1u);
+	const float4 Hc = UNI_NEB_GRID_HEADER(UNI_NEB_GRID_HEADERS + 3u * InK + 2u);
+	const float Inv = 1.0f / max(Ha.x, 1.0e-30f);
+	const float Br = (float)UNI_NEB_GRID_BRICK;
+	const float Ux = InP.x * Inv - Hb.x * Br;
+	const float Uy = InP.y * Inv - Hb.y * Br;
+	const float Uz = InP.z * Inv - Hb.z * Br;
+	if (!(Ux >= 0.0f && Uy >= 0.0f && Uz >= 0.0f && Ux < Hb.w * Br && Uy < Hb.w * Br && Uz < Hc.x * Br)) { return false; }
+	const float Bx = floor(Ux * (1.0f / Br)), By = floor(Uy * (1.0f / Br)), Bz = floor(Uz * (1.0f / Br));
+	const int Dx = (int)Hb.w, Dz = (int)Hc.x;
+	const int Wx = (int)Hb.x + (int)Bx, Wy = (int)Hb.y + (int)By, Wz = (int)Hb.z + (int)Bz;
+	const uint Tx = (uint)(((Wx % Dx) + Dx) % Dx), Ty = (uint)(((Wy % Dx) + Dx) % Dx), Tz = (uint)(((Wz % Dz) + Dz) % Dz);
+	const uint E = UNI_NEB_GRID_TABLE((uint)Ha.y + Tx + (uint)Dx * (Ty + (uint)Dx * Tz));
+	if (E == UNI_NEB_GRID_UNBAKED) { return false; }
+	if (E == UNI_NEB_GRID_EMPTY) { return true; }
+	const float4 G0 = UNI_NEB_GRID_HEADER(0u);
+	const float4 G1 = UNI_NEB_GRID_HEADER(1u);
+	const uint Sx = (uint)G0.x, Sy = (uint)G0.y;
+	const uint Ix = E % Sx, Iy = (E / Sx) % Sy, Iz = E / (Sx * Sy);
+	const float Sl = (float)UNI_NEB_GRID_SLOT;
+	// Within the brick: [0, 8) cells; the read's texel centres at slot + i + 0.5.
+	const float3 Uvw = float3(((float)Ix * Sl + (Ux - Bx * Br) + 0.5f) * G1.x, ((float)Iy * Sl + (Uy - By * Br) + 0.5f) * G1.y, ((float)Iz * Sl + (Uz - Bz * Br) + 0.5f) * G1.z);
+	OutV = UNI_NEB_GRID_POOL(Uvw);
+	return true;
+}
+
+/** D-252: InP's distance out of level InK's box over its half extent (Chebyshev; 1 at its edge). */
+UNI_FN float Uni_NebGridRatio(float3 InP, uint InK)
+{
+	const float4 Ha = UNI_NEB_GRID_HEADER(UNI_NEB_GRID_HEADERS + 3u * InK);
+	const float4 Hb = UNI_NEB_GRID_HEADER(UNI_NEB_GRID_HEADERS + 3u * InK + 1u);
+	const float4 Hc = UNI_NEB_GRID_HEADER(UNI_NEB_GRID_HEADERS + 3u * InK + 2u);
+	const float S = Ha.x * (float)UNI_NEB_GRID_BRICK;   // a brick, field units
+	const float Hx = 0.5f * Hb.w * S, Hz = 0.5f * Hc.x * S;
+	const float Cx = Hb.x * S + Hx, Cy = Hb.y * S + Hx, Cz = Hb.z * S + Hz;
+	return max(max(abs(InP.x - Cx), abs(InP.y - Cy)) / max(Hx, 1.0e-30f), abs(InP.z - Cz) / max(Hz, 1.0e-30f));
+}
+
+/** D-252: the grid's level for the segment InP0..InP1 (field units) at a pixel footprint InFoot
+ *  (field units), of InCount levels: fractional (between two in a blend), the coarsest of the level
+ *  holding both ends (its box's outer UNI_NEB_GRID_BAND share blending to the next), the level whose
+ *  cells the segment crosses at most InFetchMax of (D-255: its walk's reads, Uni_NebGridWalk: the
+ *  segment's L1 length in cells) and the footprint's; InCount or more: outside the grid. */
+UNI_FN float Uni_NebGridLevel(float3 InP0, float3 InP1, float InFoot, uint InCount, float InFetchMax)
+{
+	float Kc = (float)InCount;
+	for (uint K = 0u; K < InCount; ++K)
+	{
+		const float R = max(Uni_NebGridRatio(InP0, K), Uni_NebGridRatio(InP1, K));
+		if (R <= 1.0f) { Kc = (float)K + saturate((R - UNI_NEB_GRID_BAND) / (1.0f - UNI_NEB_GRID_BAND)); break; }
+	}
+	const float C0 = UNI_NEB_GRID_HEADER(UNI_NEB_GRID_HEADERS).x;
+	const float3 Dd = abs(InP1 - InP0);
+	const float Ks = log2(max((Dd.x + Dd.y + Dd.z) / (max(InFetchMax, 1.0f) * C0), 1.0e-6f));
+	const float Kf = log2(max(InFoot / C0, 1.0e-6f));
+	return max(max(Kc, max(Ks, Kf)), 0.0f);
+}
+
+/** D-255: the floor of InC / UNI_NEB_GRID_BRICK (a world cell's brick). */
+UNI_FN int Uni_NebGridBrickOf(int InC)
+{
+	const int Br = (int)UNI_NEB_GRID_BRICK;
+	return (InC >= 0 ? InC : InC - (Br - 1)) / Br;
+}
+
+/** D-255: level InK's table entry for its world cell (InCx, InCy, InCz) (the cell from (InCx,
+ *  InCy, InCz) x its size to the next lattice point): UNI_NEB_GRID_UNBAKED outside its box. */
+UNI_FN uint Uni_NebGridCellEntry(uint InK, int InCx, int InCy, int InCz)
+{
+	const float4 Ha = UNI_NEB_GRID_HEADER(UNI_NEB_GRID_HEADERS + 3u * InK);
+	const float4 Hb = UNI_NEB_GRID_HEADER(UNI_NEB_GRID_HEADERS + 3u * InK + 1u);
+	const float4 Hc = UNI_NEB_GRID_HEADER(UNI_NEB_GRID_HEADERS + 3u * InK + 2u);
+	const int Wx = Uni_NebGridBrickOf(InCx), Wy = Uni_NebGridBrickOf(InCy), Wz = Uni_NebGridBrickOf(InCz);
+	const int Dx = (int)Hb.w, Dz = (int)Hc.x;
+	const int Bx = Wx - (int)Hb.x, By = Wy - (int)Hb.y, Bz = Wz - (int)Hb.z;
+	if (Dx <= 0 || Dz <= 0 || Bx < 0 || By < 0 || Bz < 0 || Bx >= Dx || By >= Dx || Bz >= Dz) { return UNI_NEB_GRID_UNBAKED; }
+	const uint Tx = (uint)(((Wx % Dx) + Dx) % Dx), Ty = (uint)(((Wy % Dx) + Dx) % Dx), Tz = (uint)(((Wz % Dz) + Dz) % Dz);
+	return UNI_NEB_GRID_TABLE((uint)Ha.y + Tx + (uint)Dx * (Ty + (uint)Dx * Tz));
+}
+
+/** D-255: the trilinear read in world cell (InCx, InCy, InCz) of a baked brick (its slot InE) at
+ *  InF within the cell ([0, 1] each axis, clamped: a point on a face read from this cell's side). */
+UNI_FN float4 Uni_NebGridCellRead(uint InE, int InCx, int InCy, int InCz, float3 InF)
+{
+	const float4 G0 = UNI_NEB_GRID_HEADER(0u);
+	const float4 G1 = UNI_NEB_GRID_HEADER(1u);
+	const uint Sx = (uint)G0.x, Sy = (uint)G0.y;
+	const uint Ix = InE % Sx, Iy = (InE / Sx) % Sy, Iz = InE / (Sx * Sy);
+	const int Br = (int)UNI_NEB_GRID_BRICK;
+	const float Sl = (float)UNI_NEB_GRID_SLOT;
+	const float Lx = (float)(InCx - Uni_NebGridBrickOf(InCx) * Br), Ly = (float)(InCy - Uni_NebGridBrickOf(InCy) * Br), Lz = (float)(InCz - Uni_NebGridBrickOf(InCz) * Br);
+	const float3 F = float3(saturate(InF.x), saturate(InF.y), saturate(InF.z));
+	return UNI_NEB_GRID_POOL(float3(((float)Ix * Sl + Lx + F.x + 0.5f) * G1.x, ((float)Iy * Sl + Ly + F.y + 0.5f) * G1.y, ((float)Iz * Sl + Lz + F.z + 0.5f) * G1.z));
+}
+
+/** D-255: the segment's parameter where it next leaves cell InC along one axis (its start InU0 and
+ *  its run InDl in cells, InS the direction, InA 1 / |InDl|); 3e38 along an axis it does not cross. */
+UNI_FN float Uni_NebGridNextFace(float InU0, float InDl, int InS, float InA, int InC)
+{
+	return abs(InDl) > 1.0e-20f ? ((float)(InS > 0 ? InC + 1 : InC) - InU0) * (float)InS * InA : 3.0e38f;
+}
+
+/** D-255 (owner 2026-11-15: "march the intersection points with the grid instead of arbitrary steps,
+ *  do interpolation on those intersection points and then a blended weight for the step segment
+ *  that takes its length into account"): THE CELL WALK. Level InK's average over the segment
+ *  InP0..InP1 (field units): the segment cut where it crosses the level's cell faces, each piece
+ *  Simpson's rule over the trilinear reads at its ends and its middle times its length (in a cell
+ *  the trilinear along a line is a cubic, a product of the three axes' linear blends, and Simpson's
+ *  rule is exact for a cubic: the walk is the exact integral of the grid's field along the
+ *  segment; the ends alone, a trapezoid, missed a corner's peak between two zero faces), each face
+ *  read once and shared by the cells either side; a brick without nebulae (UNI_NEB_GRID_EMPTY)
+ *  crossed in one piece, unread. No jitter: the same ray reads the same points every frame, and a moving ray's
+ *  move them continuously. OutOk false where the segment leaves what the level holds (its box,
+ *  or a brick not yet baked: the next level reads instead). At most InFetchMax x 4 + 4 pieces (the
+ *  level's rule keeps the crossings under 2 x InFetchMax; past the cap the rest at the last read). */
+UNI_FN float4 Uni_NebGridWalk(uint InK, float3 InP0, float3 InP1, float InFetchMax, UNI_OUT(bool) OutOk)
+{
+	const float4 Emp = float4(0.0f, 0.0f, 1.0f, 1.0f);
+	OutOk = true;
+	const float C = UNI_NEB_GRID_HEADER(UNI_NEB_GRID_HEADERS + 3u * InK).x;
+	if (!(C > 0.0f)) { OutOk = false; return Emp; }
+	const float Ic = 1.0f / C;
+	const float3 U0 = InP0 * Ic;
+	const float3 Dl = (InP1 - InP0) * Ic;
+	const int Sx = Dl.x > 0.0f ? 1 : -1, Sy = Dl.y > 0.0f ? 1 : -1, Sz = Dl.z > 0.0f ? 1 : -1;
+	const float Ax = abs(Dl.x) > 1.0e-20f ? 1.0f / abs(Dl.x) : 3.0e38f;
+	const float Ay = abs(Dl.y) > 1.0e-20f ? 1.0f / abs(Dl.y) : 3.0e38f;
+	const float Az = abs(Dl.z) > 1.0e-20f ? 1.0f / abs(Dl.z) : 3.0e38f;
+	int Cx = (int)floor(U0.x), Cy = (int)floor(U0.y), Cz = (int)floor(U0.z);
+	float Tx = Uni_NebGridNextFace(U0.x, Dl.x, Sx, Ax, Cx), Ty = Uni_NebGridNextFace(U0.y, Dl.y, Sy, Ay, Cy), Tz = Uni_NebGridNextFace(U0.z, Dl.z, Sz, Az, Cz);
+	const int Br = (int)UNI_NEB_GRID_BRICK;
+	const uint Nmax = (uint)clamp(ceil(abs(Dl.x) + abs(Dl.y) + abs(Dl.z)) + 4.0f, 4.0f, 4.0f * max(InFetchMax, 1.0f) + 4.0f);
+	float4 Acc = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	float4 Va = Emp;
+	bool bHave = false;   // Va read in this cell (false: read on entering it)
+	float Tp = 0.0f;
+	UNI_LOOP
+	for (uint I = 0u; I < Nmax; ++I)
+	{
+		const uint E = Uni_NebGridCellEntry(InK, Cx, Cy, Cz);
+		if (E == UNI_NEB_GRID_UNBAKED) { OutOk = false; return Emp; }
+		if (E == UNI_NEB_GRID_EMPTY)
+		{
+			// The brick's exit: its far face along each axis; the rest of it in one piece.
+			const int Bx = Uni_NebGridBrickOf(Cx), By = Uni_NebGridBrickOf(Cy), Bz = Uni_NebGridBrickOf(Cz);
+			// (the bricks' faces a lattice UNI_NEB_GRID_BRICK cells apart)
+			const float Fx = Uni_NebGridNextFace(U0.x * (1.0f / (float)Br), Dl.x * (1.0f / (float)Br), Sx, Ax * (float)Br, Bx);
+			const float Fy = Uni_NebGridNextFace(U0.y * (1.0f / (float)Br), Dl.y * (1.0f / (float)Br), Sy, Ay * (float)Br, By);
+			const float Fz = Uni_NebGridNextFace(U0.z * (1.0f / (float)Br), Dl.z * (1.0f / (float)Br), Sz, Az * (float)Br, Bz);
+			const float Te = min(min(Fx, Fy), Fz);
+			if (Te >= 1.0f) { return Acc + Emp * (1.0f - Tp); }
+			Acc = Acc + Emp * (Te - Tp);
+			Tp = max(Te, Tp);
+			// The cell entered: one past the brick's face along the exit axes, where the ray is along the others.
+			const float3 Ue = U0 + Dl * Tp;
+			Cx = Fx <= Te ? (Sx > 0 ? (Bx + 1) * Br : Bx * Br - 1) : clamp((int)floor(Ue.x), Bx * Br, Bx * Br + Br - 1);
+			Cy = Fy <= Te ? (Sy > 0 ? (By + 1) * Br : By * Br - 1) : clamp((int)floor(Ue.y), By * Br, By * Br + Br - 1);
+			Cz = Fz <= Te ? (Sz > 0 ? (Bz + 1) * Br : Bz * Br - 1) : clamp((int)floor(Ue.z), Bz * Br, Bz * Br + Br - 1);
+			Tx = Uni_NebGridNextFace(U0.x, Dl.x, Sx, Ax, Cx);
+			Ty = Uni_NebGridNextFace(U0.y, Dl.y, Sy, Ay, Cy);
+			Tz = Uni_NebGridNextFace(U0.z, Dl.z, Sz, Az, Cz);
+			bHave = false;
+			continue;
+		}
+		const float3 Cf = float3((float)Cx, (float)Cy, (float)Cz);
+		if (!bHave) { Va = Uni_NebGridCellRead(E, Cx, Cy, Cz, U0 + Dl * Tp - Cf); }
+		const float Tn = min(min(min(Tx, Ty), Tz), 1.0f);
+		const float4 Vm = Uni_NebGridCellRead(E, Cx, Cy, Cz, U0 + Dl * (0.5f * (Tp + Tn)) - Cf);
+		const float4 Vb = Uni_NebGridCellRead(E, Cx, Cy, Cz, U0 + Dl * Tn - Cf);
+		Acc = Acc + (Va + Vm * 4.0f + Vb) * (max(Tn - Tp, 0.0f) * (1.0f / 6.0f));
+		if (Tn >= 1.0f) { return Acc; }
+		Va = Vb;
+		bHave = true;
+		Tp = max(Tn, Tp);
+		if (Tx <= Tn) { Cx += Sx; Tx += Ax; }
+		else if (Ty <= Tn) { Cy += Sy; Ty += Ay; }
+		else { Cz += Sz; Tz += Az; }
+	}
+	return Acc + (bHave ? Va : Emp) * max(1.0f - Tp, 0.0f);
+}
+
+/** D-252: the grid's average over a step's segment at level InLevel (Uni_NebGridLevel): its two
+ *  levels blended by its fraction; a level without the segment (not yet baked) gives way to the
+ *  next. OutGrid the grid's share: 1, below 1 in the outermost level's blend (the caller adds the
+ *  field for the rest), 0 where no level has it. D-255: each level's the cell walk's
+ *  (Uni_NebGridWalk). */
+UNI_FN float4 Uni_NebGridSegment(float InLevel, uint InCount, float3 InP0, float3 InP1, float InFetchMax, UNI_OUT(float) OutGrid)
+{
+	uint K = (uint)floor(InLevel);
+	float F = InLevel - (float)K;
+	float4 V = float4(0.0f, 0.0f, 1.0f, 1.0f);
+	bool bOk = false;
+	UNI_LOOP
+	for (; K < InCount; ++K)
+	{
+		V = Uni_NebGridWalk(K, InP0, InP1, InFetchMax, bOk);
+		if (bOk) { break; }
+		F = 0.0f;
+	}
+	OutGrid = 0.0f;
+	if (!bOk) { return float4(0.0f, 0.0f, 1.0f, 1.0f); }
+	OutGrid = 1.0f;
+	if (F > 0.0f)
+	{
+		if (K + 1u < InCount)
+		{
+			bool bOk1 = false;
+			const float4 V1 = Uni_NebGridWalk(K + 1u, InP0, InP1, InFetchMax, bOk1);
+			if (bOk1) { V = V * (1.0f - F) + V1 * F; }
+		}
+		else { OutGrid = 1.0f - F; }
+	}
+	return V;
+}
+
+/** D-255: the nebula grid about InP (field units; InLd the ray's local direction, InFoot the
+ *  pixel's footprint) at the level the march reads there (the finest holding it, at least the
+ *  footprint's; a brick not yet baked gives way to the next): 0 the grid has it not, 1 a brick with
+ *  nebulae, 2 a brick without (OutExit the distance along InLd to its exit, field units). */
+UNI_FN uint Uni_NebGridSpace(float3 InP, float3 InLd, float InFoot, uint InCount, UNI_OUT(float) OutExit)
+{
+	OutExit = 0.0f;
+	const float Lv = Uni_NebGridLevel(InP, InP, InFoot, InCount, 1.0f);
+	const int Br = (int)UNI_NEB_GRID_BRICK;
+	UNI_LOOP
+	for (uint K = (uint)floor(Lv); K < InCount; ++K)
+	{
+		const float C = UNI_NEB_GRID_HEADER(UNI_NEB_GRID_HEADERS + 3u * K).x;
+		if (!(C > 0.0f)) { return 0u; }
+		const float Ic = 1.0f / C;
+		const int Cx = (int)floor(InP.x * Ic), Cy = (int)floor(InP.y * Ic), Cz = (int)floor(InP.z * Ic);
+		const uint E = Uni_NebGridCellEntry(K, Cx, Cy, Cz);
+		if (E == UNI_NEB_GRID_UNBAKED) { continue; }
+		if (E != UNI_NEB_GRID_EMPTY) { return 1u; }
+		const float B = C * (float)Br;
+		const float Bx = (float)Uni_NebGridBrickOf(Cx) * B, By = (float)Uni_NebGridBrickOf(Cy) * B, Bz = (float)Uni_NebGridBrickOf(Cz) * B;
+		const float Ex = InLd.x > 0.0f ? (Bx + B - InP.x) / InLd.x : (InLd.x < 0.0f ? (Bx - InP.x) / InLd.x : 3.0e38f);
+		const float Ey = InLd.y > 0.0f ? (By + B - InP.y) / InLd.y : (InLd.y < 0.0f ? (By - InP.y) / InLd.y : 3.0e38f);
+		const float Ez = InLd.z > 0.0f ? (Bz + B - InP.z) / InLd.z : (InLd.z < 0.0f ? (Bz - InP.z) / InLd.z : 3.0e38f);
+		OutExit = max(min(min(Ex, Ey), Ez), 0.0f);
+		return 2u;
+	}
+	return 0u;
+}
+
+/** D-210: one active carrier's step limit at InT (cm; 3e38 when it sets none): its field's step
+ *  hint, loosened (D-195, D-202), over its inverse radius. The march computes it for the next
+ *  step inside the sample pass, where the carrier and its parameters are already loaded (the
+ *  same point and arithmetic as at the next step's start: the march is unchanged bit for bit). */
+UNI_FN float Uni_CarrierStepLimit(FUniCarrier InCa, FUniFieldParams InPar, float3 InLd, float InT, bool InCluster,
+	float3 InC0, float3 InC1, float3 InC2, float3 InC3, StructuredBuffer<FUniFieldParams> InParams, FUniVolumeView InView)
+{
+	if (InCa.FeatureScale > 0.0f)
+	{
+		// Prefiltered fields need no hint once the pixel footprint is past the blend.
+		if (!(InT * InView.ThetaPixel * InCa.InvRadius < 4.0f * InCa.FeatureScale)) { return 3.0e38f; }
+	}
+	const float3 P = Uni_CarrierPoint(InCa, InLd, InT);
+	const float FootH = (InCa.Flags & UNI_CARRIER_PREFILTER) != 0u ? InT * InView.ThetaPixel * InCa.InvRadius : 0.0f;   // D-160
+	float H;
+	float Neb = 3.0e38f;   // D-235: the nebulae's gas layer cap
+	if (InCluster) { H = Uni_ClusterStepHintC(P, InPar, InC0, InC1, InC2, InC3); }
+	else if (InCa.FieldId == UNI_FIELD_GALAXY)
+	{
+		// D-210: the mode phase hash from the builder's constant block.
+		uint Hp;
+		if (InView.GalaxyConstBase != 0u) { const float4 Kb = InParams[InView.GalaxyConstBase + InCa.ParamIndex].B; Hp = Uni_GalaxyConstJoin(Kb.x, Kb.y); }
+		else { Hp = Uni_GalaxyConstOf(InPar).Hp; }
+		H = Uni_GalaxyStepHintFilteredK(P, InLd, InPar, FootH, Hp);
+		if (InView.NebulaGain > 0.0f)
+		{
+			// D-236: the screen's footprint (as the march's nebula blend), so a cube pass caps as the per-pixel march.
+			const float FootNb = (InCa.Flags & UNI_CARRIER_PREFILTER) != 0u ? InT * (InView.NebulaThetaPixel > 0.0f ? InView.NebulaThetaPixel : InView.ThetaPixel) * InCa.InvRadius : 0.0f;
+			Neb = Uni_GalaxyNebulaStepCap(P, InLd, InPar, Hp, FootNb);
+			// D-255: the nebula grid's empty space: in a brick without nebulae (at the level the march
+			// reads there) nothing of them to sample before its exit: the step at least to it (the
+			// field's own hint still caps it), no D-251 cap.
+			float GridExit = 0.0f;
+			const uint GridSpace = InView.NebGridCount > 0u && InCa.ParamIndex == InView.NebGridParam ? Uni_NebGridSpace(P, InLd, FootNb, InView.NebGridCount, GridExit) : 0u;
+			if (GridSpace == 2u) { Neb = max(Neb, GridExit); }
+			// D-251: finer steps through the gas layer where the nebulae's detail is (uu.Nebula.StepRatio:
+			// the step at most that x the distance, within the detail's reach): the detail is
+			// sampled instead of drawn at one jittered point of a long step (the grain).
+			else if (UNI_NEB_TUNE3.x > 0.0f && InView.NebulaFineGain > 0.0f && InT < InView.NebulaFineReachCm && Uni_GalaxyGasLayerInside(P, InPar, Hp))
+			{
+				Neb = min(Neb, UNI_NEB_TUNE3.x * InT * InCa.InvRadius);
+			}
+		}
+	}
+	else { H = Uni_FieldStepHintFoot(InCa.FieldId, P, InLd, InPar, FootH); }
+	// D-195: from inside a carrier (the camera within its bounds) rays run along its structure
+	// and the hints can be looser (HintScale); from outside a ray crosses a disc steeply and
+	// keeps them as written (T3.vol.march: 5% per ray at x 2).
+	const bool bInside = (InCa.Flags & UNI_CARRIER_PERIODIC) == 0u && dot(InCa.CamLocal, InCa.CamLocal) < 1.0f;
+	// D-202: the background web's hints loosen with travel speed (WebHintScale): it is marched
+	// per pixel only then, and the glow is the fresh quarter alone there anyway.
+	const bool bPeriodic = (InCa.Flags & UNI_CARRIER_PERIODIC) != 0u;
+	const float Loose = bInside && InView.HintScale > 0.0f ? InView.HintScale : (bPeriodic && InView.WebHintScale > 0.0f ? InView.WebHintScale : 1.0f);
+	// D-235: the nebulae's gas layer, where a crossing can afford to sample them (not loosened).
+	return min(Loose * H, Neb) / InCa.InvRadius;
+}
+
+// D-252: the grid's update, one thread function per kernel (UniVolume.usf pass 7 and the checks'
+// emulation), with the writable resources behind macros the caller defines.
+#ifdef UNI_NEB_GRID_TABLE_STORE
+
+/** D-252: level InK's reset, thread InI: its free list every slot, its table entries unbaked, its
+ *  free count its slots and its overflow 0. */
+UNI_FN void Uni_NebGridResetThread(uint InK, uint InI)
+{
+	const float4 Ha = UNI_NEB_GRID_HEADER(UNI_NEB_GRID_HEADERS + 3u * InK);
+	const float4 Hb = UNI_NEB_GRID_HEADER(UNI_NEB_GRID_HEADERS + 3u * InK + 1u);
+	const float4 Hc = UNI_NEB_GRID_HEADER(UNI_NEB_GRID_HEADERS + 3u * InK + 2u);
+	const uint Slots = (uint)Ha.w, Entries = (uint)Hb.w * (uint)Hb.w * (uint)Hc.x;
+	if (InI < Slots) { UNI_NEB_GRID_FREE_STORE((uint)Ha.z + InI, (uint)Ha.z + InI); }
+	if (InI < Entries) { UNI_NEB_GRID_TABLE_STORE((uint)Ha.y + InI, UNI_NEB_GRID_UNBAKED); }
+	if (InI == 0u) { UNI_NEB_GRID_COUNTER_STORE(InK, Slots); UNI_NEB_GRID_COUNTER_STORE(UNI_NEB_GRID_MAX_LEVELS + InK, 0u); }
+}
+
+/** D-252: an entry whose brick changed: its slot (if any) back to its level's free list, unbaked. */
+UNI_FN void Uni_NebGridReleaseThread(FUniNebGridOp InOp)
+{
+	const uint K = InOp.LevelEntry >> 24u;
+	const float4 Ha = UNI_NEB_GRID_HEADER(UNI_NEB_GRID_HEADERS + 3u * K);
+	const uint Ti = (uint)Ha.y + (InOp.LevelEntry & 0xFFFFFFu);
+	const uint E = UNI_NEB_GRID_TABLE_LOAD(Ti);
+	if (E < UNI_NEB_GRID_EMPTY)
+	{
+		uint Orig = 0u;
+		UNI_NEB_GRID_COUNTER_ADD(K, 1u, Orig);
+		UNI_NEB_GRID_FREE_STORE((uint)Ha.z + Orig, E);
+	}
+	UNI_NEB_GRID_TABLE_STORE(Ti, UNI_NEB_GRID_UNBAKED);
+}
+
+/** D-252: an entry to bake, classified (InOccupied): empty, or a slot from its level's free list
+ *  (none left: it stays unbaked and the level's overflow counts it). Returns the slot, or
+ *  UNI_NEB_GRID_EMPTY / UNI_NEB_GRID_UNBAKED. */
+UNI_FN uint Uni_NebGridAllocThread(FUniNebGridOp InOp, bool InOccupied)
+{
+	const uint K = InOp.LevelEntry >> 24u;
+	const float4 Ha = UNI_NEB_GRID_HEADER(UNI_NEB_GRID_HEADERS + 3u * K);
+	const uint Ti = (uint)Ha.y + (InOp.LevelEntry & 0xFFFFFFu);
+	if (!InOccupied) { UNI_NEB_GRID_TABLE_STORE(Ti, UNI_NEB_GRID_EMPTY); return UNI_NEB_GRID_EMPTY; }
+	uint Orig = 0u;
+	UNI_NEB_GRID_COUNTER_ADD(K, 0xFFFFFFFFu, Orig);
+	if (Orig == 0u || Orig > (uint)Ha.w)
+	{
+		uint Dummy = 0u;
+		UNI_NEB_GRID_COUNTER_ADD(K, 1u, Dummy);
+		UNI_NEB_GRID_COUNTER_ADD(UNI_NEB_GRID_MAX_LEVELS + K, 1u, Dummy);
+		return UNI_NEB_GRID_UNBAKED;
+	}
+	const uint S = UNI_NEB_GRID_FREE_LOAD((uint)Ha.z + Orig - 1u);
+	UNI_NEB_GRID_TABLE_STORE(Ti, S);
+	return S;
+}
+
+/** D-252: lattice point InI (0 .. UNI_NEB_GRID_SLOT^3) of an allocated brick into its slot InSlot. */
+UNI_FN void Uni_NebGridBakeThread(FUniNebGridOp InOp, uint InSlot, uint InI, FUniFieldParams InPar, FUniGalaxyConst InK, float InDetail, float InDark)
+{
+	const uint K = InOp.LevelEntry >> 24u;
+	const float C = UNI_NEB_GRID_HEADER(UNI_NEB_GRID_HEADERS + 3u * K).x;
+	const float4 G0 = UNI_NEB_GRID_HEADER(0u);
+	const float4 G1 = UNI_NEB_GRID_HEADER(1u);
+	const uint Sl = UNI_NEB_GRID_SLOT;
+	const uint Lx = InI % Sl, Ly = (InI / Sl) % Sl, Lz = InI / (Sl * Sl);
+	const int Ix = InOp.Wx * (int)UNI_NEB_GRID_BRICK + (int)Lx, Iy = InOp.Wy * (int)UNI_NEB_GRID_BRICK + (int)Ly, Iz = InOp.Wz * (int)UNI_NEB_GRID_BRICK + (int)Lz;
+	const float4 V = Uni_NebGridBakePoint(float3((float)Ix, (float)Iy, (float)Iz) * C, C, InPar, InK, InDetail, InDark, Uni_NebGridHash(K, Ix, Iy, Iz), (uint)G1.w);
+	const uint Sx = (uint)G0.x, Sy = (uint)G0.y;
+	UNI_NEB_GRID_POOL_STORE((InSlot % Sx) * Sl + Lx, ((InSlot / Sx) % Sy) * Sl + Ly, (InSlot / (Sx * Sy)) * Sl + Lz, V);
+}
+
+#endif
+
+/** D-240: InJitter: the ray's noise pixel (xy) and 1 in z to jitter (with MarchFlags bit 3). */
+UNI_FN FUniVolumeResult Uni_VolumeMarchJ(float3 InDir, float InTScene,
 	StructuredBuffer<FUniCarrier> InCarriers, StructuredBuffer<FUniFieldParams> InParams,
-	StructuredBuffer<float4> InLut, FUniVolumeView InView)
+	StructuredBuffer<float4> InLut, FUniVolumeView InView, float3 InJitter)
 {
 	FUniVolumeResult Res;
 	Res.Radiance = float3(0.0f, 0.0f, 0.0f);
@@ -595,6 +1124,11 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 	float3 B = float3(0.0f, 0.0f, 0.0f);
 	float DepthW = 0.0f, DepthWL = 0.0f;   // D-184
 	bool bDone = false;
+	// D-240: this ray's lattice phase in (0, 1] (its first step's share, again after a gap) and
+	// whether its samples are jittered.
+	const bool bJitter = (InView.MarchFlags & UNI_VOL_JITTER_FLAG) != 0u && InJitter.z > 0.5f && (InView.MarchFlags & 2u) == 0u;
+	const float Phase = bJitter ? 1.0f - Uni_VolumeDraw(InJitter.x, InJitter.y, UNI_VOL_DRAW_PHASE, InView.JitterShift) : 1.0f;
+	bool bLead = true;
 	const float RefDiv = (InView.MarchFlags & 2u) != 0u ? 0.125f : 1.0f;   // D-219: the checks' fine reference
 	UNI_LOOP
 	for (uint Step = 0u; Step < InView.MaxSteps; ++Step)
@@ -627,6 +1161,7 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 		{
 			if (Next >= TMax) { bDone = true; break; }
 			T = Next;   // a gap between intervals: nothing to integrate
+			bLead = true;   // D-240: the next interval's lattice takes the ray's phase too
 			continue;
 		}
 		float S = min(max(Ratio * T, InView.MinStepCm), Hint) * RefDiv;
@@ -637,8 +1172,11 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 		{
 			S = min(S, InView.MotionWebStepCm * RefDiv);
 		}
+		// D-240: the ray's lead step takes its phase (the whole lattice after it shifts with it).
+		if (bLead) { S = S * Phase; bLead = false; }
 		S = max(min(S, Next - T), 1.0e-6f * T);
-		const float Tm = T + 0.5f * S;
+		// D-240: the sample at a jittered point of the step (its middle unjittered).
+		const float Tm = T + (bJitter ? Uni_VolumeDraw(InJitter.x, InJitter.y, Step, InView.JitterShift) : 0.5f) * S;
 
 		float3 E = float3(0.0f, 0.0f, 0.0f);      // emission over this step
 		float3 Tau = float3(0.0f, 0.0f, 0.0f);    // optical depth over this step
@@ -681,10 +1219,50 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 				else { GK = Uni_GalaxyConstOf(Par); }
 			}
 			else { GK.Hs = 0u; GK.Ho = 0u; GK.Hp = 0u; GK.ArmH = uint4(0u, 0u, 0u, 0u); GK.Hn = 0u; }
+			GK.Step = Du;   // D-238: the globulars widen over the step (render only)
 			if (bMapped)
 			{
 				float Rm = 0.0f;
-				Uni_GalaxyMapEvalN(P, Par, InParams[Ca.DustParamIndex], (Ca.Flags & UNI_CARRIER_DUST) != 0u, GK, FootS, (float)InView.MapSize, InView.MapSlot, Rm, RdPair, Comp, Neb);
+				// D-255 (the cone rule: a step's one sample stands for its step): along the disc the
+				// map and the texture terms over at least StepFoot x the step's run in the plane (the
+				// height profiles keep the pixel's: they are analytic).
+				// D-262 (paradigm C; owner: the knots sharper outside the galaxy than in it, StepFoot
+				// blurring across the ray): the step's run read at Kt points (stratified, at the
+				// step's own jitter), Kt the run over the detail's texel at the pixel's footprint
+				// (at most SegmentTaps), each over the pixel's footprint and StepFoot x its share of
+				// the run: across the ray the pixel's footprint, along it the step's. Kt 1: D-255.
+				const float Run = Du * sqrt(saturate(1.0f - ADir[J].z * ADir[J].z));
+				uint Kt = 1u;
+				if (InView.SegmentTaps > 1u)
+				{
+					const float Tx = max(FootS, 1.0f / max(Par.G.w * max(Par.H.w, 1.0f), 1.0e-6f));   // the detail's texel at the pixel's mip (field units)
+					Kt = (uint)clamp(ceil(Run / max(Tx, 1.0e-12f)), 1.0f, (float)InView.SegmentTaps);
+				}
+				const float FootP = InView.StepFoot > 0.0f ? max(FootS, InView.StepFoot * Run / (float)Kt) : FootS;
+				if (Kt <= 1u)
+				{
+					Uni_GalaxyMapEvalNP(P, Par, InParams[Ca.DustParamIndex], (Ca.Flags & UNI_CARRIER_DUST) != 0u, GK, FootS, FootP, (float)InView.MapSize, InView.MapSlot, Rm, RdPair, Comp, Neb);
+				}
+				else
+				{
+					const float Jf = (Tm - T) / max(S, 1.0e-30f);   // the step's jitter, each tap's within its share
+					const float InvK = 1.0f / (float)Kt;
+					float4 CompK = float4(0.0f, 0.0f, 0.0f, 0.0f);
+					float RdK = 0.0f, NebX = 0.0f;
+					for (uint K = 0u; K < Kt; ++K)
+					{
+						const float Tk = T + ((float)K + Jf) * InvK * S;
+						const float3 Pk = Uni_CarrierPoint(Ca, ADir[J], Tk);
+						const float FootK = (Ca.Flags & UNI_CARRIER_PREFILTER) != 0u ? Tk * InView.ThetaPixel * Ca.InvRadius : 0.0f;
+						float Rk = 0.0f, Rdk = 0.0f;
+						float4 Ck = float4(0.0f, 0.0f, 0.0f, 0.0f);
+						float4 Nk = float4(0.0f, -1.0f, 0.5f, 0.0f);
+						Uni_GalaxyMapEvalNP(Pk, Par, InParams[Ca.DustParamIndex], (Ca.Flags & UNI_CARRIER_DUST) != 0u, GK, FootK, max(FootK, FootP), (float)InView.MapSize, InView.MapSlot, Rk, Rdk, Ck, Nk);
+						Rm += Rk * InvK; RdK += Rdk * InvK; CompK = CompK + Ck * InvK; NebX += Nk.x * InvK;
+						if (K == (Kt >> 1u)) { Neb = Nk; }   // the nebulae's terms from the middle tap (their density the mean)
+					}
+					RdPair = RdK; Comp = CompK; Neb.x = NebX;
+				}
 				Rho = Rm + (Ca.MeanDensity - Rm) * Blend;
 			}
 			else if (bPair)
@@ -760,35 +1338,129 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 			// D-234: nebulae, plain light at the galaxy's full light per star (none drawn), so they
 			// stay as the stars resolve; faded out with the prefilter's blend.
 			float Kn = 0.0f;
+			float DustFine = 1.0f;   // D-237, D-241: the detail's dust multiplier
+			float ReflFine = 1.0f;   // D-242: the reflection's (the dark share's dust unlit)
 			if (Ca.FieldId == UNI_FIELD_GALAXY && (InView.NebulaGain > 0.0f || InView.NebulaReflect > 0.0f) && Blend < 1.0f)
 			{
-				Kn = Ca.Amplitude * Ca.Weight * AFade[J] * Uni_VolumeLutFull(InLut, Ca.LutIndex, Tm) * Du * (1.0f - Blend)
-					* (InView.NebulaNearCm > 0.0f ? smoothstep(InView.NebulaNearCm, 3.0f * InView.NebulaNearCm, Tm) : 1.0f);
+				const float NearF = InView.NebulaNearCm > 0.0f ? smoothstep(InView.NebulaNearCm, 3.0f * InView.NebulaNearCm, Tm) : 1.0f;
+				Kn = Ca.Amplitude * Ca.Weight * AFade[J] * Uni_VolumeLutFull(InLut, Ca.LutIndex, Tm) * Du * (1.0f - Blend) * NearF * (1.0f - Ca.NebulaHide);   // D-245
 				if (Neb.x > 0.0f && InView.NebulaGain > 0.0f)
 				{
-					// D-235: what one sample resolves: its footprint and its step along the disc plane.
-					// D-236: an early type's filaments are 3D: the whole step.
-					const float Inpl = Uni_GalaxyEarlyNebula(Par) > 0.0f ? Du : Du * sqrt(ADir[J].x * ADir[J].x + ADir[J].y * ADir[J].y);
 					// The screen's footprint, in the cube passes too: the far cache's coarser texels
 					// would blend a nebula the per-pixel march draws (cut along the split).
 					const float FootN = (Ca.Flags & UNI_CARRIER_PREFILTER) != 0u ? Tm * (InView.NebulaThetaPixel > 0.0f ? InView.NebulaThetaPixel : InView.ThetaPixel) * Ca.InvRadius : 0.0f;
-					const float Nd = Uni_GalaxyNebulaDensity(Neb, Par, FootN, Inpl);
-					const float3 Cn = Uni_GalaxyNebulaColour(Par, GK.Hs, Neb.z, Uni_GalaxyNebulaBlend(Par, FootN, Inpl));
+					// D-241: one field (structure, warped detail eroding it; Uni_GalaxyNebulaDensityAt),
+					// its level of detail from the footprint alone, the detail faded out over its
+					// reach's second half at this sample's own (jittered) distance.
+					const float Det = InView.NebulaFineGain > 0.0f && Tm < InView.NebulaFineReachCm
+						? InView.NebulaFineGain * (1.0f - smoothstep(0.5f * InView.NebulaFineReachCm, InView.NebulaFineReachCm, Tm)) : 0.0f;
+					// The distance level of detail past the detail's reach (Uni_GalaxyNebulaBlend): the
+					// nominal step (the carrier's log ratio x the distance) along the disc plane.
+					// D-244: over the refinement's sub-samples (uu.Nebula.Refine) when it is on.
+					const float Inpl = sqrt(saturate(1.0f - ADir[J].z * ADir[J].z));
+					const uint Rmax = max(InView.NebulaRefine, 1u);
+					const float LodR = AStepR[J] / (float)Rmax;
+					const float LodN = (1.0f - saturate(Det)) * LodR * Tm * Ca.InvRadius * Inpl;
+					float X = 0.0f, Md = 1.0f, Mr = 1.0f, Nd = 0.0f;
+					// D-252: the nebula grid's average over the step's segment where it holds it (Gs its
+					// share: 1 inside, falling in its outermost level's blend to the field, 0 outside it
+					// or where no level has baked it yet).
+					float Gs = 0.0f;
+					float4 Gv = float4(0.0f, 0.0f, 1.0f, 1.0f);
+					if (InView.NebGridCount > 0u && Ca.ParamIndex == InView.NebGridParam)
+					{
+						const float3 Pg0 = Uni_CarrierPoint(Ca, ADir[J], T);
+						const float3 Pg1 = Uni_CarrierPoint(Ca, ADir[J], T + S);
+						const float Lv = Uni_NebGridLevel(Pg0, Pg1, FootN, InView.NebGridCount, InView.NebGridFetchMax);
+						if (Lv < (float)InView.NebGridCount) { Gv = Uni_NebGridSegment(Lv, InView.NebGridCount, Pg0, Pg1, InView.NebGridFetchMax, Gs); }
+					}
+					if (Gs < 1.0f)
+					{
+						// D-251: the detail's footprint at least uu.Nebula.FineStepLod x the step (its sub-step's
+						// with D-244's refinement): detail finer than a step is prefiltered, not drawn at a
+						// jittered point of it.
+						const float FootD = max(FootN, UNI_NEB_TUNE2.w * Du);
+						Nd = Uni_GalaxyNebulaDensityAtF(P, Neb, Par, FootN, FootD, LodN, Det, InView.NebulaDark, X, Md, Mr);   // D-242: its dark share
+						// D-244 (CloudAtmosphere's fine steps inside the density): a long step through a
+						// spiral's gas layer split into sub-samples about UNI_NEB_SUB_TEXELS knot texels apart
+						// along the plane, stratified and jittered (the step's draw rotated by the golden
+						// ratio), each with the whole field (the nebulae's source carries the knots: sharing
+						// the step's was 8% biased); the step's nebulae their mean.
+						const uint Ns = Rmax > 1u && Uni_GalaxyEarlyNebula(Par) <= 0.0f && Neb.y > -1.0f
+							? (uint)clamp(ceil(Du * Inpl / (UNI_NEB_SUB_TEXELS * exp2(UNI_NEBULA_MIP) / max(Par.G.w * UNI_NEB_TUNE.x * max(Par.H.w, 1.0f), 1.0e-6f))), 1.0f, (float)Rmax) : 1u;
+						if (Ns > 1u)
+						{
+							Nd = 0.0f; X = 0.0f; Md = 0.0f; Mr = 0.0f;
+							const float U0 = (Tm - T) / max(S, 1.0e-30f);
+							for (uint Kq = 0u; Kq < Ns; ++Kq)
+							{
+								const float Tk = T + ((float)Kq + frac(U0 + (float)Kq * 0.618034f)) / (float)Ns * S;
+								const float3 Pk = Uni_CarrierPoint(Ca, ADir[J], Tk);
+								float4 Ck = float4(0.0f, 0.0f, 0.0f, 0.0f), Nk = float4(0.0f, -1.0f, 0.5f, 0.0f);
+								const float FootK = (Ca.Flags & UNI_CARRIER_PREFILTER) != 0u ? Tk * (InView.NebulaThetaPixel > 0.0f ? InView.NebulaThetaPixel : InView.ThetaPixel) * Ca.InvRadius : 0.0f;
+								UniField_GalaxyFilteredCKN(Pk, Par, GK, FootK, Ck, Nk);
+								const float DetK = InView.NebulaFineGain > 0.0f && Tk < InView.NebulaFineReachCm
+									? InView.NebulaFineGain * (1.0f - smoothstep(0.5f * InView.NebulaFineReachCm, InView.NebulaFineReachCm, Tk)) : 0.0f;
+								float Xk = 0.0f, Mdk = 1.0f, Mrk = 1.0f;
+								Nd += Uni_GalaxyNebulaDensityAtF(Pk, Nk, Par, FootK, max(FootK, UNI_NEB_TUNE2.w * Du / (float)Ns), (1.0f - saturate(DetK)) * LodR * Tk * Ca.InvRadius * Inpl, DetK, InView.NebulaDark, Xk, Mdk, Mrk);
+								X += Xk; Md += Mdk; Mr += Mrk;
+							}
+							const float Inv = 1.0f / (float)Ns;
+							Nd *= Inv; X *= Inv; Md *= Inv; Mr *= Inv;
+						}
+					}
+					// D-253: the grid's share without the distance level of detail (its cells are the level
+					// of detail): the dark dust and the colour then fade as its light does.
+					const float LodC = LodN * (1.0f - Gs);
+					const float Bn = Uni_GalaxyNebulaBlend(Par, FootN, LodC);
+					float Wc = UNI_NEBULA_CORE_SHARE * smoothstep(0.55f, 1.0f, X) * (1.0f - Uni_GalaxyNebulaBlend(Par, FootN, LodN));   // D-237: the knot's core toward teal (the field's)
+					if (Gs > 0.0f)
+					{
+						// D-252: the light from the grid (its core-tinted share with it); D-255: the dust's
+						// multiplier too (the walk's average over the step), the reflection's the walk's
+						// average over its smooth part x that part here (the dark share's dimming); with the
+						// field's in the outermost band.
+						const float NdG = Nd + (Gv.x - Nd) * Gs;
+						Wc = (Wc * Nd * (1.0f - Gs) + Gv.y * Gs) / max(NdG, 1.0e-30f);
+						Nd = NdG;
+						Md = Md + (Gv.z - Md) * Gs;
+						Mr = Mr + (Uni_GalaxyNebulaReflectBase(Neb, Par, FootN, 0.0f, InView.NebulaDark) * Gv.w - Mr) * Gs;
+					}
+					float3 Cn = Uni_GalaxyNebulaColour(Par, GK.Hs, Neb.z, Bn);
+					if (Uni_GalaxyEarlyNebula(Par) <= 0.0f)
+					{
+						// D-241: the dust's lanes from the detail.
+						Cn = Cn + (Uni_PaletteColour(UNI_NEBULA_CORE_HUE / 360.0f, 0.8f) - Cn) * Wc;
+						DustFine = 1.0f + (Md - 1.0f) * NearF;   // D-242: the dark dust fades with the nebulae (render only)
+						ReflFine = Mr;
+					}
 					E = E + Cn * (Kn * InView.NebulaGain * Nd);
 				}
 			}
 			if ((Ca.Flags & UNI_CARRIER_DUST) != 0u)
 			{
 				const FUniFieldParams DPar = InParams[Ca.DustParamIndex];
-				const float Rd = bPair ? RdPair : Uni_FieldSampleFoot(Ca.FieldId, P, DPar, FootS);
+				const float Rd0 = bPair ? RdPair : Uni_FieldSampleFoot(Ca.FieldId, P, DPar, FootS);
+				const float Rd = Rd0 * DustFine;   // D-237
 				if (Rd > 0.0f) { Tau = Tau + InView.DustSigmaRgb * (DPar.D.y * Rd * Du * AFade[J]); }
+				// D-250: the galaxy's diffuse dust: tau 1 over its reach (field units) along the
+				// mid-plane at the reference radius; it arrives with the nebulae past the handoff
+				// (D-245's fade): the sprite carries no internal dust, so it must not step in there.
+				if (InView.DiffuseDustGain > 0.0f && Ca.FieldId == UNI_FIELD_GALAXY && Ca.NebulaHide < 1.0f)
+				{
+					const float ReachF = Uni_GalaxyDiffuseDustReach(Par, InView.DiffuseDustReachLoCm, InView.DiffuseDustReachHiCm) * Ca.InvRadius;
+					const float Kd = InView.DiffuseDustGain * (1.0f - Ca.NebulaHide) / max(ReachF, 1.0e-30f) * Uni_GalaxyDiffuseDust(P, Par, DPar, GK.Hp, InView.DiffuseDustHeight);
+					Tau = Tau + InView.DustSigmaRgb * (Kd * Du * AFade[J]);
+				}
 				// D-234: reflection nebulae: the dust lit by the young clusters (the knots' share of
 				// the sample's light: around the emission nebulae, wider), blue.
-				if (Kn > 0.0f && Rd > 0.0f && InView.NebulaReflect > 0.0f)
+				// D-242: with the reflection's own multiplier (a dark cloud's gathered dust stays unlit).
+				const float Rr = Rd0 * ReflFine;
+				if (Kn > 0.0f && Rr > 0.0f && InView.NebulaReflect > 0.0f)
 				{
 					const float Sum = Comp.x + Comp.y + Comp.z + Comp.w;
 					const float Young = Sum > 0.0f ? Comp.w / Sum : 0.0f;
-					E = E + UNI_NEBULA_REFLECT_COLOUR * (Kn * InView.NebulaReflect * Rd * Young);
+					E = E + UNI_NEBULA_REFLECT_COLOUR * (Kn * InView.NebulaReflect * Rr * Young);
 				}
 			}
 			// D-210: this carrier's step limit at the next step's start, while it is loaded.
@@ -825,7 +1497,7 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 		}
 		NextSlice = max(NextSlice, (uint)clamp(floor(SlicePos), 0.0f, (float)UNI_VOL_SLICES));
 		if (T >= TMax) { bDone = true; break; }
-		if (max(Tr.x, max(Tr.y, Tr.z)) < 1.0e-3f) { bDone = true; break; }   // opaque
+		if (max(Tr.x, max(Tr.y, Tr.z)) < (InView.OpaqueCutoff > 0.0f ? InView.OpaqueCutoff : 1.0e-3f)) { bDone = true; break; }   // opaque (D-262: uu.Volume.OpaqueCutoff)
 	}
 	if (!bDone) { Res.Truncated = 1u; }
 	UNI_UNROLL
@@ -849,6 +1521,15 @@ UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
 	Res.DepthWeight = DepthW;
 	Res.LnDepth = DepthW > 0.0f && DepthWL > 0.0f ? Uni_LightLnDepthFromInv(DepthWL / DepthW) : UNI_VOL_LN_DEPTH_NONE;
 	return Res;
+}
+
+/** The march without jitter (the cube passes: the background map and the far cache, whose texels
+ *  are kept across frames without accumulation; the CPU sky; the checks' references). */
+UNI_FN FUniVolumeResult Uni_VolumeMarch(float3 InDir, float InTScene,
+	StructuredBuffer<FUniCarrier> InCarriers, StructuredBuffer<FUniFieldParams> InParams,
+	StructuredBuffer<float4> InLut, FUniVolumeView InView)
+{
+	return Uni_VolumeMarchJ(InDir, InTScene, InCarriers, InParams, InLut, InView, float3(0.0f, 0.0f, 0.0f));
 }
 
 // ------------------------------------------------------------------------------------------
@@ -902,6 +1583,25 @@ UNI_FN uint2 Uni_TemporalOffset(uint InPhase)
 	}
 	if (N == 3u) { return uint2(K % 3u, (K + K / 3u) % 3u); }
 	return uint2(K == 1u || K == 2u ? 1u : 0u, K == 1u || K == 3u ? 1u : 0u);
+}
+
+/** D-247: the rank of a phase's fresh pixel in its N x N cell (0..N^2-1). */
+UNI_FN uint Uni_TemporalRank(uint InPhase)
+{
+	const uint N = Uni_TemporalN(InPhase);
+	return (InPhase & 255u) % (N * N);
+}
+
+/** D-247: a sliced march's noise coordinate (CloudAtmosphere's MainMarchCS: its cell plus
+ *  NoiseOffset). The ray's cell (its pixel / N), moved by an R2 step per rank: each frame's
+ *  fresh samples, one a cell, read the tile at consecutive texels, so they are blue across the
+ *  cells. At the pixel itself they read it at stride N, and a blue tile decimated by N is no
+ *  longer blue: the fill and the clamp's moments came out blotchy at the cells' scale. */
+UNI_FN uint2 Uni_VolumeNoiseCell(uint2 InCell, uint InRank)
+{
+	const uint Ox = (uint)(frac(0.5f + (float)InRank * 0.7548776662f) * 4096.0f);
+	const uint Oy = (uint)(frac(0.5f + (float)InRank * 0.5698402910f) * 4096.0f);
+	return uint2(InCell.x + Ox, InCell.y + Oy);
 }
 
 UNI_FN bool Uni_TemporalFresh(uint2 InPx, uint InPhase)
@@ -1048,6 +1748,165 @@ UNI_FN float4 Uni_TemporalClamp(float4 InHist, float4 InLo, float4 InHi, float I
 	const float Ik = 1.0f / InK;
 	return float4(clamp(InHist.x, InLo.x * Ik, InHi.x * InK), clamp(InHist.y, InLo.y * Ik, InHi.y * InK),
 		clamp(InHist.z, InLo.z * Ik, InHi.z * InK), saturate(clamp(InHist.w, InLo.w * Ik, InHi.w * InK)));
+}
+
+// ------------------------------------------------------------------------------------------
+// D-240: accumulation. With jittered steps (Uni_VolumeMarchJ) one march is one sample of the
+// pixel's integral, not the integral, so a fresh pixel no longer replaces its history: it
+// blends into it (CloudAtmosphere's resolve). The history reprojected and clamped as a
+// reconstructed pixel's (D-194), into the box of the pixel and its fresh neighbours N away;
+// alpha = max(1 / (age + 1), 1 / MaxSamples), so the first samples average evenly and the
+// result then follows the scene over MaxSamples samples; the age (samples held) falls by the
+// share of the box the clamp had to move the history (motion, a disocclusion), so a rejected
+// history restarts from the fresh sample. A reconstructed pixel keeps its history's age less the
+// same rejection (it took no sample). MaxSamples 1: every fresh pixel its march (D-184).
+// ------------------------------------------------------------------------------------------
+
+/** D-240: a fresh pixel's fresh neighbours: N away along each axis (InPhase's N), W 1 on the grid
+ *  and 0 off it (the tap then repeats the pixel). */
+UNI_FN FUniTemporalTaps Uni_TemporalRing(uint2 InPx, uint InPhase, uint2 InSize)
+{
+	const uint N = Uni_TemporalN(InPhase);
+	const bool bL = InPx.x >= N, bR = InPx.x + N < InSize.x, bU = InPx.y >= N, bD = InPx.y + N < InSize.y;
+	FUniTemporalTaps Tp;
+	Tp.Q0 = uint2(bL ? InPx.x - N : InPx.x, InPx.y);
+	Tp.Q1 = uint2(bR ? InPx.x + N : InPx.x, InPx.y);
+	Tp.Q2 = uint2(InPx.x, bU ? InPx.y - N : InPx.y);
+	Tp.Q3 = uint2(InPx.x, bD ? InPx.y + N : InPx.y);
+	Tp.W = float4(bL ? 1.0f : 0.0f, bR ? 1.0f : 0.0f, bU ? 1.0f : 0.0f, bD ? 1.0f : 0.0f);
+	return Tp;
+}
+
+/** D-240: a fresh sample's weight against a history holding InAge samples. */
+UNI_FN float Uni_TemporalAlpha(float InAge, float InMaxSamples)
+{
+	return max(1.0f / (max(InAge, 0.0f) + 1.0f), 1.0f / max(InMaxSamples, 1.0f));
+}
+
+/** D-240: how far the clamp moved the history (InHist to InClamped), as a share of the widened box
+ *  (InLo / InK to InHi x InK), the largest over the channels: 0 untouched, 1 a box away. */
+UNI_FN float Uni_TemporalReject(float4 InHist, float4 InClamped, float4 InLo, float4 InHi, float InK)
+{
+	const float Ik = 1.0f / InK;
+	const float4 Wd = float4(max(InHi.x * InK - InLo.x * Ik, 1.0e-30f), max(InHi.y * InK - InLo.y * Ik, 1.0e-30f),
+		max(InHi.z * InK - InLo.z * Ik, 1.0e-30f), max(min(InHi.w * InK, 1.0f) - InLo.w * Ik, 1.0e-6f));
+	const float4 D = float4(abs(InHist.x - InClamped.x) / Wd.x, abs(InHist.y - InClamped.y) / Wd.y,
+		abs(InHist.z - InClamped.z) / Wd.z, abs(InHist.w - InClamped.w) / Wd.w);
+	return saturate(max(max(D.x, D.y), max(D.z, D.w)));
+}
+
+// ------------------------------------------------------------------------------------------
+// D-246 (owner 2026-11-14: "our resolve should follow the clouds template - full output
+// resolution 2x2, 3x3, or 4x4, variance clamp, pixel averaging etc, composite before tsr"):
+// CloudAtmosphere's resolve (AtmosphereTemporal.usf MainResolveCS), on our march at full
+// resolution sliced N x N. Every pixel: the fill, bilinear over the 4 x 4 fresh samples about it
+// (their pixels K N + offset), and the clamp's moments, a tent two cells wide, both weighted by
+// scene-depth agreement; the history reprojected (D-184..D-228), clamped to the moments' mean
+// +- gamma sigma on compressed radiance (Uni_ResolveCompress: one bright sample cannot widen the
+// box), gamma 4 at rest to 1 by UNI_RES_MOTION_PX of motion; the clamp's move over the box's
+// half-width (Uni_ResolveReject) takes its samples with it. A marched pixel blends its sample in
+// at 1 / (samples + 1) down to 1 / MaxSamples; the others blend in a share of the fill each frame
+// (UNI_RES_FILL at rest, fading once the pixel holds a sample of its own; UNI_RES_FILL_MOTION in
+// motion), counted toward their samples; a pixel without usable history takes the fill. Two
+// ages: all samples, and the pixel's own.
+// ------------------------------------------------------------------------------------------
+static const float UNI_RES_GAMMA = 4.0f;
+static const float UNI_RES_GAMMA_MOTION = 1.0f;
+static const float UNI_RES_FILL = 0.1f;
+static const float UNI_RES_FILL_MOTION = 0.5f;
+static const float UNI_RES_MOTION_PX = 2.0f;
+
+/** D-246: radiance compressed by its brightest channel at exposure InExp (the knee where the
+ *  image's brightness is); transmittance as is. */
+UNI_FN float4 Uni_ResolveCompress(float4 InC, float InExp)
+{
+	const float3 E = float3(InC.x, InC.y, InC.z) * InExp;
+	const float M = max(E.x, max(E.y, E.z));
+	const float K = 1.0f / (1.0f + M);
+	return float4(E.x * K, E.y * K, E.z * K, InC.w);
+}
+
+UNI_FN float4 Uni_ResolveExpand(float4 InC, float InExp)
+{
+	const float M = max(InC.x, max(InC.y, InC.z));
+	const float K = 1.0f / (max(1.0f - M, 1.0e-4f) * max(InExp, 1.0e-30f));
+	return float4(InC.x * K, InC.y * K, InC.z * K, InC.w);
+}
+
+/** D-246: a fresh sample's fill weight (bilinear) and moment weight (tent, two cells), from its
+ *  distance to the pixel in cells. */
+UNI_FN float Uni_ResolveFillW(float InDx, float InDy) { return saturate(1.0f - abs(InDx)) * saturate(1.0f - abs(InDy)); }
+UNI_FN float Uni_ResolveMomentW(float InDx, float InDy) { return saturate(1.0f - 0.5f * abs(InDx)) * saturate(1.0f - 0.5f * abs(InDy)); }
+
+/** D-246: the motion response (0 at rest .. 1 by UNI_RES_MOTION_PX) and the clamp's width. */
+UNI_FN float Uni_ResolveMotion(float InMotionPx) { return saturate(InMotionPx / UNI_RES_MOTION_PX); }
+UNI_FN float Uni_ResolveGamma(float InMotion) { return lerp(UNI_RES_GAMMA, UNI_RES_GAMMA_MOTION, InMotion); }
+
+/** D-246: the compressed history clamped to the moments' mean +- gamma sigma, per channel. */
+UNI_FN float4 Uni_ResolveClamp(float4 InH, float4 InM1, float4 InSigma, float InGamma)
+{
+	return float4(clamp(InH.x, InM1.x - InGamma * InSigma.x, InM1.x + InGamma * InSigma.x), clamp(InH.y, InM1.y - InGamma * InSigma.y, InM1.y + InGamma * InSigma.y),
+		clamp(InH.z, InM1.z - InGamma * InSigma.z, InM1.z + InGamma * InSigma.z), clamp(InH.w, InM1.w - InGamma * InSigma.w, InM1.w + InGamma * InSigma.w));
+}
+
+/** D-246: how far the clamp moved the history over the box's half-width (+0.01), its worst
+ *  channel: 1 takes all its samples. */
+UNI_FN float Uni_ResolveReject(float4 InH, float4 InClamped, float4 InSigma, float InGamma)
+{
+	const float4 D = float4(abs(InH.x - InClamped.x) / (InGamma * InSigma.x + 0.01f), abs(InH.y - InClamped.y) / (InGamma * InSigma.y + 0.01f),
+		abs(InH.z - InClamped.z) / (InGamma * InSigma.z + 0.01f), abs(InH.w - InClamped.w) / (InGamma * InSigma.w + 0.01f));
+	return saturate(max(max(D.x, D.y), max(D.z, D.w)));
+}
+
+/** D-246: an unmarched pixel's share of the fill this frame. */
+UNI_FN float Uni_ResolveFillShare(float InMotion, float InOwnAge)
+{
+	return lerp(UNI_RES_FILL * saturate(1.0f - InOwnAge), UNI_RES_FILL_MOTION, InMotion);
+}
+
+// ------------------------------------------------------------------------------------------
+// D-251 (owner 2026-11-15: "if we could come up with a solid fix for the grain noise wed be close
+// to done"): the resolved volume's spatial denoise, SVGF's (Schied et al. 2017) a-trous filter.
+// The resolve keeps each pixel's own samples' luminance moments (compressed, Uni_ResolveCompress)
+// and writes a variance for its value: the samples' spread over the samples it holds (0 before
+// two of its own). Off by default (uu.VolumeDenoise 0): measured against D-251's finer steps in
+// the gas layer it adds little in a nebula and blurs the disc's structure. The filter: a few
+// passes of a 5 x 5 B3-spline kernel at steps 1, 2, 4, ..., each tap weighted by scene-depth
+// agreement (no bleeding across occluders) and by its luminance difference over UNI_DN_SIGMA x the
+// standard deviation the (3 x 3 blurred) variance gives: noise is averaged, structure larger than
+// the noise kept; the variance filtered alongside (sum w^2 var / (sum w)^2), so each pass trusts
+// the last. The history keeps the unfiltered resolve (no blur accumulates frame to frame).
+// ------------------------------------------------------------------------------------------
+static const float UNI_DN_SIGMA = 4.0f;
+
+/** D-251: the B3 spline's weight at tap InD (-2..2). */
+UNI_FN float Uni_DenoiseKernel(int InD)
+{
+	const int A = abs(InD);
+	return A == 0 ? 0.375f : (A == 1 ? 0.25f : 0.0625f);
+}
+
+/** D-251: a tap's luminance weight (compressed luminances InLp, InLq) for the edge stop's
+ *  denominator InDen (sigma x the standard deviation; 0: only equal luminances pass). */
+UNI_FN float Uni_DenoiseLumWeight(float InLp, float InLq, float InDen)
+{
+	return exp(-abs(InLq - InLp) / max(InDen, 1.0e-12f));
+}
+
+/** D-251: a pixel's variance from its own samples' moments (InM: E[l], E[l^2]) over the samples
+ *  its value holds (InAge); 0 (left as it is) before two of its own (InOwn). Measured: the fresh
+ *  neighbourhood's spread as a fallback holds the image's structure too and blurred it (along the
+ *  disc +8% error at a tenth of it). */
+UNI_FN float Uni_DenoiseVariance(float2 InM, float InOwn, float InAge)
+{
+	const float Vs = InOwn >= 2.0f ? max(InM.y - InM.x * InM.x, 0.0f) : 0.0f;
+	return Vs / max(InAge, 1.0f);
+}
+
+/** D-240: a fresh pixel's age after its sample (InAge the history's, InReject its clamp's). */
+UNI_FN float Uni_TemporalAgeFresh(float InAge, float InReject, float InMaxSamples)
+{
+	return min(max(InAge, 0.0f) * (1.0f - InReject) + 1.0f, max(InMaxSamples, 1.0f));
 }
 
 /** The fresh taps' weights for a pixel on a scene surface at InLnTp: bilinear x depth-aware. */

@@ -1,0 +1,251 @@
+#include "../src/UniTest.h"
+#include "../src/UniVerifyCommon.h"
+#include "../src/UniRenderRef.h"
+#include "../src/UniVolumeRef.h"
+#include "../scenes/UniScenes.h"
+#include "UniWebTexture.h"
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <sys/stat.h>
+#include <vector>
+using namespace UniCore;
+using namespace UniRender;
+namespace H = UniHlsl;
+namespace
+{
+	double ZE(const char* N, double D) { const char* V = std::getenv(N); return V ? std::atof(V) : D; }
+	FCoord ZCam(const FVec3d& P) { FCoord C = FCoord::Origin(); FVec3f F; AddDisplacement(C, F, P); return C; }
+}
+UNI_TEST(zz, nebfine)
+{
+	FWebTexture T[3];
+	for (int S = 0; S < 3; ++S) { std::string E; FWebTexture::LoadDelivered("Data/Noise", GalaxyTextureName(S), T[S], &E); BindGalaxyTexture(S, &T[S]); }
+	FUniverseDef D = UniScenes::Flythrough();
+	UniScenes::UseGalaxyTextures(D, T[0].Size);
+	UniScenes::UseGalaxyPalettes(D);
+	const FFieldParams* Mw = nullptr;
+	for (const FAnchor& A : D.Anchors) { if (!A.EmitterParams.empty()) { Mw = &A.EmitterParams[0]; } }
+	const H::FUniFieldParams P = Mw->ToHlsl();
+	const H::FUniGalaxyConst K = H::Uni_GalaxyConstOf(P);
+	if (ZE("UU_STATS", 1) > 0)
+	{
+		for (float Mix : { 0.396f, 0.526f, 0.656f })
+		{
+			double Sm = 0, Sd = 0, Sm2 = 0; const int N = 200000;
+			for (int I = 0; I < N; ++I)
+			{
+				const H::float3 Pt{ H::Uni_DrawUnit(5u, 2u, u32(3 * I)) - 0.5f, H::Uni_DrawUnit(5u, 2u, u32(3 * I + 1)) - 0.5f, H::Uni_DrawUnit(5u, 2u, u32(3 * I + 2)) - 0.5f };
+				float Md = 1.0f;
+				const float M = H::Uni_GalaxyNebulaFine(Pt, P, Mix, 0.0f, 0.0f, Md);
+				Sm += M / N; Sm2 += double(M) * M / N; Sd += Md / N;
+			}
+			if (Mix < 0.4f)
+			{
+				double Er = 0, Ea = 0;
+				for (int I = 0; I < N; ++I)
+				{
+					const H::float3 Pt{ H::Uni_DrawUnit(8u, 2u, u32(3 * I)), H::Uni_DrawUnit(8u, 2u, u32(3 * I + 1)), H::Uni_DrawUnit(8u, 2u, u32(3 * I + 2)) };
+					const H::float4 Nn = UNI_GAL_DETAIL(Pt, 0.0f);
+					const double Pr = std::pow(std::max(double(Nn.x), 0.0) / 0.56713, 4.0) * 0.64591, Pa = std::pow(std::max(double(Nn.w), 0.0) / 0.49261, 3.708) * 0.71870;
+					Er += std::min(std::max(2.0 - Pr, 0.0), 2.0) / N; Ea += std::min(std::max(2.0 - Pa, 0.0), 2.0) / N;
+				}
+				std::printf("single octave dust complement means: ridged %.4f A %.4f\n", Er, Ea);
+			}
+			std::printf("mix %.3f: fine mean %.4f cv %.3f dust mean %.4f\n", Mix, Sm, std::sqrt(Sm2 - Sm * Sm) / Sm, Sd);
+		}
+	}
+	// Scan the solar annulus in the mid-plane for nebulae.
+	struct FHit { double X, Y, Z, Xs, Ratio; };
+	std::vector<FHit> Hits;
+	for (int I = 0; I < 200000; ++I)
+	{
+		const double R = ZE("UU_R0", 0.3) + ZE("UU_RW", 0.4) * H::Uni_DrawUnit(6u, 2u, u32(2 * I)), Ph = 6.2831853 * H::Uni_DrawUnit(6u, 2u, u32(2 * I + 1));
+		const H::float3 Pt{ float(R * std::cos(Ph)), float(R * std::sin(Ph)), 0.0f };
+		H::float4 C(0, 0, 0, 0), Nv(0, 0, 0, 0);
+		const float Rho = H::UniField_GalaxyFilteredCKN(Pt, P, K, 1e-5f, C, Nv);
+		const float Nd = H::Uni_GalaxyNebulaDensity(Nv, P, 1e-5f, 0.0f);
+		const float X = H::Uni_GalaxyNebulaX(Nv, P);
+		static float Xmax = 0; if (X > Xmax) { Xmax = X; std::printf("  X max %.3f Nv (%.3g %.3f %.3f %.3f)\n", X, Nv.x, Nv.y, Nv.z, Nv.w); }
+		if (X > float(ZE("UU_XMIN", 0.9))) { Hits.push_back({ Pt.x, Pt.y, Pt.z, X, Nd / std::max(Rho, 1e-30f) }); }
+	}
+	std::printf("%zu hits with X > 0.9\n", Hits.size());
+	std::sort(Hits.begin(), Hits.end(), [](const FHit& A, const FHit& B) { return A.Ratio > B.Ratio; });
+	for (size_t I = 0; I < std::min<size_t>(Hits.size(), 5); ++I) { std::printf("  (%.5f, %.5f, %.5f) X %.2f Nd/Rho %.3f\n", Hits[I].X, Hits[I].Y, Hits[I].Z, Hits[I].Xs, Hits[I].Ratio); }
+	if (Hits.empty()) { Uni::Check(2, "Z.nebfine", "x").Pass(false, "no nebula"); return; }
+	// Renders: inside the brightest nebula, and from 150 pc and 500 pc away, fine off and on.
+	const double Rk = ZE("UU_RK", 24.0) * Units::Kpc;
+	const FHit Hb = Hits[size_t(ZE("UU_HIT", 0))];
+	const double Cx = Hb.X * Rk, Cy = Hb.Y * Rk, Cz = Hb.Z * Rk;
+	FUniverseModel Mo(D);
+	FRefGenerator G(Mo);
+	FVolumeBuilder VB(Mo, G);
+	const int W = int(ZE("UU_W", 160)), Ht = W * 9 / 16;
+	const double Back[3] = { ZE("UU_D0", 0.0), ZE("UU_D1", 60.0), ZE("UU_D2", 250.0) };
+	FImage Img(W * 3, Ht * 3);
+	std::vector<float> Lo(size_t(W) * Ht * 3);
+	for (int Vi = 0; Vi < 3; ++Vi)
+	{
+		const FVec3d Pos{ Cx, Cy - Back[Vi] * Units::Pc, Cz + 5.0 * Units::Pc };
+		const FCoord Cam = ZCam(Pos);
+		FRefPipeline Pp(G);
+		Pp.bVelocityLod = false;
+		Pp.Update(Cam, FVec3f{});
+		FCamera Cm; Cm.Coord = Cam; Cm.Width = W; Cm.Height = Ht; Cm.LookAlong({ 0.0, 1.0, -0.02 });
+		for (int Fi = -1; Fi < 2; ++Fi)
+		{
+			FVolumeSettings S; S.NebulaGain = Fi < 0 ? 0.0f : 1.0f; S.NebulaReflect = Fi < 0 ? 0.0f : 6.0f; S.NebulaFineGain = float(std::max(Fi, 0));
+			if (Fi == 0) { S.NebulaFineRatio = 0.0f; }
+			const FVolumeScene Sc = VB.Build(Pp, Cam, FVec3f{}, Cm.View(), S).Subset(false);
+			if (Fi == -1)
+			{
+				for (const FCarrierGPU& Cg : Sc.Carriers)
+				{
+					const double Rl = std::sqrt(double(Cg.CamLocal[0]) * Cg.CamLocal[0] + double(Cg.CamLocal[1]) * Cg.CamLocal[1] + double(Cg.CamLocal[2]) * Cg.CamLocal[2]);
+					if (Cg.FieldId == H::UNI_FIELD_GALAXY && Rl < 1.0) { std::printf("  home: CamLocal (%.5f %.5f %.5f) R %.3f kpc rot0 (%.2f %.2f %.2f) feat %.3g flags %u weight %.3f\n", Cg.CamLocal[0], Cg.CamLocal[1], Cg.CamLocal[2], 1.0 / Cg.InvRadius / Units::Kpc, Cg.Rot0[0], Cg.Rot0[1], Cg.Rot0[2], Cg.FeatureScale, Cg.Flags, Cg.Weight); }
+				}
+			}
+			const auto V = ToHlsl(Sc.View);
+			const auto Cb = Sc.CarrierBuf(); const auto Pb = Sc.ParamBuf(); const auto Lb = Sc.LutBuf();
+			std::vector<float> L(size_t(W) * Ht * 3);
+			double Steps = 0, Trunc = 0, Peak = 0;
+			for (int Y = 0; Y < Ht; ++Y) for (int X = 0; X < W; ++X)
+			{
+				bool bS = false;
+				const H::FUniVolumeResult Rs = MarchPixel(Cb, Pb, Lb, V, Cm, W, Ht, X, Y, 3.0e38f, bS);
+				L[(size_t(Y) * W + X) * 3 + 0] = Rs.Radiance.x; L[(size_t(Y) * W + X) * 3 + 1] = Rs.Radiance.y; L[(size_t(Y) * W + X) * 3 + 2] = Rs.Radiance.z;
+				Steps += Rs.Steps; Trunc += Rs.Truncated; Peak = std::max(Peak, double(H::Uni_Luminance(Rs.Radiance)));
+			}
+			std::printf("view %d (%.0f pc back) fine %d: steps/px %.1f truncated %.0f\n", Vi, Back[Vi], Fi, Steps / (W * Ht), Trunc);
+			if (Fi < 0) { Lo = L; continue; }
+			// The nebulae alone (on - off), log tone: 6 stops below the frame's 99.5th percentile.
+			std::vector<float> Lum; for (size_t I = 0; I < L.size() / 3; ++I) { Lum.push_back(std::max(0.2126f * (L[3 * I] - Lo[3 * I]) + 0.7152f * (L[3 * I + 1] - Lo[3 * I + 1]) + 0.0722f * (L[3 * I + 2] - Lo[3 * I + 2]), 0.0f)); }
+			std::vector<float> Sl = Lum; std::sort(Sl.begin(), Sl.end());
+			static double Top[3] = { 0, 0, 0 }; if (Fi == 0) { Top[Vi] = Sl[size_t(0.995 * (Sl.size() - 1))]; }
+			double Sn = 0, So = 0; for (size_t I = 0; I < Lum.size(); ++I) { Sn += Lum[I]; So += 0.2126f * Lo[3 * I] + 0.7152f * Lo[3 * I + 1] + 0.0722f * Lo[3 * I + 2]; }
+			std::printf("   nebula light / stars' %.3f\n", Sn / So);
+			for (int Y = 0; Y < Ht; ++Y) for (int X = 0; X < W; ++X)
+			{
+				const size_t I = size_t(Y) * W + X;
+				const float Lm = Lum[I];
+				const float V = float(std::min(std::max(std::log2(std::max(Lm / Top[Vi], 1e-9)) / 6.0 + 1.0, 0.0), 1.2));
+				const float Sc = Lm > 0 ? V / Lm : 0.0f;
+				Img.Add((Fi + 1) * W + X, Vi * Ht + Y, std::max(L[3 * I] - Lo[3 * I], 0.0f) * Sc, std::max(L[3 * I + 1] - Lo[3 * I + 1], 0.0f) * Sc, std::max(L[3 * I + 2] - Lo[3 * I + 2], 0.0f) * Sc);
+				const float Lf = 0.2126f * L[3 * I] + 0.7152f * L[3 * I + 1] + 0.0722f * L[3 * I + 2];
+				if (Fi == 1) { const float Vf = float(std::min(std::max(std::log2(std::max(double(Lf) / (4.0 * Top[Vi]), 1e-9)) / 6.0 + 1.0, 0.0), 1.2)); const float Sf = Vf / std::max(Lf, 1e-30f); Img.Add(X, Vi * Ht + Y, L[3 * I] * Sf, L[3 * I + 1] * Sf, L[3 * I + 2] * Sf); }
+			}
+		}
+	}
+	// Slide: inside the nebula, the log steps' phase moved (MinStepCm x (1 + r)^phase), and the
+	// fine reference (every step an eighth).
+	if (ZE("UU_SLIDE", 1) > 0)
+	{
+		const FVec3d Pos{ Cx, Cy, Cz + 5.0 * Units::Pc };
+		const FCoord Cam = ZCam(Pos);
+		FRefPipeline Pp(G);
+		Pp.bVelocityLod = false;
+		Pp.Update(Cam, FVec3f{});
+		const int Ws = 64, Hs = 36;
+		FCamera Cm; Cm.Coord = Cam; Cm.Width = Ws; Cm.Height = Hs; Cm.LookAlong({ ZE("UU_LX", 0.3), 1.0, ZE("UU_LZ", 0.05) });
+		for (int Fi = 0; Fi < 2; ++Fi)
+		{
+			FVolumeSettings S; S.NebulaGain = 1.0f; S.NebulaReflect = 6.0f; S.NebulaFineGain = float(Fi) * float(ZE("UU_FG", 1.0));
+			S.NebulaFineRatio = float(ZE("UU_RATIO", 0.04)) * float(Fi);
+			const FVolumeScene Sc = VB.Build(Pp, Cam, FVec3f{}, Cm.View(), S).Subset(false);
+			const auto Pb = Sc.ParamBuf(); const auto Lb = Sc.LutBuf();
+			std::vector<double> Ph[5];
+			if (Fi == 0) { for (const FCarrierGPU& Cg : Sc.Carriers) { std::printf("  carrier field %u TStart %.3g pc\n", Cg.FieldId, Cg.TStart / Units::Pc); } }
+			double Steps = 0;
+			for (int K = 0; K < 5; ++K)
+			{
+				auto V = ToHlsl(Sc.View);
+				FVolumeScene Sk = Sc;
+				const double Fph = std::pow(1.0 + ZE("UU_PHR", 0.32), 0.25 * (K % 4));
+				for (FCarrierGPU& Cg : Sk.Carriers) { Cg.TStart = float(double(ZE("UU_T0PC", 0.01)) * Units::Pc * Fph); }
+				const auto Cb = Sk.CarrierBuf();
+				if (K == 4) { V.MarchFlags |= 2u; V.MaxSteps = 8192u; }
+				for (int Y = 0; Y < Hs; ++Y) for (int X = 0; X < Ws; ++X)
+				{
+					bool bS = false;
+					const H::FUniVolumeResult Rs = MarchPixel(Cb, Pb, Lb, V, Cm, Ws, Hs, X, Y, 3.0e38f, bS);
+					Ph[K].push_back(H::Uni_Luminance(Rs.Radiance));
+					if (K == 0) { Steps += Rs.Steps; }
+				}
+			}
+			double W = 0, Dsp = 0, Err = 0;
+			for (size_t I = 0; I < Ph[0].size(); ++I)
+			{
+				double Lo = 1e300, Hi = -1e300, Mn = 0;
+				for (int K = 0; K < 4; ++K) { Lo = std::min(Lo, Ph[K][I]); Hi = std::max(Hi, Ph[K][I]); Mn += 0.25 * Ph[K][I]; }
+				W += Mn; Dsp += Hi - Lo; Err += std::abs(Mn - Ph[4][I]);
+			}
+			std::printf("slide fine %d: spread %.3f%% error vs fine ref %.3f%% steps/px %.1f\n", Fi, 100.0 * Dsp / W, 100.0 * Err / W, Steps / (Ws * Hs));
+		}
+	}
+	const std::string Dd = UniVerify::Options().OutDir + "/render"; ::mkdir(UniVerify::Options().OutDir.c_str(), 0755); ::mkdir(Dd.c_str(), 0755);
+	Img.WritePpm(Dd + "/zz_nebfine.ppm");
+	for (int S = 0; S < 3; ++S) { BindGalaxyTexture(S, nullptr); }
+	Uni::Check(2, "Z.nebfine", "x").Pass(true, "ok");
+}
+
+// ---- the pattern statistics (mip 0 and 2; UU_MIP, UU_P) ----
+#include "../src/UniTest.h"
+#include "../src/UniVerifyCommon.h"
+#include "UniVolume.h"
+#include "UniWebTexture.h"
+#include <cmath>
+#include <cstdio>
+#include <vector>
+#include <cstdlib>
+#include <algorithm>
+using namespace UniCore;
+namespace H = UniHlsl;
+UNI_TEST(zz, finestat)
+{
+	FWebTexture T[3];
+	for (int S = 0; S < 3; ++S) { std::string E; FWebTexture::LoadDelivered("Data/Noise", GalaxyTextureName(S), T[S], &E); BindGalaxyTexture(S, &T[S]); }
+	const int N = 400000;
+	std::vector<H::float4> V(N);
+	for (int I = 0; I < N; ++I)
+	{
+		const H::float3 Pt{ H::Uni_DrawUnit(77u, 2u, u32(3 * I)) * 4.0f, H::Uni_DrawUnit(77u, 2u, u32(3 * I + 1)) * 4.0f, H::Uni_DrawUnit(77u, 2u, u32(3 * I + 2)) * 4.0f };
+		V[I] = UNI_GAL_DETAIL(Pt, float(std::getenv("UU_MIP") ? std::atof(std::getenv("UU_MIP")) : 0.0));
+	}
+	double M[4] = { 0, 0, 0, 0 };
+	for (auto& x : V) { M[0] += x.x / N; M[1] += x.y / N; M[2] += x.z / N; M[3] += x.w / N; }
+	std::printf("mip0 means %.5f %.5f %.5f %.5f\n", M[0], M[1], M[2], M[3]);
+	auto Stats = [&](int C, double P, double& Mean, double& Cv)
+	{
+		double S = 0, S2 = 0;
+		for (auto& x : V) { const double v = C == 0 ? x.x : (C == 1 ? x.y : (C == 2 ? x.z : x.w)); const double q = std::pow(std::max(v, 0.0) / M[C], P); S += q / N; S2 += q * q / N; }
+		Mean = S; Cv = std::sqrt(std::max(S2 - S * S, 0.0)) / S;
+	};
+	for (double P : { 2.0, 3.0, 4.0 }) { double Mn, Cv; Stats(0, P, Mn, Cv); std::printf("R p %.1f mean %.4f cv %.3f\n", P, Mn, Cv); }
+	double Mr, Cr; Stats(0, std::getenv("UU_P") ? std::atof(std::getenv("UU_P")) : 4.0, Mr, Cr);
+	for (int C = 1; C < 4; ++C)
+	{
+		double Lo = 0.5, Hi = 12;
+		for (int It = 0; It < 40; ++It) { const double Mid = 0.5 * (Lo + Hi); double Mn, Cv; Stats(C, Mid, Mn, Cv); (Cv < Cr ? Lo : Hi) = Mid; }
+		double Mn, Cv; Stats(C, Lo, Mn, Cv);
+		std::printf("ch %d: p %.3f mean %.4f cv %.3f (ridged cv %.3f)\n", C, Lo, Mn, Cv, Cr);
+	}
+	for (int C : { 0, 3 })
+	{
+		std::vector<double> Q; Q.reserve(N);
+		for (auto& x : V) { Q.push_back((C == 0 ? x.x : x.w) / M[C]); }
+		std::sort(Q.begin(), Q.end());
+		std::printf("ch %d quantiles:", C);
+		for (double q : { 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.98, 0.99, 0.999 }) { std::printf(" q%.3f=%.3f", q, Q[size_t(q * (N - 1))]); }
+		std::printf("\n");
+		for (double q0 : { 0.6, 0.7, 0.8 })
+		{
+			const double T0 = Q[size_t(q0 * (N - 1))], T1 = Q[size_t(0.99 * (N - 1))];
+			double S2 = 0, S1 = 0, S4 = 0;
+			for (double v : Q) { const double X = std::min(std::max((v - T0) / (T1 - T0), 0.0), 1.0); S2 += X * X / N; S1 += X / N; S4 += X * X * X * X / N; }
+			std::printf("  t0 q%.2f (%.4f) t1 q0.99 (%.4f): E[X^2] %.5f E[X] %.5f cv(X^2/E) %.2f\n", q0, T0, T1, S2, S1, std::sqrt(S4 - S2 * S2) / S2);
+		}
+	}
+	for (int C = 0; C < 4; ++C) BindGalaxyTexture(C < 3 ? C : 0, nullptr);
+	Uni::Check(2, "Z.finestat", "x").Pass(true, "ok");
+}

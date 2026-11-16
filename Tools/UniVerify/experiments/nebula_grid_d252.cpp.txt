@@ -1,0 +1,305 @@
+// nebula_grid_d252.cpp.txt (archived exploration; was tests/test_zz_grid.cpp, --group zz.grid): D-252 the nebula grid. The dense prototype's modes (the whole field from the grid; the knots at the point x the grid's detail ratios; the light from the grid with the dust's ratios: the one kept; two channels) and resolutions (128, 256, 512 cells across) were measured against D-251 by an earlier version of this file (Docs/DECISIONS.md D-252); this version runs the sparse grid through the passes' emulation (UNI_GRID_* environment: W, THETA, NX, SAMPLES, NEBSTEP, FETCHMAX, LAYER, VIEW, NOBASE, BASESTEP, OUT, TAG; UNI_GRID_SLACK: classify's slack probe; UNI_GRID_RAYS: emission integrals along the view's rays, the field against the grid's reads).
+// test_zz_grid.cpp (exploration, --group zz.grid): D-252 the sparse nebula grid through the CPU
+// emulation (UniNebGridRef.h) against D-251's march: engine-like pixels (UNI_GRID_THETA, 1.6
+// mrad) in a crop (UNI_GRID_W), the engine's path (cloud resolve, blue noise, 4 x 4 slicing, 64
+// frames), the converged image against the fine analytic reference and its frame-to-frame change.
+#include "../src/UniTest.h"
+#include "../src/UniRenderRef.h"
+#include "../src/UniVerifyCommon.h"
+#include "../src/UniVolumeRef.h"
+#include "../src/UniBlueNoise.h"
+#include "../src/UniNebGridRef.h"
+#include "../scenes/UniScenes.h"
+#include "UniVolume.h"
+#include "UniWebTexture.h"
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <thread>
+#include <vector>
+using namespace UniCore;
+using namespace UniRender;
+namespace H = UniHlsl;
+
+namespace
+{
+	double Gl(const H::float4& V) { return 0.2126 * V.x + 0.7152 * V.y + 0.0722 * V.z; }
+	void WriteTone(const std::vector<H::float4>& Img, int W, int Ht, double Exp, const std::string& Path)
+	{
+		FILE* F = std::fopen(Path.c_str(), "wb");
+		if (!F) { return; }
+		std::fprintf(F, "P6\n%d %d\n255\n", W, Ht);
+		for (const H::float4& V : Img)
+		{
+			const double C[3] = { V.x * Exp, V.y * Exp, V.z * Exp };
+			for (int I = 0; I < 3; ++I) { std::fputc(int(std::round(255.0 * std::pow(std::clamp(C[I] / (1.0 + C[I]), 0.0, 1.0), 1.0 / 2.2))), F); }
+		}
+		std::fclose(F);
+	}
+	double Env(const char* N, double D) { const char* V = std::getenv(N); return V ? std::atof(V) : D; }
+}
+
+UNI_TEST(zz, grid)
+{
+	FWebTexture T[3];
+	for (int S = 0; S < 3; ++S) { std::string E; FWebTexture::LoadDelivered("Data/Noise", GalaxyTextureName(S), T[S], &E); }
+	for (int I = 0; I < 3; ++I) { BindGalaxyTexture(I, &T[I]); }
+	FUniverseDef D = UniScenes::Flythrough();
+	UniScenes::UseGalaxyTextures(D, T[0].Size);
+	UniScenes::UseGalaxyPalettes(D);
+	const FFieldParams* Mw = nullptr;
+	for (const FAnchor& A : D.Anchors) { if (!A.EmitterParams.empty()) { Mw = &A.EmitterParams[0]; } }
+	const H::FUniFieldParams P = Mw->ToHlsl();
+	const H::FUniGalaxyConst K = H::Uni_GalaxyConstOf(P);
+	double Hx = 0.0, Hy = 0.0, Hb = -1.0;
+	for (int I = 0; I < 60000; ++I)
+	{
+		const double R = 0.3 + 0.4 * H::Uni_DrawUnit(0xF374u, 2u, u32(2 * I)), Ph = 6.2831853 * H::Uni_DrawUnit(0xF374u, 2u, u32(2 * I + 1));
+		const H::float3 Pt{ float(R * std::cos(Ph)), float(R * std::sin(Ph)), 0.0f };
+		H::float4 C(0, 0, 0, 0), Nv(0, 0, 0, 0);
+		const float Rho = H::UniField_GalaxyFilteredCKN(Pt, P, K, 1e-5f, C, Nv);
+		const double Sc = double(H::Uni_GalaxyNebulaX(Nv, P)) * double(H::Uni_GalaxyNebulaDensity(Nv, P, 1e-5f)) / std::max(double(Rho), 1e-30);
+		if (Sc > Hb) { Hb = Sc; Hx = Pt.x; Hy = Pt.y; }
+	}
+	FUniverseModel Mo(D);
+	FRefGenerator G(Mo);
+	FVolumeBuilder VB(Mo, G);
+	double Radius = 0.0;
+	auto CamAt = [](const FVec3d& Pc) { FCoord C = FCoord::Origin(); FVec3f F; AddDisplacement(C, F, Pc); return C; };
+	u32 GridParam = 0xFFFFFFFFu;
+	double CamField[3] = { 0, 0, 0 };
+	auto Build = [&](const FCamera& Cm, float NebStep)
+	{
+		FRefPipeline Pp(G); Pp.bVelocityLod = false; Pp.Update(Cm.Coord, FVec3f{});
+		FVolumeSettings Sv; Sv.NebulaGain = 1.0f; Sv.NebulaReflect = 6.0f; Sv.NebulaFineReachCm = float(7.0 * Units::Kpc); Sv.NebulaStepRatio = NebStep; Sv.NebulaDark = float(Env("UNI_GRID_DARK", 0.35)); Sv.NebulaReflect = float(Env("UNI_GRID_REFL", 6.0)); if (std::getenv("UNI_GRID_NODUST")) { Sv.DustSigmaRgb[0] = Sv.DustSigmaRgb[1] = Sv.DustSigmaRgb[2] = 0.0f; }
+		ApplyNebulaTune(NebulaTune(Sv));
+		FVolumeScene Sc = VB.Build(Pp, Cm.Coord, FVec3f{}, Cm.View(), Sv).Subset(false);
+		for (const FCarrierGPU& Cg : Sc.Carriers)
+		{
+			const double Rl = std::sqrt(double(Cg.CamLocal[0]) * Cg.CamLocal[0] + double(Cg.CamLocal[1]) * Cg.CamLocal[1] + double(Cg.CamLocal[2]) * Cg.CamLocal[2]);
+			if (Cg.FieldId == H::UNI_FIELD_GALAXY && Rl < 1.0) { Radius = 1.0 / double(Cg.InvRadius); GridParam = Cg.ParamIndex; }
+		}
+		for (int A = 0; A < 3; ++A) { CamField[A] = Sc.Home.CamField[A]; }
+		return Sc;
+	};
+	{ FCamera Cm; Cm.Coord = CamAt({ 8.0 * Units::Kpc, 0.0, 0.0 }); Cm.Width = 4; Cm.Height = 4; Cm.LookAlong({ 0.0, 1.0, 0.0 }); Build(Cm, 0.0f); }
+	const int W = int(Env("UNI_GRID_W", 96)), Ht = W * 9 / 16;
+	const double ThetaPx = Env("UNI_GRID_THETA", 1.6e-3);
+	const double FovX = 2.0 * std::atan(0.5 * W * ThetaPx);
+	auto Reference = [&](const FCamera& Cm)
+	{
+		FVolumeScene Sf = Build(Cm, 0.0f);
+		Sf.View.MarchFlags |= 2u; Sf.View.MaxSteps = 16384u;
+		const auto Cb = Sf.CarrierBuf(); const auto Pb = Sf.ParamBuf(); const auto Lb = Sf.LutBuf();
+		const auto V = ToHlsl(Sf.View);
+		std::vector<H::float4> Ref(size_t(W) * Ht);
+		std::atomic<int> Row{ 0 };
+		auto Work = [&]() { for (int Y = Row++; Y < Ht; Y = Row++) for (int X = 0; X < W; ++X) { bool bS = false; const H::FUniVolumeResult R = MarchPixel(Cb, Pb, Lb, V, Cm, W, Ht, X, Y, 3.0e38f, bS); Ref[size_t(Y) * W + X] = H::float4(R.Radiance.x, R.Radiance.y, R.Radiance.z, 0.0f); } };
+		std::thread T1(Work); Work(); T1.join();
+		return Ref;
+	};
+	UniVerify::FBlueNoiseBind Bn(true);
+	struct FRun { std::vector<H::float4> Vol; double Flick = 0.0, Steps = 0.0; };
+	const float FetchMax = float(Env("UNI_GRID_FETCHMAX", 32.0));
+	auto Run = [&](const FCamera& Cm, float NebStep, UniVerify::FNebGridEmu* Grid)
+	{
+		FVolumeScene Sc = Build(Cm, NebStep);
+		Sc.View.MarchFlags |= H::UNI_VOL_JITTER_FLAG;
+		if (Grid)
+		{
+			float Zc = 0.0f, Fl = 1.0f;
+			H::Uni_GalaxyLayerMid(H::float3(float(CamField[0]), float(CamField[1]), float(CamField[2])), P, K.Hp, Zc, Fl);
+			Grid->Frame(CamField, double(Zc), 0xFFFFFFFFu);
+			Grid->ToView(Sc.View, GridParam, FetchMax);
+		}
+		FTemporalVolume Tv; Tv.MaxSamples = 16.0f; Tv.bCloud = true; Tv.Interleave = 4;
+		FRun R; std::vector<H::float4> Last; size_t Nf = 0;
+		for (int F = 0; F < 64; ++F)
+		{
+			Tv.Step(Sc, Cm, FV3{ 0, 0, 0 }, true, true, 2);
+			if (F >= 48)
+			{
+				if (!Last.empty()) { for (size_t I = 0; I < Last.size(); ++I) { R.Flick += std::abs(Gl(Tv.Vol[I]) - Gl(Last[I])); } ++Nf; }
+				Last = Tv.Vol;
+			}
+		}
+		R.Flick /= double(std::max<size_t>(Nf, 1)) * double(Last.size());
+		R.Vol = Tv.Vol;
+		R.Steps = double(Tv.Steps) / double(std::max<size_t>(Tv.Marched, 1));
+		if (Grid) { UniVerify::FNebGridEmu::Unbind(); }
+		return R;
+	};
+	auto Mean = [&](const std::vector<H::float4>& Ref) { double M = 0.0; for (const H::float4& V : Ref) { M += Gl(V) / Ref.size(); } return M; };
+	auto Err = [&](const std::vector<H::float4>& A, const std::vector<H::float4>& Ref)
+	{
+		const double M = Mean(Ref);
+		double E = 0.0; for (size_t I = 0; I < A.size(); ++I) { E += std::abs(Gl(A[I]) - Gl(Ref[I])) / std::max(M, 1e-300) / A.size(); }
+		return E;
+	};
+	const double Pc = Units::Pc;
+	std::printf("crop %d x %d, %.2f mrad a pixel (fov %.1f deg)\n", W, Ht, 1e3 * ThetaPx, FovX * 57.29578);
+	const char* Out = std::getenv("UNI_GRID_OUT");
+	struct FView { const char* Name; FCamera Cm; };
+	std::vector<FView> Views;
+	{
+		const double Nxc = Hx * Radius, Nyc = Hy * Radius;
+		const double Rn = std::sqrt(Nxc * Nxc + Nyc * Nyc);
+		const double Ux = -Nxc / Rn, Uy = -Nyc / Rn, Vx = -Uy, Vy = Ux;
+		const double Dist[3] = { 250.0, 1000.0, 3000.0 };
+		const char* Names[3] = { "n250", "n1000", "n3000" };
+		for (int I = 0; I < 3; ++I)
+		{
+			const double Dd = Dist[I] * Pc;
+			const FVec3d Cp{ Nxc + (0.6 * Ux + 0.8 * Vx) * Dd, Nyc + (0.6 * Uy + 0.8 * Vy) * Dd, 0.02 * Dd };
+			FCamera C; C.Coord = CamAt(Cp); C.Width = W; C.Height = Ht; C.FovX = FovX; C.LookAlong({ Nxc - Cp.X, Nyc - Cp.Y, -Cp.Z });
+			Views.push_back({ Names[I], C });
+		}
+		FCamera Cd; Cd.Coord = CamAt({ -8.0 * Units::Kpc, 0.0, 20.0 * Pc }); Cd.Width = W; Cd.Height = Ht; Cd.FovX = FovX; Cd.LookAlong({ 1.0, 0.25, -0.02 });
+		Views.push_back({ "disc", Cd });
+	}
+	if (std::getenv("UNI_GRID_SLACK"))
+	{
+		// Classify's slack: per level, random bricks about the solar camera within the gas layer:
+		// truly occupied (any of its 9^3 lattice points bakes non-empty, 1 sample) against the
+		// highest knot shape before its clamp over classify's samples.
+		const double Cam0[3] = { -8.0 * Units::Kpc / Radius, 0.0, 0.0 };
+		const double C0 = 4.0 * Pc / Radius, Lh = 4.0 * UNI_NEBULA_HEIGHT * P.A.y + 50.0 * Pc / Radius;
+		const double Kt = H::Uni_GalaxyNebulaKnotTexel(P);
+		for (int Lv = 0; Lv < 4; ++Lv)
+		{
+			const double C = C0 * std::exp2(double(Lv)), Bs = 8.0 * C;
+			const int Nb = int(Env("UNI_GRID_SLACK", 600));
+			const u32 N = std::max(u32(std::ceil(10.0 * C / (0.5 * Kt))) + 1u, 2u);
+			std::vector<float> MaxX(size_t(Nb), -1e9f); std::vector<int> Truth(size_t(Nb), 0);
+			std::atomic<int> Next{ 0 };
+			auto Work = [&]()
+			{
+				for (int I = Next++; I < Nb; I = Next++)
+				{
+					const int Wx = int(std::floor((Cam0[0] + (H::Uni_DrawUnit(0x51ACu + u32(Lv), 1u, u32(3 * I)) * 2.0 - 1.0) * 64.0 * C) / Bs));
+					const int Wy = int(std::floor((Cam0[1] + (H::Uni_DrawUnit(0x51ACu + u32(Lv), 1u, u32(3 * I + 1)) * 2.0 - 1.0) * 64.0 * C) / Bs));
+					const int Wz = int(std::floor(((H::Uni_DrawUnit(0x51ACu + u32(Lv), 1u, u32(3 * I + 2)) * 2.0 - 1.0) * Lh) / Bs));
+					float Mx = -1e9f;
+					for (u32 S = 0; S < N * N * N; ++S)
+					{
+						const u32 Nn = N;
+						const float Sp = 10.0f / float(Nn - 1u);
+						const float Fx = float(Wx * 8) - 1.0f + Sp * float(S % Nn), Fy = float(Wy * 8) - 1.0f + Sp * float((S / Nn) % Nn), Fz = float(Wz * 8) - 1.0f + Sp * float(S / (Nn * Nn));
+						H::float4 Cc(0, 0, 0, 0), Nv(0, -1, 0.5f, 0);
+						H::UniField_GalaxyFilteredCKN(H::float3(Fx, Fy, Fz) * float(C), P, K, float(C), Cc, Nv);
+						if (Nv.x > 0.0f) { Mx = std::max(Mx, H::Uni_GalaxyNebulaXRaw(Nv)); }
+					}
+					int Tr = 0;
+					for (int Q = 0; Q < 729 && !Tr; ++Q)
+					{
+						const int Ix = Wx * 8 + Q % 9, Iy = Wy * 8 + (Q / 9) % 9, Iz = Wz * 8 + Q / 81;
+						const H::float4 V = H::Uni_NebGridBakePoint(H::float3(float(Ix), float(Iy), float(Iz)) * float(C), float(C), P, K, 1.0f, 0.35f, H::Uni_NebGridHash(u32(Lv), Ix, Iy, Iz), 1u);
+						Tr = (V.x != 0.0f || V.y != 0.0f || V.z != 1.0f || V.w != 1.0f) ? 1 : 0;
+					}
+					MaxX[size_t(I)] = Mx; Truth[size_t(I)] = Tr;
+				}
+			};
+			std::thread T1(Work); Work(); T1.join();
+			float Worst = 1e9f; int Occ = 0;
+			for (int I = 0; I < Nb; ++I) { if (Truth[size_t(I)]) { ++Occ; Worst = std::min(Worst, MaxX[size_t(I)]); } }
+			std::printf("level %d (cell %.0f pc, N %u): truly occupied %.1f%%, worst occupied brick's max X raw %.3f;", Lv, C * Radius / Pc, N, 100.0 * Occ / Nb, Worst);
+			const float Sl[6] = { 0.0f, 0.05f, 0.1f, 0.2f, 0.3f, 0.5f };
+			for (float Sk : Sl) { int Kept = 0; for (int I = 0; I < Nb; ++I) { Kept += MaxX[size_t(I)] > -Sk ? 1 : 0; } std::printf(" slack %.2f keeps %.1f%%", Sk, 100.0 * Kept / Nb); }
+			std::printf("\n"); std::fflush(stdout);
+		}
+	}
+	const char* Only = std::getenv("UNI_GRID_VIEW");
+	const float NebStep = float(Env("UNI_GRID_NEBSTEP", 0.08));
+	const u32 Cells = u32(Env("UNI_GRID_NX", 128));
+	const u32 Samples = u32(Env("UNI_GRID_SAMPLES", 1));
+	for (FView& Vw : Views)
+	{
+		if (Only && std::string(Only) != Vw.Name) { continue; }
+		const std::vector<H::float4> Ref = Reference(Vw.Cm);
+		const double M = Mean(Ref);
+		const bool bBase = !std::getenv("UNI_GRID_NOBASE");
+		const FRun R1 = bBase ? Run(Vw.Cm, float(Env("UNI_GRID_BASESTEP", 0.08)), nullptr) : FRun{};
+		UniVerify::FNebGridEmu Emu;
+		FNebGridConfig Cfg;
+		{
+			FVolumeScene Sc = Build(Vw.Cm, NebStep);
+			const auto Pb = Sc.ParamBuf();
+			const H::FUniFieldParams Gp = Pb[GridParam];
+			Cfg.Cells = Cells;
+			Cfg.Cell0 = 4.0 * Pc / Radius;
+			Cfg.LayerHalf = Env("UNI_GRID_LAYER", 3.0) * UNI_NEBULA_HEIGHT * Gp.A.y + 50.0 * Pc / Radius;
+			Cfg.KnotTexel = H::Uni_GalaxyNebulaKnotTexel(Gp);
+			Cfg.Levels = NebGridLevelsFor(8.0 * Units::Kpc / Radius, Cells, Cfg.Cell0);
+			Cfg.Samples = Samples;
+			Emu.Configure(Cfg, 1u, Gp, Sc.View.NebulaFineGain, Sc.View.NebulaDark);
+		}
+		const FRun Rg = Run(Vw.Cm, NebStep, &Emu);
+		if (std::getenv("UNI_GRID_RAYS"))
+		{
+			// Emission integrals along rays near the view: the field (footprint the pixel's, 0.5 pc steps)
+			// against the grid's reads at the same points (the level the march would pick for a 0.5 pc step).
+			Emu.Bind();
+			FVolumeScene Sc = Build(Vw.Cm, NebStep);
+			const auto Pb = Sc.ParamBuf();
+			const H::FUniFieldParams Gp = Pb[GridParam];
+			const H::FUniGalaxyConst Gk = H::Uni_GalaxyConstOf(Gp);
+			double Sa = 0.0, Sg = 0.0, Sf = 0.0;
+			const int Nr = 60;
+			for (int Rr = 0; Rr < Nr; ++Rr)
+			{
+				const FV3 Dw = PixelDir(Vw.Cm, W, Ht, (Rr % 10 + 0.5) * W / 10.0, (Rr / 10 + 0.5) * Ht / 6.0);
+				FCarrierGPU Ca{}; for (const FCarrierGPU& Cg : Sc.Carriers) { if (Cg.ParamIndex == GridParam && Cg.FieldId == H::UNI_FIELD_GALAXY) { Ca = Cg; } }
+				const H::FUniCarrier Hc = ToHlsl(Ca);
+				const H::float3 Ld = H::Uni_CarrierLocalDir(Hc, H::float3(float(Dw.X), float(Dw.Y), float(Dw.Z)));
+				for (double T = 1.0 * Pc; T < 4000.0 * Pc; T += 0.5 * Pc)
+				{
+					const H::float3 Pt = H::Uni_CarrierPoint(Hc, Ld, float(T));
+					H::float4 Cc(0, 0, 0, 0), Nv(0, -1, 0.5f, 0);
+					const float Foot = float(T * ThetaPx / Radius);
+					H::UniField_GalaxyFilteredCKN(Pt, Gp, Gk, Foot, Cc, Nv);
+					float X = 0, Md = 1, Mr = 1;
+					const double Det = 1.0 - (T > 3500.0 * Pc ? std::min((T - 3500.0 * Pc) / (3500.0 * Pc), 1.0) : 0.0);
+					const double Na = Nv.x > 0.0f ? double(H::Uni_GalaxyNebulaDensityAtF(Pt, Nv, Gp, Foot, Foot, 0.0f, float(Det), Sc.View.NebulaDark, X, Md, Mr)) : 0.0;
+					const double Nf = Nv.x > 0.0f ? double(H::Uni_GalaxyNebulaDensityAtF(Pt, Nv, Gp, Foot, Foot, 0.0f, 0.0f, Sc.View.NebulaDark, X, Md, Mr)) : 0.0;
+					const float Lv = H::Uni_NebGridLevel(Pt, Pt, float(0.5 * Pc / Radius), Foot, H::uint(Emu.Planner.Layout().Levels.size()), 32.0f);
+					double Ng = Na;
+					if (Lv < float(Emu.Planner.Layout().Levels.size()))
+					{
+						float Gs = 0.0f;
+						const H::float4 G4 = H::Uni_NebGridSegment(Lv, H::uint(Emu.Planner.Layout().Levels.size()), Pt, Pt, float(0.5 * Pc / Radius), 0.5f, 32.0f, Gs);
+						Ng = Na * (1.0 - Gs) + double(G4.x) * Gs;
+					}
+					Sa += Na; Sg += Ng; Sf += Nf;
+				}
+			}
+			std::printf("  emission integrals: field %.4e grid %.4e (x%.4f) faded field x%.4f\n", Sa, Sg, Sg / std::max(Sa, 1e-300), Sf / std::max(Sa, 1e-300));
+			UniVerify::FNebGridEmu::Unbind();
+		}
+		const FNebGridLayout& L = Emu.Planner.Layout();
+		std::printf("[%s] mean %.3e\n", Vw.Name, M);
+		if (bBase) { std::printf("  D-251: err %.2f%% flick %.3f%% steps %.1f\n", 100 * Err(R1.Vol, Ref), 100 * R1.Flick / M, R1.Steps); }
+		std::printf("  light grid %.4f base %.4f\n", Mean(Rg.Vol) / M, bBase ? Mean(R1.Vol) / M : 0.0);
+		std::printf("  grid %u cells %zu levels, pool %.1f MB (%u slots), table %.2f MB: err %.2f%% flick %.3f%% steps %.1f; classified %zu empty %zu allocated %zu overflow %zu\n",
+			Cells, L.Levels.size(), double(L.PoolBytes()) / 1048576.0, L.Slots, double(L.TableBytes()) / 1048576.0, 100 * Err(Rg.Vol, Ref), 100 * Rg.Flick / M, Rg.Steps, Emu.Classified, Emu.Empty, Emu.Allocated, Emu.Overflow);
+		for (size_t Lv = 0; Lv < L.Levels.size(); ++Lv)
+		{
+			std::printf("    level %zu: cell %.0f pc, bricks %u x %u x %u, slots %u, classify %u\n", Lv, L.Levels[Lv].Cell * Radius / Pc, L.Levels[Lv].Bx, L.Levels[Lv].Bx, L.Levels[Lv].Bz, L.Levels[Lv].SlotCount, L.Levels[Lv].ClassifyN);
+		}
+		std::fflush(stdout);
+		if (Out)
+		{
+			std::vector<double> Ls; for (const H::float4& V : Ref) { Ls.push_back(Gl(V)); }
+			std::sort(Ls.begin(), Ls.end());
+			const double Ex = 1.0 / std::max(Ls[size_t(0.99 * double(Ls.size() - 1))], 1e-300);
+			const std::string B = std::string(Out) + "/" + Vw.Name;
+			const char* Tag = std::getenv("UNI_GRID_TAG") ? std::getenv("UNI_GRID_TAG") : "sparse";
+			WriteTone(Ref, W, Ht, Ex, B + "_ref.ppm"); if (bBase) { WriteTone(R1.Vol, W, Ht, Ex, B + "_d251.ppm"); } WriteTone(Rg.Vol, W, Ht, Ex, B + "_" + Tag + ".ppm");
+		}
+	}
+	for (int I = 0; I < 3; ++I) { BindGalaxyTexture(I, nullptr); }
+	ApplyNebulaTune(FNebulaTune{});
+	Uni::Check(3, "zz.grid", "D-252 sparse grid exploration").Pass(true, "see output");
+}

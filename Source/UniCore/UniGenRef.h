@@ -502,7 +502,9 @@ namespace UniCore
 				for (u32 K = 0; K < H::UNI_PROBES_PER_CELL; ++K)
 				{
 					const H::float3 U = H::Uni_ProbeUnit(Seed, K);
-					S += H::Uni_FieldSample(C.Emitter->FieldId, H::float3(O.x + U.x * Cell, O.y + U.y * Cell, O.z + U.z * Cell), P);
+					const H::float3 Q(O.x + U.x * Cell, O.y + U.y * Cell, O.z + U.z * Cell);
+					// D-238, D-239: the globulars as their smooth halo, the open clusters as their mean.
+					S += C.Emitter->FieldId == H::UNI_FIELD_GALAXY ? H::Uni_GalaxyIntegrand(Q, P) : H::Uni_FieldSample(C.Emitter->FieldId, Q, P);
 				}
 				Sum += S / double(H::UNI_PROBES_PER_CELL) * double(Cell) * double(Cell) * double(Cell);
 			}
@@ -513,13 +515,14 @@ namespace UniCore
 		 *  exact one is on a worker (~0.2-0.3 s each, four at a time: flying into a rich cluster,
 		 *  hundreds of galaxies reach the volume handoff at once and stayed plain sprites for
 		 *  seconds). Importance sampled over the unit ball, deterministic per contributor:
-		 *  QuickIntegralSamples (4096) points, a third uniform in the ball, a third in the thin disc
+		 *  QuickIntegralSamples (8192; D-262: 4096 until D-256's narrower barred arms took the worst
+		 *  to 8.8%) points, a third uniform in the ball, a third in the thin disc
 		 *  (x, y uniform in the unit disc, z Laplace with the field's scale height, Par.A.y), a third
 		 *  toward the centre (r = 0.3 u^2). Measured on a rich cluster's galaxies: ~2% from the exact
-		 *  (worst ~6%), ~0.8 ms. Never used for generation (counts wait for the exact value); the
+		 *  (worst ~6%), ~0.8 ms (D-262, at 8192: ~1.6 ms). Never used for generation (counts wait for the exact value); the
 		 *  volume eases to the exact one when it arrives (FUniStreamer::VolumeIntegral). Galaxy
 		 *  fields only: -1 for every other (their integral is analytic or the exact path's). */
-		static constexpr u32 QuickIntegralSamples = 4096u;
+		static constexpr u32 QuickIntegralSamples = 8192u;
 		static double ComputeIntegralQuick(const FContributor& C)
 		{
 			if (C.bRoot || C.Emitter->bDensityMode || C.Emitter->FieldId != H::UNI_FIELD_GALAXY) { return -1.0; }
@@ -558,7 +561,8 @@ namespace UniCore
 				const double Rr = std::sqrt(R2);
 				const double Core = Rr < Rc && Rr > 0.0 ? 1.0 / (2.0 * std::sqrt(Rr * Rc)) / (4.0 * Pi * R2) : 0.0;
 				const double Q = (Ball + Disc + Core) / 3.0;
-				Sum += double(H::Uni_FieldSample(C.Emitter->FieldId, H::float3(float(X), float(Y), float(Z)), P)) / Q;
+				const H::float3 Pq{ float(X), float(Y), float(Z) };
+				Sum += double(H::Uni_GalaxyIntegrand(Pq, P)) / Q;   // D-238, D-239: the clusters as their means
 			}
 			return Sum / double(QuickIntegralSamples);
 		}
@@ -693,6 +697,8 @@ namespace UniCore
 			R.Count = C.Count; R.CandidateBudget = C.CandidateBudget; R.Mean = C.Mean; R.Envelope = C.Envelope;
 			R.Oct[0] = C.OctLo.x; R.Oct[1] = C.OctLo.y; R.Oct[2] = C.OctLo.z; R.Oct[3] = C.OctLo.w;
 			R.Oct[4] = C.OctHi.x; R.Oct[5] = C.OctHi.y; R.Oct[6] = C.OctHi.z; R.Oct[7] = C.OctHi.w;
+			const H::float4 G[7] = { C.GcHead, C.GcIdx0, C.GcIdx1, C.GcMass0, C.GcMass1, C.OcHead, C.OcRange };   // D-238, D-239
+			for (int I = 0; I < 7; ++I) { R.Gc[4 * I] = G[I].x; R.Gc[4 * I + 1] = G[I].y; R.Gc[4 * I + 2] = G[I].z; R.Gc[4 * I + 3] = G[I].w; }
 			return R;
 		}
 		static H::FUniTaskCount ToHlsl(const FTaskCountGPU& C)
@@ -701,6 +707,10 @@ namespace UniCore
 			R.Count = C.Count; R.CandidateBudget = C.CandidateBudget; R.Mean = C.Mean; R.Envelope = C.Envelope;
 			R.OctLo = H::float4(C.Oct[0], C.Oct[1], C.Oct[2], C.Oct[3]);
 			R.OctHi = H::float4(C.Oct[4], C.Oct[5], C.Oct[6], C.Oct[7]);
+			R.GcHead = H::float4(C.Gc[0], C.Gc[1], C.Gc[2], C.Gc[3]);   // D-238
+			R.GcIdx0 = H::float4(C.Gc[4], C.Gc[5], C.Gc[6], C.Gc[7]); R.GcIdx1 = H::float4(C.Gc[8], C.Gc[9], C.Gc[10], C.Gc[11]);
+			R.GcMass0 = H::float4(C.Gc[12], C.Gc[13], C.Gc[14], C.Gc[15]); R.GcMass1 = H::float4(C.Gc[16], C.Gc[17], C.Gc[18], C.Gc[19]);
+			R.OcHead = H::float4(C.Gc[20], C.Gc[21], C.Gc[22], C.Gc[23]); R.OcRange = H::float4(C.Gc[24], C.Gc[25], C.Gc[26], C.Gc[27]);   // D-239
 			return R;
 		}
 

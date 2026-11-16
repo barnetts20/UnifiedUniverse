@@ -1,0 +1,83 @@
+// nebula_cal_d259.cpp.txt (archived exploration; was tests/test_zz_nebcal.cpp, --group zz.nebcal): D-259's re-measure of D-241's nebula constants (FM1, FM2, the lanes' mean, the eroded shape's mean) on D-256's Milky Way.
+// test_zz_nebcal.cpp (exploration, --group zz.nebcal): re-measure D-241's nebula shape constants on
+// the Milky Way's gas layer (after D-256 / D-258 moved its knots): the fade means UNI_NEB_FM2 (the
+// texture faded keeps the full detail's light) and UNI_NEB_FM1 (both faded), the lanes' mean
+// UNI_NEB_LANE_MEAN (the dust multiplier's mean 1 where the structure is) and the eroded shape's
+// mean UNI_NEB_SHAPE_MEAN2 (the full detail's light D-234's). Same samples as T2.galaxy.nebula_detail.
+#include "../src/UniTest.h"
+#include "../src/UniVerifyCommon.h"
+#include "../scenes/UniScenes.h"
+#include "UniVolume.h"
+#include "UniWebTexture.h"
+#include <cmath>
+#include <cstdio>
+#include <string>
+#include <vector>
+
+using namespace UniCore;
+namespace H = UniHlsl;
+
+UNI_TEST(zz, nebcal)
+{
+	FWebTexture T[3];
+	for (int S = 0; S < 3; ++S) { std::string E; if (!FWebTexture::LoadDelivered("Data/Noise", GalaxyTextureName(S), T[S], &E)) { std::printf("tex fail\n"); return; } }
+	for (int I = 0; I < 3; ++I) { BindGalaxyTexture(I, &T[I]); }
+	FUniverseDef D = UniScenes::Flythrough();
+	UniScenes::UseGalaxyTextures(D, T[0].Size);
+	UniScenes::UseGalaxyPalettes(D);
+	const FFieldParams* Mw = nullptr;
+	for (const FAnchor& A : D.Anchors) { if (!A.EmitterParams.empty()) { Mw = &A.EmitterParams[0]; } }
+	const H::FUniFieldParams P = Mw->ToHlsl();
+	const H::FUniGalaxyConst K = H::Uni_GalaxyConstOf(P);
+	struct FS { H::float3 P; H::float4 Neb; };
+	std::vector<FS> S;
+	const int N = 240000;
+	for (int I = 0; I < N; ++I)
+	{
+		const double R = 0.2 + 0.5 * H::Uni_DrawUnit(0xA11u, 2u, u32(3 * I)), Ph = 6.2831853 * H::Uni_DrawUnit(0xA11u, 2u, u32(3 * I + 1));
+		const double Z = (2.0 * H::Uni_DrawUnit(0xA11u, 2u, u32(3 * I + 2)) - 1.0) * 0.5 * double(P.A.y);
+		const H::float3 Pt{ float(R * std::cos(Ph)), float(R * std::sin(Ph)), float(Z) };
+		H::float4 C(0, 0, 0, 0), Nv(0, 0, 0, 0);
+		H::UniField_GalaxyFilteredCKN(Pt, P, K, 1e-6f, C, Nv);
+		S.push_back({ Pt, Nv });
+	}
+	const float FootTexOff = H::Uni_GalaxyNebulaFineTexel(P, 1.0f) * std::exp2(5.0f - UNI_NEB_FINE_MIP);
+	const float FootOff = H::Uni_GalaxyNebulaFineTexel(P, 0.0f) * std::exp2(5.0f - UNI_NEB_FINE_MIP);
+	auto Mean = [&](float Foot, float Detail, double* OutDust)
+	{
+		double Sum = 0.0, Du = 0.0; size_t Ni = 0;
+		for (const FS& Q : S)
+		{
+			float X = 0.0f, Md = 1.0f;
+			Sum += double(H::Uni_GalaxyNebulaShapeAt(Q.P, Q.Neb, P, Foot, Detail, X, Md));
+			if (X > 0.0f) { Du += Md; ++Ni; }
+		}
+		if (OutDust) { *OutDust = Du / double(std::max<size_t>(Ni, 1)); }
+		return Sum / double(S.size());
+	};
+	const float Fm1o = H::GKnobNebFm1, Fm2o = H::GKnobNebFm2, Lmo = H::GKnobNebLaneMean, M2o = H::GKnobNebShapeMean2;
+	const double Ref = H::UNI_NEBULA_SHAPE_MEAN;
+	double Du0 = 0.0;
+	const double F0 = Mean(0.0f, 1.0f, &Du0);
+	std::printf("before: full x%.5f, texture faded x%.5f, both x%.5f, detail 0 x%.5f; dust %.5f\n", F0 / Ref, Mean(FootTexOff, 1.0f, nullptr) / Ref, Mean(FootOff, 1.0f, nullptr) / Ref, Mean(0.0f, 0.0f, nullptr) / Ref, Du0);
+	auto Bis = [&](float& Knob, auto Fn, double Target, bool bDecreasing)
+	{
+		float Lo = 0.02f, Hi = 1.0f;
+		for (int It = 0; It < 40; ++It) { Knob = 0.5f * (Lo + Hi); const bool bHigh = Fn() > Target; if (bHigh == bDecreasing) { Lo = Knob; } else { Hi = Knob; } }
+		Knob = 0.5f * (Lo + Hi);
+	};
+	// The fade means first (they set what full detail's mean is normalised against: the faded sides
+	// match the full's), against the full detail's mean (the walls and the texture read: neither FM enters).
+	Bis(H::GKnobNebFm2, [&]() { return Mean(FootTexOff, 1.0f, nullptr); }, F0, true);
+	Bis(H::GKnobNebFm1, [&]() { return Mean(FootOff, 1.0f, nullptr); }, F0, true);
+	// The lanes' mean: the dust multiplier's mean 1 where the structure is (higher lane mean: less dust).
+	Bis(H::GKnobNebLaneMean, [&]() { double Du = 0.0; Mean(0.0f, 1.0f, &Du); return Du; }, 1.0, true);
+	// The eroded shape's mean: full detail's light D-234's.
+	const float M2n = float(double(M2o) * F0 / Ref);
+	H::GKnobNebShapeMean2 = M2n; H::GNebTune.w = M2n;
+	double Du1 = 0.0;
+	const double F1 = Mean(0.0f, 1.0f, &Du1);
+	std::printf("after: FM1 %.5f -> %.5f, FM2 %.5f -> %.5f, LANE_MEAN %.5f -> %.5f, SHAPE_MEAN2 %.8g -> %.8g\n", Fm1o, H::GKnobNebFm1, Fm2o, H::GKnobNebFm2, Lmo, H::GKnobNebLaneMean, double(M2o), double(M2n));
+	std::printf("check: full x%.5f, texture faded x%.5f, both x%.5f, detail 0 x%.5f; dust %.5f\n", F1 / Ref, Mean(FootTexOff, 1.0f, nullptr) / Ref, Mean(FootOff, 1.0f, nullptr) / Ref, Mean(0.0f, 0.0f, nullptr) / Ref, Du1);
+	Uni::Check(2, "zz.nebcal", "D-241 constants re-measured").Pass(true, "see stdout");
+}

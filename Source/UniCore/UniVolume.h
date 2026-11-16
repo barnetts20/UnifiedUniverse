@@ -56,9 +56,13 @@ namespace UniCore
 		float StepRatio;   // D-164: 0 = the view's
 		u32 PaletteIndex;  // D-182: the galaxy's palette (a parameter block: A..D bulge, disc, arms, knots; E whole body), with UNI_CARRIER_PALETTE; D-191: a cluster's total-light LUT block, with UNI_CARRIER_ICL
 		float IclRatio;    // D-191: intracluster light / members' light, with UNI_CARRIER_ICL
+		float NebulaHide = 0.0f;   // D-245: a galaxy's nebulae hidden (1) to shown (0) past the handoff
+		float CarrierPad0 = 0.0f;
+		float CarrierPad1 = 0.0f;
+		float CarrierPad2 = 0.0f;
 	};
-	static_assert(sizeof(FCarrierGPU) == 112, "FCarrierGPU must match FUniCarrier (UniVolume.ush)");
-	static_assert(sizeof(HV::FUniCarrier) == 112, "shim FUniCarrier layout");
+	static_assert(sizeof(FCarrierGPU) == 128, "FCarrierGPU must match FUniCarrier (UniVolume.ush)");
+	static_assert(sizeof(HV::FUniCarrier) == 128, "shim FUniCarrier layout");
 
 	// GPU-MIRROR
 	struct FVolumeViewGPU
@@ -80,12 +84,12 @@ namespace UniCore
 		u32 GlowMask[4];        // D-203: levels with cells still loading or fading in (their grids follow the LUT blocks)
 		u32 GlowBase;           // float4 index of the first grid header in the LUT buffer
 		u32 GlowLevels;         // set bits in GlowMask (0: no cell glow)
-		u32 MarchFlags;         // D-206: bit 0: no shared web texel reads (checks only); D-219: bit 1: every step an eighth (the checks' fine reference); D-231: bit 2: with bit 1, the motion web's detail blurred over the unrefined step (checks only)
+		u32 MarchFlags;         // D-206: bit 0: no shared web texel reads (checks only); D-219: bit 1: every step an eighth (the checks' fine reference); D-231: bit 2: with bit 1, the motion web's detail blurred over the unrefined step (checks only); D-240: bit 3: jittered steps
 		u32 GalaxyConstBase;    // D-210: params index of the galaxy constant blocks (one per parameter block); 0: hash inline
 		u32 MapCarrier;         // D-212: the mapped carrier's index + 1 (0: none)
 		u32 MapSize;            // texels a side of the map's mip 0
 		u32 MapSlot;            // D-214: its slot in the map array
-		u32 MapPad1;
+		u32 NebulaRefine;          // D-244: the most sub-samples of a nebula step (0, 1: none)
 		// D-230: the motion web (render only; Uni_MotionWebEmission).
 		float MotionWebGain;     // radiance per cm at full strength (0: off)
 		float MotionWebNearCm;   // faded in over [0, this]
@@ -100,9 +104,25 @@ namespace UniCore
 		float NebulaReflect;       // D-234: the reflection nebulae's gain (0: off)
 		float NebulaNearCm;        // D-234: the nebulae fade in from here to 3x
 		float NebulaThetaPixel;    // D-235: the cube passes set it to the screen's ThetaPixel (0: ThetaPixel)
+		float NebulaFineGain;      // D-237, D-241: the nebulae's detail layers' strength (0: off)
+		float NebulaDark;          // D-242: the nebulae's mean dark share (0..1; below 0: none)
+		float NebulaFineReachCm;   // D-237: the detail's reach (faded over its second half)
+		float JitterShift;         // D-240: every jitter draw's shift this sample (the renderer sets it per frame)
+		float DiffuseDustReachLoCm;   // D-250: the galaxies' diffuse dust reach range, cm (log-uniform by seed)
+		float DiffuseDustReachHiCm;
+		float DiffuseDustGain;        // D-250: x its opacity (0: off)
+		float DiffuseDustHeight;      // D-250: its scale height over the dust set's
+		u32 NebGridCount;             // D-252: the nebula grid's levels (0: off; the renderer sets it)
+		u32 NebGridParam;             // D-252: the parameter index of the spiral it holds
+		float NebGridFetchMax;        // D-252: a step's grid reads at most this many
+		float StepFoot;               // D-255: a galaxy's field over at least this x the step along the disc (0: the pixel's)
+		u32 SegmentTaps;              // D-262: the camera's galaxy's step read at up to this many points along its run (paradigm C; 0, 1: one)
+		float OpaqueCutoff;           // D-262: a ray stops under this transmittance (0: 1e-3)
+		u32 SegPad1;
+		u32 SegPad2;
 	};
-	static_assert(sizeof(FVolumeViewGPU) == 160, "FVolumeViewGPU must match FUniVolumeView (UniVolume.ush)");
-	static_assert(sizeof(HV::FUniVolumeView) == 160, "shim FUniVolumeView layout");
+	static_assert(sizeof(FVolumeViewGPU) == 224, "FVolumeViewGPU must match FUniVolumeView (UniVolume.ush)");
+	static_assert(sizeof(HV::FUniVolumeView) == 224, "shim FUniVolumeView layout");
 
 	inline HV::FUniCarrier ToHlsl(const FCarrierGPU& C) { HV::FUniCarrier H; std::memcpy(static_cast<void*>(&H), &C, sizeof(H)); return H; }
 	inline HV::FUniVolumeView ToHlsl(const FVolumeViewGPU& V) { HV::FUniVolumeView H; std::memcpy(static_cast<void*>(&H), &V, sizeof(H)); return H; }
@@ -471,6 +491,29 @@ namespace UniCore
 		float NebulaGain = 0.0f;                          // D-234: the emission nebulae (x the galaxy's unresolved light per star; 0: off)
 		float NebulaReflect = 0.0f;                       // D-234: the reflection nebulae (0: off)
 		float NebulaNearCm = 0.0f;                        // D-234: the nebulae fade in from here to 3x (0: none)
+		float NebulaFineGain = 1.0f;                      // D-237, D-241: the nebulae's detail layers (with NebulaGain; 0: off)
+		float NebulaDark = 0.35f;                         // D-242: the nebulae's mean dark share: 0 all glow, 1 all dust (below 0: none, D-241's)
+		u32 NebulaRefine = 1u;                            // D-244: the most sub-samples of a step inside a spiral's gas layer, each the whole field (0, 1: off; uu.Nebula.Refine)
+		bool bNebulaHandoffFade = true;                   // D-245: a galaxy's nebulae fade in past the handoff (false: D-244's, at once; checks)
+		float NebulaFineReachCm = 3.0856775814913673e21f; // D-237: 1 kpc: the detail out to here (D-248: the engine's uu.Nebula.FineReachKpc is 7; the checks keep 1)
+		float NebulaScale = 1.0f;                         // D-248: the nebulae's size (x; render only; NebulaTune)
+		float NebulaPrevalence = 1.0f;                    // D-248: their coverage over the default's (~11% of the gas layer)
+		float NebulaFineScale = 1.0f;                     // D-248: the detail layers' size (x)
+		float NebulaFineOctave = 4.0f;                    // D-248: the texture layer's frequency over the walls'
+		float NebulaFineLodBias = 0.0f;                   // D-248: mips added to the detail reads (+: fades sooner)
+		float NebulaFineStepLod = 0.0f;                   // D-251: the detail's footprint at least this x the march's step (0: the pixel's)
+		float NebulaStepRatio = 0.0f;                     // D-251: the step ratio through a spiral's gas layer within the detail's reach (0: the carrier's)
+		float NebulaPeak = 0.0f;                          // D-253: the nebulae's shape softly held under this x its mean (0: off)
+		// D-250: the galaxies' diffuse dust: each dusty galaxy's mid-plane reach (tau 1) at 2.5 disc
+		// scale lengths, log-uniform in [lo, hi] by its seed; x gain (0: off: the checks' default; the
+		// engine's uu.Galaxy.DiffuseDust is 1); its scale height x the dust set's.
+		float DiffuseDustReachLoCm = 2.3142581861185255e21f;   // 0.75 kpc
+		float DiffuseDustReachHiCm = 3.0856775814913673e22f;   // 10 kpc
+		float DiffuseDustGain = 0.0f;
+		float DiffuseDustHeight = 1.5f;
+		float StepFoot = 0.0f;                            // D-255: a galaxy's field over at least this x the march's step along the disc (the cone rule; 0: the pixel's footprint alone)
+		u32 SegmentTaps = 1u;                             // D-262: the camera's galaxy's step read at up to this many points along its run (paradigm C; 1: one, D-255's)
+		float OpaqueCutoff = 1.0e-3f;                     // D-262: a ray stops when its transmittance is under this (uu.Volume.OpaqueCutoff)
 		/** D-203: cell glow: the LUT carries each table's drawn light per level, and the source's
 		 *  loading cells (FVolumeSource::CellGlow) are drawn as glow by the march. */
 		bool bCellGlow = false;
@@ -480,6 +523,116 @@ namespace UniCore
 		float TexturedWebStepRatio = 0.4f;                // D-164: log step ratio of a textured web carrier (T3.webtex.background: same light as 0.08, 30% fewer steps);
 		                                                  // D-199: 0.2 -> 0.4 (50 -> 40 steps a texel; cube light -0.13%, correlation 0.999, unchanged: the texture's hint bounds it)
 	};
+
+	/** D-248 (owner 2026-11-15: handles for the nebulae's frequency, scale and prevalence, and the
+	 *  detail's frequencies and fade): the values UniFields.ush's UNI_NEB_TUNE / UNI_NEB_TUNE2 take
+	 *  (render only). Scale: the nebulae's size (the knot read's frequency over it); Prevalence:
+	 *  their coverage over the default's (~11% of the gas layer): the knot thresholds shift by d
+	 *  where the measured coverage is that multiple (kNebulaPrevalence, sampled: d against the
+	 *  coverage, the knot shape's mean E[X^2 J] and the eroded shape's mean E[D2^2 J] at full
+	 *  detail over the Milky Way's gas layer, each over d = 0's; experiments/nebula_prevalence_d248), the shape means scaled by
+	 *  them so the far blend and the near detail keep one light; each nebula keeps its brightness,
+	 *  so the light grows with the coverage; the eroded shape's mean also follows the scale
+	 *  (kNebulaErodeByScale). FineScale: the detail's size; FineOctave: the texture
+	 *  layer's frequency over the walls'; FineLodBias: mips added to the detail reads' (+1: each
+	 *  layer fades an octave sooner). Defaults: D-241..D-247's constants exactly. */
+	struct FNebulaTune
+	{
+		std::array<float, 4> T{ { 1.0f, 0.0f, 0.01122f, 0.00168205f } };
+		std::array<float, 4> T2{ { 1.0f, 4.0f, 0.0f, 0.0f } };
+		std::array<float, 4> T3{ { 0.0f, 0.0f, 0.0f, 0.0f } };   // D-251: (the gas layer's step ratio, 0, 0, 0)
+	};
+
+	struct FNebulaPrevalenceRow { float D, Cover, Mean, Mean2; };
+	inline constexpr FNebulaPrevalenceRow kNebulaPrevalence[] = {
+		{ -0.300f, 0.057638f, 0.026664f, 0.009411f },
+		{ -0.275f, 0.070813f, 0.039304f, 0.016409f },
+		{ -0.250f, 0.086986f, 0.056205f, 0.027056f },
+		{ -0.225f, 0.111818f, 0.078462f, 0.042930f },
+		{ -0.200f, 0.143839f, 0.107703f, 0.066187f },
+		{ -0.175f, 0.184736f, 0.146051f, 0.099949f },
+		{ -0.150f, 0.239819f, 0.196276f, 0.148616f },
+		{ -0.125f, 0.311011f, 0.261856f, 0.217205f },
+		{ -0.100f, 0.401085f, 0.346702f, 0.308659f },
+		{ -0.075f, 0.510872f, 0.455879f, 0.425968f },
+		{ -0.050f, 0.642295f, 0.595562f, 0.573182f },
+		{ -0.025f, 0.800735f, 0.773656f, 0.760715f },
+		{ 0.000f, 1.000000f, 1.000000f, 1.000000f },
+		{ 0.025f, 1.241742f, 1.285522f, 1.298749f },
+		{ 0.050f, 1.525167f, 1.645147f, 1.674183f },
+		{ 0.075f, 1.846671f, 2.095955f, 2.148812f },
+		{ 0.100f, 2.204186f, 2.657163f, 2.750275f },
+		{ 0.125f, 2.592359f, 3.350356f, 3.517101f },
+		{ 0.150f, 3.009852f, 4.200084f, 4.502619f },
+		{ 0.175f, 3.444601f, 5.226611f, 5.747475f },
+		{ 0.200f, 3.892498f, 6.449276f, 7.291674f },
+		{ 0.225f, 4.340946f, 7.889145f, 9.197646f },
+		{ 0.250f, 4.780291f, 9.561095f, 11.516197f },
+		{ 0.275f, 5.204367f, 11.474563f, 14.290104f },
+		{ 0.300f, 5.608983f, 13.636032f, 17.570494f }
+	};
+
+	/** D-248: the erosion's share of a nebula's light (the eroded shape's mean over the structure's
+	 *  E[X^2 J], full detail) at its scale over the default's, scale 1/4 .. 4 in half octaves: the
+	 *  detail layers read the same texture as the knots at a fixed size, so their overlap changes
+	 *  with the nebulae's size (Milky Way gas layer, two sample sets within ~3%; past x4 it falls
+	 *  away, so the scale is held to 1/4 .. 4). */
+	inline constexpr float kNebulaErodeByScale[9] = { 0.8951f, 0.9145f, 0.9316f, 0.9152f, 1.0000f, 1.0517f, 1.1006f, 1.1391f, 1.1559f };
+
+	inline float NebulaErodeFactor(float InScale)
+	{
+		const float L = std::clamp(2.0f * std::log2(std::clamp(InScale, 0.25f, 4.0f)) + 4.0f, 0.0f, 8.0f);
+		const int I = std::min(int(L), 7);
+		const float T = L - float(I);
+		return kNebulaErodeByScale[I] + (kNebulaErodeByScale[I + 1] - kNebulaErodeByScale[I]) * T;
+	}
+
+	/** D-248: the thresholds' shift and the shape means' factors for a prevalence (coverage over the
+	 *  default's), log-interpolated in the coverage; clamped to the table (x0.058 .. x5.61). */
+	inline FNebulaPrevalenceRow NebulaPrevalenceRow(float InPrevalence)
+	{
+		constexpr size_t N = sizeof(kNebulaPrevalence) / sizeof(kNebulaPrevalence[0]);
+		const float P = std::clamp(InPrevalence, kNebulaPrevalence[0].Cover, kNebulaPrevalence[N - 1].Cover);
+		if (P == 1.0f) { return { 0.0f, 1.0f, 1.0f, 1.0f }; }
+		size_t I = 0;
+		while (I + 2 < N && kNebulaPrevalence[I + 1].Cover < P) { ++I; }
+		const FNebulaPrevalenceRow& A = kNebulaPrevalence[I];
+		const FNebulaPrevalenceRow& B = kNebulaPrevalence[I + 1];
+		const double T = std::clamp((std::log(double(P)) - std::log(double(A.Cover))) / (std::log(double(B.Cover)) - std::log(double(A.Cover))), 0.0, 1.0);
+		auto Lg = [T](float X, float Y) { return float(std::exp(std::log(double(X)) + (std::log(double(Y)) - std::log(double(X))) * T)); };
+		return { float(double(A.D) + (double(B.D) - double(A.D)) * T), P, Lg(A.Mean, B.Mean), Lg(A.Mean2, B.Mean2) };
+	}
+
+	inline FNebulaTune NebulaTune(float InScale, float InPrevalence, float InFineScale, float InFineOctave, float InFineLodBias, float InFineStepLod = 0.0f, float InStepRatio = 0.0f, float InPeak = 0.0f)
+	{
+		FNebulaTune R;
+		const FNebulaPrevalenceRow Pr = NebulaPrevalenceRow(InPrevalence);
+		const float Sc = std::clamp(InScale, 0.25f, 4.0f);
+		R.T[0] = Sc == 1.0f ? 1.0f : 1.0f / Sc;
+		R.T[1] = Pr.D;
+		R.T[2] = 0.01122f * Pr.Mean;
+		R.T[3] = 0.00168205f * Pr.Mean2 * (Sc == 1.0f ? 1.0f : NebulaErodeFactor(Sc));
+		R.T2[0] = 1.0f / std::clamp(InFineScale, 0.1f, 10.0f);
+		R.T2[1] = std::clamp(InFineOctave, 1.0f, 16.0f);
+		R.T2[2] = std::clamp(InFineLodBias, -4.0f, 4.0f);
+		R.T2[3] = std::clamp(InFineStepLod, 0.0f, 4.0f);   // D-251
+		R.T3[0] = InStepRatio > 0.0f ? std::clamp(InStepRatio, 0.005f, 1.0f) : 0.0f;
+		R.T3[1] = InPeak > 0.0f ? std::clamp(InPeak, 1.0f, 100000.0f) : 0.0f;   // D-253
+		return R;
+	}
+
+	inline FNebulaTune NebulaTune(const FVolumeSettings& InS)
+	{
+		return NebulaTune(InS.NebulaScale, InS.NebulaPrevalence, InS.NebulaFineScale, InS.NebulaFineOctave, InS.NebulaFineLodBias, InS.NebulaFineStepLod, InS.NebulaStepRatio, InS.NebulaPeak);
+	}
+
+	/** D-248: the shim's tuning globals set for the harness (UNI_NEB_TUNE in the C++ cores). */
+	inline void ApplyNebulaTune(const FNebulaTune& InT)
+	{
+		HV::GNebTune = HV::float4(InT.T[0], InT.T[1], InT.T[2], InT.T[3]);
+		HV::GNebTune2 = HV::float4(InT.T2[0], InT.T2[1], InT.T2[2], InT.T2[3]);
+		HV::GNebTune3 = HV::float4(InT.T3[0], InT.T3[1], InT.T3[2], InT.T3[3]);
+	}
 
 	/** D-196: a local carrier's share of its parent object's light, as built this frame: the
 	 *  handoff curve (Uni_CarrierHandoff) x the cap fade (D-161). The object's sprite draws the
@@ -892,6 +1045,8 @@ namespace UniCore
 					// a cluster. Dust absorbs at any distance, so dusty carriers keep the 1 pc start.
 					if (!Cd.bDust && S.bLutStart) { G.TStart = float(std::max(S.LocalStartCm, KeepSig)); }
 					if (S.bPrefilter && C.Emitter->FieldId == HV::UNI_FIELD_GALAXY) { G.Flags |= HV::UNI_CARRIER_PREFILTER; }
+					// D-245: a galaxy's nebulae fade in past the handoff (the sprite has none of their light).
+					if (C.Emitter->FieldId == HV::UNI_FIELD_GALAXY && S.bNebulaHandoffFade) { G.NebulaHide = HV::Uni_CarrierNebulaHide(float(Theta), View.ThetaPixel); }
 					// D-191: a rich cluster's intracluster light rides on its own carrier: the same
 					// field sample, a second LUT block (every child's light: never resolved as
 					// sprites) at IclRatio x its members' amplitude. It is there at any distance, so
@@ -1031,6 +1186,19 @@ namespace UniCore
 			V.NebulaReflect = S.NebulaReflect;
 			V.NebulaNearCm = S.NebulaNearCm;
 			V.NebulaThetaPixel = 0.0f;   // D-235: set by the cube passes
+			V.NebulaFineGain = S.NebulaFineGain;         // D-237
+			V.NebulaDark = S.NebulaDark;                 // D-242
+			V.NebulaRefine = S.NebulaRefine;             // D-244
+			V.NebulaFineReachCm = S.NebulaFineReachCm;
+			V.DiffuseDustReachLoCm = S.DiffuseDustReachLoCm;   // D-250
+			V.DiffuseDustReachHiCm = S.DiffuseDustReachHiCm;
+			V.DiffuseDustGain = S.DiffuseDustGain;
+			V.DiffuseDustHeight = S.DiffuseDustHeight;
+			V.StepFoot = S.StepFoot;                     // D-255
+			V.SegmentTaps = S.SegmentTaps;               // D-262
+			V.OpaqueCutoff = S.OpaqueCutoff;             // D-262
+			V.SegPad1 = 0u; V.SegPad2 = 0u;
+			V.JitterShift = 0.0f;   // D-240: set per frame by the renderer
 			V.HintScale = S.HintScale;
 			return Out;
 		}

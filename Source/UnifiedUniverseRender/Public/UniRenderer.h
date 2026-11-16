@@ -23,12 +23,14 @@
 #include "UniQuery.h"   // D-193
 #include "UniVolume.h"
 #include "UniFarCache.h"   // D-228
+#include "UniNebGrid.h"    // D-252
 
 #include <atomic>
 #include <memory>
 
 class FRDGBuilder;
 class FSceneView;
+class FTextureResource;
 struct FScreenPassTexture;
 struct FScreenPassRenderTarget;
 
@@ -51,7 +53,30 @@ struct FUniFrameData
 	float ShiftAmount = 0.0f;  // D-230: the travel shift (ln of the factor straight ahead, ramped; 0: none)
 	float ShiftK = 0.0f;       // its colour strength
 	float VolumeBudgetScale = 1.0f;   // D-200: the auto budget's scale of the march pixel budget (1: off)
+	// D-246: the march's blue noise (the engine's FastBlueNoise_scalar_128x128x8, held by the
+	// subsystem); null: D-240's hashed draws.
+	FTextureResource* BlueNoiseResource = nullptr;
+	// D-248: the nebulae's tuning (UniCore::NebulaTune; UniFields.ush UNI_NEB_TUNE, UNI_NEB_TUNE2).
+	FVector4f NebTune = FVector4f(1.0f, 0.0f, 0.01122f, 0.00168205f);
+	FVector4f NebTune2 = FVector4f(1.0f, 4.0f, 0.0f, 0.0f);
+	FVector4f NebTune3 = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);   // D-251
 	float VolumeNearCm = 0.0f;        // D-208: the nearest marched structure's distance (FVolumeScene::NearCm; 0: unknown)
+	// D-252: the nebula grid (UniCore/UniNebGrid.h; the renderer plans and bakes it): on with a
+	// spiral about the camera and the nebulae on; its shape, what its bake reads (Key: a change
+	// rebakes it), the camera in the spiral's field units (double) and the gas layer's mid-plane
+	// there, the bricks processed a frame at most and a step's reads at most.
+	struct FNebGridFrame
+	{
+		bool bOn = false;
+		uint32 ParamIndex = 0;
+		double CamField[3] = { 0.0, 0.0, 0.0 };
+		double MidZ = 0.0;
+		UniCore::FNebGridConfig Config;
+		uint64 Key = 0;
+		uint32 Budget = 128;
+		float FetchMax = 32.0f;
+	};
+	FNebGridFrame NebGrid;
 	// D-212 / D-214: the galaxy map array (UniCore::FGalaxyMapCache): its slots and texels a side
 	// (a change of either, or of Config, recreates it), the bakes the cache waits on (a slot, the
 	// epoch its contents belong to, the light's and dust's parameters), the texels the GPU may
@@ -184,6 +209,19 @@ struct FUniRenderStats
 	std::atomic<uint32> FarSceneChanges{ 0 };
 	std::atomic<uint32> FarHistoryDrops{ 0 };
 	std::atomic<uint32> ActivationsLastReadback{ 0 };
+	// D-252: the nebula grid: its levels (0: off), pool and table (KiB), entries waiting, processed
+	// last frame and in all, level resets in all; per level the slots and, read back a few frames
+	// late, the free slots and the bricks that found none (overflow, in all since its last reset).
+	std::atomic<uint32> NebGridLevels{ 0 };
+	std::atomic<uint32> NebGridPoolKiB{ 0 };
+	std::atomic<uint32> NebGridPending{ 0 };
+	std::atomic<uint32> NebGridProcessed{ 0 };
+	std::atomic<uint64> NebGridProcessedTotal{ 0 };
+	std::atomic<uint64> NebGridLevelResets{ 0 };
+	static constexpr int32 MaxNebGridLevels = 12;   // UNI_NEB_GRID_MAX_LEVELS
+	std::atomic<uint32> NebGridSlots[MaxNebGridLevels] = {};
+	std::atomic<uint32> NebGridFree[MaxNebGridLevels] = {};
+	std::atomic<uint32> NebGridOverflow[MaxNebGridLevels] = {};
 	/** The last rendered view's angular pixel size (rad): the game thread builds the next
 	 *  frame's carriers with it (one frame late, harmless: it only sets handoff weights). */
 	std::atomic<float> ThetaPixelLastFrame{ 1.0f / 960.0f };
@@ -232,9 +270,16 @@ public:
 	 *  after SetWebTexture), or the NaN dummy. */
 	FRDGTextureRef RegisterWebTexture_RenderThread(FRDGBuilder& GraphBuilder);
 
-	/** Game thread (D-179): one galaxy texture (Slot 0 warp_fine, 1 warp_large, 2 galaxy_detail),
+	/** Game thread (D-179): one galaxy texture (Slot 0 warp_fine, 1 warp_large, 2 galaxy_detail; D-249: 3 the nebulae's detail; D-259: 4 galaxy_shape),
 	 *  every mip, packed as SetWebTexture's. Size 0 clears it (the NaN dummy is bound). */
 	void SetGalaxyTexture_GameThread(int32 Slot, uint32 Size, TArray<TArray<FUintVector2>> Mips);
+
+	/** Game thread (D-259): the galaxy shaping's switches every pass that samples a galaxy binds
+	 *  (UniWebTexture.ush's UniGalShapeTune: knots' amplitude, dust and light structure on, the
+	 *  structure's frequency). */
+	void SetGalaxyShapeTune_GameThread(const FVector4f& Tune);
+	/** Render thread (D-259): the shaping's switches. */
+	FVector4f GalaxyShapeTune_RenderThread() const { return GalShapeTuneRT; }
 
 
 	/** Render thread (D-179): galaxy texture Slot registered into a graph (uploaded on first use
@@ -246,6 +291,16 @@ public:
 	 *  scene colour, made by the view extension). Called from the view extension. */
 	void RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& View, const FScreenPassRenderTarget& Output,
 		FRDGTextureRef SceneDepth, const FIntRect& DepthViewRect, float PreExposure);
+
+	/** D-246: is the volume drawn before TSR this frame (uu.VolumeBeforeTSR)? */
+	static bool VolumeBeforeTSR_RenderThread();
+
+	/** D-246: render thread, from the view extension's BeforeDOF callback: draws the volume
+	 *  additively into Output (a copy of scene colour at the internal resolution, before TSR)
+	 *  and keeps its slices for this view's sprites after TSR (RenderBackdrop). JitterPx: the
+	 *  view's TAA jitter (render pixels). False: nothing drawn (RenderBackdrop draws it). */
+	bool RenderVolumeBeforeTSR_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& View, const FScreenPassRenderTarget& Output,
+		FRDGTextureRef SceneDepth, const FIntRect& DepthViewRect, float PreExposure, FVector2f JitterPx);
 
 	/** Render thread: drop every GPU resource (engine pre-exit, before RHI shutdown). */
 	void Release_RenderThread();
@@ -277,10 +332,11 @@ private:
 	TRefCountPtr<IPooledRenderTarget> WebDummy;
 
 	// D-179: the galaxy textures (render thread), by slot.
-	static constexpr int32 GalaxyTextureSlots = 3;
+	static constexpr int32 GalaxyTextureSlots = 5;   // D-249: 3, the nebulae's detail (render only; galaxy_detail's while empty); D-259: 4, galaxy_shape
 	TArray<TArray<FUintVector2>> GalMipsRT[GalaxyTextureSlots];
-	uint32 GalSizeRT[GalaxyTextureSlots] = { 0, 0, 0 };
-	bool bGalDirty[GalaxyTextureSlots] = { false, false, false };
+	uint32 GalSizeRT[GalaxyTextureSlots] = { 0, 0, 0, 0, 0 };
+	bool bGalDirty[GalaxyTextureSlots] = { false, false, false, false, false };
+	FVector4f GalShapeTuneRT = FVector4f(1.0f, 1.0f, 1.0f, 0.25f);   // D-259: UNI_GAL_SHAPE (UniFields.ush's default)
 	// D-212 / D-214: the galaxy map array (render thread): per slot the bake under way (its epoch,
 	// rows done, whether complete).
 	struct FGalMapSlotRT
@@ -316,6 +372,15 @@ private:
 	// D-184: temporal slicing of the march. The previous frame's reconstructed output (radiance +
 	// transmittance, slices, light depth + scene depth) and its view, for the reprojection.
 	TRefCountPtr<IPooledRenderTarget> TemporalVolume, TemporalSlices, TemporalDepth;
+	TRefCountPtr<IPooledRenderTarget> TemporalAge;   // D-240: samples each history pixel holds; D-246: and its own (G16R16F)
+	TRefCountPtr<IPooledRenderTarget> TemporalMoments;   // D-251: each pixel's own samples' compressed luminance moments (G32R32F)
+	// D-246: the volume drawn before TSR this frame: its graph, view and render frame, and its
+	// slices and march size for the sprites after TSR (RenderBackdrop takes them, once).
+	const FRDGBuilder* PreBuilder = nullptr;
+	const FSceneView* PreView = nullptr;
+	uint64 PreFrameRT = ~0ull;
+	FRDGTextureRef PreSlices = nullptr;
+	FIntPoint PreMarchSize = FIntPoint(1, 1);
 	// D-223 amendment: the splat path's deposit buffers and tile marks persist (zeroed where each
 	// frame wrote them, SplatZeroCS), recreated cleared when the buffers' size changes.
 	TRefCountPtr<FRDGPooledBuffer> SplatLumBuffer, SplatColBuffer, SplatTileBuffer;
@@ -329,6 +394,7 @@ private:
 	uint32 TemporalStep = 0;           // D-208: counts sliced frames
 	uint32 TemporalInterleave = 2;     // D-208: the last frame's N (for uu.perf)
 	bool bTemporalHave = false;
+	bool TemporalBeforeTSR = false;    // D-246: the history's placement (before TSR: the internal rect)
 	int32 BgPrev = 0, BgCur = 1, BgBack = 2;
 	bool bBgHaveCur = false;
 	bool bBgFilling = false;
@@ -361,8 +427,21 @@ private:
 	uint64 FarLastFrame = ~0ull;           // the game frame the rules last ran for (a frame rendered twice reuses it)
 	bool bFarResetPending = false;         // the map was re-created on a frame rendered twice: tell the rules next frame
 	UniCore::FFarCacheDecision FarLast;
+	// D-252: the nebula grid: the plan (render thread), the table, free lists, counters and pool
+	// (persistent), the game frame last planned (a frame rendered twice reuses its headers), and the
+	// counters' readback (uu.Perf).
+	UniCore::FNebGridPlanner NebGridPlanner;
+	UniCore::FNebGridPlanner::FFrameOps NebGridOps;
+	TRefCountPtr<FRDGPooledBuffer> NebGridTableBuf, NebGridFreeBuf, NebGridCounterBuf;
+	TRefCountPtr<IPooledRenderTarget> NebGridPool;
+	uint64 NebGridLastFrame = ~0ull;
+	struct FNebGridReadbackRT;
+	TSharedPtr<FNebGridReadbackRT> NebGridReadback;
+	/** D-246: bBeforeTSR: Output is scene colour before TSR (the rays take the view's jitter,
+	 *  JitterPx in render pixels); otherwise after it (D-124). */
 	void RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& View, const FScreenPassRenderTarget& Output,
-		FRDGTextureRef SceneDepth, const FIntRect& DepthViewRect, float PreExposure, FRDGTextureRef& OutSlices, FIntPoint& OutMarchSize);
+		FRDGTextureRef SceneDepth, const FIntRect& DepthViewRect, float PreExposure, FRDGTextureRef& OutSlices, FIntPoint& OutMarchSize,
+		bool bBeforeTSR = false, FVector2f JitterPx = FVector2f::ZeroVector);
 
 	// Promotion readbacks, a small ring so the render thread never waits on the GPU.
 	struct FPromoteReadback;
