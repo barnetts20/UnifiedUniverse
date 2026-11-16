@@ -2506,3 +2506,14 @@ Owner, 2026-11-16: "maybe the galaxy could run a similar layered density march -
 Not verified: the engine side (UE-89): the look, the cost (the steps a ray x1.5 in the disc), the tuning page.
 Reroll impact: none (render only).
 Status: built; offline check; engine test UE-89.
+
+D-266 — The bubble of detail: each detail layer limited to a range about the camera, faded in over a share of it
+Owner, 2026-11-16 13:51 (on D-265): "the mid detail can actually be constrained closer to the camera than it currently is... maybe around .33 galactic radius, and we should make our fade in from coarse to mid occur over its full range, fine detail should fade in over around .5 of its range, leaving a bubble of detail around the player".
+- **Uni_DetailRangeW (UniVolume.ush):** layer i's weight at T x InvRadius galaxy radii from the camera: 1 within (1 - Fade_i) x Range_i, smoothstep to 0 at Range_i; its light and dust amplitudes x the weight (mean 1 kept: 1 + w A (S - 1)). Weight 0: the layer is not read (the D-265 early-out), so past the bubble the march costs exactly the layers off. Per tap (D-262) at the tap's own distance; a sphere about the camera (the distance along the ray), so a bubble that moves with the player.
+- **The step cap and the taps follow it:** a layer's step reach is min(its D-265 reach, its range), and the light layers' tap spacing counts only the layers whose bubble the sample is in, and only inside the disc's slab (as the reads and the cap: D-265's spacing took extra taps above the slab, where no layer is read).
+- **Defaults:** uu.Galaxy.Detail.Range0 0.33 (the mid detail; the Milky Way's 24 kpc radius: ~8 kpc), Fade0 1 (from the coarse structure over all its range: full only at the camera); Range1 0.08 (the fine detail, ~2 kpc: a quarter of layer 0's as its frequency is 4x; the owner gave no number), Fade1 0.5 (full within half its range). 0: no limit (D-265's behaviour). Live; the tuning page's Galaxy|Detail Layers. The checks' harness keeps the layers off.
+- **Check:** T2.vol.galaxy_detail_layers runs with the defaults' bubble, and from 18 kpc above the solar circle (the bubble's 7.9 kpc wholly above the disc's slab, 8.6 kpc flared at the edge: no layer applies) holds the frame and its steps exactly the layers off. (From 10 kpc above the faint thick disc within the bubble is inside the slab: the layers rightly apply there.) The view struct 256 -> 272 bytes.
+- **Measured (the check, the defaults' bubble):** toward the centre err 0.74%, spread 1.17% (layers off 1.22%: the bubble's fade below the step's grain), light -1.0%, steps x1.49; 300 pc above err 1.60%, spread 1.10%, light -2.5%; 18 kpc above: identical to off (difference 0, 48.18 steps both).
+Not verified: the engine side (UE-90).
+Reroll impact: none (render only).
+Status: built; offline check; engine test UE-90.

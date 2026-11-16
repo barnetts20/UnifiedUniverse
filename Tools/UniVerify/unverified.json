@@ -318,5 +318,9 @@
   {
     "id": "UE-89",
     "what": "D-265: the camera's galaxy's detail layers in the engine: cloudier near disc without grain or a fade band, the volume pass's cost with uu.Galaxy.Detail.Steps 0 / 16 / 32, the Galaxy|Detail Layers page live (REVIEW_TONIGHT section 90)."
+  },
+  {
+    "id": "UE-90",
+    "what": "D-266: the detail layers' bubble about the camera (uu.Galaxy.Detail.Range0/1, Fade0/1): the detail thinning smoothly with distance with no band, and from far above the disc the image and the volume pass's cost as with the layers off (REVIEW_TONIGHT section 91)."
   }
 ]

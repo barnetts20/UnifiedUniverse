@@ -171,6 +171,11 @@ static TAutoConsoleVariable<float> CVarUniGalDetailDust1(TEXT("uu.Galaxy.Detail.
 static TAutoConsoleVariable<float> CVarUniGalDetailSteps(TEXT("uu.Galaxy.Detail.Steps"), 16.0f, TEXT("D-265: the steps each detail layer may spend at its resolving step past where the march's own step reaches it (its reach: each finer layer a shorter reach for the same steps). More: the detail further out, a costlier march in the disc. 0: no step cap (the layers only read, faded by the march's own step)."), ECVF_Default);
 static TAutoConsoleVariable<float> CVarUniGalDetailStepTexels(TEXT("uu.Galaxy.Detail.StepTexels"), 4.0f, TEXT("D-265: a detail layer's resolving step in its texels (dust: one step; light: uu.Volume.SegmentTaps taps a step). Smaller: sharper, more steps."), ECVF_Default);
 static TAutoConsoleVariable<float> CVarUniGalDetailFoot(TEXT("uu.Galaxy.Detail.Foot"), 0.5f, TEXT("D-265: a detail layer is read over at least this x its share of the step (the fade where the step does not resolve it: mean-kept blur instead of grain). 0: 0.5."), ECVF_Default);
+// D-266: the bubble of detail about the camera.
+static TAutoConsoleVariable<float> CVarUniGalDetailRange0(TEXT("uu.Galaxy.Detail.Range0"), 0.33f, TEXT("D-266: detail layer 0 (the mid detail) reaches this far from the camera, in the galaxy's radii (the Milky Way's 24 kpc: 0.33 ~ 8 kpc), fading in from the coarse structure over uu.Galaxy.Detail.Fade0 of it; past it the layer is not read (no cost). 0: no limit (fades only by the march's step)."), ECVF_Default);
+static TAutoConsoleVariable<float> CVarUniGalDetailFade0(TEXT("uu.Galaxy.Detail.Fade0"), 1.0f, TEXT("D-266: the share of layer 0's range it fades in over (1: all of it, full strength only at the camera; 0.5: full within half its range, fading over the outer half)."), ECVF_Default);
+static TAutoConsoleVariable<float> CVarUniGalDetailRange1(TEXT("uu.Galaxy.Detail.Range1"), 0.08f, TEXT("D-266: detail layer 1 (the fine detail) reaches this far from the camera, in the galaxy's radii (0.08 ~ 2 kpc in the Milky Way: a quarter of layer 0's, as its frequency is 4x); past it not read. 0: no limit."), ECVF_Default);
+static TAutoConsoleVariable<float> CVarUniGalDetailFade1(TEXT("uu.Galaxy.Detail.Fade1"), 0.5f, TEXT("D-266: the share of layer 1's range it fades in over (0.5: full strength within half its range: the bubble of detail about the camera)."), ECVF_Default);
 static TAutoConsoleVariable<float> CVarUniGalaxyDiffuseDustHeight(TEXT("uu.Galaxy.DiffuseDustHeight"), 1.5f, TEXT("D-250: the diffuse dust's scale height over the galaxy's dust layer's (thicker than the lanes)."), ECVF_Default);
 static TAutoConsoleVariable<float> CVarUniNebulaScale(TEXT("uu.Nebula.Scale"), 1.0f, TEXT("D-248: the nebulae's size (x 0.25..4; 2: twice as large, half as many across the disc). Away from 1 they leave the stars' knots (the young clusters stay where they are). Render only."), ECVF_Default);
 static TAutoConsoleVariable<float> CVarUniNebulaPrevalence(TEXT("uu.Nebula.Prevalence"), 1.0f, TEXT("D-248: how much of the gas layer is nebula, over the default's (~11%): 0.5 half as much, 2 twice (x0.05..x5.6). Each nebula keeps its brightness, so their light grows with it. Render only."), ECVF_Default);
@@ -1293,6 +1298,10 @@ void UUniSubsystem::PushFrame()
 			Settings.DetailSteps = FMath::Clamp(CVarUniGalDetailSteps.GetValueOnGameThread(), 0.0f, 1024.0f);
 			Settings.DetailStepTexels = FMath::Clamp(CVarUniGalDetailStepTexels.GetValueOnGameThread(), 0.25f, 64.0f);
 			Settings.DetailFoot = FMath::Clamp(CVarUniGalDetailFoot.GetValueOnGameThread(), 0.0f, 4.0f);
+			Settings.DetailRange0 = FMath::Clamp(CVarUniGalDetailRange0.GetValueOnGameThread(), 0.0f, 4.0f);   // D-266
+			Settings.DetailRange1 = FMath::Clamp(CVarUniGalDetailRange1.GetValueOnGameThread(), 0.0f, 4.0f);
+			Settings.DetailFade0 = FMath::Clamp(CVarUniGalDetailFade0.GetValueOnGameThread(), 0.01f, 1.0f);
+			Settings.DetailFade1 = FMath::Clamp(CVarUniGalDetailFade1.GetValueOnGameThread(), 0.01f, 1.0f);
 			Settings.NebulaPrevalence = CVarUniNebulaPrevalence.GetValueOnGameThread();
 			Settings.NebulaFineScale = CVarUniNebulaFineScale.GetValueOnGameThread();
 			Settings.NebulaFineOctave = CVarUniNebulaFineOctave.GetValueOnGameThread();

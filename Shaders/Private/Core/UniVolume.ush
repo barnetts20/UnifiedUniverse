@@ -158,6 +158,12 @@ struct FUniVolumeView
 	float DetailLight1;
 	float DetailDust1;
 	float DetailFoot;        // a layer read over at least this x the step's share (the step's fade; 0: 0.5)
+	// D-266: the bubble of detail about the camera (Uni_DetailRangeW): layer i reaches DetailRange_i
+	// galaxy radii (0: no limit), fading in from the edge over DetailFade_i of that range.
+	float DetailRange0;
+	float DetailRange1;
+	float DetailFade0;
+	float DetailFade1;
 	float DetailPad;
 };
 
@@ -943,13 +949,27 @@ UNI_FN bool Uni_DetailLayersOn(FUniVolumeView InView)
 		|| (InView.DetailFreq1 > 0.0f && (InView.DetailLight1 > 0.0f || InView.DetailDust1 > 0.0f));
 }
 
+/** D-266 (owner: "the mid detail can actually be constrained closer to the camera ... maybe around
+ *  .33 galactic radius, and we should make our fade in from coarse to mid occur over its full range,
+ *  fine detail should fade in over around .5 of its range, leaving a bubble of detail around the
+ *  player"): a layer's weight at InTu galaxy radii from the camera: 1 within (1 - InFade) x InRange,
+ *  falling smoothly to 0 at InRange (InFade 1: over the whole range; 0.5: its outer half). InRange 0:
+ *  no limit (1 everywhere, D-265). The layer's amplitudes are scaled by it (mean 1 kept); 0: not read. */
+UNI_FN float Uni_DetailRangeW(float InTu, float InRange, float InFade)
+{
+	if (!(InRange > 0.0f)) { return 1.0f; }
+	const float F = clamp(InFade > 0.0f ? InFade : 1.0f, 1.0e-3f, 1.0f);
+	return 1.0f - smoothstep((1.0f - F) * InRange, InRange, InTu);
+}
+
 /** D-265: the light layers' tap spacing (field units: DetailStepTexels of the finest light layer's
- *  texels; 0: no light layer). */
-UNI_FN float Uni_DetailLightSpacing(FUniFieldParams InPar, FUniVolumeView InView)
+ *  texels; 0: no light layer). D-266: only the layers whose bubble InTu (galaxy radii from the
+ *  camera) is inside. */
+UNI_FN float Uni_DetailLightSpacing(FUniFieldParams InPar, FUniVolumeView InView, float InTu)
 {
 	const float Tx = InView.DetailStepTexels > 0.0f ? InView.DetailStepTexels : 4.0f;
-	const float L0 = Uni_GalaxyDetailLayerStep(InPar, float4(InView.DetailFreq0, InView.DetailLight0, InView.DetailDust0, 0.0f), Tx, false);
-	const float L1 = Uni_GalaxyDetailLayerStep(InPar, float4(InView.DetailFreq1, InView.DetailLight1, InView.DetailDust1, 0.0f), Tx, false);
+	const float L0 = Uni_DetailRangeW(InTu, InView.DetailRange0, InView.DetailFade0) > 0.0f ? Uni_GalaxyDetailLayerStep(InPar, float4(InView.DetailFreq0, InView.DetailLight0, InView.DetailDust0, 0.0f), Tx, false) : 0.0f;
+	const float L1 = Uni_DetailRangeW(InTu, InView.DetailRange1, InView.DetailFade1) > 0.0f ? Uni_GalaxyDetailLayerStep(InPar, float4(InView.DetailFreq1, InView.DetailLight1, InView.DetailDust1, 0.0f), Tx, false) : 0.0f;
 	return L0 > 0.0f && L1 > 0.0f ? min(L0, L1) : max(L0, L1);
 }
 
@@ -977,7 +997,10 @@ UNI_FN float Uni_GalaxyDetailStepCap(FUniCarrier InCa, FUniFieldParams InPar, fl
 		const float Ld = Uni_GalaxyDetailLayerStep(InPar, L, Tx, true);
 		const float Ll = Uni_GalaxyDetailLayerStep(InPar, L, Tx * Taps, false);
 		const float Lam = (Ld > 0.0f && Ll > 0.0f ? min(Ld, Ll) : max(Ld, Ll)) / InCa.InvRadius;
-		if (Lam > 0.0f && InT < Lam * (1.0f / max(InRatio, 1.0e-6f) + InView.DetailSteps)) { Cap = min(Cap, Lam); }
+		// D-266: never past the layer's bubble.
+		const float Range = I == 0u ? InView.DetailRange0 : InView.DetailRange1;
+		const float Reach = Range > 0.0f ? min(Lam * (1.0f / max(InRatio, 1.0e-6f) + InView.DetailSteps), Range / InCa.InvRadius) : Lam * (1.0f / max(InRatio, 1.0e-6f) + InView.DetailSteps);
+		if (Lam > 0.0f && InT < Reach) { Cap = min(Cap, Lam); }
 	}
 	return Cap;
 }
@@ -1309,7 +1332,7 @@ UNI_FN FUniVolumeResult Uni_VolumeMarchJ(float3 InDir, float InTScene,
 				{
 					float Tx = max(FootS, 1.0f / max(Par.G.w * max(Par.H.w, 1.0f), 1.0e-6f));   // the detail's texel at the pixel's mip (field units)
 					// D-265: the light layers' spacing (their taps resolve them within the step).
-					const float Ls = bDetailOn ? Uni_DetailLightSpacing(Par, InView) : 0.0f;
+					const float Ls = bDetailOn && !(abs(P.z) > Uni_GalaxyDiscSlab(Par)) ? Uni_DetailLightSpacing(Par, InView, Tm * Ca.InvRadius) : 0.0f;   // D-266: in the slab, as the reads
 					if (Ls > 0.0f) { Tx = max(FootS, min(Tx, Ls)); }
 					Kt = (uint)clamp(ceil(Run / max(Tx, 1.0e-12f)), 1.0f, (float)InView.SegmentTaps);
 				}
@@ -1320,7 +1343,9 @@ UNI_FN FUniVolumeResult Uni_VolumeMarchJ(float3 InDir, float InTScene,
 					if (bDetailOn)
 					{
 						// D-265: the detail layers over the pixel's footprint or DetailFoot x the step.
-						const float2 Ml = Uni_GalaxyDetailLayers(P, Par, GK, max(FootS, DetFoot * Du), DetL0, DetL1);
+						const float Tu = Tm * Ca.InvRadius;   // D-266: the bubble's weights
+						const float W0 = Uni_DetailRangeW(Tu, InView.DetailRange0, InView.DetailFade0), W1 = Uni_DetailRangeW(Tu, InView.DetailRange1, InView.DetailFade1);
+						const float2 Ml = Uni_GalaxyDetailLayers(P, Par, GK, max(FootS, DetFoot * Du), float4(DetL0.x, DetL0.y * W0, DetL0.z * W0, 0.0f), float4(DetL1.x, DetL1.y * W1, DetL1.z * W1, 0.0f));
 						Rm = Rm * Ml.x; Comp = Comp * Ml.x; RdPair = RdPair * Ml.y;
 					}
 				}
@@ -1342,7 +1367,9 @@ UNI_FN FUniVolumeResult Uni_VolumeMarchJ(float3 InDir, float InTScene,
 						if (bDetailOn)
 						{
 							// D-265: each tap over its footprint or DetailFoot x its share of the step.
-							const float2 Ml = Uni_GalaxyDetailLayers(Pk, Par, GK, max(FootK, DetFoot * Du * InvK), DetL0, DetL1);
+							const float Tu = Tk * Ca.InvRadius;   // D-266: the bubble's weights at the tap
+							const float W0 = Uni_DetailRangeW(Tu, InView.DetailRange0, InView.DetailFade0), W1 = Uni_DetailRangeW(Tu, InView.DetailRange1, InView.DetailFade1);
+							const float2 Ml = Uni_GalaxyDetailLayers(Pk, Par, GK, max(FootK, DetFoot * Du * InvK), float4(DetL0.x, DetL0.y * W0, DetL0.z * W0, 0.0f), float4(DetL1.x, DetL1.y * W1, DetL1.z * W1, 0.0f));
 							Rk = Rk * Ml.x; Ck = Ck * Ml.x; Rdk = Rdk * Ml.y;
 						}
 						Rm += Rk * InvK; RdK += Rdk * InvK; CompK = CompK + Ck * InvK; NebX += Nk.x * InvK;

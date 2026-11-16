@@ -127,10 +127,14 @@ namespace UniCore
 		float DetailLight1;
 		float DetailDust1;
 		float DetailFoot;             // D-265: a layer read over at least this x the step's share (0: 0.5)
+		float DetailRange0;           // D-266: layer 0's bubble about the camera, galaxy radii (0: no limit)
+		float DetailRange1;           // D-266: layer 1's
+		float DetailFade0;            // D-266: layer 0 fades in over this share of its range (1: all of it)
+		float DetailFade1;            // D-266: layer 1's
 		float DetailPad;
 	};
-	static_assert(sizeof(FVolumeViewGPU) == 256, "FVolumeViewGPU must match FUniVolumeView (UniVolume.ush)");
-	static_assert(sizeof(HV::FUniVolumeView) == 256, "shim FUniVolumeView layout");
+	static_assert(sizeof(FVolumeViewGPU) == 272, "FVolumeViewGPU must match FUniVolumeView (UniVolume.ush)");
+	static_assert(sizeof(HV::FUniVolumeView) == 272, "shim FUniVolumeView layout");
 
 	inline HV::FUniCarrier ToHlsl(const FCarrierGPU& C) { HV::FUniCarrier H; std::memcpy(static_cast<void*>(&H), &C, sizeof(H)); return H; }
 	inline HV::FUniVolumeView ToHlsl(const FVolumeViewGPU& V) { HV::FUniVolumeView H; std::memcpy(static_cast<void*>(&H), &V, sizeof(H)); return H; }
@@ -529,6 +533,8 @@ namespace UniCore
 		float DetailFreq0 = 0.0f, DetailLight0 = 0.0f, DetailDust0 = 0.0f;   // layer 0: x the detail's frequency (0: off), amplitudes 0..1
 		float DetailFreq1 = 0.0f, DetailLight1 = 0.0f, DetailDust1 = 0.0f;   // layer 1
 		float DetailFoot = 0.5f;                          // a layer read over at least this x the step's share
+		float DetailRange0 = 0.0f, DetailRange1 = 0.0f;   // D-266: each layer's bubble about the camera, galaxy radii (0: no limit)
+		float DetailFade0 = 1.0f, DetailFade1 = 1.0f;     // D-266: the share of its range each fades in over
 		/** D-203: cell glow: the LUT carries each table's drawn light per level, and the source's
 		 *  loading cells (FVolumeSource::CellGlow) are drawn as glow by the march. */
 		bool bCellGlow = false;
@@ -1216,7 +1222,10 @@ namespace UniCore
 			V.DetailStepTexels = S.DetailStepTexels;
 			V.DetailFreq0 = S.DetailFreq0; V.DetailLight0 = S.DetailLight0; V.DetailDust0 = S.DetailDust0;
 			V.DetailFreq1 = S.DetailFreq1; V.DetailLight1 = S.DetailLight1; V.DetailDust1 = S.DetailDust1;
-			V.DetailFoot = S.DetailFoot; V.DetailPad = 0.0f;
+			V.DetailFoot = S.DetailFoot;
+			V.DetailRange0 = S.DetailRange0; V.DetailRange1 = S.DetailRange1;   // D-266
+			V.DetailFade0 = S.DetailFade0; V.DetailFade1 = S.DetailFade1;
+			V.DetailPad = 0.0f;
 			V.JitterShift = 0.0f;   // D-240: set per frame by the renderer
 			V.HintScale = S.HintScale;
 			return Out;

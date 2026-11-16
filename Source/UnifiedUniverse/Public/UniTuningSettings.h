@@ -281,6 +281,12 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Galaxy|Detail Layers", meta = (DisplayName = "Galaxy.Detail.Dust1", UniCVar = "uu.Galaxy.Detail.Dust1", ToolTip = "D-265: detail layer 1's dust amplitude (0..1)."))
 	float U_Galaxy_Detail_Dust1 = 0.0f;
 
+	UPROPERTY(config, EditAnywhere, Category = "Galaxy|Detail Layers", meta = (DisplayName = "Galaxy.Detail.Fade0", UniCVar = "uu.Galaxy.Detail.Fade0", ToolTip = "D-266: the share of layer 0's range it fades in over (1: all of it, full strength only at the camera; 0.5: full within half its range, fading over the outer half)."))
+	float U_Galaxy_Detail_Fade0 = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Galaxy|Detail Layers", meta = (DisplayName = "Galaxy.Detail.Fade1", UniCVar = "uu.Galaxy.Detail.Fade1", ToolTip = "D-266: the share of layer 1's range it fades in over (0.5: full strength within half its range: the bubble of detail about the camera)."))
+	float U_Galaxy_Detail_Fade1 = 0.0f;
+
 	UPROPERTY(config, EditAnywhere, Category = "Galaxy|Detail Layers", meta = (DisplayName = "Galaxy.Detail.Foot", UniCVar = "uu.Galaxy.Detail.Foot", ToolTip = "D-265: a detail layer is read over at least this x its share of the step (the fade where the step does not resolve it: mean-kept blur instead of grain). 0: 0.5."))
 	float U_Galaxy_Detail_Foot = 0.0f;
 
@@ -295,6 +301,12 @@ public:
 
 	UPROPERTY(config, EditAnywhere, Category = "Galaxy|Detail Layers", meta = (DisplayName = "Galaxy.Detail.Light1", UniCVar = "uu.Galaxy.Detail.Light1", ToolTip = "D-265: detail layer 1's light amplitude (0..1)."))
 	float U_Galaxy_Detail_Light1 = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Galaxy|Detail Layers", meta = (DisplayName = "Galaxy.Detail.Range0", UniCVar = "uu.Galaxy.Detail.Range0", ToolTip = "D-266: detail layer 0 (the mid detail) reaches this far from the camera, in the galaxy's radii (the Milky Way's 24 kpc: 0.33 ~ 8 kpc), fading in from the coarse structure over uu.Galaxy.Detail.Fade0 of it; past it the layer is not read (no cost). 0: no limit (fades only by the march's step)."))
+	float U_Galaxy_Detail_Range0 = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Galaxy|Detail Layers", meta = (DisplayName = "Galaxy.Detail.Range1", UniCVar = "uu.Galaxy.Detail.Range1", ToolTip = "D-266: detail layer 1 (the fine detail) reaches this far from the camera, in the galaxy's radii (0.08 ~ 2 kpc in the Milky Way: a quarter of layer 0's, as its frequency is 4x); past it not read. 0: no limit."))
+	float U_Galaxy_Detail_Range1 = 0.0f;
 
 	UPROPERTY(config, EditAnywhere, Category = "Galaxy|Detail Layers", meta = (DisplayName = "Galaxy.Detail.StepTexels", UniCVar = "uu.Galaxy.Detail.StepTexels", ToolTip = "D-265: a detail layer's resolving step in its texels (dust: one step; light: uu.Volume.SegmentTaps taps a step). Smaller: sharper, more steps."))
 	float U_Galaxy_Detail_StepTexels = 0.0f;

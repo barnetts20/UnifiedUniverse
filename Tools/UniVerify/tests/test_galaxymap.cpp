@@ -420,7 +420,10 @@ UNI_TEST(volume, galaxy_detail_layers)
 	// wanders: -1.1% toward the centre, -2.5% from above when set); with the step cap the spread over
 	// the phases (grain) no more than the layers read without it (the step's fade alone) and the
 	// error against the reference under 2.5% (1.1%, 1.8% when set); the steps a ray at most 2x the
-	// layers off (x1.50).
+	// layers off (x1.50). D-266: with the defaults' bubble (layer 0 to 0.33 of the radius fading over
+	// all of it, layer 1 to 0.08 fading over its outer half); and from 18 kpc above the solar circle
+	// (the bubble's 0.33 radii, 7.9 kpc, above the disc's slab: 12 flared scale heights, where the
+	// layers apply) the frame and its steps exactly the layers off.
 	const FCacheTex& Tx = GalTex();
 	if (!Tx.bOk) { Uni::Check(2, "T2.vol.galaxy_detail_layers", "D-265 detail layers").Pass(false, "textures not loaded: " + Tx.Err); return; }
 	FGalBindAll Bind(Tx);
@@ -455,6 +458,7 @@ UNI_TEST(volume, galaxy_detail_layers)
 			FVolumeSettings S;
 			S.StepFoot = bRef ? 0.0f : 0.5f; S.SegmentTaps = bRef ? 1u : 4u;
 			if (C.bOn) { S.DetailFreq0 = 4.0f; S.DetailLight0 = 0.5f; S.DetailDust0 = 0.5f; S.DetailFreq1 = 16.0f; S.DetailLight1 = 0.5f; S.DetailDust1 = 0.5f; }
+			S.DetailRange0 = 0.33f; S.DetailFade0 = 1.0f; S.DetailRange1 = 0.08f; S.DetailFade1 = 0.5f;   // D-266
 			S.DetailSteps = C.Steps; S.DetailStepTexels = 4.0f; S.DetailFoot = 0.5f;
 			FVolumeScene Sc = VB.Build(P, Cam, FVec3f{}, Cm.View(), S).Subset(false);
 			const FCarrierGPU* Home = HomeCarrierOf(Sc);
@@ -503,9 +507,43 @@ UNI_TEST(volume, galaxy_detail_layers)
 		BindGalaxyMap(0u, nullptr);
 		Detail += Uni::Fmt("%s%s: %s", Detail.empty() ? "" : "; ", Vw.Name, Vd.c_str());
 	}
+	// D-266: outside the bubble: 18 kpc above the solar circle looking down (every point within the
+	// bubble above the disc's slab, so no layer is read).
+	bool bOutside = false;
+	{
+		const FCoord Cam = CamAt({ 8.0 * Units::Kpc, 1.0 * Units::Kpc, 18.0 * Units::Kpc });
+		FRefPipeline P(G);
+		P.bVelocityLod = false;
+		P.Update(Cam, FVec3f{});
+		FCamera Cm; Cm.Coord = Cam; Cm.Width = 64; Cm.Height = 36; Cm.LookAlong({ -0.2, 0.05, -1.0 });
+		FRun Rr[2];
+		for (int K = 0; K < 2; ++K)
+		{
+			FVolumeSettings S;
+			S.StepFoot = 0.5f; S.SegmentTaps = 4u;
+			if (K == 1) { S.DetailFreq0 = 4.0f; S.DetailLight0 = 0.5f; S.DetailDust0 = 0.5f; S.DetailFreq1 = 16.0f; S.DetailLight1 = 0.5f; S.DetailDust1 = 0.5f; S.DetailSteps = 16.0f; }
+			S.DetailRange0 = 0.33f; S.DetailFade0 = 1.0f; S.DetailRange1 = 0.08f; S.DetailFade1 = 0.5f;
+			FVolumeScene Sc = VB.Build(P, Cam, FVec3f{}, Cm.View(), S).Subset(false);
+			const FCarrierGPU* Home = HomeCarrierOf(Sc);
+			if (Home) { PublishGalaxyMap(Sc.View, Sc.Home.Carrier, 512u); }
+			if (Home && K == 0)
+			{
+				const auto& Pa = Sc.Params[Home->ParamIndex].V;   // A.y, E.x, E.w, G.x: Uni_GalaxyDiscSlab's terms
+				const double Rk = 1.0 / double(Home->InvRadius) / Units::Kpc;
+				Detail += Uni::Fmt("; the slab %.1f kpc (at the edge, flared), the bubble 0.33 radii %.1f kpc", Rk * (12.0 * Pa[1] * (1.0 + std::max(Pa[19], 0.0f)) + std::abs(Pa[16]) + 3.0 * std::abs(Pa[24])), 0.33 * Rk);
+			}
+			BindGalaxyMap(0u, &Map);
+			Rr[K] = March(Sc, Cm);
+			BindGalaxyMap(0u, nullptr);
+		}
+		double MaxD = 0.0, Mean = 0.0;
+		for (size_t I = 0; I < Rr[0].Lum.size(); ++I) { MaxD = std::max(MaxD, std::abs(Rr[1].Lum[I] - Rr[0].Lum[I])); Mean += Rr[0].Lum[I]; }
+		bOutside = MaxD == 0.0 && Rr[1].Steps == Rr[0].Steps && Mean > 0.0;
+		Detail += Uni::Fmt("; 18 kpc above (outside the bubble): largest difference %.3g, steps %.2f / %.2f", MaxD, Rr[1].Steps, Rr[0].Steps);
+	}
 	const double StepsX = Steps[2] / std::max(Steps[0], 1e-9);
-	bPass = bPass && std::abs(Light[1]) <= 0.04 && std::abs(Light[2]) <= 0.04 && Spread[2] <= Spread[1] && Err[2] < 0.025 && StepsX <= 2.0;
-	Uni::Check(2, "T2.vol.galaxy_detail_layers", "D-265 detail layers (x4, x16; light and dust 0.5; 16 steps a layer at 4 texels): from the solar circle toward the centre and 300 pc above, 8 jitter phases against each configuration's fine reference: the light within 4% of the layers off, with the step cap the grain no more than the layers' without it, the error under 2.5%, the steps at most 2x")
+	bPass = bPass && std::abs(Light[1]) <= 0.04 && std::abs(Light[2]) <= 0.04 && Spread[2] <= Spread[1] && Err[2] < 0.025 && StepsX <= 2.0 && bOutside;
+	Uni::Check(2, "T2.vol.galaxy_detail_layers", "D-265 detail layers (x4, x16; light and dust 0.5; 16 steps a layer at 4 texels): from the solar circle toward the centre and 300 pc above, 8 jitter phases against each configuration's fine reference: the light within 4% of the layers off, with the step cap the grain no more than the layers' without it, the error under 2.5%, the steps at most 2x; D-266: with the defaults' bubble (0.33 radii fading over all of it, 0.08 over its outer half), and outside it (18 kpc above the solar circle) the frame and steps exactly the layers off")
 		.Metric("light_on", Light[2]).Metric("spread_off", Spread[0]).Metric("spread_nocap", Spread[1]).Metric("spread_cap", Spread[2]).Metric("err_cap", Err[2]).Metric("steps_x", StepsX)
 		.Pass(bPass, Detail + Uni::Fmt("; steps x%.2f", StepsX));
 }
