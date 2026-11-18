@@ -33,6 +33,43 @@ namespace UniCore
 {
 	namespace HV = UniHlsl;
 
+	/** D-270 (B-036): Cardelli, Clayton & Mathis (1989, ApJ 345, 245) extinction A(lambda) / A(V) in
+	 *  the optical and near infrared (0.3 <= 1 / lambda <= 3.3 per micron; their Eq. 2-3), for R_V. */
+	inline double CardelliAlav(double InLambdaUm, double InRv = 3.1)
+	{
+		const double X = 1.0 / InLambdaUm;
+		double A, B;
+		if (X < 1.1)
+		{
+			const double Xp = std::pow(X, 1.61);
+			A = 0.574 * Xp; B = -0.527 * Xp;
+		}
+		else
+		{
+			const double Y = X - 1.82;
+			A = 1.0 + Y * (0.17699 + Y * (-0.50447 + Y * (-0.02427 + Y * (0.72085 + Y * (0.01979 + Y * (-0.77530 + Y * 0.32999))))));
+			B = Y * (1.41338 + Y * (2.28305 + Y * (1.07233 + Y * (-5.38434 + Y * (-0.62251 + Y * (5.30260 + Y * -2.09002))))));
+		}
+		return A + B / InRv;
+	}
+
+	/** D-270: the effective wavelengths (micron) of the linear sRGB primaries' channels (their
+	 *  dominant wavelengths: 612, 549, 465 nm). */
+	inline constexpr double DustCurveLambdaUm[3] = { 0.612, 0.549, 0.465 };
+
+	/** D-270: the dust's relative extinction per colour channel, green 1: D-132's (0.8, 1, 1.3)
+	 *  toward Cardelli's R_V 3.1 at the channels' wavelengths (0.886, 1, 1.233) by InCurve (0..1). */
+	inline void DustCurveRgb(float InCurve, float OutRgb[3])
+	{
+		static constexpr float D132[3] = { 0.8f, 1.0f, 1.3f };
+		const float T = InCurve < 0.0f ? 0.0f : (InCurve > 1.0f ? 1.0f : InCurve);
+		const double G = CardelliAlav(DustCurveLambdaUm[1]);
+		for (int K = 0; K < 3; ++K)
+		{
+			OutRgb[K] = T == 0.0f ? D132[K] : float(double(D132[K]) + (CardelliAlav(DustCurveLambdaUm[K]) / G - double(D132[K])) * double(T));
+		}
+	}
+
 	// GPU-MIRROR
 	struct FCarrierGPU
 	{
@@ -131,10 +168,26 @@ namespace UniCore
 		float DetailRange1;           // D-266: layer 1's
 		float DetailFade0;            // D-266: layer 0 fades in over this share of its range (1: all of it)
 		float DetailFade1;            // D-266: layer 1's
-		float DetailPad;
+		float DetailKnotTint;         // D-267: the knots' young light toward the galaxy's nebula colours (0..1)
+		float DetailKnot0;            // D-267: layer 0's knot amplitude (0..1)
+		float DetailKnot1;            // D-267: layer 1's
+		float WebDustKnots;           // D-269: the web dust's pattern, 0 dark filaments .. 1 dark knots
+		float WebDustDetail;          // D-269: the pattern's amplitude (0..1)
+		float WebDustTauCm;           // D-269: optical depth (V) per cm at the filament + node matter's mean (0: off)
+		float WebDustInvMean;         // D-269: 1 / that matter's mean (the web texture's channels)
+		float WebDustNearCm;          // D-269: faded in over this from the camera
+		float WebDustDepthCm;         // D-269: faded out over the second half of this
+		float WebDustDetailCm;        // D-269: the pattern's period, cm
+		float WebDustPeak;            // D-269: the matter held softly under this x its mean (0: no hold)
+		float WebDustTexN;            // D-269: galaxy_shape's texels a period
+		float WebDustRedden;          // D-269: its colour, 0 grey .. 1 the galaxies' dust's reddening
+		float SliceFarCm;             // D-271: the slices' far segment ends here (evenly in t from e^SliceLnTHi; at or below it: none)
+		float ViewPad0 = 0.0f;
+		float ViewPad1 = 0.0f;
+		float ViewPad2 = 0.0f;
 	};
-	static_assert(sizeof(FVolumeViewGPU) == 272, "FVolumeViewGPU must match FUniVolumeView (UniVolume.ush)");
-	static_assert(sizeof(HV::FUniVolumeView) == 272, "shim FUniVolumeView layout");
+	static_assert(sizeof(FVolumeViewGPU) == 336, "FVolumeViewGPU must match FUniVolumeView (UniVolume.ush)");
+	static_assert(sizeof(HV::FUniVolumeView) == 336, "shim FUniVolumeView layout");
 
 	inline HV::FUniCarrier ToHlsl(const FCarrierGPU& C) { HV::FUniCarrier H; std::memcpy(static_cast<void*>(&H), &C, sizeof(H)); return H; }
 	inline HV::FUniVolumeView ToHlsl(const FVolumeViewGPU& V) { HV::FUniVolumeView H; std::memcpy(static_cast<void*>(&H), &V, sizeof(H)); return H; }
@@ -486,6 +539,8 @@ namespace UniCore
 		double BackgroundPeriods = 0.5;                   // march extent (50 Mpc for the demo web); the analytic tail follows
 		double SliceLoCm = 3.0856775814913673e18;         // transmittance slices: 1 pc ..
 		double SliceHiCm = 3.0856775814913673e23;         // .. 100 kpc
+		double SliceFarCm = 0.0;                          // D-271: the far slices evenly in t from SliceHiCm to here (at or below SliceHiCm: none, the checks' default;
+		                                                  // the engine: 50 Mpc, or the web dust's depth if farther)
 		float DustSigmaRgb[3] = { 0.8f, 1.0f, 1.3f };
 		float TailDim = 0.0f;                             // D-189: the web in the sky (uu.SkyWeb): 0 physical
 		float WebGlowGain = 0.0f;
@@ -535,6 +590,18 @@ namespace UniCore
 		float DetailFoot = 0.5f;                          // a layer read over at least this x the step's share
 		float DetailRange0 = 0.0f, DetailRange1 = 0.0f;   // D-266: each layer's bubble about the camera, galaxy radii (0: no limit)
 		float DetailFade0 = 1.0f, DetailFade1 = 1.0f;     // D-266: the share of its range each fades in over
+		float DetailKnot0 = 0.0f, DetailKnot1 = 0.0f;     // D-267: each layer's knot amplitude (0..1)
+		float DetailKnotTint = 0.0f;                      // D-267: the knots toward the galaxy's nebula colours (0..1)
+		// D-269: the cosmic web's dark dust (render only; Uni_WebDustTau). Off here (the checks' march as
+		// before); the engine's defaults are uu.WebDust*'s.
+		float WebDustTauCm = 0.0f;                        // optical depth (V) per cm at the filament + node matter's mean (0: off)
+		float WebDustInvMean = 0.0f;                      // 1 / that matter's mean
+		float WebDustNearCm = 0.0f, WebDustDepthCm = 0.0f;   // faded in over Near, out over Depth's second half
+		float WebDustDetailCm = 0.0f;                     // the pattern's period, cm (0: none)
+		float WebDustDetail = 0.0f, WebDustKnots = 0.0f;  // the pattern's amplitude, filaments .. knots
+		float WebDustPeak = 0.0f;                         // the matter's soft hold, x its mean (0: none)
+		float WebDustTexN = 128.0f;                       // galaxy_shape's texels a period
+		float WebDustRedden = 0.0f;                       // its colour: 0 grey .. 1 the galaxies' dust's reddening
 		/** D-203: cell glow: the LUT carries each table's drawn light per level, and the source's
 		 *  loading cells (FVolumeSource::CellGlow) are drawn as glow by the march. */
 		bool bCellGlow = false;
@@ -1190,6 +1257,7 @@ namespace UniCore
 			V.ThetaPixel = View.ThetaPixel;
 			V.SliceLnTLo = float(std::log(S.SliceLoCm));
 			V.SliceLnTHi = float(std::log(S.SliceHiCm));
+			V.SliceFarCm = float(std::max(S.SliceFarCm, S.SliceHiCm));   // D-271
 			for (int K = 0; K < 3; ++K) { V.DustSigmaRgb[K] = S.DustSigmaRgb[K]; }
 			V.WebHintScale = S.WebHintScale;
 			V.TailDim = S.TailDim;
@@ -1225,7 +1293,13 @@ namespace UniCore
 			V.DetailFoot = S.DetailFoot;
 			V.DetailRange0 = S.DetailRange0; V.DetailRange1 = S.DetailRange1;   // D-266
 			V.DetailFade0 = S.DetailFade0; V.DetailFade1 = S.DetailFade1;
-			V.DetailPad = 0.0f;
+			V.DetailKnotTint = S.DetailKnotTint;         // D-267
+			V.DetailKnot0 = S.DetailKnot0; V.DetailKnot1 = S.DetailKnot1;
+			V.WebDustKnots = S.WebDustKnots; V.WebDustDetail = S.WebDustDetail;   // D-269
+			V.WebDustTauCm = S.WebDustTauCm; V.WebDustInvMean = S.WebDustInvMean;
+			V.WebDustNearCm = S.WebDustNearCm; V.WebDustDepthCm = S.WebDustDepthCm;
+			V.WebDustDetailCm = S.WebDustDetailCm; V.WebDustPeak = S.WebDustPeak;
+			V.WebDustTexN = S.WebDustTexN; V.WebDustRedden = S.WebDustRedden;
 			V.JitterShift = 0.0f;   // D-240: set per frame by the renderer
 			V.HintScale = S.HintScale;
 			return Out;

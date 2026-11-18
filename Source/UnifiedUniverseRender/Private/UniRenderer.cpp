@@ -3,6 +3,7 @@
 #include "UnifiedUniverseRender.h"
 #include "UniShaders.h"
 #include "UniTravel.h"
+#include "UniCompact.h"   // D-276: the disc's look
 
 #include "GlobalShader.h"
 #include "PipelineStateCache.h"
@@ -32,6 +33,21 @@ static TAutoConsoleVariable<float> CVarUniSpriteHaloGain(TEXT("uu.Sprite.HaloGai
 static TAutoConsoleVariable<float> CVarUniSpriteHaloGrowth(TEXT("uu.Sprite.HaloGrowth"), UniHlsl::UNI_SPRITE_HALO_GROWTH_PX, TEXT("Halo size growth per doubling of brightness over saturation (pixels of Gaussian sigma)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<float> CVarUniSpriteHaloChroma(TEXT("uu.Sprite.HaloChroma"), UniHlsl::UNI_SPRITE_HALO_CHROMA, TEXT("D-185: halo colour saturation x the star's (luminance kept; 1: the star's colour)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<float> CVarUniSpriteFloor(TEXT("uu.Sprite.Floor"), UniHlsl::UNI_SPRITE_FLOOR, TEXT("D-188: scene colour (pre-exposed) below which a sprite's quad may end: it reaches until its core and halo fall below this (3 to 8 sigmas)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniBhDiscKnee(TEXT("uu.Bh.DiscKnee"), UniHlsl::UNI_BH_DISC_KNEE, TEXT("D-274: a black hole's accretion disc up close: its light per pixel softened above this (exposure units: 1 = a star at the exposure magnitude), logarithmically (10x reads 2x, 1e8x reads 9x), colour kept, so its shape shows under bloom. Lower: dimmer. 0: physical (an active nucleus up close is billions of times the exposure). Render only, live."), ECVF_RenderThreadSafe);
+// D-276: the accretion disc's look (render only, live; UniCore::FDiscLook).
+static TAutoConsoleVariable<float> CVarUniBhDiscBrightness(TEXT("uu.Bh.DiscBrightness"), 1.0f, TEXT("D-276: the accretion disc's brightness relative to the exposure: its peak temperature shows this many exposure units a pixel (1 = a star at the exposure magnitude), whatever its physical light: what one thinks a black hole looks like. 0: physical (its nucleus's light; with uu.Bh.DiscKnee)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<int32> CVarUniBhDiscVolume(TEXT("uu.Bh.DiscVolume"), 1, TEXT("D-276: the disc is a volume (a flared slab of rotating clouds the camera can fly through). 0: D-273's thin, smooth disc."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniBhDiscThickness(TEXT("uu.Bh.DiscThickness"), 0.025f, TEXT("D-276: the volumetric disc's half-thickness over the radius (flared: thicker outwards). D-277: 0.025 (was 0.05)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniBhDiscOpacity(TEXT("uu.Bh.DiscOpacity"), 2.5f, TEXT("D-276: the disc's optical depth through its plane at mean density (lower: more of the sky shows through)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniBhDiscClouds(TEXT("uu.Bh.DiscClouds"), 0.85f, TEXT("D-276: 0..1: a smooth disc .. clumped clouds with gaps."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniBhDiscBands(TEXT("uu.Bh.DiscBands"), 0.3f, TEXT("D-276: the contrast of the disc's bright and dim rings (0: none)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniBhDiscHeat(TEXT("uu.Bh.DiscHeat"), 0.35f, TEXT("D-276: the clouds' temperature contrast: hot blue-white knots among cooler orange gas (0: none)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniBhDiscSpiral(TEXT("uu.Bh.DiscSpiral"), 12.0f, TEXT("D-276: the clouds wound into log spirals (radians per e-fold of radius; 0: none). D-277: 4 (was 1.5); D-278: 12."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniBhDiscErosion(TEXT("uu.Bh.DiscErosion"), 0.8f, TEXT("D-278: 0..1: a finer noise moving with the gas eats the clouds' thin edges, roughens the disc's top surface and its outer rim (0: smooth clouds, D-276's)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniBhDiscPeriod(TEXT("uu.Bh.DiscPeriod"), 8.0f, TEXT("D-276: seconds for one orbit of the disc's inner edge (outer gas slower, Keplerian). Art: physically hours to days. 0: still."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniBhDiscCycle(TEXT("uu.Bh.DiscCycle"), 1.0f, TEXT("D-276: the clouds' life in inner orbits: two phases each wound by the rotation for this long, then reborn, cross-faded (longer: longer spiral streaks)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarUniBhDiscFalloff(TEXT("uu.Bh.DiscFalloff"), 0.35f, TEXT("D-276: how fast the disc dims with its temperature outwards (1: physical V band, the outer disc dark; lower: it glows)."), ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<int32> CVarUniBhDiscSamples(TEXT("uu.Bh.DiscSamples"), int32(UniHlsl::UNI_LENS_VOL_SAMPLES), TEXT("D-276: the volume samples a ray takes half a thickness apart before falling back to one a step (cost)."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<float> CVarUniWarpStreakFrames(TEXT("uu.Warp.StreakFrames"), 1.0f, TEXT("D-187: warp streak length in frames of motion (the camera's move only), at full warp."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<float> CVarUniWarpStreakMax(TEXT("uu.Warp.StreakMax"), 64.0f, TEXT("D-187: longest warp streak, pixels."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<float> CVarUniWarpArrival(TEXT("uu.Warp.Arrival"), 8.0f, TEXT("D-187: at warp, frames over which a new cell's objects fade in, streaking in from ahead (0: off)."), ECVF_RenderThreadSafe);
@@ -839,7 +855,7 @@ void FUniRenderer::RenderVolume_RenderThread(FRDGBuilder& GraphBuilder, const FS
 		C.WarpVelBeta = WarpVelBetaOf(F);   // D-190
 		C.WarpDopplerKQ = WarpDopplerKQOf();
 		C.ShiftVelAmount = ShiftVelAmountOf(F);   // D-230
-		C.ShiftK = F.ShiftK;
+		C.ShiftKBoost = FVector4f(F.ShiftK, F.ShiftBoostFrom, F.ShiftBoost, 0.0f);   // D-268
 	};
 	auto FillCommon = [&](FUniVolumeCommonParameters& C, const TArray<UniCore::FCarrierGPU>& Carriers, const UniCore::FVolumeViewGPU& V)
 	{
@@ -1739,10 +1755,13 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 		P->WarpVelBeta = WarpVelBetaOf(F);   // D-190
 		P->WarpDopplerKQ = WarpDopplerKQOf();
 		P->ShiftVelAmount = ShiftVelAmountOf(F);   // D-230
-		P->ShiftK = F.ShiftK;
+		P->ShiftKBoost = FVector4f(F.ShiftK, F.ShiftBoostFrom, F.ShiftBoost, 0.0f);   // D-268
 		P->ArrivalFrames = FMath::Max(CVarUniWarpArrival.GetValueOnRenderThread(), 0.0f);
 		P->DiscArchetypeMask = F.DiscArchetypeMask;   // D-183
 		P->FixedDiscSeeds = FUintVector4(F.FixedDiscSeeds[0], F.FixedDiscSeeds[1], F.FixedDiscSeeds[2], F.FixedDiscSeeds[3]);
+		P->NucleusArchetypeMask = F.NucleusArchetypeMask;   // D-272
+		P->NucleusParams = F.NucleusParams;
+		P->NucleusHandSeed = F.NucleusHandSeed;   // D-273
 		P->ViewForward = Forward; P->ViewRight = Right; P->ViewUp = Up;
 		P->TanHalfFovX = TanX; P->TanHalfFovY = TanY;
 		P->LimitingMag = LimitingMag;
@@ -1944,6 +1963,7 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 		P->Sprite.bVolume = F.bVolume ? 1u : 0u;
 		P->Sprite.SliceLnTLo = F.VolumeView.SliceLnTLo;
 		P->Sprite.SliceLnTHi = F.VolumeView.SliceLnTHi;
+		P->Sprite.SliceFarCm = F.VolumeView.SliceFarCm;   // D-271
 		P->Sprite.OutToMarch = FVector4f(float(MarchSize.X) / float(FMath::Max(OutRect.Width(), 1)), float(MarchSize.Y) / float(FMath::Max(OutRect.Height(), 1)),
 			-float(OutRect.Min.X) * float(MarchSize.X) / float(FMath::Max(OutRect.Width(), 1)), -float(OutRect.Min.Y) * float(MarchSize.Y) / float(FMath::Max(OutRect.Height(), 1)));
 		P->Sprite.MarchSize = FUintVector2(uint32(MarchSize.X), uint32(MarchSize.Y));
@@ -2063,6 +2083,7 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 				Sp->bVolume = P->Sprite.bVolume;
 				Sp->SliceLnTLo = P->Sprite.SliceLnTLo;
 				Sp->SliceLnTHi = P->Sprite.SliceLnTHi;
+				Sp->SliceFarCm = P->Sprite.SliceFarCm;   // D-271
 				Sp->OutToMarch = P->Sprite.OutToMarch;
 				Sp->MarchSize = P->Sprite.MarchSize;
 				TShaderMapRef<FUniSplatCS> CS(GetGlobalShaderMap(View.GetFeatureLevel()));
@@ -2143,6 +2164,182 @@ void FUniRenderer::RenderBackdrop_RenderThread(FRDGBuilder& GraphBuilder, const 
 			}
 		}
 	}
+	// D-273: the near field of one black hole over everything the backdrop drew: a copy of scene colour
+	// read, every pixel of the view rect written (copied outside the black hole's region).
+	if (F.Lens.bActive)
+	{
+		RDG_EVENT_SCOPE(GraphBuilder, "Uni.Lens");
+		FRDGTextureDesc CopyDesc = SceneColor.Texture->Desc;
+		CopyDesc.Flags = TexCreate_ShaderResource;
+		CopyDesc.ClearValue = FClearValueBinding::Black;
+		FRDGTextureRef LensSrc = GraphBuilder.CreateTexture(CopyDesc, TEXT("UniLensSource"));
+		AddCopyTexturePass(GraphBuilder, SceneColor.Texture, LensSrc);
+		FUniLensPassParameters* Lp = GraphBuilder.AllocParameters<FUniLensPassParameters>();
+		FUniLensParameters& L = Lp->Lens;
+		L.InColor = LensSrc;
+		L.InColorSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+		L.InExtentInv = FVector4f(1.0f / float(FMath::Max(CopyDesc.Extent.X, 1)), 1.0f / float(FMath::Max(CopyDesc.Extent.Y, 1)), 0.0f, 0.0f);
+		L.OutRectMinSize = FVector4f(float(OutRect.Min.X), float(OutRect.Min.Y), float(OutRect.Width()), float(OutRect.Height()));
+		L.ViewForward = Forward; L.ViewRight = Right; L.ViewUp = Up;
+		L.LensPad0 = L.LensPad1 = L.LensPad2 = L.LensPad4 = 0.0f;
+		L.DiscKnee = FMath::Max(CVarUniBhDiscKnee.GetValueOnRenderThread(), 0.0f);   // D-274
+		L.TanHalfFov = FVector2f(TanX, TanY);
+		L.FocalPx = PixelsPerRadian;   // output pixels per unit tangent at the centre
+		L.MaxSteps = FMath::Clamp(F.Lens.MaxSteps, 16u, 2000u);
+		L.CamRs = F.Lens.CamRs;
+		L.BhDir = F.Lens.BhDir;
+		L.BhDistanceCm = F.Lens.BhDistanceCm;
+		L.DiscAxis = F.Lens.DiscAxis;
+		L.DiscOuterX = F.Lens.DiscOuterX;
+		L.DiscPeakK = F.Lens.DiscPeakK;
+		L.DiscOn = F.Lens.bDisc ? 1.0f : 0.0f;
+		// The radiance scale: the frame's (exposure-independent) log scale + 0.4 m_exp, x the disc's share;
+		// D-276: or relative to the exposure (uu.Bh.DiscBrightness).
+		const double ExposureMag = double(LimitingMag) - 1.0 + double(F.ExposureBias);
+		const float Brightness = FMath::Max(CVarUniBhDiscBrightness.GetValueOnRenderThread(), 0.0f);
+		const double DiscScaleD = Brightness > 0.0f ? UniCore::DiscArtScale(F.Lens.DiscPeakK, 1.0 / double(PixelsPerRadian), double(Brightness)) : FMath::Pow(10.0, F.Lens.DiscLog10Scale + 0.4 * ExposureMag);
+		L.DiscScale = F.Lens.bDisc && F.Lens.DiscShare > 0.0f ? float(FMath::Min(DiscScaleD, 1.0e30) * double(F.Lens.DiscShare)) : 0.0f;
+		{
+			// D-276: the disc's look and its flow phases at this frame's time.
+			UniCore::FDiscLook Lk;
+			Lk.bVolume = CVarUniBhDiscVolume.GetValueOnRenderThread() != 0;
+			Lk.Thickness = CVarUniBhDiscThickness.GetValueOnRenderThread();
+			Lk.Opacity = CVarUniBhDiscOpacity.GetValueOnRenderThread();
+			Lk.Clouds = CVarUniBhDiscClouds.GetValueOnRenderThread();
+			Lk.Bands = CVarUniBhDiscBands.GetValueOnRenderThread();
+			Lk.Heat = CVarUniBhDiscHeat.GetValueOnRenderThread();
+			Lk.Spiral = CVarUniBhDiscSpiral.GetValueOnRenderThread();
+			Lk.PeriodS = FMath::Max(CVarUniBhDiscPeriod.GetValueOnRenderThread(), 0.0f);
+			Lk.CycleOrbits = CVarUniBhDiscCycle.GetValueOnRenderThread();
+			Lk.Falloff = CVarUniBhDiscFalloff.GetValueOnRenderThread();
+			Lk.Erosion = CVarUniBhDiscErosion.GetValueOnRenderThread();   // D-278
+			Lk.MaxSamples = uint32(FMath::Clamp(CVarUniBhDiscSamples.GetValueOnRenderThread(), 8, 1024));
+			UniHlsl::FUniLensDisc Dl{};
+			Dl.Axis = UniHlsl::float3(F.Lens.DiscAxis.X, F.Lens.DiscAxis.Y, F.Lens.DiscAxis.Z);
+			UniCore::ApplyDiscLook(Dl, Lk, F.Lens.TimeS, F.Lens.DiscSeed);
+			L.DiscE1 = FVector3f(Dl.E1.x, Dl.E1.y, Dl.E1.z);
+			L.LensPad5 = 0.0f;
+			L.DiscVol0 = FVector4f(Dl.Thickness, Dl.Opacity, Dl.Clouds, Dl.Bands);
+			L.DiscVol1 = FVector4f(Dl.Heat, Dl.Spiral, Dl.OmegaIsco, Dl.Falloff);
+			L.DiscFlow = FVector4f(Dl.FlowTA, Dl.FlowTB, Dl.FlowWA, Dl.Erosion);   // D-278: w the erosion
+			L.DiscSeeds = FUintVector4(Dl.SeedA, Dl.SeedB, Dl.MaxSamples, 0u);
+		}
+		L.SceneColourScale = FVector3f(F.SceneColourScale * PreExposure);
+		// The nucleus as a point x (1 - the disc's share), in the sprites' style (Uni_PointStyle: the
+		// project pass's core and glare for that intensity), its sprite held back by the project pass.
+		L.PointCoreRgb = FVector3f::ZeroVector; L.PointHaloRgb = FVector3f::ZeroVector;
+		L.PointCoreSigmaPx = 1.0f; L.PointHaloSigmaPx = 1.0f;
+		float PointReachPx = 0.0f;
+		if (F.Lens.PointAppMag < UniHlsl::UNI_BH_NONE_MAG)
+		{
+			UniHlsl::FUniView Vs{};
+			Vs.ThetaPixel = 1.0f / PixelsPerRadian;
+			Vs.CorePx = FMath::Clamp(CVarUniSpriteCorePx.GetValueOnRenderThread(), 0.25f, 16.0f);
+			Vs.CoreSat = FMath::Max(CVarUniSpriteSaturation.GetValueOnRenderThread(), 0.0f);
+			Vs.HaloGain = FMath::Max(CVarUniSpriteHaloGain.GetValueOnRenderThread(), 0.0f);
+			Vs.HaloGrowthPx = FMath::Max(CVarUniSpriteHaloGrowth.GetValueOnRenderThread(), 0.0f);
+			Vs.HaloMaxPx = FMath::Clamp(CVarUniSpriteHaloMax.GetValueOnRenderThread(), 0.0f, 64.0f);
+			const float Keep = 1.0f - FMath::Clamp(F.Lens.DiscShare, 0.0f, 1.0f);
+			const float Intensity = float(FMath::Pow(10.0, -0.4 * (double(F.Lens.PointAppMag) - ExposureMag))) * UniHlsl::Uni_MagFade(F.Lens.PointAppMag, LimitingMag) * UniHlsl::Uni_HorizonDimming(F.Lens.BhDistanceCm) * Keep;
+			if (Intensity > 0.0f)
+			{
+				const UniHlsl::float4 St = UniHlsl::Uni_PointStyle(Intensity, F.Lens.PointPhysAngRad, Vs);
+				const UniHlsl::float3 Col(F.Lens.PointColour.X, F.Lens.PointColour.Y, F.Lens.PointColour.Z);
+				const UniHlsl::float3 Core = Col * (St.x / FMath::Max(UniHlsl::Uni_Luminance(Col), 1.0e-3f));
+				L.PointCoreRgb = FVector3f(Core.x, Core.y, Core.z);
+				L.PointCoreSigmaPx = St.z * PixelsPerRadian;
+				if (St.y > 0.0f && St.x > 0.0f)
+				{
+					const UniHlsl::float3 Halo = UniHlsl::Uni_SpriteChroma(Core, FMath::Clamp(CVarUniSpriteHaloChroma.GetValueOnRenderThread(), 0.0f, 4.0f)) * (St.y / St.x);
+					L.PointHaloRgb = FVector3f(Halo.x, Halo.y, Halo.z);
+					L.PointHaloSigmaPx = St.w * PixelsPerRadian;
+				}
+				PointReachPx = 4.0f * FMath::Max(L.PointCoreSigmaPx, L.PointHaloRgb.IsZero() ? 0.0f : L.PointHaloSigmaPx) + 2.0f;
+			}
+		}
+		L.RegionCos = FMath::Cos(FMath::Min(FMath::Max(F.Lens.RegionRad, PointReachPx / PixelsPerRadian), 3.14159265f));
+		L.InvDeviceZToWorldZTransform = FVector4f(View.InvDeviceZToWorldZTransform);
+		{
+			const FIntPoint DepthExtent = SceneDepth->Desc.Extent;
+			const FVector2f Scale(float(DepthViewRect.Width()) / float(FMath::Max(OutRect.Width(), 1)) / float(DepthExtent.X),
+				float(DepthViewRect.Height()) / float(FMath::Max(OutRect.Height(), 1)) / float(DepthExtent.Y));
+			const FVector2f Bias(float(DepthViewRect.Min.X) / float(DepthExtent.X) - float(OutRect.Min.X) * Scale.X,
+				float(DepthViewRect.Min.Y) / float(DepthExtent.Y) - float(OutRect.Min.Y) * Scale.Y);
+			L.DepthUVScaleBias = FVector4f(Scale.X, Scale.Y, Bias.X, Bias.Y);
+		}
+		L.SceneDepthTexture = SceneDepth;
+		L.SceneDepthSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+		{
+			// D-279: the sky-only pyramid over the view rect: mip 0 the scene behind the hole
+			// (premultiplied by that mask), each mip the 2 x 2 average of the one above; the pass
+			// fills a ray's origin covered by the foreground from it.
+			const FIntPoint SkySize(FMath::Max(OutRect.Width(), 1), FMath::Max(OutRect.Height(), 1));
+			const uint32 SkyMipCount = uint32(FMath::FloorLog2(uint32(FMath::Max(SkySize.X, SkySize.Y)))) + 1u;
+			FRDGTextureRef Sky = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(SkySize, PF_FloatRGBA, FClearValueBinding::Transparent,
+				TexCreate_ShaderResource | TexCreate_UAV, uint8(SkyMipCount)), TEXT("UniLensSky"));
+			{
+				FUniLensSkyMaskCS::FParameters* Pm = GraphBuilder.AllocParameters<FUniLensSkyMaskCS::FParameters>();
+				Pm->InColor = LensSrc;
+				Pm->OutRectMinSize = L.OutRectMinSize;
+				Pm->TanHalfFov = L.TanHalfFov;
+				Pm->BhDistanceCm = L.BhDistanceCm;
+				Pm->InvDeviceZToWorldZTransform = L.InvDeviceZToWorldZTransform;
+				Pm->DepthUVScaleBias = L.DepthUVScaleBias;
+				Pm->SceneDepthTexture = SceneDepth;
+				Pm->SceneDepthSampler = L.SceneDepthSampler;
+				Pm->SkyDstSize = FUintVector2(uint32(SkySize.X), uint32(SkySize.Y));
+				Pm->OutSky = GraphBuilder.CreateUAV(FRDGTextureUAVDesc(Sky, 0));
+				TShaderMapRef<FUniLensSkyMaskCS> CS(GetGlobalShaderMap(View.GetFeatureLevel()));
+				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Lens.SkyMask"), CS, Pm, FIntVector(FMath::DivideAndRoundUp(SkySize.X, 8), FMath::DivideAndRoundUp(SkySize.Y, 8), 1));
+			}
+			for (uint32 M = 1; M < SkyMipCount; ++M)
+			{
+				const FIntPoint Src(FMath::Max(SkySize.X >> (M - 1), 1), FMath::Max(SkySize.Y >> (M - 1), 1));
+				const FIntPoint Dst(FMath::Max(SkySize.X >> M, 1), FMath::Max(SkySize.Y >> M, 1));
+				FUniLensSkyDownCS::FParameters* Pd = GraphBuilder.AllocParameters<FUniLensSkyDownCS::FParameters>();
+				Pd->InSkyMip = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::CreateForMipLevel(Sky, int32(M - 1)));
+				Pd->SkyDstSize = FUintVector2(uint32(Dst.X), uint32(Dst.Y));
+				Pd->SkySrcSize = FUintVector2(uint32(Src.X), uint32(Src.Y));
+				Pd->OutSky = GraphBuilder.CreateUAV(FRDGTextureUAVDesc(Sky, uint8(M)));
+				TShaderMapRef<FUniLensSkyDownCS> CS(GetGlobalShaderMap(View.GetFeatureLevel()));
+				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Uni.Lens.SkyMip %u", M), CS, Pd, FIntVector(FMath::DivideAndRoundUp(Dst.X, 8), FMath::DivideAndRoundUp(Dst.Y, 8), 1));
+			}
+			L.SkyTexture = Sky;
+			L.SkySampler = TStaticSamplerState<SF_Trilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+			L.SkyMips = SkyMipCount;
+		}
+		L.VolumeSlices = VolumeSlices;
+		L.bVolume = F.bVolume ? 1u : 0u;
+		L.SliceLnTLo = F.VolumeView.SliceLnTLo;
+		L.SliceLnTHi = F.VolumeView.SliceLnTHi;
+		L.SliceFarCm = F.VolumeView.SliceFarCm;
+		L.OutToMarch = FVector4f(float(MarchSize.X) / float(FMath::Max(OutRect.Width(), 1)), float(MarchSize.Y) / float(FMath::Max(OutRect.Height(), 1)),
+			-float(OutRect.Min.X) * float(MarchSize.X) / float(FMath::Max(OutRect.Width(), 1)), -float(OutRect.Min.Y) * float(MarchSize.Y) / float(FMath::Max(OutRect.Height(), 1)));
+		L.MarchSize = FUintVector2(uint32(MarchSize.X), uint32(MarchSize.Y));
+		Lp->RenderTargets[0] = FRenderTargetBinding(SceneColor.Texture, ERenderTargetLoadAction::ELoad);
+		TShaderMapRef<FUniLensVS> LVS(GetGlobalShaderMap(View.GetFeatureLevel()));
+		TShaderMapRef<FUniLensPS> LPS(GetGlobalShaderMap(View.GetFeatureLevel()));
+		GraphBuilder.AddPass(RDG_EVENT_NAME("Uni.Lens %.3g R_s", double(F.Lens.CamRs.Size())), Lp, ERDGPassFlags::Raster,
+			[Lp, LVS, LPS, OutRect](FRHICommandList& RHICmdList)
+			{
+				RHICmdList.SetViewport(float(OutRect.Min.X), float(OutRect.Min.Y), 0.0f, float(OutRect.Max.X), float(OutRect.Max.Y), 1.0f);
+				FGraphicsPipelineStateInitializer Pso;
+				RHICmdList.ApplyCachedRenderTargets(Pso);
+				Pso.BlendState = TStaticBlendState<>::GetRHI();   // replace: the pass writes every pixel of the rect
+				Pso.RasterizerState = TStaticRasterizerState<FM_Solid, CM_None>::GetRHI();
+				Pso.DepthStencilState = TStaticDepthStencilState<false, CF_Always>::GetRHI();
+				Pso.BoundShaderState.VertexDeclarationRHI = GEmptyVertexDeclaration.VertexDeclarationRHI;
+				Pso.BoundShaderState.VertexShaderRHI = LVS.GetVertexShader();
+				Pso.BoundShaderState.PixelShaderRHI = LPS.GetPixelShader();
+				Pso.PrimitiveType = PT_TriangleList;
+				SetGraphicsPipelineState(RHICmdList, Pso, 0);
+				SetShaderParameters(RHICmdList, LVS, LVS.GetVertexShader(), Lp->Lens);
+				SetShaderParameters(RHICmdList, LPS, LPS.GetPixelShader(), Lp->Lens);
+				RHICmdList.DrawPrimitive(0, 1, 1);
+			});
+		Stats.LensPassesLastFrame = 1u;
+	}
+	else { Stats.LensPassesLastFrame = 0u; }
 	Stats.CellsLastFrame = uint32(F.Cells.Num());
 }
 

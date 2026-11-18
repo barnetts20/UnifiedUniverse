@@ -45,7 +45,14 @@ namespace UniRender
 		float HaloChroma = 1.0f;   // D-185: halo chroma; 1 here by default (sprites as before)
 		// D-230: the travel shift (Uni_TravelShift) on sprites and the volume (0: none).
 		double ShiftAmount = 0.0, ShiftK = 0.0;
+		double ShiftBoostFrom = 0.0, ShiftBoost = 0.0;   // D-268: the blue side's brightening past the reference (0: none)
 		FV3 ShiftVel{ 0, 0, 0 };
+		// D-272: galaxies' nuclei (Uni_ProjectNucleusC): the archetypes that have them (0: none, as before)
+		// and the uu.Bh.* settings.
+		u32 NucleusArchetypeMask = 0u;
+		float NucleusActive = H::UNI_BH_ACTIVE_SHARE, NucleusCap = 0.5f, NucleusGain = 1.0f;
+		u32 NucleusHandSeed = 0u; float NucleusHandShare = 0.0f;   // D-273: the lensed nucleus's share handed to its disc
+		double ExposureBias = 0.0;   // D-273: the exposure magnitude's offset (uu.ExposureBias; 0: m_lim - 1, as before)
 
 		void LookAlong(FV3 F, FV3 WorldUp = { 0, 0, 1 })
 		{
@@ -69,12 +76,14 @@ namespace UniRender
 			V.LimitingMag = H::Uni_LimitingMag(float(DeltaMag));
 			V.SurfaceLimit = H::UNI_MU_REF + float(DeltaMag);
 			V.CameraFraction = H::float3(Frac.X, Frac.Y, Frac.Z);
-			V.ExposureMag = V.LimitingMag - 1.0f;
+			V.ExposureMag = V.LimitingMag - 1.0f + float(ExposureBias);
 			V.ThetaPixel = float(1.0 / FocalPx());
 			V.SystemArchetypeMask = SystemArchetypeMask;
 			V.DiscArchetypeMask = DiscArchetypeMask;
 			V.FixedDiscSeeds = H::uint4(FixedDiscSeeds[0], FixedDiscSeeds[1], FixedDiscSeeds[2], FixedDiscSeeds[3]);
-			V.WarpVel = H::float3(0, 0, 0); V.WarpBeta = 0.0f; V.WarpDoppler = 0.0f; V.WarpBeaming = 0.0f; V.ShiftAmount = float(ShiftAmount); V.ShiftK = float(ShiftK); V.ShiftVel = H::float3(float(ShiftVel.X), float(ShiftVel.Y), float(ShiftVel.Z)); V.ShiftPad = 0.0f;   // D-190: no warp optics; D-230: the travel shift
+			V.WarpVel = H::float3(0, 0, 0); V.WarpBeta = 0.0f; V.WarpDoppler = 0.0f; V.WarpBeaming = 0.0f; V.ShiftAmount = float(ShiftAmount); V.ShiftK = float(ShiftK); V.ShiftBoostFrom = float(ShiftBoostFrom); V.ShiftBoost = float(ShiftBoost); V.ShiftVel = H::float3(float(ShiftVel.X), float(ShiftVel.Y), float(ShiftVel.Z)); V.ShiftPad = 0.0f;   // D-190: no warp optics; D-230: the travel shift
+			V.NucleusArchetypeMask = NucleusArchetypeMask; V.NucleusActive = NucleusActive; V.NucleusCap = NucleusCap; V.NucleusGain = NucleusGain;   // D-272
+			V.NucleusHandSeed = NucleusHandSeed; V.NucleusHandShare = NucleusHandShare; V.NucleusPad0 = 0.0f; V.NucleusPad1 = 0.0f;   // D-273
 			return H::Uni_SpriteDefaults(V);   // D-156 sprite style
 		}
 	};
@@ -264,6 +273,11 @@ namespace UniRender
 			H::uint4 D[3];
 			CellDelta(K, Cam.Coord, D);
 			const H::FUniSprite S = H::Uni_ProjectObject(D[0], D[1], D[2], u32(K.Level), Fade, UniCore::ToHlsl(O), V, false);
+			if (V.NucleusArchetypeMask != 0u)   // D-272: a galaxy's nucleus, as the project pass appends it
+			{
+				const H::FUniSprite Sn = H::Uni_ProjectNucleusH(D[0], D[1], D[2], u32(K.Level), Fade, UniCore::ToHlsl(O), V);
+				if (Sn.Flags & H::UNI_SPRITE_VISIBLE) { Sprites.push_back({ Sn, K.Level }); }
+			}
 			if (S.Flags & H::UNI_SPRITE_PROMOTE_CANDIDATE)
 			{
 				// Main pass: point-like bodies as true-scale spheres; extended objects hand off to

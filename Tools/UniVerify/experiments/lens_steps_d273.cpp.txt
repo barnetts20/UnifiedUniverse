@@ -1,0 +1,22 @@
+// lens_steps_d273.cpp.txt (archived experiment, D-273): the lens trace's integrated sphere and step against the exact
+// orbit (u'' + u = 1.5 u^2, double). Built against copies of the cores with the constants edited:
+//   sphere 20,  k 0.06        worst 0.0129 (b < 3), 0.0081 (b >= 3: the closed form's missing 15 pi / 16 b^2)
+//   sphere 200, k 0.06 / 0.15 worst 4.9e-4 (b 2.62), under 1e-4 elsewhere  <- adopted
+//   sphere 100, k 0.04 / 0.12 worst 1e-4 (b < 3), 3e-4 (b 100: closed form)
+// g++ -std=c++17 -O2 -I Source/UniCore -I <cores copy> -I Tools/UniVerify/src lens_steps_d273.cpp
+#include "UniCompact.h"
+#include <cstdio>
+#include <cmath>
+using namespace UniCore; namespace H=UniHlsl;
+const double Pi=3.14159265358979323846;
+struct FExact { bool bCaptured=false; double PhiInf=0; };
+FExact ExactOrbit(double Rc, double Th){FExact E;const double S=std::sqrt(1-1/Rc);const double B=Rc*std::sin(Th)/S;double U=1/Rc;double W=std::sqrt(std::max(1/(B*B)-U*U+U*U*U,0.0))*(std::cos(Th)>0?1:-1);double Phi=0;auto F=[](double u){return 1.5*u*u-u;};
+while(Phi<60){double H0=std::max(std::min(2e-4,0.02*std::max(U,1e-3)/std::max(std::fabs(W),1e-9)),1e-7);double K1u=W,K1w=F(U);double K2u=W+0.5*H0*K1w,K2w=F(U+0.5*H0*K1u);double K3u=W+0.5*H0*K2w,K3w=F(U+0.5*H0*K2u);double K4u=W+H0*K3w,K4w=F(U+H0*K3u);double U1=U+H0/6*(K1u+2*K2u+2*K3u+K4u),W1=W+H0/6*(K1w+2*K2w+2*K3w+K4w);if(U1<=0){E.PhiInf=Phi+H0*U/(U-U1);return E;}if(U1>=1){E.bCaptured=true;return E;}U=U1;W=W1;Phi+=H0;}E.bCaptured=true;return E;}
+double Wrap(double A){while(A>Pi)A-=2*Pi;while(A<-Pi)A+=2*Pi;return A;}
+int main(){H::FUniLensDisc D{};D.Axis=H::float3(0,0,1);
+ for(double Rc:{6.0,15.0,40.0,300.0,1e4,1e6}){double S=std::sqrt(1-1/Rc);
+  for(double B:{2.62,2.7,3.0,4.0,6.5,10.0,15.0,20.0,30.0,50.0,100.0,300.0,1000.0,3000.0}){double st=B*S/Rc;if(st>=0.999)continue;
+   for(int o=0;o<2;++o){ if(o&&Rc>50)continue; double Th=o?Pi-std::asin(st):std::asin(st);FExact E=ExactOrbit(Rc,Th);
+   H::FUniLensResult R=H::Uni_LensTrace(H::float3(float(Rc),0,0),H::float3(float(-std::cos(Th)),float(std::sin(Th)),0),D,400);
+   if(E.bCaptured||R.Captured>0.5f) continue; double g=std::atan2(R.Dir.y,R.Dir.x); double e=std::fabs(Wrap(g-E.PhiInf));
+   if(e>1e-4) printf("Rc %g b %g out %d err %.3g defl %.4g steps %g\n",Rc,B,o,e,std::fabs(Wrap(E.PhiInf-(Pi-Th))),R.Steps);}}}}

@@ -184,13 +184,25 @@ UNI_FN float3 Uni_DopplerTint(float3 InC, float InD, float InK, float InQ)
 }
 
 /** D-230: the travel shift (an art choice, render only; uu.Shift): while travelling, light ahead
- *  is shifted blue and light behind red, as a Doppler shift would, the luminance kept (hue only,
- *  never brightness). InAmount: ln of the shift factor straight ahead (0: none; the CPU ramps it
- *  by the travel curve); InVel: the motion (unit). Uni_DopplerTint's strength InK. */
-UNI_FN float3 Uni_TravelShift(float3 InC, float3 InDir, float3 InVel, float InAmount, float InK)
+ *  is shifted blue and light behind red, as a Doppler shift would, the luminance kept. InAmount:
+ *  ln of the shift factor straight ahead (0: none; the CPU sets it from the speed, D-268); InVel:
+ *  the motion (unit); InK: the tint's strength (Uni_DopplerTint's). D-268: the factor's log up to
+ *  +-3 (x20; Uni_DopplerTint's x4 cap was the old top end), and where it passes InBoostFrom (the
+ *  shift at the reference speed: D-230's top) the hue deepens (the green falls with the excess)
+ *  and, on the blue side only, the light brightens by exp(InBoost x the excess). */
+UNI_FN float3 Uni_TravelShift(float3 InC, float3 InDir, float3 InVel, float InAmount, float InK, float InBoostFrom, float InBoost)
 {
 	if (InAmount == 0.0f || !(dot(InVel, InVel) > 0.25f)) { return InC; }
-	return Uni_DopplerTint(InC, exp(InAmount * clamp(dot(InDir, InVel), -1.0f, 1.0f)), InK, 0.0f);
+	const float L = clamp(InAmount * clamp(dot(InDir, InVel), -1.0f, 1.0f), -3.0f, 3.0f);
+	if (L == 0.0f) { return InC; }
+	const float Y = Uni_Luminance(InC);
+	// Past the old top end the green falls too (exp(-0.5 x the excess)): deep blue and deep red
+	// instead of the cyan and orange a green held at 1 gives; up to InBoostFrom D-230's tint exactly.
+	const float Ex = max(abs(L) - InBoostFrom, 0.0f);
+	float3 C = InC * float3(exp(-InK * L), exp(-0.5f * InK * Ex), exp(InK * L));
+	const float Yc = Uni_Luminance(C);
+	C = Yc > 0.0f ? C * (Y / Yc) : InC;
+	return (InBoost > 0.0f && L > InBoostFrom) ? C * exp(InBoost * (L - InBoostFrom)) : C;
 }
 
 #endif // UNI_PHOTOMETRY_USH

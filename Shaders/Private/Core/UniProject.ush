@@ -21,6 +21,7 @@
 #include "UniPhotometry.ush"
 #include "UniPlacement.ush"
 #include "UniSystem.ush"
+#include "UniCompact.ush"   // D-272
 
 static const float UNI_THETA_PROMOTE = 0.02f;     // rad: angular size that promotes to an actor (D-119)
 static const float UNI_PROMOTE_HYSTERESIS = 1.25f;
@@ -87,8 +88,20 @@ struct FUniView
 	float WarpBeaming;        // D-190: beaming exponent (0: light kept)
 	float ShiftAmount;        // D-230: the travel shift (Uni_TravelShift): ln of the factor straight ahead (0: none)
 	float ShiftK;             // its colour strength
+	float ShiftBoostFrom;     // D-268: the shift past which the blue side brightens (ln)
+	float ShiftBoost;         // D-268: that brightening's exponent (0: none)
 	float3 ShiftVel;          // the motion it shifts by (unit; any when ShiftAmount is 0)
 	float ShiftPad;
+	// D-272: galaxies' nuclei (Uni_ProjectNucleusC): their supermassive black holes' accretion light.
+	uint NucleusArchetypeMask; // archetypes (id < 32) whose objects have one (0: none drawn)
+	float NucleusActive;       // the accreting share of galaxies (UNI_BH_ACTIVE_SHARE; uu.Bh.ActiveFraction)
+	float NucleusCap;          // a nucleus at most this x its host's light (uu.Bh.NucleusCap)
+	float NucleusGain;         // x its light (art; 1 physical; uu.Bh.NucleusGain)
+	// D-273: the nucleus whose black hole the lens pass draws hands this share of its light to the disc.
+	uint NucleusHandSeed;      // its galaxy's seed (record B.x)
+	float NucleusHandShare;    // 0: none handed (every nucleus a whole sprite)
+	float NucleusPad0;
+	float NucleusPad1;
 };
 
 struct FUniSprite
@@ -349,7 +362,7 @@ UNI_FN FUniSprite Uni_ProjectObjectC(FUniCellRel InCell,
 	S.Radiance = Col * (CoreE / max(Uni_Luminance(Col), 1.0e-3f));   // the core's light; luminance = core energy (D-135)
 	S.Flags = S.Flags | UNI_SPRITE_VISIBLE | (bExtended ? UNI_SPRITE_EXTENDED : 0u) | (bBody ? UNI_SPRITE_BODY : 0u) | (bPromoted ? UNI_SPRITE_HALO_ONLY : 0u);
 	if (InView.WarpBeta != 0.0f) { S.Radiance = Uni_DopplerTint(S.Radiance, Dop, InView.WarpDoppler, InView.WarpBeaming); }   // D-190
-	S.Radiance = Uni_TravelShift(S.Radiance, TrueDir, InView.ShiftVel, InView.ShiftAmount, InView.ShiftK);   // D-230
+	S.Radiance = Uni_TravelShift(S.Radiance, TrueDir, InView.ShiftVel, InView.ShiftAmount, InView.ShiftK, InView.ShiftBoostFrom, InView.ShiftBoost);   // D-230, D-268
 	// D-183: a disc galaxy reads as an ellipse at its inclination: the disc normal is its
 	// contributor's (the object seed's random rotation, UniGenRef RandomRotation), the axis ratio
 	// sqrt(cos^2 i + q0^2 sin^2 i) (q0 0.2 for a disc, 0.65 for an early type: the rolled fields'
@@ -376,6 +389,100 @@ UNI_FN FUniSprite Uni_ProjectObjectH(uint4 InCellDeltaX, uint4 InCellDeltaY, uin
 	float InLevelFade, FUniObject InObj, FUniView InView, bool InWasPromoted, float InCarrierShare)
 {
 	return Uni_ProjectObjectC(Uni_CellRel(InCellDeltaX, InCellDeltaY, InCellDeltaZ, InLevel), InLevelFade, InObj, InView, InWasPromoted, InCarrierShare);
+}
+
+/** D-272: a galaxy's nucleus, its supermassive black hole's accretion light (UniCompact.ush), as a
+ *  second sprite of the galaxy's record: a point source at the record's position (the bulge's
+ *  centre) with its own magnitude and colour, with the glare of a point source, never handed to the
+ *  galaxy's volume carrier (an unresolved point cannot be marched: it stays a sprite at every
+ *  distance, over the march, dimmed by the dust in front of it through the slices). The galaxy's own
+ *  sprite is untouched. Hidden with a deleted galaxy; never a promotion candidate. Not visible: an
+ *  archetype without nuclei, a nucleus under 1e-6 of its host, or culled as any point source.
+ *  D-273: its light towards the camera is its disc's (UNI_BH_DISC_BEAM by the angle to the disc's
+ *  axis; the record's magnitude the mean over directions), its colour the disc's
+ *  (Uni_NucleusColour), and the black hole the lens pass draws hands NucleusHandShare of it to the
+ *  resolved disc. */
+UNI_FN FUniSprite Uni_ProjectNucleusC(FUniCellRel InCell, float InLevelFade, FUniObject InObj, FUniView InView)
+{
+	FUniSprite S;
+	S.RenderPos = float3(0.0f, 0.0f, 0.0f);
+	S.AngularRadius = 0.0f;
+	S.Radiance = float3(0.0f, 0.0f, 0.0f);
+	S.TrueDistance = 0.0f;
+	S.NdcX = 0.0f;
+	S.NdcY = 0.0f;
+	S.Flags = 0u;
+	S.PhysAngularRadius = 0.0f;
+	S.HaloRadius = 0.0f;
+	S.HaloRatio = 0.0f;
+	S.EllipseAngle = 0.0f;
+	S.EllipseAxis = 0.0f;
+	const uint Arch = Uni_ObjectArchetype(InObj);
+	if (Arch >= 32u || ((InView.NucleusArchetypeMask >> Arch) & 1u) == 0u) { return S; }
+	const float Host = Uni_ObjectAbsMag(InObj);
+	const FUniBlackHole Bh = Uni_GalaxyBlackHole(InObj, InView.NucleusActive);
+	float Mn = Uni_NucleusAbsMag(Bh, Host, InView.NucleusCap, InView.NucleusGain);
+	if (!(Mn < UNI_BH_NONE_MAG)) { return S; }
+	// D-273: the disc's light by direction (UNI_BH_DISC_BEAM, lensing and all): brighter face-on,
+	// dimmer edge-on, its mean over directions the record's magnitude (GetGalaxyBlackHole's).
+	{
+		const uint Sd = InObj.B.x;
+		const bool bFixed = Sd != 0u && (InView.FixedDiscSeeds.x == Sd || InView.FixedDiscSeeds.y == Sd || InView.FixedDiscSeeds.z == Sd || InView.FixedDiscSeeds.w == Sd);
+		const float3 Axis = Uni_BhDiscAxis(Sd, bFixed ? float3(0.0f, 0.0f, 1.0f) : Uni_DiscNormal(Sd));
+		const float3 Rel = Uni_ObjectRelativeC(InCell, uint3(InObj.A.x, InObj.A.y, InObj.A.z), InView.CameraFraction);
+		const float Mu = abs(dot(Axis, Rel)) / max(Uni_SafeLength(Rel), 1.0e-3f);
+		Mn -= 2.5f * log10(max(Uni_BhDiscBeam(Uni_BhDiscPeakK(Bh), Mu), 1.0e-6f));
+	}
+	// D-273: the black hole the lens pass draws hands this light to its resolved disc.
+	if (InView.NucleusHandShare > 0.0f && InObj.B.x == InView.NucleusHandSeed)
+	{
+		const float Keep = 1.0f - saturate(InView.NucleusHandShare);
+		if (!(Keep > 1.0e-4f)) { return S; }
+		Mn -= 2.5f * log10(Keep);
+	}
+	// The point: the accretion disc's light region, ~100 Schwarzschild radii (never resolved here).
+	FUniObject N;
+	N.A = uint4(InObj.A.x, InObj.A.y, InObj.A.z, Arch | ((Uni_ObjectFlags(InObj) & UNI_OBJ_FLAG_DELTA_HIDDEN) << 16u));
+	N.B = uint4(InObj.B.x, asuint(log2(100.0f * Uni_BhSchwarzschildCm(Bh.Log10Mass))), Uni_F32ToF16(Mn) | (Uni_F32ToF16(Mn) << 16u), Uni_PackColour(Uni_NucleusColour(Bh)));
+	S = Uni_ProjectObjectC(InCell, InLevelFade, N, InView, false, 0.0f);
+	S.Flags = S.Flags & ~UNI_SPRITE_PROMOTE_CANDIDATE;
+	return S;
+}
+
+/** D-273: a point source's sprite style as Uni_ProjectObjectC gives it (the D-156 / D-158 core and
+ *  glare), for the lens pass, which draws the nucleus of the black hole it lenses itself (a sprite
+ *  in scene colour would be lensed as if behind the black hole): (core energy, glare energy, core
+ *  sigma, glare sigma), the sigmas in rad. InIntensity: exposure units; InPhysAngularRadius: the
+ *  point's true angular radius (rad). */
+UNI_FN float4 Uni_PointStyle(float InIntensity, float InPhysAngularRadius, FUniView InView)
+{
+	const float CorePx = Uni_SpriteCorePx(InView);
+	const float CoreMin = CorePx * InView.ThetaPixel;
+	const float Ang = max(InPhysAngularRadius, CoreMin);
+	float CoreE = InIntensity;
+	float HaloE = 0.0f;
+	float HaloR = 0.0f;
+	if (InView.CoreSat > 0.0f)
+	{
+		const float Area = Ang / CoreMin;
+		const float Sat = InView.CoreSat * Area * Area;
+		CoreE = Uni_SpriteSaturate(InIntensity, Sat);
+		const float Over = max(log2(max(InIntensity, 1.0e-30f) / Sat), 0.0f);
+		const float He = InView.HaloGain * Sat * Over;
+		if (He > 0.0f && CoreE > 0.0f)
+		{
+			const float Growth = min(max(InView.HaloMaxPx / CorePx - 1.0f, 0.0f), InView.HaloGrowthPx * Over / CorePx);
+			HaloE = He;
+			HaloR = Ang * (1.0f + Growth);
+		}
+	}
+	return float4(CoreE, HaloE, Ang, HaloR);
+}
+
+UNI_FN FUniSprite Uni_ProjectNucleusH(uint4 InCellDeltaX, uint4 InCellDeltaY, uint4 InCellDeltaZ, uint InLevel,
+	float InLevelFade, FUniObject InObj, FUniView InView)
+{
+	return Uni_ProjectNucleusC(Uni_CellRel(InCellDeltaX, InCellDeltaY, InCellDeltaZ, InLevel), InLevelFade, InObj, InView);
 }
 
 /** Project one object with the handoff curve (the sprites alone, offline). */

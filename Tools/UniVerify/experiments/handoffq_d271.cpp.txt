@@ -1,0 +1,72 @@
+// zz_handoffq.cpp (experiment): the galaxies' light-weighted thickness (sqrt(Czz / Cxy-plane)) of
+// the field at several footprints, against the sprite's q0 (0.2 discs, 0.65 early types; D-183):
+// T2.galaxy.sprites' hand-off error grew 0.042 -> 0.059 at D-256..D-262.
+
+#include "../src/UniTest.h"
+#include "../src/UniRenderRef.h"
+#include "../src/UniVerifyCommon.h"
+#include "../scenes/UniScenes.h"
+#include "UniWebTexture.h"
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <vector>
+
+using namespace UniCore;
+using namespace UniRender;
+namespace H = UniHlsl;
+
+UNI_TEST(zz, handoffq)
+{
+	FUniverseModel M(UniScenes::WebToGalaxy());
+	FRefGenerator G(M);
+	FRefPipeline P(G);
+	P.bVelocityLod = false;
+	P.Update(UniScenes::VoidCamera(), FVec3f{});
+	const float Foots[] = { 0.0f, 0.03f, 0.1f, 0.3f };
+	for (int Tex = 0; Tex < 2; ++Tex)
+	{
+		FWebTexture Gt[3];
+		if (Tex == 1) { for (int K = 0; K < 3; ++K) { std::string E; FWebTexture::LoadDelivered("Data/Noise", GalaxyTextureName(K), Gt[K], &E); BindGalaxyTexture(K, &Gt[K]); } }
+		std::vector<std::vector<double>> Q(8);
+		int N = 0;
+		for (const auto& KV : P.Contributors())
+		{
+			const FContributor& Ct = KV.second;
+			if (Ct.Emitter == nullptr || Ct.Emitter->FieldId != H::UNI_FIELD_GALAXY || N >= 40) { continue; }
+			auto It = P.CacheRef().find(Ct.Parent.Cell);
+			if (It == P.CacheRef().end() || Ct.Parent.Index >= It->second.Objects.size()) { continue; }
+			const FObjectGPU& O = It->second.Objects[Ct.Parent.Index];
+			const bool bEarly = ((O.A[3] >> 16) & H::UNI_OBJ_FLAG_EARLY) != 0u;
+			const H::FUniFieldParams Pp = Ct.Params.ToHlsl();
+			for (int F = 0; F < 4; ++F)
+			{
+				double Sw = 0, Cxx = 0, Cyy = 0, Czz = 0;
+				for (u32 K = 0; K < 60000; ++K)
+				{
+					const u32 Sd = H::Uni_SeedMix(0x0D15Cu, K);
+					const H::float3 Pt(float(2 * H::Uni_DrawUnit(Sd, 0x51u, 0) - 1), float(2 * H::Uni_DrawUnit(Sd, 0x51u, 1) - 1), float(2 * H::Uni_DrawUnit(Sd, 0x51u, 2) - 1));
+					if (H::dot(Pt, Pt) >= 1.0f) { continue; }
+					const double W = H::UniField_GalaxyFiltered(Pt, Pp, Foots[F]);
+					Sw += W; Cxx += W * Pt.x * Pt.x; Cyy += W * Pt.y * Pt.y; Czz += W * Pt.z * Pt.z;
+				}
+				Q[size_t((bEarly ? 1 : 0) * 4 + F)].push_back(std::sqrt(Czz / std::max(0.5 * (Cxx + Cyy), 1e-300)));
+			}
+			++N;
+		}
+		for (int E = 0; E < 2; ++E)
+		{
+			std::printf("tex %d %s (%zu):", Tex, E ? "early" : "disc ", Q[size_t(E * 4)].size());
+			for (int F = 0; F < 4; ++F)
+			{
+				std::vector<double> V(Q[size_t(E * 4 + F)]);
+				if (V.empty()) { continue; }
+				std::sort(V.begin(), V.end());
+				double Mn = 0; for (double X : V) { Mn += X; } Mn /= V.size();
+				std::printf("  foot %.2f: mean %.3f median %.3f [%.3f..%.3f]", Foots[F], Mn, V[V.size() / 2], V.front(), V.back());
+			}
+			std::printf("\n");
+		}
+		if (Tex == 1) { for (int K = 0; K < 3; ++K) { BindGalaxyTexture(K, nullptr); } }
+	}
+}

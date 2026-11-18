@@ -41,7 +41,7 @@ namespace UniGpuLayout
 	inline constexpr uint32 CarrierBytes = sizeof(UniCore::FCarrierGPU);        // 128 (D-245)
 	inline constexpr uint32 VolumeViewBytes = sizeof(UniCore::FVolumeViewGPU);  // 48
 	inline constexpr uint32 FieldParamsBytes = sizeof(UniCore::FFieldParamsGPU); // 128 (D-178)
-	inline constexpr uint32 VolumeSlices = 8;                                   // UNI_VOL_SLICES (UniVolume.ush)
+	inline constexpr uint32 VolumeSlices = 12;                                  // UNI_VOL_SLICES (UniVolume.ush; D-271: 8 -> 12)
 	inline constexpr uint32 VolumeLutEntries = 256;                             // UNI_VOL_LUT_SIZE
 	inline constexpr uint32 MaxCarriers = 128;                                  // D-161
 }
@@ -274,11 +274,14 @@ public:
 		SHADER_PARAMETER(FVector4f, WarpVelBeta)   // D-190
 		SHADER_PARAMETER(FVector4f, WarpDopplerKQ)
 		SHADER_PARAMETER(FVector4f, ShiftVelAmount)   // D-230
-		SHADER_PARAMETER(float, ShiftK)
+		SHADER_PARAMETER(FVector4f, ShiftKBoost)   // D-268: colour strength, boost start, boost
 		SHADER_PARAMETER(float, ArrivalFrames)
 		SHADER_PARAMETER(uint32, DiscArchetypeMask)   // D-183
 		SHADER_PARAMETER(FUintVector4, FixedDiscSeeds)   // D-183
 		SHADER_PARAMETER(uint32, WriteSpriteSource)      // D-193
+		SHADER_PARAMETER(uint32, NucleusArchetypeMask)   // D-272
+		SHADER_PARAMETER(FVector4f, NucleusParams)       // D-272: accreting share, cap, gain; D-273: w the lensed nucleus's share handed to its disc
+		SHADER_PARAMETER(uint32, NucleusHandSeed)        // D-273
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint4>, InHandoffs)   // D-196
 		SHADER_PARAMETER(uint32, NumHandoffs)
 		SHADER_PARAMETER(uint32, SplatMode)                                       // D-223
@@ -382,7 +385,7 @@ BEGIN_SHADER_PARAMETER_STRUCT(FUniVolumeCommonParameters, )
 	SHADER_PARAMETER(FVector4f, WarpVelBeta)     // D-190
 	SHADER_PARAMETER(FVector4f, WarpDopplerKQ)
 	SHADER_PARAMETER(FVector4f, ShiftVelAmount)  // D-230
-	SHADER_PARAMETER(float, ShiftK)
+	SHADER_PARAMETER(FVector4f, ShiftKBoost)   // D-268: colour strength, boost start, boost
 	SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniWebTexture)   // D-164
 	SHADER_PARAMETER_SAMPLER(SamplerState, UniWebSampler)
 	SHADER_PARAMETER_RDG_TEXTURE(Texture3D<float4>, UniGalWarpFine)    // D-179
@@ -800,6 +803,7 @@ BEGIN_SHADER_PARAMETER_STRUCT(FUniSpriteParameters, )
 	SHADER_PARAMETER(uint32, bVolume)
 	SHADER_PARAMETER(float, SliceLnTLo)
 	SHADER_PARAMETER(float, SliceLnTHi)
+	SHADER_PARAMETER(float, SliceFarCm)   // D-271
 	SHADER_PARAMETER(FVector4f, OutToMarch)
 	SHADER_PARAMETER(FUintVector2, MarchSize)
 	SHADER_PARAMETER(uint32, bQuadIndex)                                    // D-223: instance i draws InQuadIndex[i]
@@ -860,6 +864,7 @@ public:
 		SHADER_PARAMETER(uint32, bVolume)
 		SHADER_PARAMETER(float, SliceLnTLo)
 		SHADER_PARAMETER(float, SliceLnTHi)
+		SHADER_PARAMETER(float, SliceFarCm)   // D-271
 		SHADER_PARAMETER(FVector4f, OutToMarch)
 		SHADER_PARAMETER(FUintVector2, MarchSize)
 	END_SHADER_PARAMETER_STRUCT()
@@ -961,6 +966,119 @@ public:
 
 BEGIN_SHADER_PARAMETER_STRUCT(FUniSplatResolvePassParameters, )
 	SHADER_PARAMETER_STRUCT_INCLUDE(FUniSplatResolveParameters, Resolve)
+	RENDER_TARGET_BINDING_SLOTS()
+END_SHADER_PARAMETER_STRUCT()
+
+/** D-273: the near field of one black hole (UniLens.usf): lensing and its accretion disc, a full-screen
+ *  pass after the backdrop reading a copy of it. */
+BEGIN_SHADER_PARAMETER_STRUCT(FUniLensParameters, )
+	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, InColor)
+	SHADER_PARAMETER_SAMPLER(SamplerState, InColorSampler)
+	SHADER_PARAMETER(FVector4f, InExtentInv)
+	SHADER_PARAMETER(FVector4f, OutRectMinSize)
+	SHADER_PARAMETER(FVector3f, ViewForward)
+	SHADER_PARAMETER(float, LensPad0)
+	SHADER_PARAMETER(FVector3f, ViewRight)
+	SHADER_PARAMETER(float, LensPad1)
+	SHADER_PARAMETER(FVector3f, ViewUp)
+	SHADER_PARAMETER(float, LensPad2)
+	SHADER_PARAMETER(FVector2f, TanHalfFov)
+	SHADER_PARAMETER(float, FocalPx)
+	SHADER_PARAMETER(uint32, MaxSteps)
+	SHADER_PARAMETER(FVector3f, CamRs)
+	SHADER_PARAMETER(float, RegionCos)
+	SHADER_PARAMETER(FVector3f, BhDir)
+	SHADER_PARAMETER(float, BhDistanceCm)
+	SHADER_PARAMETER(FVector3f, DiscAxis)
+	SHADER_PARAMETER(float, DiscOuterX)
+	SHADER_PARAMETER(float, DiscPeakK)
+	SHADER_PARAMETER(float, DiscOn)
+	SHADER_PARAMETER(float, DiscScale)
+	SHADER_PARAMETER(float, DiscKnee)        // D-274
+	SHADER_PARAMETER(FVector3f, DiscE1)      // D-276
+	SHADER_PARAMETER(float, LensPad5)
+	SHADER_PARAMETER(FVector4f, DiscVol0)
+	SHADER_PARAMETER(FVector4f, DiscVol1)
+	SHADER_PARAMETER(FVector4f, DiscFlow)
+	SHADER_PARAMETER(FUintVector4, DiscSeeds)
+	SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float4>, SkyTexture)   // D-279: the sky-only pyramid
+	SHADER_PARAMETER_SAMPLER(SamplerState, SkySampler)
+	SHADER_PARAMETER(uint32, SkyMips)
+	SHADER_PARAMETER(FVector3f, SceneColourScale)
+	SHADER_PARAMETER(float, LensPad4)
+	SHADER_PARAMETER(FVector3f, PointCoreRgb)
+	SHADER_PARAMETER(float, PointCoreSigmaPx)
+	SHADER_PARAMETER(FVector3f, PointHaloRgb)
+	SHADER_PARAMETER(float, PointHaloSigmaPx)
+	SHADER_PARAMETER(FVector4f, InvDeviceZToWorldZTransform)
+	SHADER_PARAMETER(FVector4f, DepthUVScaleBias)
+	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneDepthTexture)
+	SHADER_PARAMETER_SAMPLER(SamplerState, SceneDepthSampler)
+	SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float>, VolumeSlices)
+	SHADER_PARAMETER(uint32, bVolume)
+	SHADER_PARAMETER(float, SliceLnTLo)
+	SHADER_PARAMETER(float, SliceLnTHi)
+	SHADER_PARAMETER(float, SliceFarCm)
+	SHADER_PARAMETER(FVector4f, OutToMarch)
+	SHADER_PARAMETER(FUintVector2, MarchSize)
+END_SHADER_PARAMETER_STRUCT()
+
+class FUniLensVS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FUniLensVS);
+	SHADER_USE_PARAMETER_STRUCT(FUniLensVS, FGlobalShader);
+	using FParameters = FUniLensParameters;
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
+};
+
+class FUniLensPS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FUniLensPS);
+	SHADER_USE_PARAMETER_STRUCT(FUniLensPS, FGlobalShader);
+	using FParameters = FUniLensParameters;
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
+};
+
+/** D-279: the sky-only pyramid's mip 0 (UniLens.usf SkyMaskCS): scene colour x (behind the hole). */
+class FUniLensSkyMaskCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FUniLensSkyMaskCS);
+	SHADER_USE_PARAMETER_STRUCT(FUniLensSkyMaskCS, FGlobalShader);
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, InColor)
+		SHADER_PARAMETER(FVector4f, OutRectMinSize)
+		SHADER_PARAMETER(FVector2f, TanHalfFov)
+		SHADER_PARAMETER(float, BhDistanceCm)
+		SHADER_PARAMETER(FVector4f, InvDeviceZToWorldZTransform)
+		SHADER_PARAMETER(FVector4f, DepthUVScaleBias)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneDepthTexture)
+		SHADER_PARAMETER_SAMPLER(SamplerState, SceneDepthSampler)
+		SHADER_PARAMETER(FUintVector2, SkyDstSize)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutSky)
+	END_SHADER_PARAMETER_STRUCT()
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
+};
+
+/** D-279: one mip of the sky-only pyramid (UniLens.usf SkyDownCS). */
+class FUniLensSkyDownCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FUniLensSkyDownCS);
+	SHADER_USE_PARAMETER_STRUCT(FUniLensSkyDownCS, FGlobalShader);
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<float4>, InSkyMip)
+		SHADER_PARAMETER(FUintVector2, SkyDstSize)
+		SHADER_PARAMETER(FUintVector2, SkySrcSize)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutSky)
+	END_SHADER_PARAMETER_STRUCT()
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
+};
+
+BEGIN_SHADER_PARAMETER_STRUCT(FUniLensPassParameters, )
+	SHADER_PARAMETER_STRUCT_INCLUDE(FUniLensParameters, Lens)
 	RENDER_TARGET_BINDING_SLOTS()
 END_SHADER_PARAMETER_STRUCT()
 

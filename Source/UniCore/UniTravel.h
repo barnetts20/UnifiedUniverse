@@ -52,14 +52,41 @@ namespace UniCore
 	 *  inf there, so the motion came out zero with the optics on: every direction shrank by
 	 *  sqrt(1 - b^2), and every sprite off the view's centre took a capped 64 px streak (its light
 	 *  spread 64x): at intergalactic speed nearly everything vanished. */
-	/** D-230: the travel look's ramp (the motion web, the travel shift): 0 below Start on the
-	 *  travel curve (0 at 100 kpc/s, 1 at 10 Mpc/s, log in between), 1 above Full, smooth between. */
-	inline double TravelLookRamp(double InSpeed01, double InStart, double InFull)
+	/** D-268: the travel shift's strength (ln of the shift factor straight ahead) from the camera's
+	 *  speed, its own curve (D-230's rode the travel curve: in at ~308 kpc/s, full at ~2.2 Mpc/s,
+	 *  x1.65). In log speed: 0 below Start; to RefAmount at Ref as (u / U1)^1.5 (it comes in
+	 *  gently); from Ref to TopAmount at Full, its slope continuous at Ref and accelerating (a x +
+	 *  (1 - a) x^2: the top end climbs fastest); TopAmount above Full. Speeds in any one unit. */
+	inline double TravelShiftTarget(double InSpeed, double InStart, double InRef, double InFull, double InRefAmount, double InTopAmount)
 	{
-		if (!(InFull > InStart)) { return InSpeed01 >= InStart ? 1.0 : 0.0; }
-		const double X = std::clamp((InSpeed01 - InStart) / (InFull - InStart), 0.0, 1.0);
-		return X * X * (3.0 - 2.0 * X);
+		if (!(InSpeed > InStart) || !(InStart > 0.0)) { return 0.0; }
+		const double Ref = std::max(InRef, InStart * 1.001);
+		const double Full = std::max(InFull, Ref * 1.001);
+		const double U = std::log(InSpeed / InStart);
+		const double U1 = std::log(Ref / InStart), U2 = std::log(Full / Ref);
+		if (U <= U1) { return InRefAmount * std::pow(U / U1, 1.5); }
+		const double X = std::min((U - U1) / U2, 1.0);
+		const double Rise = InTopAmount - InRefAmount;
+		if (!(Rise > 0.0)) { return InRefAmount + Rise * X; }
+		const double A = std::clamp(1.5 * InRefAmount / U1 * U2 / Rise, 0.0, 2.0);   // the slope at Ref carried on
+		return InRefAmount + Rise * (A * X + (1.0 - A) * X * X);
 	}
+
+	/** D-268: the travel shift's strength eased in time (as the motion web's ramp: speed jitter
+	 *  cannot flicker it): towards TravelShiftTarget over UpSeconds rising, DownSeconds falling. */
+	struct FTravelShiftRamp
+	{
+		double Value = 0.0;
+		double UpSeconds = 0.3, DownSeconds = 0.6;
+
+		double Update(double InTarget, double InDt)
+		{
+			const double Tau = InTarget > Value ? UpSeconds : DownSeconds;
+			const double K = InDt > 0.0 ? 1.0 - std::exp(-InDt / std::max(Tau, 1e-3)) : 0.0;
+			Value += (InTarget - Value) * K;
+			return Value;
+		}
+	};
 
 	/** D-231: the motion web's ramp, from the camera's speed itself (the travel curve is 0 below
 	 *  100 kpc/s; the owner wants the web while crossing a galaxy in a second or two, ~15-50 kpc/s):

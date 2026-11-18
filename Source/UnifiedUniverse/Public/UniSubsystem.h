@@ -66,6 +66,7 @@
 #include "UniVolume.h"
 #include "UniGalaxyMap.h"
 #include "UniSystem.h"
+#include "UniCompact.h"   // D-272
 #include "UniPromotion.h"
 #include "UniDemoScenes.h"
 #include "UniTravel.h"
@@ -241,6 +242,12 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Universe|Query")
 	bool GetKnownObject(const FUniObjectId& Id, FUniObjectInfo& OutObject) const;
 
+	/** D-272: a resident galaxy's supermassive black hole (at its centre): mass, accretion,
+	 *  luminosity, Schwarzschild radius and the nucleus it shows; D-273: its accretion disc's axis,
+	 *  outer radius and peak temperature (what the lens pass draws). False if Id is not a resident galaxy. */
+	UFUNCTION(BlueprintCallable, Category = "Universe|Query")
+	bool GetGalaxyBlackHole(const FUniObjectId& Id, FUniBlackHoleInfo& OutBlackHole) const;
+
 	/** Which archetypes raise OnObjectResident / OnObjectEvicted (ids 0..31 of objects the CPU
 	 *  knows: galaxies, clusters, groups and anchors; empty: none, the default). Objects already
 	 *  resident are reported at once. */
@@ -302,6 +309,7 @@ private:
 	// Travel sensitivity (D-154): the owner's sensitivity plus a speed-driven boost
 	UniCore::FTravelSensitivity Warp;   // D-187: the same curve, 0..1, for the warp effects
 	UniCore::FMotionWebRamp MotionWebRamp;   // D-231: the motion web's ramp from the camera's speed
+	UniCore::FTravelShiftRamp TravelShiftRamp;   // D-268: the travel shift's strength from the camera's speed
 	UniCore::FVolumeAutoBudget VolumeBudget;   // D-200: the glow's pixel budget follows the GPU frame time
 	// D-212 / D-214: the galaxy maps (a cache of GPU array slots): generation places a galaxy's
 	// stars from its map, the volume marches the camera's galaxy from it (uu.GalaxyMap).
@@ -341,6 +349,10 @@ private:
 	TUniquePtr<UniCore::FSystemManager> Systems;
 	uint32 SystemArchetypeMask = 0;
 	uint32 DiscArchetypeMask = 0;   // D-183: archetypes emitting through the galaxy field (inclined sprites)
+	UniCore::FNucleusConfig NucleusConfig() const;   // D-272: uu.Bh.* (the nuclei and the black hole lookup)
+	/** D-273: the black hole the lens pass draws this frame (of the camera's galaxies, the most visible), into F. */
+	void UpdateLensTarget(struct FUniFrameData& F, const UniCore::FVolumeScene& Sc, const UniCore::FCoord& Cam);
+	UniCore::FLensTarget LensLast;   // D-273: the last one (uu.Perf)
 	uint32 FixedDiscSeeds[4] = { 0, 0, 0, 0 };   // D-183: seeds of fixed-orientation anchors (up to four)
 	double UniverseTime = 0.0;
 	double TimeScale = 1.0;

@@ -99,7 +99,7 @@ A **carrier** is one marched volume: a contributor (the object that owns an emit
 - **Dust field.** The archetype's volume profile holds a dust field. For galaxies it is the galaxy field with a thinner disc (h_d = 0.5 h), arms phase-shifted toward the inner edge, and no bulge.
 - **Normalisation and colour.** Normalised by τ⊥, the face-on optical depth at one scale length. Reddening is σ_RGB = σ · (0.8, 1.0, 1.3).
 - **Volume self-absorption** is in the march.
-- **Sprites behind dust: transmittance slices** (the design's v2, proposed for v1). The march writes T at 8 slices uniform in ln t (half resolution, R16F, 8 MB at 1080p). The sprite pixel shader reads T at its true distance with bilinear and log interpolation. This gives the Milky Way's dark rift over its own stars, and galaxies hidden behind the disc (the zone of avoidance). Conservation holds because both terms see the same T.
+- **Sprites behind dust: transmittance slices** (the design's v2, proposed for v1). The march writes T at 8 slices uniform in ln t (half resolution, R16F, 8 MB at 1080p). The sprite pixel shader reads T at its true distance with bilinear and log interpolation. This gives the Milky Way's dark rift over its own stars, and galaxies hidden behind the disc (the zone of avoidance). Conservation holds because both terms see the same T. **D-271:** 12 slices: the 8 over 1 pc..100 kpc in ln t, then 4 evenly in t to 50 Mpc (`SliceFarCm`; the web dust's depth if farther), so galaxies behind the web's dark dust (D-269) and behind other galaxies' dust dim; each slice records T at its boundary within the step that crosses it (the step's extinction even along it), not at the step's end.
 - **Known gap:** internal extinction makes a dusty galaxy's carrier dimmer than its sprite, by up to about 30% edge-on (to be measured). v1.1 computes the carrier's mean transmittance on the CPU (16 rays through the same core) for carriers in the handoff ramp and applies it to the sprite.
 
 ## 8. Engine pass (written on `uu/volumetrics`, not compiled: UE-9)
@@ -113,7 +113,7 @@ Every hook stays in the existing post-MotionBlur callback (`UniRenderHooks.cpp`)
    - A background version bump requests a re-march of the direction map (D-136).
 2. **`Uni.Volume.Background`** (compute). Re-marches the dirty faces of the persistent 6 × 256² RGBA32F direction map, `uu.BackgroundFacesPerFrame` (2) per frame.
 3. **`Uni.Volume.March`** (compute). Marches the local carriers at 1 / `uu.VolumeDivisor` (2) of the output resolution.
-   - Outputs: RGBA32F (radiance, luminance T) and an 8-layer R16F slice array (luminance T).
+   - Outputs: RGBA32F (radiance, luminance T) and a 12-layer R16F slice array (luminance T; D-271: 8 before).
    - Pixels on sub-pixel carriers are supersampled up to 8 × 8.
 4. **`Uni.Volume.Composite`** (full-screen triangle, additive into the scene-colour copy).
    - Depth-aware bilinear upsample (log-distance weights).
@@ -122,7 +122,7 @@ Every hook stays in the existing post-MotionBlur callback (`UniRenderHooks.cpp`)
 5. **Sprites** read the slice array at their true distance (luminance transmittance). With the volume off, a 1 × 1 dummy slice texture of 1s is bound.
 6. **Console:** `uu.Volume 0|1`, `uu.VolumeDivisor`, `uu.BackgroundSize`, `uu.BackgroundFacesPerFrame`. `uu.Stats` logs carriers, faces marched and LUT rebuilds.
 
-**Memory at 1080p, half resolution:** volume 8 MB, slices 8 MB, background map 6 MB. The volume and background targets are float32: radiance per steradian overflows half floats, at ~7e4 per sr for a galaxy disc at the default exposure.
+**Memory at 1080p, half resolution:** volume 8 MB, slices 12 MB (D-271: 12 layers), background map 6 MB. The volume and background targets are float32: radiance per steradian overflows half floats, at ~7e4 per sr for a galaxy disc at the default exposure.
 
 **Accepted GPU/CPU differences:**
 - The engine stores luminance-only near transmittance (for the background) and luminance-only slices (for sprites). The reference uses RGB. They differ only in dust reddening of the background and of stars behind dust.
@@ -212,7 +212,7 @@ The march's cost is rays x steps per ray x cost per step. These are the console 
 | `uu.VolumeFarFillFrames` | 8 | frames a face's re-march is spread over (one face in one frame is ~3x the march) | D-228 |
 | `uu.VolumeFarOnFrames` / `OnMotion` / `OffMotion` | 30 / 0.02 / 0.04 | on below OnMotion texels of parallax at the split a frame, held OnFrames frames; off above OffMotion (break-even ~0.06) | D-228 |
 | `uu.VolumeFarDueTexels` | 0.3 | a face in view is re-marched past this parallax since it was marched (out of view: 1.2) | D-228 |
-| `uu.TravelLook.Start` / `Full` | 0.15 / 0.75 | the travel curve values (0 at 100 kpc/s, 1 at 10 Mpc/s) between which the travel shift ramps in | D-230 |
+| `uu.Shift.StartKpcS` / `RefKpcS` / `FullKpcS` | 150 / 2200 / 8900 | the travel shift's own speed curve: in from Start, `uu.Shift` at Ref, `uu.Shift.Top` at Full (D-230's uu.TravelLook.* gone) | D-268 |
 | `uu.MotionWeb.StartKpcS` / `FullKpcS` | 5 / 5000 | D-231: the motion web's own ramp from the camera's speed (ease-out on log speed, eased in time): ~0.36 at 20 kpc/s, 0.56 at 50 | D-231 |
 | `uu.MotionWeb.Detail` / `DetailMpc` | 1.0 / 20 | D-231: one galaxy_detail read (ridged) multiplies the web; its period. 0: none | D-231 |
 | `uu.MotionWeb.StepMpc` | 0.5 | D-231: with the detail on, the background's step cap in the web's band, so the detail is sampled, not swimming (~2x the background's steps while on). 0: no cap (the detail blurs away) | D-231 |
@@ -226,7 +226,11 @@ The march's cost is rays x steps per ray x cost per step. These are the console 
 | `uu.Nebula.Refine` | 1 | D-244: inside a spiral's gas layer, a long step split into up to this many sub-samples (each the whole field): far knots sharp N x farther, ~2.5x the galaxy work along the disc at 4. 1: off | D-244 |
 | `uu.MotionWeb` | 0.01 | the motion web: the web's filaments and nodes glow faintly while travelling; a galaxy disc's surface brightness per Mpc at full strength. 0: off | D-230 |
 | `uu.MotionWeb.Threshold` / `Near` / `Depth` | 3 / 4 / 50 | above this multiple of the filament + node mean; faded in over the first Near Mpc, out over the second half of Depth Mpc | D-230 |
-| `uu.Shift` / `uu.Shift.Colour` | 0.5 / 1.0 | the travel shift: ahead blue, behind red, luminance kept, on the volume and every sprite (ln of the factor ahead; the tint's strength). 0: off | D-230 |
+| `uu.Shift` / `uu.Shift.Colour` | 0.5 / 1.0 | the travel shift: ahead blue, behind red, on the volume and every sprite (ln of the factor ahead at the reference speed, D-268; the tint's strength). 0: off | D-230 |
+| `uu.Shift.Top` / `Boost` | 2 / 1 | D-268: ln of the factor at the full speed (x7.4); past `uu.Shift` the hues deepen and the blue side brightens by exp(Boost x the excess) | D-268 |
+| `uu.WebDust` | 3 | D-269: the cosmic web's dark dust: optical depth per 100 Mpc at the filament + node matter's mean (held under `Peak` 30 x it), x a dark pattern; faded in over `NearMpc` 2, out by `DepthMpc` 50. 0: off | D-269 |
+| `uu.WebDust.Detail` / `Knots` / `DetailMpc` / `Redden` | 1 / 0.3 / 30 / 0.5 | D-269: the pattern's amplitude, dark filaments (0) to dark knots (1), its period, grey (0) to the galaxies' reddening (1) | D-269 |
+| `uu.Galaxy.Detail.Knots0` / `Knots1` / `KnotTint` | 0.5 / 0.5 / 0.5 | D-267: the detail layers' knot channel on the knots' young light; the knots toward the galaxy's nebula colours | D-267 |
 
 **Steps per ray.**
 | Setting | Default | What it does | Decision |
@@ -278,6 +282,7 @@ The march's cost is rays x steps per ray x cost per step. These are the console 
 | `uu.Nebula.GridBudget` | 128 | D-252: bricks (8^3 cells) classified and baked a frame at most | D-252 |
 | `uu.Nebula.GridFetches` | 32 | D-252: a step's grid reads at most (a longer step reads a coarser level); D-255: the cells a step's walk crosses | D-252, D-255 |
 | `uu.Volume.StepFoot` | 0.5 | D-255: the camera's galaxy's map read over at least this x the step along the disc (the cone rule; 0: the pixel's footprint) | D-255 |
+| `uu.Volume.DustCurve` | 0 | D-270: the galaxy dust's colour: D-132's reddening (0.8, 1, 1.3) toward Cardelli's R_V 3.1 curve at the screen's primaries (0.886, 1, 1.233) by this (0..1); the web dust's reddening follows | D-270 |
 | `uu.Nebula.GridCellPc` / `GridReachKpc` | 4 / 64 | D-252: the finest cell; the levels' reach (D-253: 8 -> 32; D-254: 64, the nearest spiral within it) | D-252..D-254 |
 | `uu.Nebula.Peak` | 200 | D-253: the nebulae's shape held softly under this x its mean (0: off) | D-253 |
 | `uu.Nebula.GridPool` / `GridLayer` | 1.25 / 3 | D-252: pool slots over the expected occupancy; the gas layer's scale heights covered | D-252 |

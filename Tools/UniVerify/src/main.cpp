@@ -6,6 +6,7 @@
 //   univerify gen --scene NAME                               run a scene's reference pipeline, print stats
 //   univerify galslices [--out DIR] [--quick]                the sliced galaxy-map prototype's measurements
 //   univerify galwarp [--out DIR] [--quick] [--only N]       D-220: the disc warp's aliasing and look, by variant
+//   univerify lenstable [--quick]                            D-273: the accretion disc's light by direction (UniCompact.ush's table)
 //   univerify list                                           list tests
 //
 // Every command is run from the plugin root (verify_all does this), so relative paths in
@@ -24,6 +25,7 @@ int UniFuzzDump(int N, const char* Path);   // fuzzdump.cpp
 int UniSeedDump();                          // seeddump.cpp
 int UniGenCommand(int Argc, char** Argv);   // gencmd.cpp
 int UniGalSlicesCommand(int Argc, char** Argv);   // galslices.cpp
+int UniLensTableCommand(int Argc, char** Argv);    // lenstable.cpp (D-273)
 int UniGalWarpCommand(int Argc, char** Argv);     // galwarp.cpp
 
 namespace
@@ -104,6 +106,7 @@ int main(int Argc, char** Argv)
 	if (Cmd == "gen") { return UniGenCommand(Argc, Argv); }
 	if (Cmd == "galslices") { return UniGalSlicesCommand(Argc, Argv); }
 	if (Cmd == "galwarp") { return UniGalWarpCommand(Argc, Argv); }
+	if (Cmd == "lenstable") { return UniLensTableCommand(Argc, Argv); }
 	std::fprintf(stderr, "unknown command %s\n", Cmd.c_str());
 	return 2;
 }

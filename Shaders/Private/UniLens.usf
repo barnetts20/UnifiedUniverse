@@ -1,0 +1,290 @@
+// UniLens.usf
+// D-273 (Docs/COMPACT_OBJECTS.md, phase D): the near field of one black hole, as a full-screen pass
+// after the backdrop (sprites and volume composited, before bloom and tonemapping). Per output
+// pixel inside the black hole's region:
+//   1. its ray (the unjittered projection) traced back by the core's Uni_LensTrace (camera in R_s
+//      about the black hole);
+//   2. the scene behind sampled where the ray came from (bilinear in InColor, the backdrop's
+//      output; Uni_LensSkyNdc folds a ray that left the view back into it): surface brightness is
+//      conserved, so the lens moves light and never adds any; black where it fell in;
+//   3. the disc's light along it (front to back, over what it hides) at the frame's radiance scale
+//      x the pixel's solid angle (D-274: softened above uu.Bh.DiscKnee) x the dust's transmittance to the black hole (the volume's
+//      slices, as the sprites read them) x scene colour's scale;
+//   4. the nucleus as a point (core and glare in the sprites' style, Uni_PointStyle) x (1 - the
+//      disc's share), at the black hole's own direction: its sprite is held back while the pass
+//      runs (in scene colour it would be lensed as if it were behind the black hole).
+// Outside the region, or where the scene's own surface is nearer than the black hole (a ship in
+// front), the pixel is copied. D-275, D-279: a ray whose origin on the screen is covered by such a
+// surface samples the sky mirrored out of the covered stretch of its line (SkyBehind; the mask grown
+// by 2 px over the foreground's colour fringe), the sky-only pyramid (SkyMaskCS, SkyDownCS) filling
+// what is still covered: no lensed copy of the player, no contours. The CPU reference is Tools/UniVerify/src/UniLensRef.h.
+
+#include "/Engine/Public/Platform.ush"
+#include "UniWebTexture.ush"   // D-164: before any core (UniFields.ush samples it)
+#include "Core/UniCompact.ush"
+#include "Core/UniVolume.ush"
+
+Texture2D InColor;                  // the backdrop's output (scene colour with sprites and volume)
+SamplerState InColorSampler;
+float4 InExtentInv;                 // (1 / width, 1 / height) of InColor's texture, then 0, 0
+float4 OutRectMinSize;              // the output view rect: (min x, min y, width, height)
+float3 ViewForward;
+float LensPad0;
+float3 ViewRight;
+float LensPad1;
+float3 ViewUp;
+float LensPad2;
+float2 TanHalfFov;
+float FocalPx;                      // output pixels per unit tangent (the pixel's solid angle cos^3 / f^2)
+uint MaxSteps;
+float3 CamRs;                       // the camera relative to the black hole, R_s (world axes)
+float RegionCos;                    // pixels whose ray is farther than this from the black hole's direction are copied
+float3 BhDir;                       // towards the black hole (unit)
+float BhDistanceCm;
+float3 DiscAxis;
+float DiscOuterX;
+float DiscPeakK;
+float DiscOn;                       // 0: no disc (lensing alone)
+float DiscScale;                    // radiance scale x share (exposure units per sr per Uni_BhDiscLight unit)
+float DiscKnee;                     // D-274: the disc's light per pixel softened above this (exposure units; 0: physical)
+float3 DiscE1;                      // D-276: the volumetric disc (UniCore::ApplyDiscLook): a unit vector in its plane ..
+float LensPad5;
+float4 DiscVol0;                    // .. (thickness, opacity, clouds, bands) ..
+float4 DiscVol1;                    // .. (heat, spiral, angular speed at the ISCO rad/s, falloff) ..
+float4 DiscFlow;                    // .. the flow phases (time A, time B, weight A; D-278: erosion) ..
+uint4 DiscSeeds;                    // .. (seed A, seed B, sample budget, 0)
+float3 SceneColourScale;            // exposure units -> scene colour (pre-exposed)
+float LensPad4;
+float3 PointCoreRgb;                // the nucleus as a point x (1 - the disc's share): its core's light (exposure units; 0: none) ..
+float PointCoreSigmaPx;             // .. and Gaussian sigma (px)
+float3 PointHaloRgb;                // its glare's light (0: none) ..
+float PointHaloSigmaPx;             // .. and sigma
+
+float4 InvDeviceZToWorldZTransform;
+float4 DepthUVScaleBias;            // output pixel -> scene-depth UV
+Texture2D SceneDepthTexture;
+SamplerState SceneDepthSampler;
+
+Texture2DArray<float> VolumeSlices; // luminance transmittance at UNI_VOL_SLICES boundaries (D-132)
+uint bVolume;
+float SliceLnTLo;
+float SliceLnTHi;
+float SliceFarCm;
+float4 OutToMarch;
+uint2 MarchSize;
+
+float SceneDistance(float2 PixelPos, float CosToForward)
+{
+	const float2 UV = PixelPos * DepthUVScaleBias.xy + DepthUVScaleBias.zw;
+	const float DeviceZ = SceneDepthTexture.SampleLevel(SceneDepthSampler, UV, 0).r;
+	if (DeviceZ <= 0.0f) { return 3.0e38f; }   // reverse-Z far plane: the sky
+	const float ViewZ = DeviceZ * InvDeviceZToWorldZTransform[0] + InvDeviceZToWorldZTransform[1]
+		+ 1.0f / (DeviceZ * InvDeviceZToWorldZTransform[2] - InvDeviceZToWorldZTransform[3]);
+	return ViewZ / CosToForward;
+}
+
+// D-279: the sky without what is in front of the hole: mip 0 the scene colour x its mask (1 behind
+// the hole), alpha the mask (premultiplied); each mip the 2 x 2 average of the one above.
+Texture2D<float4> SkyTexture;
+SamplerState SkySampler;
+uint SkyMips;
+RWTexture2D<float4> OutSky;          // SkyMaskCS / SkyDownCS: the mip written
+Texture2D<float4> InSkyMip;          // SkyDownCS: the mip above
+uint2 SkyDstSize;
+uint2 SkySrcSize;
+
+/** Mip 0's coverage (1: all sky) at an output pixel position. */
+float SkyAlpha(float2 Px)
+{
+	return SkyTexture.SampleLevel(SkySampler, (Px - OutRectMinSize.xy) / OutRectMinSize.zw, 0.0f).a;
+}
+
+float3 SkySample(float2 Px);
+
+/** D-279: the sky for a ray whose origin Ps may be covered (this pixel Po being sky): the covered
+ *  stretch of the line towards this pixel found (bisection), the sample mirrored out of it by its
+ *  depth: continuous in the position (no contours) and starry (not a blur); still covered there:
+ *  the pyramid's fill at the edge. */
+float3 SkyBehind(float2 Ps, float2 Po)
+{
+	if (SkyAlpha(Ps) >= 0.999f) { return SkySample(Ps); }
+	float Lo = 0.0f, Hi = 1.0f;
+	UNI_UNROLL
+	for (int I = 0; I < 7; ++I)
+	{
+		const float M = 0.5f * (Lo + Hi);
+		if (SkyAlpha(lerp(Ps, Po, M)) >= 0.999f) { Hi = M; } else { Lo = M; }
+	}
+	const float2 B = lerp(Ps, Po, Hi);
+	const float2 Pm = clamp(2.0f * B - Ps, OutRectMinSize.xy + 0.5f, OutRectMinSize.xy + OutRectMinSize.zw - 0.5f);
+	return SkyAlpha(Pm) >= 0.999f ? SkySample(Pm) : SkySample(B);
+}
+
+/** The sky at an output pixel position: mip 0's covered share (bilinear, premultiplied) filled from
+ *  the coarser mips, composited front to back until covered (continuous in the position). */
+float3 SkySample(float2 Px)
+{
+	const float2 Uv = (Px - OutRectMinSize.xy) / OutRectMinSize.zw;
+	const float4 S0 = SkyTexture.SampleLevel(SkySampler, Uv, 0.0f);
+	if (S0.a >= 0.999f) { return S0.rgb / S0.a; }
+	float4 Acc = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	UNI_LOOP
+	for (uint L = 1u; L < SkyMips; ++L)
+	{
+		const float4 Sl = SkyTexture.SampleLevel(SkySampler, Uv, (float)L);
+		Acc += Sl * (1.0f - Acc.a);
+		if (Acc.a > 0.98f) { break; }
+	}
+	const float3 Fill = Acc.a > 1.0e-5f ? Acc.rgb / Acc.a : float3(0.0f, 0.0f, 0.0f);
+	return S0.rgb + Fill * (1.0f - S0.a);
+}
+
+/** D-275: the scene at an output pixel is farther than the black hole (sky, the backdrop): not
+ *  something in front of it. */
+bool BehindHole(float2 PixelPos)
+{
+	const float2 Lp = PixelPos - OutRectMinSize.xy;
+	const float2 Ndc = (Lp / OutRectMinSize.zw) * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f);
+	const float CosF = rsqrt(1.0f + dot(Ndc * TanHalfFov, Ndc * TanHalfFov));
+	return SceneDistance(PixelPos, CosF) >= BhDistanceCm * 0.999f;
+}
+
+/** The dust's luminance transmittance at an output pixel to a true distance (UniSprite.usf's). */
+float DustTransmittance(float2 PixelPos, float TrueDistance)
+{
+	float T = 1.0f;
+	if (bVolume != 0u)
+	{
+		const int2 M = clamp(int2(PixelPos * OutToMarch.xy + OutToMarch.zw), int2(0, 0), int2(MarchSize) - 1);
+		const float X = Uni_SlicePosT(TrueDistance, SliceLnTLo, SliceLnTHi, SliceFarCm);
+		if (X >= (float)UNI_VOL_SLICES) { T = VolumeSlices.Load(int4(M, UNI_VOL_SLICES - 1, 0)); }
+		else if (X > 0.0f)
+		{
+			const uint I = (uint)X;
+			const float Lo = (I == 0u) ? 1.0f : VolumeSlices.Load(int4(M, I - 1u, 0));
+			const float Hi = VolumeSlices.Load(int4(M, I, 0));
+			T = Lo + (Hi - Lo) * (X - (float)I);
+		}
+	}
+	return T;
+}
+
+void MainVS(uint VertexId : SV_VertexID, out float4 OutPosition : SV_POSITION)
+{
+	// One full-screen triangle; the viewport is the output view rect.
+	const float2 Uv = float2((float)((VertexId << 1u) & 2u), (float)(VertexId & 2u));
+	OutPosition = float4(Uv * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), 0.0f, 1.0f);
+}
+
+void MainPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	const float4 Src = InColor.Load(int3(int2(SvPosition.xy), 0));
+	OutColor = Src;
+	const float2 Lp = SvPosition.xy - OutRectMinSize.xy;
+	const float2 Ndc = (Lp / OutRectMinSize.zw) * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f);
+	const float3 Dir = normalize(ViewForward + ViewRight * (Ndc.x * TanHalfFov.x) + ViewUp * (Ndc.y * TanHalfFov.y));
+	if (dot(Dir, BhDir) < RegionCos) { return; }
+	const float CosF = dot(Dir, ViewForward);
+	if (SceneDistance(SvPosition.xy, CosF) < BhDistanceCm * 0.999f) { return; }   // the scene's surface is in front
+	const float Dust = DustTransmittance(SvPosition.xy, BhDistanceCm);
+
+	FUniLensDisc Disc;
+	Disc.Axis = DiscAxis;
+	Disc.OuterX = DiscOuterX;
+	Disc.PeakK = DiscPeakK;
+	Disc.bDisc = DiscOn;
+	Disc.Pad0 = 0.0f;
+	Disc.Pad1 = 0.0f;
+	Disc.E1 = DiscE1;                  // D-276: the volumetric disc's look
+	Disc.Thickness = DiscVol0.x;
+	Disc.Opacity = DiscVol0.y;
+	Disc.Clouds = DiscVol0.z;
+	Disc.Bands = DiscVol0.w;
+	Disc.Heat = DiscVol1.x;
+	Disc.Spiral = DiscVol1.y;
+	Disc.OmegaIsco = DiscVol1.z;
+	Disc.Falloff = DiscVol1.w;
+	Disc.FlowTA = DiscFlow.x;
+	Disc.FlowTB = DiscFlow.y;
+	Disc.FlowWA = DiscFlow.z;
+	Disc.SeedA = DiscSeeds.x;
+	Disc.SeedB = DiscSeeds.y;
+	Disc.MaxSamples = DiscSeeds.z;
+	Disc.Erosion = DiscFlow.w;         // D-278
+	Disc.LookPad1 = 0.0f;
+	Disc.LookPad2 = 0.0f;
+	const FUniLensResult R = Uni_LensTrace(CamRs, Dir, Disc, MaxSteps);
+
+	float3 Bg = float3(0.0f, 0.0f, 0.0f);
+	if (R.Captured < 0.5f && R.Transmit > 0.0f)
+	{
+		const float2 N = Uni_LensSkyNdc(R.Dir, ViewForward, ViewRight, ViewUp, TanHalfFov, true);
+		const float2 P = OutRectMinSize.xy + (N * float2(0.5f, -0.5f) + 0.5f) * OutRectMinSize.zw;
+		const float2 Pc = clamp(P, OutRectMinSize.xy + 0.5f, OutRectMinSize.xy + OutRectMinSize.zw - 0.5f);
+		// D-275, D-279: where the ray came from may be covered by something in front of the black hole
+		// (the player, a ship): the screen has nothing of the sky behind it. Mirrored out of the
+		// covered stretch (SkyBehind; the pyramid fills the rest): no lensed copy of the foreground,
+		// and no contours (D-275's quarter steps drew a train of the figure's outlines).
+		Bg = SkyBehind(Pc, SvPosition.xy);
+	}
+	float3 C = Bg * R.Transmit;
+	if (DiscOn > 0.0f && DiscScale > 0.0f)
+	{
+		const float Omega = CosF * CosF * CosF / (FocalPx * FocalPx);
+		C += Uni_BhDiscSoften(R.Disc * (DiscScale * Omega), DiscKnee) * Dust * SceneColourScale;   // D-274
+	}
+	// The nucleus as a point at the black hole's own direction (not lensed: it is at the lens).
+	const float Fb = dot(BhDir, ViewForward);
+	if (Fb > 1.0e-4f && (PointCoreRgb.x + PointCoreRgb.y + PointCoreRgb.z) > 0.0f)
+	{
+		const float2 Nb = float2(dot(BhDir, ViewRight) / (Fb * TanHalfFov.x), dot(BhDir, ViewUp) / (Fb * TanHalfFov.y));
+		const float2 Pb = OutRectMinSize.xy + (Nb * float2(0.5f, -0.5f) + 0.5f) * OutRectMinSize.zw;
+		const float2 Dp = SvPosition.xy - Pb;
+		const float D2 = dot(Dp, Dp);
+		const float Sc = max(PointCoreSigmaPx, 0.3f), Sh = max(PointHaloSigmaPx, 0.3f);
+		float3 P = PointCoreRgb * (exp(-0.5f * D2 / (Sc * Sc)) / (6.2831853f * Sc * Sc));
+		P += PointHaloRgb * (exp(-0.5f * D2 / (Sh * Sh)) / (6.2831853f * Sh * Sh));
+		C += P * Dust * SceneColourScale;
+	}
+	OutColor = float4(min(C, float3(6.0e4f, 6.0e4f, 6.0e4f)), Src.a);   // half-float scene colour: no inf into bloom
+}
+
+/** D-279: the sky-only mip 0: scene colour where the scene is behind the black hole, alpha 1;
+ *  0 where something is in front of it. One thread a pixel of the view rect. */
+[numthreads(8, 8, 1)]
+void SkyMaskCS(uint3 Id : SV_DispatchThreadID)
+{
+	if (Id.x >= SkyDstSize.x || Id.y >= SkyDstSize.y) { return; }
+	const float2 Px = OutRectMinSize.xy + float2(Id.xy) + 0.5f;
+	const float3 C = InColor.Load(int3(int2(Px), 0)).rgb;
+	// The mask grown by 2 px (the 5 x 5 window): the foreground's colour reaches
+	// past its depth by a pixel or two (antialiasing; the depth at the internal resolution, the colour
+	// upscaled by TSR), and that fringe is not sky (D-275's stepping sampled it: the shells).
+	float M = 1.0f;
+	UNI_UNROLL
+	for (int Dy = -2; Dy <= 2; ++Dy)
+	{
+		UNI_UNROLL
+		for (int Dx = -2; Dx <= 2; ++Dx)
+		{
+			const float2 Q = clamp(Px + float2((float)Dx, (float)Dy), OutRectMinSize.xy + 0.5f, OutRectMinSize.xy + OutRectMinSize.zw - 0.5f);
+			if (!BehindHole(Q)) { M = 0.0f; }
+		}
+	}
+	OutSky[Id.xy] = float4(C * M, M);
+}
+
+/** D-279: one mip of the sky-only pyramid: the 2 x 2 average of the one above (clamped at its edge). */
+[numthreads(8, 8, 1)]
+void SkyDownCS(uint3 Id : SV_DispatchThreadID)
+{
+	if (Id.x >= SkyDstSize.x || Id.y >= SkyDstSize.y) { return; }
+	const int2 S = int2(Id.xy) * 2;
+	const int2 Mx = int2(SkySrcSize) - 1;
+	const float4 A = InSkyMip.Load(int3(min(S, Mx), 0));
+	const float4 B = InSkyMip.Load(int3(min(S + int2(1, 0), Mx), 0));
+	const float4 C = InSkyMip.Load(int3(min(S + int2(0, 1), Mx), 0));
+	const float4 D = InSkyMip.Load(int3(min(S + int2(1, 1), Mx), 0));
+	OutSky[Id.xy] = (A + B + C + D) * 0.25f;
+}
+

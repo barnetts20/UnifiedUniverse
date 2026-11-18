@@ -54,6 +54,54 @@ struct UNIFIEDUNIVERSE_API FUniObjectInfo
 	int32 Seed = 0;
 };
 
+/** D-272: a galaxy's supermassive black hole (Docs/COMPACT_OBJECTS.md), from the galaxy's record:
+ *  the same numbers its nucleus is drawn from. */
+USTRUCT(BlueprintType)
+struct UNIFIEDUNIVERSE_API FUniBlackHoleInfo
+{
+	GENERATED_BODY()
+
+	/** False when the object is not a resident galaxy. */
+	UPROPERTY(BlueprintReadOnly, Category = "Universe|BlackHole")
+	bool bValid = false;
+
+	/** Where it is: the galaxy's centre. */
+	UPROPERTY(BlueprintReadOnly, Category = "Universe|BlackHole")
+	FUniCoord Coord;
+
+	/** Solar masses (~0.0014 x the bulge's mass, 0.3 dex scatter). */
+	UPROPERTY(BlueprintReadOnly, Category = "Universe|BlackHole")
+	double MassSolar = 0.0;
+
+	/** Its accretion rate over the Eddington rate (1e-9 quiet .. 1 a quasar's). */
+	UPROPERTY(BlueprintReadOnly, Category = "Universe|BlackHole")
+	double EddingtonRatio = 0.0;
+
+	/** Its accretion's bolometric luminosity, erg/s. */
+	UPROPERTY(BlueprintReadOnly, Category = "Universe|BlackHole")
+	double LuminosityErgS = 0.0;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Universe|BlackHole")
+	double SchwarzschildRadiusCm = 0.0;
+
+	/** The nucleus the galaxy shows, V absolute magnitude (99: too faint to draw). D-273: its mean
+	 *  over directions (it is brighter seen face-on to its disc, dimmer edge-on). */
+	UPROPERTY(BlueprintReadOnly, Category = "Universe|BlackHole")
+	float NucleusAbsoluteMagnitude = 99.0f;
+
+	/** D-273: its accretion disc's axis (unit, world axes; the disc turns counter-clockwise about it). */
+	UPROPERTY(BlueprintReadOnly, Category = "Universe|BlackHole")
+	FVector DiscAxis = FVector(0.0, 0.0, 1.0);
+
+	/** D-273: its accretion disc's outer radius, cm (from the innermost stable orbit, 3 Schwarzschild radii). */
+	UPROPERTY(BlueprintReadOnly, Category = "Universe|BlackHole")
+	double DiscOuterRadiusCm = 0.0;
+
+	/** D-273: its accretion disc's peak temperature, K. */
+	UPROPERTY(BlueprintReadOnly, Category = "Universe|BlackHole")
+	float DiscPeakTemperatureK = 0.0f;
+};
+
 /** What a resident query matches. */
 USTRUCT(BlueprintType)
 struct UNIFIEDUNIVERSE_API FUniQueryFilter

@@ -296,6 +296,15 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Galaxy|Detail Layers", meta = (DisplayName = "Galaxy.Detail.Freq1", UniCVar = "uu.Galaxy.Detail.Freq1", ToolTip = "D-265: detail layer 1's frequency, x the detail texture's (16: a sixteenth the size, the Milky Way's 500 pc and 4 pc texels; its reach a quarter of layer 0's, ~300 pc at the defaults). 0: off."))
 	float U_Galaxy_Detail_Freq1 = 0.0f;
 
+	UPROPERTY(config, EditAnywhere, Category = "Galaxy|Detail Layers", meta = (DisplayName = "Galaxy.Detail.KnotTint", UniCVar = "uu.Galaxy.Detail.KnotTint", ToolTip = "D-267: the knots' young light toward the galaxy's nebula colours (its three, D-236), luminance kept, by the knots' share of the light: every galaxy at any distance (render only). 0: the stars' colours."))
+	float U_Galaxy_Detail_KnotTint = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Galaxy|Detail Layers", meta = (DisplayName = "Galaxy.Detail.Knots0", UniCVar = "uu.Galaxy.Detail.Knots0", ToolTip = "D-267: detail layer 0's knot amplitude (0..1): the knots' young light x 1 + this x (the layer's knot channel, G^8 over its mean, - 1): each knot of the map breaks into the layer's clumps (the Milky Way's ~16 pc texels). Mean 1: the light kept."))
+	float U_Galaxy_Detail_Knots0 = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Galaxy|Detail Layers", meta = (DisplayName = "Galaxy.Detail.Knots1", UniCVar = "uu.Galaxy.Detail.Knots1", ToolTip = "D-267: detail layer 1's knot amplitude (0..1): the clumps within the clumps (~4 pc texels)."))
+	float U_Galaxy_Detail_Knots1 = 0.0f;
+
 	UPROPERTY(config, EditAnywhere, Category = "Galaxy|Detail Layers", meta = (DisplayName = "Galaxy.Detail.Light0", UniCVar = "uu.Galaxy.Detail.Light0", ToolTip = "D-265: detail layer 0's light amplitude (0..1): the light x 1 + this x (the shaped fBm - 1). Mean 1: the brightness is kept."))
 	float U_Galaxy_Detail_Light0 = 0.0f;
 
@@ -337,6 +346,9 @@ public:
 
 	UPROPERTY(config, EditAnywhere, Category = "Galaxy|Balance", meta = (DisplayName = "GalaxyPalettes", UniCVar = "uu.GalaxyPalettes", UniReenable, ToolTip = "D-182: every galaxy its own colour palette (bulge, disc, arms, knots), which its stars and glow take (chroma only: brightness unchanged). 0: physical colours. Applies at uu.Enable; rerolls star and galaxy colours only. [re-enables the scene on change]"))
 	int32 U_GalaxyPalettes = 0;
+
+	UPROPERTY(config, EditAnywhere, Category = "Galaxy|Balance", meta = (DisplayName = "Volume.DustCurve", UniCVar = "uu.Volume.DustCurve", ToolTip = "D-270: the galaxy dust's colour (render only): 0 D-132's reddening (red 0.8, green 1, blue 1.3 of the green's optical depth), 1 Cardelli's extinction curve for R_V 3.1 at the screen's primaries (0.886, 1, 1.233: a little less red), in between a blend. The web dust's reddening follows it."))
+	float U_Volume_DustCurve = 0.0f;
 
 	UPROPERTY(config, EditAnywhere, Category = "Galaxy|Balance", meta = (DisplayName = "Volume.DustGain", UniCVar = "uu.Volume.DustGain", UniReenable, ToolTip = "D-261: every galaxy dust layer's optical depth in the volume x this (render only; the light / dust balance: 0 no extinction, 2 twice as dark). uu.Galaxy.DustScale scales the dust itself (at uu.Enable), uu.Galaxy.DiffuseDust the background dust. [re-enables the scene on change]"))
 	float U_Volume_DustGain = 0.0f;
@@ -473,6 +485,84 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Sprites", meta = (DisplayName = "SpriteExtent", UniCVar = "uu.SpriteExtent", ToolTip = "Sprite quad half size in Gaussian sigmas."))
 	float U_SpriteExtent = 0.0f;
 
+	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.ActiveFraction", UniCVar = "uu.Bh.ActiveFraction", ToolTip = "D-272: the share of galaxies whose black hole is accreting (Eddington ratio 1e-4..1, most low; the rest 1e-9..1e-5). 0..1; raise it to find bright nuclei to test. Render only (a gameplay lookup reads the same value)."))
+	float U_Bh_ActiveFraction = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.Disc", UniCVar = "uu.Bh.Disc", ToolTip = "D-273: with uu.Bh.Lens, the accretion disc is drawn as the nucleus resolves (the nucleus sprite hands its light to it). 0: lensing alone, the nucleus a sprite throughout. Render only, live."))
+	int32 U_Bh_Disc = 0;
+
+	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.DiscBands", UniCVar = "uu.Bh.DiscBands", ToolTip = "D-276: the contrast of the disc's bright and dim rings (0: none)."))
+	float U_Bh_DiscBands = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.DiscBrightness", UniCVar = "uu.Bh.DiscBrightness", ToolTip = "D-276: the accretion disc's brightness relative to the exposure: its peak temperature shows this many exposure units a pixel (1 = a star at the exposure magnitude), whatever its physical light: what one thinks a black hole looks like. 0: physical (its nucleus's light; with uu.Bh.DiscKnee)."))
+	float U_Bh_DiscBrightness = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.DiscClouds", UniCVar = "uu.Bh.DiscClouds", ToolTip = "D-276: 0..1: a smooth disc .. clumped clouds with gaps."))
+	float U_Bh_DiscClouds = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.DiscCycle", UniCVar = "uu.Bh.DiscCycle", ToolTip = "D-276: the clouds' life in inner orbits: two phases each wound by the rotation for this long, then reborn, cross-faded (longer: longer spiral streaks)."))
+	float U_Bh_DiscCycle = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.DiscErosion", UniCVar = "uu.Bh.DiscErosion", ToolTip = "D-278: 0..1: a finer noise moving with the gas eats the clouds' thin edges, roughens the disc's top surface and its outer rim (0: smooth clouds, D-276's)."))
+	float U_Bh_DiscErosion = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.DiscFalloff", UniCVar = "uu.Bh.DiscFalloff", ToolTip = "D-276: how fast the disc dims with its temperature outwards (1: physical V band, the outer disc dark; lower: it glows)."))
+	float U_Bh_DiscFalloff = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.DiscFromPx", UniCVar = "uu.Bh.DiscFromPx", ToolTip = "D-273: the disc takes over the nucleus's light from this outer radius (pixels) .."))
+	float U_Bh_DiscFromPx = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.DiscHeat", UniCVar = "uu.Bh.DiscHeat", ToolTip = "D-276: the clouds' temperature contrast: hot blue-white knots among cooler orange gas (0: none)."))
+	float U_Bh_DiscHeat = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.DiscKnee", UniCVar = "uu.Bh.DiscKnee", ToolTip = "D-274: a black hole's accretion disc up close: its light per pixel softened above this (exposure units: 1 = a star at the exposure magnitude), logarithmically (10x reads 2x, 1e8x reads 9x), colour kept, so its shape shows under bloom. Lower: dimmer. 0: physical (an active nucleus up close is billions of times the exposure). Render only, live."))
+	float U_Bh_DiscKnee = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.DiscOpacity", UniCVar = "uu.Bh.DiscOpacity", ToolTip = "D-276: the disc's optical depth through its plane at mean density (lower: more of the sky shows through)."))
+	float U_Bh_DiscOpacity = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.DiscPeriod", UniCVar = "uu.Bh.DiscPeriod", ToolTip = "D-276: seconds for one orbit of the disc's inner edge (outer gas slower, Keplerian). Art: physically hours to days. 0: still."))
+	float U_Bh_DiscPeriod = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.DiscSamples", UniCVar = "uu.Bh.DiscSamples", ToolTip = "D-276: the volume samples a ray takes half a thickness apart before falling back to one a step (cost)."))
+	int32 U_Bh_DiscSamples = 0;
+
+	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.DiscSpiral", UniCVar = "uu.Bh.DiscSpiral", ToolTip = "D-276: the clouds wound into log spirals (radians per e-fold of radius; 0: none). D-277: 4 (was 1.5); D-278: 12."))
+	float U_Bh_DiscSpiral = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.DiscThickness", UniCVar = "uu.Bh.DiscThickness", ToolTip = "D-276: the volumetric disc's half-thickness over the radius (flared: thicker outwards). D-277: 0.025 (was 0.05)."))
+	float U_Bh_DiscThickness = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.DiscToPx", UniCVar = "uu.Bh.DiscToPx", ToolTip = "D-273: .. to all of it at this (smoothstep between)."))
+	float U_Bh_DiscToPx = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.DiscVolume", UniCVar = "uu.Bh.DiscVolume", ToolTip = "D-276: the disc is a volume (a flared slab of rotating clouds the camera can fly through). 0: D-273's thin, smooth disc."))
+	int32 U_Bh_DiscVolume = 0;
+
+	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.Lens", UniCVar = "uu.Bh.Lens", ToolTip = "D-273: the black hole of a galaxy the camera is in or near lenses the scene behind it (its shadow, photon ring and Einstein ring) once its ring is uu.Bh.LensRingMinPx across, and shows its accretion disc once that is resolved. 0: off (the nucleus stays a sprite). Needs the volume (the camera's galaxies come from it). Render only, live."))
+	int32 U_Bh_Lens = 0;
+
+	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.LensBendMinPx", UniCVar = "uu.Bh.LensBendMinPx", ToolTip = "D-273: the lens pass's region reaches where the deflection is this many pixels (pixels beyond it are copied)."))
+	float U_Bh_LensBendMinPx = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.LensMaxSteps", UniCVar = "uu.Bh.LensMaxSteps", ToolTip = "D-273: the most RK4 steps a ray takes; a ray still winding at the photon sphere after them is taken as fallen in (16..2000)."))
+	int32 U_Bh_LensMaxSteps = 0;
+
+	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.LensRingMinPx", UniCVar = "uu.Bh.LensRingMinPx", ToolTip = "D-273: the lens pass runs while the black hole's Einstein ring (a source at infinity) is at least this many pixels in radius, or its disc is drawn."))
+	float U_Bh_LensRingMinPx = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.LensScale", UniCVar = "uu.Bh.LensScale", ToolTip = "D-277: the black hole lenses as if this x heavier (art): its shadow, photon ring and lensing this x larger against its disc, which keeps its physical size (its inner edge out at the heavier hole's innermost stable orbit). 1: physical. D-278: 4 (was 2)."))
+	float U_Bh_LensScale = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.Nucleus", UniCVar = "uu.Bh.Nucleus", ToolTip = "D-272: every galaxy's supermassive black hole shows as a nucleus: a point at its centre with its accretion light (most are far too faint to see; a few percent are Seyfert-bright). 0: none. Render only, live."))
+	int32 U_Bh_Nucleus = 0;
+
+	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.NucleusCap", UniCVar = "uu.Bh.NucleusCap", ToolTip = "D-272: a nucleus is at most this x its galaxy's light (the galaxy's streaming level comes from its own light). Render only, live."))
+	float U_Bh_NucleusCap = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.NucleusGain", UniCVar = "uu.Bh.NucleusGain", ToolTip = "D-272: the nuclei's light x this (art; 1 physical), under the cap. Render only, live."))
+	float U_Bh_NucleusGain = 0.0f;
+
 	UPROPERTY(config, EditAnywhere, Category = "Web", meta = (DisplayName = "MotionWeb", UniCVar = "uu.MotionWeb", ToolTip = "D-230: the motion web: while travelling, the cosmic web's filaments and nodes glow faintly so the structure shows motion (render only). Strength at full travel: a galaxy disc's surface brightness per Mpc of web (0.01: a few-Mpc filament at a few % of a disc). 0: off."))
 	float U_MotionWeb = 0.0f;
 
@@ -515,23 +605,56 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Web", meta = (DisplayName = "SkyWeb.Tail", UniCVar = "uu.SkyWeb.Tail", ToolTip = "D-189: the far background's share kept in mode 2 (1: physical)."))
 	float U_SkyWeb_Tail = 0.0f;
 
-	UPROPERTY(config, EditAnywhere, Category = "Travel", meta = (DisplayName = "Shift", UniCVar = "uu.Shift", ToolTip = "D-230: the travel shift: while travelling, light ahead is shifted blue and behind red, as a Doppler shift would, the brightness kept (render only). ln of the shift factor straight ahead at full travel (0.5: x1.65). 0: off."))
+	UPROPERTY(config, EditAnywhere, Category = "Web", meta = (DisplayName = "WebDust", UniCVar = "uu.WebDust", ToolTip = "D-269: dark dust in the cosmic web: absorption following its filaments and nodes, shaped into dark filaments or knots (render only). Optical depth per 100 Mpc where the filament + node matter is at its mean (filaments and nodes are tens of times that, held under uu.WebDust.Peak); it reddens as the galaxies' dust does. 0: off."))
+	float U_WebDust = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Web", meta = (DisplayName = "WebDust.DepthMpc", UniCVar = "uu.WebDust.DepthMpc", ToolTip = "D-269: the web's dust fades out over the second half of this many Mpc (the far sky not dimmed as a whole)."))
+	float U_WebDust_DepthMpc = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Web", meta = (DisplayName = "WebDust.Detail", UniCVar = "uu.WebDust.Detail", ToolTip = "D-269: the dark pattern's amplitude (0: the dust follows the web's matter alone; 1: all of the pattern). Mean 1: the dust's total kept."))
+	float U_WebDust_Detail = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Web", meta = (DisplayName = "WebDust.DetailMpc", UniCVar = "uu.WebDust.DetailMpc", ToolTip = "D-269: the dark pattern's period, Mpc (galaxy_shape tiled a whole number of times a 200 Mpc web tile: 30 rounds to 28.6; features of ~5 Mpc, 220 kpc texels; 10 was too fine to read 10-50 Mpc away). Read over the pixel's footprint or the step: blurred to its mean where the march does not resolve it, never grain."))
+	float U_WebDust_DetailMpc = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Web", meta = (DisplayName = "WebDust.Knots", UniCVar = "uu.WebDust.Knots", ToolTip = "D-269: the dark pattern: 0 dark filaments (galaxy_shape's ridged channel^4), 1 dark knots (its knots^8), between a mix."))
+	float U_WebDust_Knots = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Web", meta = (DisplayName = "WebDust.NearMpc", UniCVar = "uu.WebDust.NearMpc", ToolTip = "D-269: the web's dust fades in over this many Mpc from the camera (the home group not fogged)."))
+	float U_WebDust_NearMpc = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Web", meta = (DisplayName = "WebDust.Peak", UniCVar = "uu.WebDust.Peak", ToolTip = "D-269: the web's matter held softly under this x its mean for the dust (nodes are hundreds of times the mean: not opaque bricks). 0: no hold."))
+	float U_WebDust_Peak = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Web", meta = (DisplayName = "WebDust.Redden", UniCVar = "uu.WebDust.Redden", ToolTip = "D-269: the web dust's colour: 0 grey (dark, every colour alike), 1 the galaxies' dust's reddening (blue absorbed most)."))
+	float U_WebDust_Redden = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Travel", meta = (DisplayName = "Shift", UniCVar = "uu.Shift", ToolTip = "D-230: the travel shift: while travelling, light ahead is shifted blue and behind red, as a Doppler shift would (render only). D-268: ln of the shift factor straight ahead at uu.Shift.RefKpcS (0.5: x1.65, D-230's full strength); past it the blue side brightens (uu.Shift.Boost). 0: off."))
 	float U_Shift = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Travel", meta = (DisplayName = "Shift.Boost", UniCVar = "uu.Shift.Boost", ToolTip = "D-268: the blue side's brightening past the reference: x exp(this x (the shift's ln there - uu.Shift)): straight ahead at the top, 1: x4.5. 0: luminance kept everywhere (D-230)."))
+	float U_Shift_Boost = 0.0f;
 
 	UPROPERTY(config, EditAnywhere, Category = "Travel", meta = (DisplayName = "Shift.Colour", UniCVar = "uu.Shift.Colour", ToolTip = "D-230: the travel shift's colour strength (the Doppler tint's exponent)."))
 	float U_Shift_Colour = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Travel", meta = (DisplayName = "Shift.FullKpcS", UniCVar = "uu.Shift.FullKpcS", ToolTip = "D-268: the speed (kpc/s) where the travel shift reaches uu.Shift.Top (4x D-230's full speed)."))
+	float U_Shift_FullKpcS = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Travel", meta = (DisplayName = "Shift.RefKpcS", UniCVar = "uu.Shift.RefKpcS", ToolTip = "D-268: the reference speed (kpc/s) where the travel shift is uu.Shift (D-230's full strength, reached at ~2200 kpc/s), and past which the blue side brightens."))
+	float U_Shift_RefKpcS = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Travel", meta = (DisplayName = "Shift.StartKpcS", UniCVar = "uu.Shift.StartKpcS", ToolTip = "D-268: the speed (kpc/s) where the travel shift starts to come in (D-230's: ~308)."))
+	float U_Shift_StartKpcS = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Travel", meta = (DisplayName = "Shift.Top", UniCVar = "uu.Shift.Top", ToolTip = "D-268: ln of the travel shift's factor straight ahead at uu.Shift.FullKpcS and above (2: x7.4; up to 3). From the reference speed it climbs faster and faster to this."))
+	float U_Shift_Top = 0.0f;
 
 	UPROPERTY(config, EditAnywhere, Category = "Travel", meta = (DisplayName = "TravelExposure", UniCVar = "uu.TravelExposure", ToolTip = "D-205: magnitudes everything is brightened by at full travel speed (render only: sprites, glow and background; windows and what is generated unchanged), lerped by the travel curve (100 kpc/s to 10 Mpc/s). Brings back the visibility travel sensitivity gave nearby clusters at speed without widening windows. 0: off."))
 	float U_TravelExposure = 0.0f;
 
 	UPROPERTY(config, EditAnywhere, Category = "Travel", meta = (DisplayName = "TravelFull", UniCVar = "uu.TravelFull", ToolTip = "Speed (cm/s) where travel sensitivity is full (default 10 Mpc/s)."))
 	float U_TravelFull = 0.0f;
-
-	UPROPERTY(config, EditAnywhere, Category = "Travel", meta = (DisplayName = "TravelLook.Full", UniCVar = "uu.TravelLook.Full", ToolTip = "D-230: the travel curve value where the travel shift is at full strength (0.75: ~3 Mpc/s)."))
-	float U_TravelLook_Full = 0.0f;
-
-	UPROPERTY(config, EditAnywhere, Category = "Travel", meta = (DisplayName = "TravelLook.Start", UniCVar = "uu.TravelLook.Start", ToolTip = "D-230: the travel curve value (0 at 100 kpc/s, 1 at 10 Mpc/s, log) where the travel shift starts to come in (0.15: ~200 kpc/s). D-231: the motion web has its own speed ramp (uu.MotionWeb.StartKpcS / FullKpcS)."))
-	float U_TravelLook_Start = 0.0f;
 
 	UPROPERTY(config, EditAnywhere, Category = "Travel", meta = (DisplayName = "TravelStart", UniCVar = "uu.TravelStart", ToolTip = "Speed (cm/s) where travel sensitivity starts (default 100 kpc/s)."))
 	float U_TravelStart = 0.0f;

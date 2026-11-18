@@ -1015,6 +1015,14 @@ UNI_FN float Uni_GalaxyStructureMul(float4 InDtL, FUniFieldParams InPar)
 	return Sh.z > 0.0f ? max(InDtL.y, 0.0f) : 1.0f;
 }
 
+/** D-267: a galaxy's light's soft edge at its cut (the map and field paths' factor: 1 inside 0.95 of
+ *  the cut, 0 at it), for terms taken before it (the components). */
+UNI_FN float Uni_GalaxyCutEdge(float3 InP, FUniFieldParams InPar)
+{
+	const float Cut = InPar.D.x;
+	return saturate((Cut - sqrt(dot(InP, InP))) / max(0.05f * Cut, 1.0e-12f));
+}
+
 /** D-265 (owner 2026-11-16: "a similar layered density march" - the map and the structure at every
  *  range, detail layers near the camera blending finer noise in; "directly scale our step scales
  *  based on the frequency of the detail layers"): up to two detail layers over the camera's galaxy,
@@ -1023,11 +1031,14 @@ UNI_FN float Uni_GalaxyStructureMul(float4 InDtL, FUniFieldParams InPar)
  *  the detail (Uni_GalaxyTexTermsL's frame, its own offset), over the footprint InFoot: its light
  *  multiplier 1 + InLi.y (fBm^3 / mean - 1), its dust's 1 + InLi.z (ridged^4 / mean - 1), amplitudes
  *  0..1 (never negative, mean 1). A layer the footprint does not resolve reads a coarse mip: ~1, its
- *  mean (the fade: the march passes max(the pixel's footprint, a share of the step)). Returns
- *  (light, dust) multipliers; (1, 1) untextured or with no layer on. */
-UNI_FN float2 Uni_GalaxyDetailLayers(float3 InP, FUniFieldParams InPar, FUniGalaxyConst InK, float InFoot, float4 InL0, float4 InL1)
+ *  mean (the fade: the march passes max(the pixel's footprint, a share of the step)). D-267 (owner:
+ *  the nebulae as part of the field, their fidelity from the layers): the same read's knot channel
+ *  (G^8 / mean, the knots' own shaping) multiplies the knots' young light by 1 + InLi.w (S.z - 1):
+ *  each map knot breaks into the layer's clumps, a clump only where its parent knot is. Returns
+ *  (light, dust, knots) multipliers; (1, 1, 1) untextured or with no layer on. */
+UNI_FN float3 Uni_GalaxyDetailLayers(float3 InP, FUniFieldParams InPar, FUniGalaxyConst InK, float InFoot, float4 InL0, float4 InL1)
 {
-	float2 M = float2(1.0f, 1.0f);
+	float3 M = float3(1.0f, 1.0f, 1.0f);
 	if (!Uni_GalaxyTextured(InPar) || !(abs(InP.z) <= Uni_GalaxyDiscSlab(InPar))) { return M; }
 	// A layer whose footprint reaches galaxy_shape's last mip (one texel: its mean, 1) adds nothing:
 	// not read (the far march pays nothing for the layers).
@@ -1035,8 +1046,8 @@ UNI_FN float2 Uni_GalaxyDetailLayers(float3 InP, FUniFieldParams InPar, FUniGala
 	const float MipTop = log2(TexN);
 	const float Mip0 = log2(max(InFoot * InPar.G.w * InL0.x * TexN, 1.0f));
 	const float Mip1 = log2(max(InFoot * InPar.G.w * InL1.x * TexN, 1.0f));
-	const bool b0 = InL0.x > 0.0f && (InL0.y > 0.0f || InL0.z > 0.0f) && Mip0 < MipTop;
-	const bool b1 = InL1.x > 0.0f && (InL1.y > 0.0f || InL1.z > 0.0f) && Mip1 < MipTop;
+	const bool b0 = InL0.x > 0.0f && (InL0.y > 0.0f || InL0.z > 0.0f || InL0.w > 0.0f) && Mip0 < MipTop;
+	const bool b1 = InL1.x > 0.0f && (InL1.y > 0.0f || InL1.z > 0.0f || InL1.w > 0.0f) && Mip1 < MipTop;
 	if (!b0 && !b1) { return M; }
 	// Uni_GalaxyTexTermsL's frame: the arms' winding twist, the height doubled.
 	const uint Ho = InK.Ho;
@@ -1054,6 +1065,7 @@ UNI_FN float2 Uni_GalaxyDetailLayers(float3 InP, FUniFieldParams InPar, FUniGala
 		const float4 S = UNI_GAL_SHAPED(Fr * F + float3(Off.x, Off.z, Off.y) + float3(0.173f, 0.619f, 0.281f), Mip0);
 		M.x = M.x * max(1.0f + InL0.y * (S.y - 1.0f), 0.0f);
 		M.y = M.y * max(1.0f + InL0.z * (S.x - 1.0f), 0.0f);
+		M.z = M.z * max(1.0f + InL0.w * (S.z - 1.0f), 0.0f);   // D-267
 	}
 	if (b1)
 	{
@@ -1061,15 +1073,17 @@ UNI_FN float2 Uni_GalaxyDetailLayers(float3 InP, FUniFieldParams InPar, FUniGala
 		const float4 S = UNI_GAL_SHAPED(Fr * F + float3(Off.y, Off.x, Off.z) + float3(0.527f, 0.083f, 0.911f), Mip1);
 		M.x = M.x * max(1.0f + InL1.y * (S.y - 1.0f), 0.0f);
 		M.y = M.y * max(1.0f + InL1.z * (S.x - 1.0f), 0.0f);
+		M.z = M.z * max(1.0f + InL1.w * (S.z - 1.0f), 0.0f);   // D-267
 	}
 	return M;
 }
 
 /** D-265: the detail layers' step (field units) where layer InLi is resolved: InTexels of its texels;
- *  0 when the layer is off or not of the kind asked (InDust: dust amplitude, else light). */
+ *  0 when the layer is off or not of the kind asked (InDust: dust amplitude, else light: D-267 the
+ *  knots are light). */
 UNI_FN float Uni_GalaxyDetailLayerStep(FUniFieldParams InPar, float4 InLi, float InTexels, bool InDust)
 {
-	if (!(InLi.x > 0.0f) || !((InDust ? InLi.z : InLi.y) > 0.0f)) { return 0.0f; }
+	if (!(InLi.x > 0.0f) || !((InDust ? InLi.z : max(InLi.y, InLi.w)) > 0.0f)) { return 0.0f; }
 	return InTexels / max(InPar.G.w * InLi.x * max(InPar.H.w, 1.0f), 1.0e-6f);
 }
 

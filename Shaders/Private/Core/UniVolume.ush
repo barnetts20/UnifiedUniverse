@@ -35,7 +35,8 @@ static const uint UNI_VOL_LUT_SIZE = 256u;          // entries per emission LUT 
 static const float UNI_VOL_LN_T_LO = 34.538776f;    // ln(1e15 cm): below, entry 0
 static const float UNI_VOL_LN_T_HI = 71.383884f;    // ln(1e31 cm): above, last entry
 static const uint UNI_VOL_MAX_ACTIVE = 12u;         // carriers marched by one ray (D-161: 8 -> 12; past it, the least significant are faded out, not cut)
-static const uint UNI_VOL_SLICES = 8u;              // transmittance slices
+static const uint UNI_VOL_SLICES = 12u;             // transmittance slices (D-271: 8 -> 12)
+static const uint UNI_VOL_SLICES_NEAR = 8u;         // D-271: the first ones log-spaced over [SliceLnTLo, SliceLnTHi]; the rest evenly in t to SliceFarCm
 static const float UNI_VOL_LN_DEPTH_NONE = 87.0f;   // D-184: ln t of a ray with no light (beyond any distance: reprojects by direction)
 // D-194: the light's depth is the luminance-weighted HARMONIC mean distance (the mean of 1/t:
 // the mean parallax, which is what the reprojection needs). A pixel that mixes near light with
@@ -43,6 +44,19 @@ static const float UNI_VOL_LN_DEPTH_NONE = 87.0f;   // D-184: ln t of a ray with
 // e^UNI_VOL_LN_DEPTH_REF (t ~ 36 Mpc) so it never underflows a float.
 static const float UNI_VOL_LN_DEPTH_REF = 60.0f;
 UNI_FN float Uni_LightInvDepth(float InLnDepth) { return exp(UNI_VOL_LN_DEPTH_REF - InLnDepth); }
+
+/** D-271: a distance's position along the transmittance slices (slice K ends at K + 1): the near
+ *  segment in ln t (UNI_VOL_SLICES_NEAR over [InLnLo, InLnHi], D-130's), the far one in t (the rest
+ *  evenly from e^InLnHi to InFarCm: dust spread through the web is even in t, not in ln t). Past the
+ *  far end, or past e^InLnHi with no far segment: UNI_VOL_SLICES or more. */
+UNI_FN float Uni_SlicePosT(float InT, float InLnLo, float InLnHi, float InFarCm)
+{
+	const float Ln = log(max(InT, 1.0f));
+	if (Ln <= InLnHi) { return (Ln - InLnLo) * ((float)UNI_VOL_SLICES_NEAR / max(InLnHi - InLnLo, 1.0e-3f)); }
+	const float THi = exp(InLnHi);
+	if (!(InFarCm > THi)) { return (float)UNI_VOL_SLICES; }
+	return (float)UNI_VOL_SLICES_NEAR + (float)(UNI_VOL_SLICES - UNI_VOL_SLICES_NEAR) * (InT - THi) / (InFarCm - THi);
+}
 UNI_FN float Uni_LightLnDepthFromInv(float InInvMean) { return UNI_VOL_LN_DEPTH_REF - log(InInvMean); }
 
 static const uint UNI_VOL_GLOW_LEVELS = 32u;        // D-203: a carrier's children span at most this many levels for cell glow
@@ -164,7 +178,30 @@ struct FUniVolumeView
 	float DetailRange1;
 	float DetailFade0;
 	float DetailFade1;
-	float DetailPad;
+	float DetailKnotTint;    // D-267: the knots' young light toward the galaxy's nebula colours (0..1; all of the galaxy, any distance)
+	// D-267: each detail layer's knot amplitude (0..1): the knots' young light x 1 + this x (the
+	// layer's knot channel - 1).
+	float DetailKnot0;
+	float DetailKnot1;
+	// D-269: dark dust in the cosmic web (Uni_WebDustTau; render only): absorption following the
+	// textured web's filament and node matter, shaped by a dark pattern (galaxy_shape), near the camera.
+	float WebDustKnots;      // the pattern: 0 dark filaments (the ridged channel^4), 1 dark knots (the knots^8); mean 1 either way
+	float WebDustDetail;     // the pattern's amplitude (0: the web's matter alone; 1: all of the pattern)
+	float WebDustTauCm;      // optical depth (V) per cm where the filament + node matter is at its mean (0: off)
+	float WebDustInvMean;    // 1 / the filament + node channels' mean
+	float WebDustNearCm;     // it fades in over this distance from the camera (the home group not fogged)
+	float WebDustDepthCm;    // and out over the second half of this (the far sky not dimmed)
+	float WebDustDetailCm;   // the pattern's period, cm (a whole number a web tile)
+	float WebDustPeak;       // the matter held softly under this x its mean (nodes not opaque bricks; 0: no hold)
+	float WebDustTexN;       // galaxy_shape's texels a period (its mip from the footprint)
+	float WebDustRedden;     // its colour: 0 grey (dark), 1 the galaxies' dust's reddening
+	// D-271: the transmittance slices' far segment: UNI_VOL_SLICES - UNI_VOL_SLICES_NEAR slices evenly
+	// in t from e^SliceLnTHi to here (the web's dust and the galaxies past 100 kpc in front of a
+	// sprite). At or below e^SliceLnTHi: none (every far slice the near segment's last).
+	float SliceFarCm;
+	float ViewPad0;
+	float ViewPad1;
+	float ViewPad2;
 };
 
 struct FUniVolumeResult
@@ -470,6 +507,38 @@ UNI_FN float3 Uni_MotionWebEmission(float4 InCh, float3 InP, float InFoot, float
 		M = 1.0f + (Pat - 1.0f) * saturate(InView.MotionWebDetailGain);
 	}
 	return UNI_MOTION_WEB_COLOUR * (InView.MotionWebGain * X * Fade * M);
+}
+
+/** D-269 (owner: "some dark matter dust type absorption in the universe cosmic web field ... like
+ *  dark knots or filaments", with the galaxy march's lessons): the web's dark dust, optical depth
+ *  (V) per cm at a step's point InP (the web carrier's, field units: one web tile), InFoot its
+ *  footprint there (field units: the pixel's or the step's, whichever is larger: the cone rule,
+ *  D-255), InT its distance (cm), from the web channels InCh read over that footprint.
+ *  - Linear in the filament + node matter (over its mean), held softly under WebDustPeak x its
+ *    mean: a prefiltered read keeps its mean (no threshold: a threshold of a filtered field loses
+ *    its peaks with distance, D-234), and the voids' matter (the other channels) carries none.
+ *  - x a dark pattern (galaxy_shape, shaped before its mips: mean 1 at every footprint, D-259):
+ *    the ridged channel^4 (dark filaments) toward the knots^8 (dark knots) by WebDustKnots, with
+ *    amplitude WebDustDetail, tiled a whole number of times a web tile (periodic); read over the
+ *    same footprint, so where a step does not resolve it it is its mean (blur, never grain: D-265).
+ *  - Faded in over WebDustNearCm and out over the second half of WebDustDepthCm (no edge). */
+UNI_FN float Uni_WebDustTau(float4 InCh, float3 InP, float InFoot, float InInvRadius, float InT, FUniVolumeView InView)
+{
+	const float Fn = (InCh.y + InCh.z) * InView.WebDustInvMean;
+	if (!(Fn > 0.0f)) { return 0.0f; }
+	const float Fade = smoothstep(0.0f, max(InView.WebDustNearCm, 1.0f), InT) * (1.0f - smoothstep(0.5f * InView.WebDustDepthCm, InView.WebDustDepthCm, InT));
+	if (!(Fade > 0.0f)) { return 0.0f; }
+	const float D = InView.WebDustPeak > 0.0f ? Fn / (1.0f + Fn / InView.WebDustPeak) : Fn;
+	float M = 1.0f;
+	if (InView.WebDustDetail > 0.0f && InView.WebDustDetailCm > 0.0f)
+	{
+		const float Tiles = max(round(1.0f / max(InInvRadius * InView.WebDustDetailCm, 1.0e-6f)), 1.0f);   // pattern periods a web tile
+		const float Mip = max(log2(max(InFoot * Tiles * max(InView.WebDustTexN, 1.0f), 1.0e-6f)), 0.0f);
+		const float4 Sh = UNI_GAL_SHAPED(frac(InP * Tiles) + float3(0.371f, 0.137f, 0.653f), Mip);
+		const float Pat = Sh.x + (Sh.z - Sh.x) * saturate(InView.WebDustKnots);
+		M = max(1.0f + (Pat - 1.0f) * saturate(InView.WebDustDetail), 0.0f);
+	}
+	return InView.WebDustTauCm * D * M * Fade;
 }
 
 // ------------------------------------------------------------------------------------------
@@ -945,8 +1014,8 @@ UNI_FN float Uni_CarrierStepLimit(FUniCarrier InCa, FUniFieldParams InPar, float
 /** D-265: the camera's galaxy's detail layers are on (a layer with a frequency and an amplitude). */
 UNI_FN bool Uni_DetailLayersOn(FUniVolumeView InView)
 {
-	return (InView.DetailFreq0 > 0.0f && (InView.DetailLight0 > 0.0f || InView.DetailDust0 > 0.0f))
-		|| (InView.DetailFreq1 > 0.0f && (InView.DetailLight1 > 0.0f || InView.DetailDust1 > 0.0f));
+	return (InView.DetailFreq0 > 0.0f && (InView.DetailLight0 > 0.0f || InView.DetailDust0 > 0.0f || InView.DetailKnot0 > 0.0f))
+		|| (InView.DetailFreq1 > 0.0f && (InView.DetailLight1 > 0.0f || InView.DetailDust1 > 0.0f || InView.DetailKnot1 > 0.0f));   // D-267
 }
 
 /** D-266 (owner: "the mid detail can actually be constrained closer to the camera ... maybe around
@@ -968,8 +1037,8 @@ UNI_FN float Uni_DetailRangeW(float InTu, float InRange, float InFade)
 UNI_FN float Uni_DetailLightSpacing(FUniFieldParams InPar, FUniVolumeView InView, float InTu)
 {
 	const float Tx = InView.DetailStepTexels > 0.0f ? InView.DetailStepTexels : 4.0f;
-	const float L0 = Uni_DetailRangeW(InTu, InView.DetailRange0, InView.DetailFade0) > 0.0f ? Uni_GalaxyDetailLayerStep(InPar, float4(InView.DetailFreq0, InView.DetailLight0, InView.DetailDust0, 0.0f), Tx, false) : 0.0f;
-	const float L1 = Uni_DetailRangeW(InTu, InView.DetailRange1, InView.DetailFade1) > 0.0f ? Uni_GalaxyDetailLayerStep(InPar, float4(InView.DetailFreq1, InView.DetailLight1, InView.DetailDust1, 0.0f), Tx, false) : 0.0f;
+	const float L0 = Uni_DetailRangeW(InTu, InView.DetailRange0, InView.DetailFade0) > 0.0f ? Uni_GalaxyDetailLayerStep(InPar, float4(InView.DetailFreq0, InView.DetailLight0, InView.DetailDust0, InView.DetailKnot0), Tx, false) : 0.0f;
+	const float L1 = Uni_DetailRangeW(InTu, InView.DetailRange1, InView.DetailFade1) > 0.0f ? Uni_GalaxyDetailLayerStep(InPar, float4(InView.DetailFreq1, InView.DetailLight1, InView.DetailDust1, InView.DetailKnot1), Tx, false) : 0.0f;
 	return L0 > 0.0f && L1 > 0.0f ? min(L0, L1) : max(L0, L1);
 }
 
@@ -988,8 +1057,8 @@ UNI_FN float Uni_GalaxyDetailStepCap(FUniCarrier InCa, FUniFieldParams InPar, fl
 	if (abs(P.z) > Uni_GalaxyDiscSlab(InPar)) { return Cap; }
 	const float Tx = InView.DetailStepTexels > 0.0f ? InView.DetailStepTexels : 4.0f;
 	const float Taps = max((float)InView.SegmentTaps, 1.0f);
-	const float4 L0 = float4(InView.DetailFreq0, InView.DetailLight0, InView.DetailDust0, 0.0f);
-	const float4 L1 = float4(InView.DetailFreq1, InView.DetailLight1, InView.DetailDust1, 0.0f);
+	const float4 L0 = float4(InView.DetailFreq0, InView.DetailLight0, InView.DetailDust0, InView.DetailKnot0);   // D-267: the knots are light
+	const float4 L1 = float4(InView.DetailFreq1, InView.DetailLight1, InView.DetailDust1, InView.DetailKnot1);
 	UNI_UNROLL
 	for (uint I = 0u; I < 2u; ++I)
 	{
@@ -1201,9 +1270,8 @@ UNI_FN FUniVolumeResult Uni_VolumeMarchJ(float3 InDir, float InTScene,
 	}
 
 	const float DetFoot = InView.DetailFoot > 0.0f ? InView.DetailFoot : 0.5f;   // D-265
-	const float4 DetL0 = float4(InView.DetailFreq0, InView.DetailLight0, InView.DetailDust0, 0.0f);
-	const float4 DetL1 = float4(InView.DetailFreq1, InView.DetailLight1, InView.DetailDust1, 0.0f);
-	const float SliceScale = (float)UNI_VOL_SLICES / max(InView.SliceLnTHi - InView.SliceLnTLo, 1.0e-3f);
+	const float4 DetL0 = float4(InView.DetailFreq0, InView.DetailLight0, InView.DetailDust0, InView.DetailKnot0);   // D-267: .w the knots
+	const float4 DetL1 = float4(InView.DetailFreq1, InView.DetailLight1, InView.DetailDust1, InView.DetailKnot1);
 	uint NextSlice = 0u;
 	float3 SliceT[UNI_VOL_SLICES];
 	UNI_UNROLL
@@ -1277,6 +1345,7 @@ UNI_FN FUniVolumeResult Uni_VolumeMarchJ(float3 InDir, float InTScene,
 		float3 Tau = float3(0.0f, 0.0f, 0.0f);    // optical depth over this step
 		float4 WebCh = float4(0.0f, 0.0f, 0.0f, 0.0f);   // D-206: this step's web texel
 		bool bMotionWebDone = false;                     // D-230: the motion web once a step (two web carriers read one texel)
+		bool bWebDustDone = false;                       // D-269: the web's dust once a step, likewise
 		uint WebFrom = UNI_VOL_MAX_ACTIVE;                // and the carrier that read it
 		for (uint J = 0u; J < NA; ++J)
 		{
@@ -1345,8 +1414,9 @@ UNI_FN FUniVolumeResult Uni_VolumeMarchJ(float3 InDir, float InTScene,
 						// D-265: the detail layers over the pixel's footprint or DetailFoot x the step.
 						const float Tu = Tm * Ca.InvRadius;   // D-266: the bubble's weights
 						const float W0 = Uni_DetailRangeW(Tu, InView.DetailRange0, InView.DetailFade0), W1 = Uni_DetailRangeW(Tu, InView.DetailRange1, InView.DetailFade1);
-						const float2 Ml = Uni_GalaxyDetailLayers(P, Par, GK, max(FootS, DetFoot * Du), float4(DetL0.x, DetL0.y * W0, DetL0.z * W0, 0.0f), float4(DetL1.x, DetL1.y * W1, DetL1.z * W1, 0.0f));
-						Rm = Rm * Ml.x; Comp = Comp * Ml.x; RdPair = RdPair * Ml.y;
+						const float3 Ml = Uni_GalaxyDetailLayers(P, Par, GK, max(FootS, DetFoot * Du), float4(DetL0.x, DetL0.y * W0, DetL0.z * W0, DetL0.w * W0), float4(DetL1.x, DetL1.y * W1, DetL1.z * W1, DetL1.w * W1));
+						// D-267: the knots' young light (Comp.w, before the cut's soft edge) x the knot multiplier.
+						Rm = (Rm + Comp.w * Uni_GalaxyCutEdge(P, Par) * (Ml.z - 1.0f)) * Ml.x; Comp = Comp * Ml.x; Comp.w = Comp.w * Ml.z; RdPair = RdPair * Ml.y;
 					}
 				}
 				else
@@ -1369,8 +1439,8 @@ UNI_FN FUniVolumeResult Uni_VolumeMarchJ(float3 InDir, float InTScene,
 							// D-265: each tap over its footprint or DetailFoot x its share of the step.
 							const float Tu = Tk * Ca.InvRadius;   // D-266: the bubble's weights at the tap
 							const float W0 = Uni_DetailRangeW(Tu, InView.DetailRange0, InView.DetailFade0), W1 = Uni_DetailRangeW(Tu, InView.DetailRange1, InView.DetailFade1);
-							const float2 Ml = Uni_GalaxyDetailLayers(Pk, Par, GK, max(FootK, DetFoot * Du * InvK), float4(DetL0.x, DetL0.y * W0, DetL0.z * W0, 0.0f), float4(DetL1.x, DetL1.y * W1, DetL1.z * W1, 0.0f));
-							Rk = Rk * Ml.x; Ck = Ck * Ml.x; Rdk = Rdk * Ml.y;
+							const float3 Ml = Uni_GalaxyDetailLayers(Pk, Par, GK, max(FootK, DetFoot * Du * InvK), float4(DetL0.x, DetL0.y * W0, DetL0.z * W0, DetL0.w * W0), float4(DetL1.x, DetL1.y * W1, DetL1.z * W1, DetL1.w * W1));
+							Rk = (Rk + Ck.w * Uni_GalaxyCutEdge(Pk, Par) * (Ml.z - 1.0f)) * Ml.x; Ck = Ck * Ml.x; Ck.w = Ck.w * Ml.z; Rdk = Rdk * Ml.y;   // D-267
 						}
 						Rm += Rk * InvK; RdK += Rdk * InvK; CompK = CompK + Ck * InvK; NebX += Nk.x * InvK;
 						if (K == (Kt >> 1u)) { Neb = Nk; }   // the nebulae's terms from the middle tap (their density the mean)
@@ -1414,6 +1484,22 @@ UNI_FN FUniVolumeResult Uni_VolumeMarchJ(float3 InDir, float InTScene,
 					E = E + Uni_MotionWebEmission(WebCh, P, Tm * InView.ThetaPixel * Ca.InvRadius, Du, Ca.InvRadius, Tm, InView) * S;   // per cm x the step in cm (Du is in field units)
 					bMotionWebDone = true;
 				}
+				// D-269: the web's dark dust, once a step, over the cone rule's footprint (the pixel's or
+				// the step's: extinction wants the step's mean density, not one jittered point's), its
+				// channels re-read only where that is a coarser mip than the light's read.
+				if (InView.WebDustTauCm > 0.0f && !bWebDustDone && (Ca.Flags & UNI_CARRIER_PERIODIC) != 0u && Uni_CarrierWebTex(Ca, Par))
+				{
+					const float FootD = max(FootS, Du);
+					const float MipD = Uni_WebTexMip(Par, FootD);
+					const float4 ChD = MipD > Uni_WebTexMip(Par, FootS) + 0.25f ? UNI_WEB_TEX_SAMPLE(P, MipD) : WebCh;
+					const float Tw = Uni_WebDustTau(ChD, P, FootD, Ca.InvRadius, Tm, InView) * S * (1.0f - Blend);   // per cm x the step in cm
+					if (Tw > 0.0f)
+					{
+						const float3 Red = InView.DustSigmaRgb * (1.0f / max(InView.DustSigmaRgb.y, 1.0e-6f));
+						Tau = Tau + (float3(1.0f, 1.0f, 1.0f) + (Red - float3(1.0f, 1.0f, 1.0f)) * saturate(InView.WebDustRedden)) * Tw;
+					}
+					bWebDustDone = true;
+				}
 				// D-189: the near-web glow (non-physical, an art choice): the periodic web's light
 				// lifted where it is overdense, so its structure shows in the sky.
 				if (InView.WebGlowGain > 0.0f && Ca.FieldId == UNI_FIELD_WEB && (Ca.Flags & UNI_CARRIER_PERIODIC) != 0u && Tm < InView.WebGlowDepthCm)
@@ -1445,6 +1531,18 @@ UNI_FN FUniVolumeResult Uni_VolumeMarchJ(float3 InDir, float InTScene,
 					Pal.Knot = float3(Pc.D.x, Pc.D.y, Pc.D.z);
 					const float Far = saturate(2.0f * FootS / max(Par.A.x, 1.0e-4f) - 1.0f);
 					L = Uni_TintKeepLuminance(L, Uni_GalaxyTintFar(Pal, Comp, Far, float3(Pc.E.x, Pc.E.y, Pc.E.z)));
+				}
+				// D-267 (the nebulae as part of the field): the knots' young light toward the galaxy's
+				// nebula colours (Uni_GalaxyNebulaColour: three a galaxy, nebula to nebula by the knot
+				// read's mix term, toward their average as the knots blend), luminance kept, by its share
+				// of the sample's light; every galaxy, any distance (no edge), hidden through the
+				// sprite's handoff with the nebulae (D-245: the sprite has no such colour).
+				if (InView.DetailKnotTint > 0.0f && Ca.FieldId == UNI_FIELD_GALAXY && Comp.w > 0.0f)
+				{
+					const float Sum = Comp.x + Comp.y + Comp.z + Comp.w;
+					const float Fk = Sum > 0.0f ? saturate(Comp.w / Sum) : 0.0f;
+					const float3 Cn = Uni_GalaxyNebulaColour(Par, GK.Hs, Neb.z, Uni_GalaxyNebulaBlend(Par, FootS, 0.0f));
+					L = L + (Cn * Uni_PaletteLum(L) - L) * (InView.DetailKnotTint * Fk * (1.0f - Ca.NebulaHide));
 				}
 				const float K = (Ca.Amplitude * Ca.Weight * AFade[J] * Rho) * Du;
 				E = E + L * K;
@@ -1592,6 +1690,7 @@ UNI_FN FUniVolumeResult Uni_VolumeMarchJ(float3 InDir, float InTScene,
 			Tau.z > 1.0e-5f ? (1.0f - Ex.z) / Tau.z : 1.0f - 0.5f * Tau.z);
 		const float3 Bs = Tr * (E * W);
 		B = B + Bs;
+		const float3 TrStep = Tr;   // D-271: before the step (its slices interpolate within it)
 		Tr = Tr * Ex;
 		// D-184: where the light comes from (the temporal reprojection's depth).
 		const float Ls = Uni_Luminance(Bs);
@@ -1602,12 +1701,24 @@ UNI_FN FUniVolumeResult Uni_VolumeMarchJ(float3 InDir, float InTScene,
 
 		// Transmittance slices: record T at every boundary passed. Static indices only (an
 		// unrolled compare per slice): FXC cannot address a struct-member or local array
-		// dynamically inside a [loop] without forcing an unroll.
-		const float SlicePos = (log(T) - InView.SliceLnTLo) * SliceScale;
-		UNI_UNROLL
-		for (uint Ks = 0u; Ks < UNI_VOL_SLICES; ++Ks)
+		// dynamically inside a [loop] without forcing an unroll. D-271: at the boundary itself,
+		// within the step (its extinction even along it, as the step's light assumes; the step's
+		// share from the slice positions: in ln t over the near segment, in t over the far one),
+		// not at the step's end (a step past 10 Mpc is several Mpc long).
+		const float SlicePos = Uni_SlicePosT(T, InView.SliceLnTLo, InView.SliceLnTHi, InView.SliceFarCm);   // D-271
+		if (SlicePos >= (float)(NextSlice + 1u))
 		{
-			if (Ks >= NextSlice && SlicePos >= (float)(Ks + 1u)) { SliceT[Ks] = Tr; }
+			const float Pos0 = Uni_SlicePosT(T - S, InView.SliceLnTLo, InView.SliceLnTHi, InView.SliceFarCm);
+			const float InvSpan = 1.0f / max(SlicePos - Pos0, 1.0e-6f);
+			UNI_UNROLL
+			for (uint Ks = 0u; Ks < UNI_VOL_SLICES; ++Ks)
+			{
+				if (Ks >= NextSlice && SlicePos >= (float)(Ks + 1u))
+				{
+					const float Fs = saturate(((float)(Ks + 1u) - Pos0) * InvSpan);
+					SliceT[Ks] = TrStep * float3(exp(-Tau.x * Fs), exp(-Tau.y * Fs), exp(-Tau.z * Fs));
+				}
+			}
 		}
 		NextSlice = max(NextSlice, (uint)clamp(floor(SlicePos), 0.0f, (float)UNI_VOL_SLICES));
 		if (T >= TMax) { bDone = true; break; }
@@ -2265,11 +2376,11 @@ UNI_FN uint Uni_CubeDirToFace(float3 InD, float InN, UNI_OUT(float) OutX, UNI_OU
 	return Face;
 }
 
-/** Transmittance at true distance InT from the slices (sprite pass): piecewise linear in ln t,
- *  1 at the near end of the first slice. */
+/** Transmittance at true distance InT from the slices (sprite pass): piecewise linear in ln t
+ *  (D-271: in t over the far segment), 1 at the near end of the first slice. */
 UNI_FN float3 Uni_SliceTransmittance(float3 InSliceT[UNI_VOL_SLICES], float InT, FUniVolumeView InView)
 {
-	const float X = (log(max(InT, 1.0f)) - InView.SliceLnTLo) * (float)UNI_VOL_SLICES / max(InView.SliceLnTHi - InView.SliceLnTLo, 1.0e-3f);
+	const float X = Uni_SlicePosT(InT, InView.SliceLnTLo, InView.SliceLnTHi, InView.SliceFarCm);   // D-271
 	if (X <= 0.0f) { return float3(1.0f, 1.0f, 1.0f); }
 	if (X >= (float)UNI_VOL_SLICES) { return InSliceT[UNI_VOL_SLICES - 1u]; }
 	const uint I = (uint)X;
@@ -2299,8 +2410,7 @@ UNI_FN float4 Uni_FarComposite(float4 InNear, float4 InFar)
  *  its first step, from R), else the far march's. */
 UNI_FN float Uni_FarSliceT(uint InK, float InSliceT, float InStartCm, FUniVolumeView InView)
 {
-	const float Boundary = InView.SliceLnTLo + (float)(InK + 1u) * (InView.SliceLnTHi - InView.SliceLnTLo) / (float)UNI_VOL_SLICES;
-	return Boundary <= log(max(InStartCm, 1.0f)) ? 1.0f : InSliceT;
+	return (float)(InK + 1u) <= Uni_SlicePosT(InStartCm, InView.SliceLnTLo, InView.SliceLnTHi, InView.SliceFarCm) ? 1.0f : InSliceT;   // D-271: the boundary at or before R
 }
 
 /** A history texel converted at a switch, once (the reconstruct): InSign +1, it holds the near part

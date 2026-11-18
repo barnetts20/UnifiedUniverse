@@ -50,8 +50,10 @@ struct FUniFrameData
 	bool bCameraStepValid = false;
 	float WarpAmount = 0.0f;   // D-187: 0 at rest, 1 at full warp (the travel curve), drives streaks and arrival
 	float SpeedAmount = 0.0f;  // D-198: the travel curve itself (not x uu.Warp): the volume march's budget falls with it
-	float ShiftAmount = 0.0f;  // D-230: the travel shift (ln of the factor straight ahead, ramped; 0: none)
+	float ShiftAmount = 0.0f;  // D-230: the travel shift (ln of the factor straight ahead, from the speed: D-268; 0: none)
 	float ShiftK = 0.0f;       // its colour strength
+	float ShiftBoostFrom = 0.0f;   // D-268: the shift (ln) past which the blue side brightens
+	float ShiftBoost = 0.0f;       // D-268: that brightening's exponent (0: none)
 	float VolumeBudgetScale = 1.0f;   // D-200: the auto budget's scale of the march pixel budget (1: off)
 	// D-246: the march's blue noise (the engine's FastBlueNoise_scalar_128x128x8, held by the
 	// subsystem); null: D-240's hashed draws.
@@ -125,6 +127,37 @@ struct FUniFrameData
 	// D-183: archetypes (id < 32) whose sprites are inclined ellipses (disc galaxies); 0: all round.
 	uint32 DiscArchetypeMask = 0;
 	uint32 FixedDiscSeeds[4] = { 0, 0, 0, 0 };   // D-183: fixed-orientation anchors' seeds (their disc normal is world z)
+	// D-272: galaxies' nuclei (their supermassive black holes' accretion light): the archetypes that have
+	// them (0: none) and (accreting share, cap x the host, gain, 0).
+	uint32 NucleusArchetypeMask = 0;
+	FVector4f NucleusParams = FVector4f(0.4f, 0.5f, 1.0f, 0.0f);   // D-273: w the lensed nucleus's share handed to its disc
+	uint32 NucleusHandSeed = 0;                                     // D-273: that nucleus's galaxy seed
+
+	// D-273: the near field of one black hole (UniLens.usf; UniCore::LensTargetOf): lensing and its
+	// accretion disc, drawn after the backdrop while bActive.
+	struct FLensFrame
+	{
+		bool bActive = false;
+		FVector3f CamRs = FVector3f::ZeroVector;      // the camera relative to the black hole, R_s (world axes)
+		FVector3f BhDir = FVector3f(1.0f, 0.0f, 0.0f); // towards it (unit)
+		float BhDistanceCm = 0.0f;
+		float RegionRad = 0.0f;                       // the pass's angular radius about it (pi: the whole view)
+		FVector3f DiscAxis = FVector3f(0.0f, 0.0f, 1.0f);
+		float DiscOuterX = 0.0f;
+		float DiscPeakK = 0.0f;
+		bool bDisc = false;
+		float DiscShare = 0.0f;
+		double DiscLog10Scale = -99.0;                // + 0.4 m_exp: the radiance scale (exposure units per sr per disc light unit)
+		uint32 MaxSteps = 400u;
+		// The nucleus as a point, drawn by the pass x (1 - DiscShare) with the sprite style (its sprite
+		// is held back while the pass runs: in scene colour it would be lensed as if behind the hole).
+		double TimeS = 0.0;                           // D-276: the game's time (the disc's rotation, its flow phases)
+		uint32 DiscSeed = 0u;                         // D-276: its clouds' seed (the galaxy's)
+		float PointAppMag = 99.0f;                    // 99: none
+		float PointPhysAngRad = 0.0f;
+		FVector3f PointColour = FVector3f(1.0f, 1.0f, 1.0f);
+	};
+	FLensFrame Lens;
 
 	// Volume pass (Docs/VOLUMETRICS.md, UniCore::FVolumeBuilder). Local carriers are marched per
 	// pixel; background (periodic) carriers into the direction map whenever BackgroundVersion
@@ -179,6 +212,7 @@ struct FUniRenderStats
 {
 	std::atomic<uint32> SpritesLastFrame{ 0 };
 	std::atomic<uint32> PromoteCandidatesLastFrame{ 0 };
+	std::atomic<uint32> LensPassesLastFrame{ 0 };   // D-273: 1 while a black hole's lens pass ran last frame
 	std::atomic<uint32> CellsLastFrame{ 0 };
 	std::atomic<uint32> GenBatchesCompleted{ 0 };
 	std::atomic<uint32> GenBatchesFailed{ 0 };

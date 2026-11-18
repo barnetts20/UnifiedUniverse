@@ -8,6 +8,8 @@
 // frame with a pick request, each sprite's (cell index, slot) beside it (UniQuery.usf).
 // D-196: an object with a volume carrier draws only the share its carrier did not take this
 // frame (InHandoffs, from the volume builder); one with no carrier keeps its whole sprite.
+// D-272: a galaxy whose archetype has nuclei (NucleusArchetypeMask) may add a second sprite, its
+// nucleus (Uni_ProjectNucleusC): a point at its centre, never handed off.
 // D-223: with SplatMode on, each sprite's slot also goes to one of two lists: plain point sprites
 // (Uni_SpriteSplattable) to the splat path's, the rest to the quads' (their draw arguments
 // {6, quads, 0, 0} in OutQuadArgs). OutSprites and OutDrawArgs are unchanged (pick, uu.Perf).
@@ -51,12 +53,15 @@ uint SystemArchetypeMask;                        // bit per archetype id < 32 wh
 float WarpAmount;                                // D-187: warp 0..1 (0: at rest, every sprite as before)
 float4 WarpVelBeta;                              // D-190: warp optics: the camera's motion (unit), effective speed (0: none)
 float4 ShiftVelAmount;                           // D-230: the travel shift: the motion (unit), ln of the factor ahead (0: none)
-float ShiftK;                                    // D-230: its colour strength
+float4 ShiftKBoost;                              // D-230: its colour strength; D-268: the boost's start (ln) and exponent
 float4 WarpDopplerKQ;                            // D-190: Doppler colour strength, beaming exponent
 float ArrivalFrames;                             // D-187: frames over which a new cell's objects arrive at warp
 uint DiscArchetypeMask;                          // D-183: bit per archetype id < 32 whose objects are disc galaxies (inclined elliptical sprites)
 uint4 FixedDiscSeeds;                            // D-183: seeds of fixed-orientation anchors (disc normal world z)
 uint WriteSpriteSource;                          // D-193: 1 on a frame with a pick request
+uint NucleusArchetypeMask;                       // D-272: archetypes whose objects have a nucleus (0: none)
+float4 NucleusParams;                            // D-272: (accreting share, cap x the host, gain, D-273: the lensed nucleus's share handed to its disc)
+uint NucleusHandSeed;                            // D-273: that nucleus's galaxy seed
 StructuredBuffer<uint4> InHandoffs;              // D-196: (cell index, slot, carrier share bits, 0), sorted by (cell index, slot)
 uint NumHandoffs;
 uint SplatMode;                                  // D-223: 1: sort the sprites into the splat and quad lists
@@ -97,6 +102,33 @@ float SpriteHaloGain;
 float SpriteHaloGrowthPx;
 float SpriteHaloMaxPx;
 
+/** A visible sprite into the frame's list (and, D-223, the splat or the quad list); D-193: its
+ *  source (cell index, slot) for a pick. */
+void AppendSprite(FUniSprite S, uint CellIndex, uint I)
+{
+	uint Slot;
+	InterlockedAdd(OutDrawArgs[1], 1u, Slot);
+	if (Slot < MaxSprites)
+	{
+		OutSprites[Slot] = S;
+		if (WriteSpriteSource != 0u) { OutSpriteSource[Slot] = uint2(CellIndex, I); }
+		if (SplatMode != 0u)   // D-223
+		{
+			uint K;
+			if (Uni_SpriteSplattable(S, 1.0f / max(ThetaPixel, 1.0e-30f), SpriteCorePx, WarpAmount))
+			{
+				InterlockedAdd(OutSplatCount[0], 1u, K);
+				OutSplatIndex[K] = Slot;
+			}
+			else
+			{
+				InterlockedAdd(OutQuadArgs[1], 1u, K);
+				OutQuadIndex[K] = Slot;
+			}
+		}
+	}
+}
+
 [numthreads(64, 1, 1)]
 void MainCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
 {
@@ -133,9 +165,19 @@ void MainCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
 	V.WarpDoppler = WarpDopplerKQ.x;
 	V.WarpBeaming = WarpDopplerKQ.y;
 	V.ShiftAmount = ShiftVelAmount.w;   // D-230
-	V.ShiftK = ShiftK;
+	V.ShiftK = ShiftKBoost.x;
+	V.ShiftBoostFrom = ShiftKBoost.y;   // D-268
+	V.ShiftBoost = ShiftKBoost.z;
 	V.ShiftVel = ShiftVelAmount.xyz;
 	V.ShiftPad = 0.0f;
+	V.NucleusArchetypeMask = NucleusArchetypeMask;   // D-272
+	V.NucleusActive = NucleusParams.x;
+	V.NucleusCap = NucleusParams.y;
+	V.NucleusGain = NucleusParams.z;
+	V.NucleusHandSeed = NucleusHandSeed;             // D-273
+	V.NucleusHandShare = NucleusParams.w;
+	V.NucleusPad0 = 0.0f;
+	V.NucleusPad1 = 0.0f;
 
 	// D-187: at warp a new cell's objects streak in from ahead (the sprite pass stretches their
 	// tails by their arrival). D-203: their fade-in is the cell's own (bits 8..15: the level's fade
@@ -170,28 +212,15 @@ void MainCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
 			InterlockedAdd(OutPromoteCount[0], 1u, P);
 			if (P < MaxPromote) { OutPromote[P] = uint2(CellIndex, I); }
 		}
-		if ((S.Flags & UNI_SPRITE_VISIBLE) != 0u)
+		if ((S.Flags & UNI_SPRITE_VISIBLE) != 0u) { AppendSprite(S, CellIndex, I); }
+		// D-272: a galaxy's nucleus, a second sprite of its record (never handed to the volume).
+		if (NucleusArchetypeMask != 0u)
 		{
-			uint Slot;
-			InterlockedAdd(OutDrawArgs[1], 1u, Slot);
-			if (Slot < MaxSprites)
+			FUniSprite Sn = Uni_ProjectNucleusC(CellRel, LevelFade, O, V);
+			if ((Sn.Flags & UNI_SPRITE_VISIBLE) != 0u)
 			{
-				OutSprites[Slot] = S;
-				if (WriteSpriteSource != 0u) { OutSpriteSource[Slot] = uint2(CellIndex, I); }
-				if (SplatMode != 0u)   // D-223
-				{
-					uint K;
-					if (Uni_SpriteSplattable(S, 1.0f / max(ThetaPixel, 1.0e-30f), SpriteCorePx, WarpAmount))
-					{
-						InterlockedAdd(OutSplatCount[0], 1u, K);
-						OutSplatIndex[K] = Slot;
-					}
-					else
-					{
-						InterlockedAdd(OutQuadArgs[1], 1u, K);
-						OutQuadIndex[K] = Slot;
-					}
-				}
+				Sn.Flags = Sn.Flags | ArrivalBits;
+				AppendSprite(Sn, CellIndex, I);
 			}
 		}
 	}

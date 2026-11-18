@@ -1,0 +1,757 @@
+// UniCompact.ush
+// D-272 (Docs/COMPACT_OBJECTS.md, phase A; owner 2026-11-17: "probably do supermassives first since
+// every spiral galaxy will have one, and placement is always in the center of the bulge... the
+// implementation should be robust enough to use for stellar or supermassive"): black holes.
+//
+// Two layers, so the same code serves a galaxy's supermassive black hole now and a stellar black
+// hole (or an X-ray binary's) later:
+//   1. A black hole of any mass: FUniBlackHole from its mass and its accretion rate as a share of
+//      the Eddington rate (Uni_BlackHoleOf): its bolometric luminosity, the V magnitude of its
+//      accretion light, its Schwarzschild radius (the lensing pass, phase D), its colour.
+//   2. A galaxy's supermassive black hole, a property of the galaxy record alone (no new records:
+//      the project pass and the CPU read it from the same function): its mass from the host's
+//      bulge (Haring & Rix 2004: 0.0014 x the bulge's mass, 0.3 dex scatter), the bulge from the
+//      host's V luminosity, a bulge share and a mass-to-light ratio by type; its Eddington ratio
+//      from a mixture: an accreting share of galaxies (p(log lambda) ~ lambda^-0.65 over 1e-4..1,
+//      Aird et al. 2012) and a quiet rest (1e-9..1e-5, log-uniform: Sgr A* to M87). New seed
+//      channels BH.MASS and BH.EDDINGTON (never reused): nothing else in the galaxy changes.
+//
+// The nucleus (Uni_NucleusAbsMag) is that black hole's accretion light as the galaxy shows it: an
+// unresolved point at the bulge's centre (UniProject.ush, Uni_ProjectNucleusC), at most InCap x
+// the host's light (0.5: the galaxy's level comes from the host's magnitude alone, and a brighter
+// nucleus would outgrow its level's window), x an art gain (1: physical). Render only.
+//
+// D-273 (phase D; owner 2026-11-17: "Gravitational sensing ans accretion discs, there are quite a
+// few shader references online for black holes as well"): the near field, for a black hole of any
+// mass (everything below is in units of its Schwarzschild radius R_s):
+//   - Lensing (Uni_LensTrace): a camera ray traced back through the Schwarzschild metric. Inside a
+//     sphere of UNI_LENS_SPHERE_X (or 1.25 x the disc) the ray is integrated (RK4) as Riccardo
+//     Antonelli's "starless" does it: in flat coordinates, with a central acceleration
+//     -1.5 h^2 x / r^5 (h = |x x v|, conserved), whose orbits are exactly the photon orbits
+//     u'' + u = 1.5 u^2 (u = R_s / r). Outside it the same acceleration is integrated in closed
+//     form along the straight line (Uni_LensTailK): it falls as r^-5, so the far part of the
+//     orbit is straight to ~b^3 / R^4 (the weak-field 2 R_s / b is the whole line's). The camera
+//     is a static observer: its measured direction becomes the coordinate one by its radial part
+//     x sqrt(1 - 1/r). A ray falls in (the shadow, impact parameter 3 sqrt(3) / 2) or leaves in a
+//     direction the caller samples the scene in: the lens moves light, never adds it (surface
+//     brightness is conserved), so a pixel is the scene's radiance where its ray came from.
+//   - The disc (Uni_LensTrace's plane crossings): a thin, optically thick disc from the innermost
+//     stable orbit (3 R_s) outwards, at the Shakura-Sunyaev / Page-Thorne shape
+//     T ~ (x^-3 (1 - sqrt(3 / x)))^1/4, its peak the physical thin disc's (from the mass and the
+//     Eddington ratio, Uni_BhDiscPeakK), floored at UNI_BH_DISC_TMIN (a slow accretor is a hot
+//     thin flow, not a cool disc: the floor keeps its light warm, D-272's LINER colour). Gas on
+//     circular orbits: each crossing's light shifted by g = sqrt(1 - 1.5 / x) / (1 - Omega
+//     lambda) (gravity, the orbit's Doppler and beaming: Luminet 1979; lambda the photon's angular
+//     momentum about the disc's axis), seen as the blackbody at g T (I_nu / nu^3 is invariant: a
+//     blackbody stays one): the V band's Planck weight at g T x that temperature's colour. Its
+//     scale (the caller's) makes the disc's light, averaged over every direction, the nucleus's
+//     (UniCompact.h, DiscNormalization): the sprite hands its light to the disc as the disc is
+//     resolved, and the nucleus's colour is the disc's (Uni_NucleusColour).
+//   - Its axis: the host's disc normal tilted by up to 60 degrees (BH.SPIN; real AGN discs are only
+//     loosely aligned with their hosts).
+// References: R. Antonelli, "starless" (github.com/rantonels/starless); E. Bruneton, "Real-time
+// high-quality rendering of non-rotating black holes" (2020); J.-P. Luminet, "Image of a spherical
+// black hole with thin accretion disk" (A&A 75, 1979); O. James et al., "Gravitational lensing by
+// spinning black holes in astrophysics, and in the movie Interstellar" (CQG 32, 2015).
+
+#ifndef UNI_COMPACT_USH
+#define UNI_COMPACT_USH
+
+#include "UniCoreDefs.ush"
+#include "UniSeed.ush"
+#include "UniPlacement.ush"
+#include "UniPhotometry.ush"   // D-273: Uni_Luminance
+
+static const uint UNI_CH_BH_MASS = 0x1AF45697u;        // ChannelId("BH.MASS")       a galaxy black hole's mass scatter (draws 0, 1) and its host's bulge share (2) (D-272)
+static const uint UNI_CH_BH_EDDINGTON = 0xEB93DBAFu;   // ChannelId("BH.EDDINGTON")  its accretion rate: accreting or quiet, and where (draw 0) (D-272)
+
+static const float UNI_BH_LOG_LEDD = 38.100371f;       // log10 of the Eddington luminosity per solar mass, 1.26e38 erg/s
+static const float UNI_BH_LOG_LSUN = 33.582971f;       // log10 of the Sun's luminosity, 3.828e33 erg/s (IAU nominal)
+static const float UNI_BH_LOG_RS_SUN_CM = 5.470296f;   // log10 of the Sun's Schwarzschild radius, 2 G M_sun / c^2 = 2.9532e5 cm
+static const float UNI_BH_LOG_OPT_SHARE = -1.0f;       // log10 of the accretion light's share in the V band (~10% of bolometric)
+static const float UNI_BH_SUN_ABS_MAG_V = 4.83f;
+static const float UNI_BH_NONE_MAG = 99.0f;            // a nucleus too faint to matter (not drawn)
+
+// The galaxy relation (Haring & Rix 2004) and its hosts.
+static const float UNI_BH_LOG_MASS_RATIO = -2.853872f;   // log10 0.0014: black hole over bulge mass
+static const float UNI_BH_MASS_SCATTER_DEX = 0.3f;
+static const float UNI_BH_BT_DISC_LO = 0.08f;            // a disc galaxy's bulge share, log-uniform (Sd .. Sa)
+static const float UNI_BH_BT_DISC_HI = 0.45f;
+static const float UNI_BH_BT_EARLY_LO = 0.6f;            // an early type's, uniform (lenticular .. elliptical)
+static const float UNI_BH_BT_EARLY_HI = 1.0f;
+static const float UNI_BH_ML_DISC = 2.0f;                // the bulge's V mass-to-light ratio, solar units
+static const float UNI_BH_ML_EARLY = 4.0f;
+
+// The Eddington ratio's mixture (log10 lambda).
+static const float UNI_BH_EDD_SLOPE = 0.65f;             // accreting: p(log lambda) ~ lambda^-0.65 (Aird et al. 2012)
+static const float UNI_BH_EDD_ACTIVE_LO = -4.0f;
+static const float UNI_BH_EDD_ACTIVE_HI = 0.0f;
+static const float UNI_BH_EDD_QUIET_LO = -9.0f;          // quiet: log-uniform
+static const float UNI_BH_EDD_QUIET_HI = -5.0f;
+static const float UNI_BH_ACTIVE_SHARE = 0.4f;           // the default accreting share (uu.Bh.ActiveFraction): 30-40% of nearby galaxies host a low-level nucleus
+
+// D-273: the disc (the near field) and its light. D-272's colour model (5000 K at a low accretion
+// rate to 25000 K at a high one) is superseded: the nucleus's colour is its disc's.
+static const uint UNI_CH_BH_SPIN = 0x564A2FF7u;        // ChannelId("BH.SPIN")       its disc's axis from its host's: tilt (draw 0), azimuth (1) (D-273)
+static const float UNI_BH_ISCO_X = 3.0f;               // the innermost stable circular orbit (6 G M / c^2), R_s
+static const float UNI_BH_SHADOW_B = 2.5980762f;       // the shadow's impact parameter, 3 sqrt(3) / 2 R_s
+static const float UNI_BH_LOG_TSTAR = 31.2612f;        // log10 T*^4 + log10 M - log10 lambda: T*^4 = 9 L / (4 pi sigma R_s^2) (K^4), with L = 1.26e38 M lambda
+static const float UNI_BH_DISC_PEAK_P = 0.21402493f;   // (x^-3 (1 - sqrt(3 / x)))^1/4 at its peak, x = 49 / 12
+static const float UNI_BH_DISC_TMIN = 4000.0f;         // the disc's peak temperature at least this (a slow accretor's light stays warm)
+static const float UNI_BH_DISC_EDGE_K = 3000.0f;       // the disc ends where it has cooled to this (its V light gone)
+static const float UNI_BH_DISC_X_MIN = 12.0f;          // .. but no nearer than this, R_s
+static const float UNI_BH_DISC_X_MAX = 1000.0f;        // .. nor farther
+static const float UNI_BH_DISC_FADE = 0.6f;            // opaque to this x its outer radius, then fading to none at it
+static const float UNI_BH_V_HC_K = 26159.58f;          // h c / (k 550 nm): the V band's Planck weight 1 / (exp(this / T) - 1)
+static const float UNI_BH_AXIS_TILT_COS = 0.5f;        // the disc's axis within 60 degrees of its host's (uniform over that cap)
+static const uint UNI_BH_COLOUR_TAPS = 12u;            // Uni_NucleusColour's radii (12: 0.5% of a fine integral's chromaticity)
+
+struct FUniBlackHole
+{
+	float Log10Mass;        // solar masses
+	float Log10Eddington;   // the accretion rate's share of the Eddington rate
+	float Log10LumBol;      // its accretion's bolometric luminosity, erg/s
+	float AbsMagV;          // that light's V absolute magnitude (the V share), before any cap
+};
+
+/** A black hole of any mass from its mass and Eddington ratio (both log10). */
+UNI_FN FUniBlackHole Uni_BlackHoleOf(float InLog10Mass, float InLog10Eddington)
+{
+	FUniBlackHole B;
+	B.Log10Mass = InLog10Mass;
+	B.Log10Eddington = InLog10Eddington;
+	B.Log10LumBol = UNI_BH_LOG_LEDD + InLog10Mass + InLog10Eddington;
+	B.AbsMagV = UNI_BH_SUN_ABS_MAG_V - 2.5f * (B.Log10LumBol + UNI_BH_LOG_OPT_SHARE - UNI_BH_LOG_LSUN);
+	return B;
+}
+
+/** The Schwarzschild radius in cm (3e15 for 1e10 solar masses: a float holds it). */
+UNI_FN float Uni_BhSchwarzschildCm(float InLog10Mass)
+{
+	return pow(10.0f, UNI_BH_LOG_RS_SUN_CM + InLog10Mass);
+}
+
+/** log10 of the Eddington ratio from one uniform draw: accreting (InActive of them, the truncated
+ *  power law by its inverse CDF) or quiet (log-uniform). */
+UNI_FN float Uni_BhLog10EddingtonAt(float InU, float InActive)
+{
+	const float Act = saturate(InActive);
+	if (InU < Act)
+	{
+		const float V = InU / max(Act, 1.0e-6f);
+		const float Lo = pow(10.0f, -UNI_BH_EDD_SLOPE * UNI_BH_EDD_ACTIVE_LO);   // 10^(-a x) at the ends
+		const float Hi = pow(10.0f, -UNI_BH_EDD_SLOPE * UNI_BH_EDD_ACTIVE_HI);
+		return clamp(-log10(max(Lo - V * (Lo - Hi), 1.0e-30f)) / UNI_BH_EDD_SLOPE, UNI_BH_EDD_ACTIVE_LO, UNI_BH_EDD_ACTIVE_HI);
+	}
+	const float W = (InU - Act) / max(1.0f - Act, 1.0e-6f);
+	return UNI_BH_EDD_QUIET_LO + (UNI_BH_EDD_QUIET_HI - UNI_BH_EDD_QUIET_LO) * saturate(W);
+}
+
+/** A galaxy's bulge share of its V light (by type, from BH.MASS draw 2). */
+UNI_FN float Uni_GalaxyBulgeShare(uint InSeed, bool InEarly)
+{
+	const float U = Uni_DrawUnit(InSeed, UNI_CH_BH_MASS, 2u);
+	if (InEarly) { return UNI_BH_BT_EARLY_LO + (UNI_BH_BT_EARLY_HI - UNI_BH_BT_EARLY_LO) * U; }
+	return UNI_BH_BT_DISC_LO * pow(UNI_BH_BT_DISC_HI / UNI_BH_BT_DISC_LO, U);
+}
+
+/** log10 of the bulge's mass (solar) from the host's V absolute magnitude. */
+UNI_FN float Uni_GalaxyLog10BulgeMass(uint InSeed, float InHostAbsMag, bool InEarly)
+{
+	const float LogL = -0.4f * (InHostAbsMag - UNI_BH_SUN_ABS_MAG_V);
+	return LogL + log10(Uni_GalaxyBulgeShare(InSeed, InEarly) * (InEarly ? UNI_BH_ML_EARLY : UNI_BH_ML_DISC));
+}
+
+/** The relation's scatter in units of its sigma: a standard normal (Box-Muller from BH.MASS draws 0
+ *  and 1), held within 3 sigma. */
+UNI_FN float Uni_GalaxyBhMassZ(uint InSeed)
+{
+	const float U1 = Uni_DrawUnitPos(InSeed, UNI_CH_BH_MASS, 0u);
+	const float U2 = Uni_DrawUnit(InSeed, UNI_CH_BH_MASS, 1u);
+	return clamp(sqrt(-2.0f * log(U1)) * cos(6.2831853f * U2), -3.0f, 3.0f);
+}
+
+/** A galaxy's supermassive black hole from its record (seed, V magnitude, early-type flag).
+ *  InActive: the accreting share (uu.Bh.ActiveFraction). */
+UNI_FN FUniBlackHole Uni_GalaxyBlackHole(FUniObject InObj, float InActive)
+{
+	const uint Seed = InObj.B.x;
+	const bool bEarly = (Uni_ObjectFlags(InObj) & UNI_OBJ_FLAG_EARLY) != 0u;
+	const float LogM = UNI_BH_LOG_MASS_RATIO + Uni_GalaxyLog10BulgeMass(Seed, Uni_ObjectAbsMag(InObj), bEarly) + UNI_BH_MASS_SCATTER_DEX * Uni_GalaxyBhMassZ(Seed);
+	return Uni_BlackHoleOf(LogM, Uni_BhLog10EddingtonAt(Uni_DrawUnit(Seed, UNI_CH_BH_EDDINGTON, 0u), InActive));
+}
+
+/** The nucleus the galaxy shows: the black hole's V light x InGain, at most InCap x the host's;
+ *  UNI_BH_NONE_MAG where under 1e-6 of the host (nothing to draw). */
+UNI_FN float Uni_NucleusAbsMag(FUniBlackHole InBh, float InHostAbsMag, float InCap, float InGain)
+{
+	if (!(InGain > 0.0f) || !(InCap > 0.0f)) { return UNI_BH_NONE_MAG; }
+	const float LogRatio = -0.4f * (InBh.AbsMagV - InHostAbsMag) + log10(InGain);   // log10 (nucleus / host)
+	if (LogRatio < -6.0f) { return UNI_BH_NONE_MAG; }
+	return InHostAbsMag - 2.5f * min(LogRatio, log10(InCap));
+}
+
+/** D-273: the disc's peak temperature (K): the thin disc's, T* x 0.214 at x = 49 / 12, from its
+ *  mass and Eddington ratio (T* ~ (lambda / M)^1/4: ~8e4 K for 1e8 M_sun at 0.1, ~1e7 K for a
+ *  stellar black hole), at least UNI_BH_DISC_TMIN. */
+UNI_FN float Uni_BhDiscPeakK(FUniBlackHole InBh)
+{
+	const float LogT = 0.25f * (UNI_BH_LOG_TSTAR + InBh.Log10Eddington - InBh.Log10Mass);
+	return max(UNI_BH_DISC_PEAK_P * pow(10.0f, LogT), UNI_BH_DISC_TMIN);
+}
+
+/** The disc's temperature at x (R_s) over its peak: 0 inside the innermost stable orbit. */
+UNI_FN float Uni_BhDiscProfile(float InX)
+{
+	if (!(InX > UNI_BH_ISCO_X)) { return 0.0f; }
+	return pow(max(1.0f - sqrt(UNI_BH_ISCO_X / InX), 0.0f) / (InX * InX * InX), 0.25f) * (1.0f / UNI_BH_DISC_PEAK_P);
+}
+
+/** The disc's outer radius (R_s): where it has cooled to UNI_BH_DISC_EDGE_K, within
+ *  [UNI_BH_DISC_X_MIN, UNI_BH_DISC_X_MAX] (a fixed point of the profile, 6 rounds). */
+UNI_FN float Uni_BhDiscOuterX(float InPeakK)
+{
+	const float Q = UNI_BH_DISC_PEAK_P * UNI_BH_DISC_EDGE_K / max(InPeakK, 1.0f);
+	float X = pow(Q, -4.0f / 3.0f);
+	UNI_UNROLL
+	for (int I = 0; I < 6; ++I)
+	{
+		X = pow(Q / pow(max(1.0f - sqrt(UNI_BH_ISCO_X / max(X, 3.01f)), 1.0e-4f), 0.25f), -4.0f / 3.0f);
+	}
+	return clamp(X, UNI_BH_DISC_X_MIN, UNI_BH_DISC_X_MAX);
+}
+
+/** The disc's opacity at x (R_s): 1 from the innermost stable orbit to UNI_BH_DISC_FADE x its outer
+ *  radius, falling smoothly to 0 at it; 0 inside the innermost stable orbit (the plunging gas). */
+UNI_FN float Uni_BhDiscOpacity(float InX, float InOuterX)
+{
+	if (!(InX >= UNI_BH_ISCO_X) || !(InX <= InOuterX)) { return 0.0f; }
+	return 1.0f - smoothstep(UNI_BH_DISC_FADE * InOuterX, InOuterX, InX);
+}
+
+/** The V band's Planck weight of a blackbody at InK (relative: 1 / (exp(hc / k lambda T) - 1)). */
+UNI_FN float Uni_BhPlanckV(float InK)
+{
+	return 1.0f / (exp(min(UNI_BH_V_HC_K / max(InK, 1.0f), 80.0f)) - 1.0f);
+}
+
+/** A blackbody's light at InK in the disc's units: its V weight x its colour at luminance 1. */
+UNI_FN float3 Uni_BhDiscLight(float InK)
+{
+	const float3 C = Uni_TemperatureColour(InK);
+	return C * (Uni_BhPlanckV(InK) / max(Uni_Luminance(C), 1.0e-3f));
+}
+
+// D-273: the disc's light by direction (Tools/UniVerify: `univerify lenstable`, generated from the
+// lens core; T1.lens.disc_light checks it between its nodes). Rows: peak temperature, ln-even from
+// 4000 K to 1e7 K (36, clamped beyond); columns: cos i = 0, 1/16 .. 1 to the disc's axis (17).
+//   UNI_BH_DISC_BEAM     the disc's light seen from far over its mean over directions (the nucleus
+//                        sprite's factor: face-on brighter, edge-on dimmer, a small disc lifted by
+//                        its own lensing);
+//   UNI_BH_DISC_LOGNORM  log10 of that mean (R_s^2 x sr x Uni_BhDiscLight units at radiance scale 1).
+static const uint UNI_BH_BEAM_NT = 36u;
+static const uint UNI_BH_BEAM_NM = 17u;
+static const float UNI_BH_BEAM_LNT0 = 8.294050f;   // ln 4000
+static const float UNI_BH_BEAM_DLNT = 0.223544f;   // ln(1e7 / 4000) / 35
+static const float UNI_BH_DISC_BEAM[612] = {
+	0.34070f, 0.54089f, 0.72434f, 0.88056f, 1.01107f, 1.11281f, 1.18734f, 1.23895f, 1.26381f, 1.26074f, 1.23162f, 1.17926f, 1.10623f, 1.01631f, 0.91173f, 0.79879f, 0.67382f,
+	0.33758f, 0.49781f, 0.64818f, 0.78107f, 0.89790f, 0.99516f, 1.07601f, 1.14321f, 1.19264f, 1.22170f, 1.23008f, 1.22005f, 1.19160f, 1.14653f, 1.08711f, 1.01620f, 0.92843f,
+	0.29898f, 0.43338f, 0.56255f, 0.68014f, 0.78454f, 0.88515f, 0.98266f, 1.06681f, 1.13677f, 1.19218f, 1.23241f, 1.25872f, 1.27082f, 1.26951f, 1.25494f, 1.23003f, 1.18795f,
+	0.27100f, 0.38714f, 0.49935f, 0.59949f, 0.70671f, 0.81738f, 0.91970f, 1.01211f, 1.09501f, 1.16739f, 1.22940f, 1.28179f, 1.32332f, 1.35512f, 1.37664f, 1.38991f, 1.38743f,
+	0.24839f, 0.34909f, 0.44382f, 0.54342f, 0.65966f, 0.77123f, 0.87610f, 0.97454f, 1.06615f, 1.15052f, 1.22764f, 1.29780f, 1.36004f, 1.41510f, 1.46252f, 1.50456f, 1.53470f,
+	0.21700f, 0.30974f, 0.39602f, 0.51069f, 0.62802f, 0.73991f, 0.84722f, 0.94956f, 1.04724f, 1.13987f, 1.22726f, 1.31001f, 1.38682f, 1.45885f, 1.52528f, 1.58803f, 1.64062f,
+	0.18982f, 0.27385f, 0.36757f, 0.48739f, 0.60419f, 0.71684f, 0.82611f, 0.93175f, 1.03409f, 1.13287f, 1.22803f, 1.31965f, 1.40727f, 1.49119f, 1.57188f, 1.64959f, 1.71941f,
+	0.16533f, 0.23862f, 0.34811f, 0.46856f, 0.58554f, 0.69941f, 0.81079f, 0.91957f, 1.02585f, 1.12953f, 1.23049f, 1.32905f, 1.42453f, 1.51742f, 1.60739f, 1.69546f, 1.77878f,
+	0.13976f, 0.21321f, 0.33270f, 0.45318f, 0.57081f, 0.68584f, 0.79904f, 0.91027f, 1.01967f, 1.12721f, 1.23268f, 1.33649f, 1.43805f, 1.53777f, 1.63516f, 1.73116f, 1.82348f,
+	0.11842f, 0.19647f, 0.31968f, 0.44020f, 0.55836f, 0.67459f, 0.78933f, 0.90268f, 1.01473f, 1.12543f, 1.23463f, 1.34251f, 1.44880f, 1.55367f, 1.65690f, 1.75908f, 1.85818f,
+	0.09813f, 0.18338f, 0.30786f, 0.42879f, 0.54781f, 0.66534f, 0.78165f, 0.89690f, 1.01125f, 1.12452f, 1.23662f, 1.34789f, 1.45790f, 1.56682f, 1.67456f, 1.78154f, 1.88582f,
+	0.08039f, 0.17300f, 0.29756f, 0.41895f, 0.53874f, 0.65740f, 0.77518f, 0.89221f, 1.00852f, 1.12404f, 1.23867f, 1.35262f, 1.46563f, 1.57790f, 1.68915f, 1.79986f, 1.90880f,
+	0.06448f, 0.16407f, 0.28879f, 0.41085f, 0.53150f, 0.65114f, 0.77027f, 0.88863f, 1.00654f, 1.12390f, 1.24048f, 1.35663f, 1.47209f, 1.58697f, 1.70096f, 1.81458f, 1.92718f,
+	0.05191f, 0.15682f, 0.28139f, 0.40372f, 0.52511f, 0.64577f, 0.76592f, 0.88565f, 1.00496f, 1.12379f, 1.24214f, 1.36014f, 1.47756f, 1.59454f, 1.71096f, 1.82705f, 1.94204f,
+	0.04145f, 0.15070f, 0.27538f, 0.39814f, 0.52009f, 0.64154f, 0.76259f, 0.88327f, 1.00369f, 1.12379f, 1.24352f, 1.36296f, 1.48197f, 1.60066f, 1.71893f, 1.83692f, 1.95425f,
+	0.03268f, 0.14559f, 0.27028f, 0.39342f, 0.51594f, 0.63805f, 0.75988f, 0.88144f, 1.00279f, 1.12390f, 1.24474f, 1.36537f, 1.48568f, 1.60573f, 1.72544f, 1.84496f, 1.96396f,
+	0.02618f, 0.14175f, 0.26647f, 0.38989f, 0.51284f, 0.63547f, 0.75789f, 0.88010f, 1.00216f, 1.12401f, 1.24565f, 1.36716f, 1.48842f, 1.60949f, 1.73029f, 1.85094f, 1.97121f,
+	0.02143f, 0.13888f, 0.26363f, 0.38727f, 0.51053f, 0.63354f, 0.75640f, 0.87909f, 1.00167f, 1.12408f, 1.24634f, 1.36850f, 1.49046f, 1.61228f, 1.73389f, 1.85538f, 1.97658f,
+	0.01803f, 0.13680f, 0.26157f, 0.38537f, 0.50887f, 0.63216f, 0.75533f, 0.87837f, 1.00132f, 1.12415f, 1.24685f, 1.36947f, 1.49194f, 1.61430f, 1.73649f, 1.85859f, 1.98045f,
+	0.01562f, 0.13531f, 0.26010f, 0.38402f, 0.50768f, 0.63117f, 0.75457f, 0.87786f, 1.00108f, 1.12419f, 1.24721f, 1.37016f, 1.49299f, 1.61573f, 1.73833f, 1.86086f, 1.98320f,
+	0.01392f, 0.13426f, 0.25906f, 0.38306f, 0.50684f, 0.63048f, 0.75403f, 0.87750f, 1.00091f, 1.12423f, 1.24747f, 1.37065f, 1.49374f, 1.61674f, 1.73963f, 1.86246f, 1.98513f,
+	0.01272f, 0.13351f, 0.25832f, 0.38238f, 0.50625f, 0.62999f, 0.75366f, 0.87725f, 1.00079f, 1.12426f, 1.24765f, 1.37100f, 1.49427f, 1.61746f, 1.74056f, 1.86360f, 1.98650f,
+	0.01185f, 0.13297f, 0.25779f, 0.38189f, 0.50582f, 0.62963f, 0.75339f, 0.87707f, 1.00071f, 1.12428f, 1.24779f, 1.37126f, 1.49465f, 1.61798f, 1.74122f, 1.86442f, 1.98748f,
+	0.01122f, 0.13257f, 0.25740f, 0.38153f, 0.50551f, 0.62937f, 0.75319f, 0.87694f, 1.00065f, 1.12429f, 1.24788f, 1.37144f, 1.49492f, 1.61836f, 1.74170f, 1.86501f, 1.98819f,
+	0.01075f, 0.13228f, 0.25711f, 0.38127f, 0.50528f, 0.62918f, 0.75305f, 0.87684f, 1.00061f, 1.12431f, 1.24796f, 1.37158f, 1.49513f, 1.61864f, 1.74206f, 1.86545f, 1.98872f,
+	0.01039f, 0.13206f, 0.25689f, 0.38107f, 0.50510f, 0.62904f, 0.75294f, 0.87677f, 1.00057f, 1.12432f, 1.24801f, 1.37168f, 1.49529f, 1.61884f, 1.74233f, 1.86578f, 1.98911f,
+	0.01013f, 0.13189f, 0.25672f, 0.38092f, 0.50497f, 0.62893f, 0.75286f, 0.87671f, 1.00055f, 1.12432f, 1.24806f, 1.37176f, 1.49540f, 1.61900f, 1.74253f, 1.86603f, 1.98941f,
+	0.00992f, 0.13176f, 0.25660f, 0.38080f, 0.50487f, 0.62885f, 0.75279f, 0.87667f, 1.00053f, 1.12433f, 1.24809f, 1.37182f, 1.49549f, 1.61912f, 1.74268f, 1.86622f, 1.98964f,
+	0.00977f, 0.13166f, 0.25650f, 0.38072f, 0.50479f, 0.62879f, 0.75275f, 0.87664f, 1.00052f, 1.12434f, 1.24811f, 1.37187f, 1.49556f, 1.61922f, 1.74280f, 1.86636f, 1.98981f,
+	0.00964f, 0.13158f, 0.25643f, 0.38065f, 0.50473f, 0.62874f, 0.75271f, 0.87662f, 1.00051f, 1.12434f, 1.24813f, 1.37190f, 1.49562f, 1.61929f, 1.74290f, 1.86648f, 1.98995f,
+	0.00955f, 0.13152f, 0.25637f, 0.38059f, 0.50469f, 0.62870f, 0.75268f, 0.87660f, 1.00050f, 1.12434f, 1.24815f, 1.37193f, 1.49566f, 1.61935f, 1.74297f, 1.86656f, 1.99005f,
+	0.00947f, 0.13147f, 0.25632f, 0.38055f, 0.50465f, 0.62867f, 0.75266f, 0.87658f, 1.00049f, 1.12434f, 1.24816f, 1.37195f, 1.49569f, 1.61939f, 1.74302f, 1.86663f, 1.99014f,
+	0.00941f, 0.13144f, 0.25628f, 0.38052f, 0.50462f, 0.62865f, 0.75264f, 0.87657f, 1.00049f, 1.12435f, 1.24817f, 1.37197f, 1.49572f, 1.61943f, 1.74307f, 1.86669f, 1.99020f,
+	0.00937f, 0.13141f, 0.25625f, 0.38049f, 0.50460f, 0.62863f, 0.75262f, 0.87656f, 1.00048f, 1.12435f, 1.24818f, 1.37199f, 1.49574f, 1.61945f, 1.74310f, 1.86673f, 1.99025f,
+	0.00933f, 0.13138f, 0.25623f, 0.38047f, 0.50458f, 0.62861f, 0.75261f, 0.87655f, 1.00048f, 1.12435f, 1.24818f, 1.37200f, 1.49575f, 1.61948f, 1.74313f, 1.86677f, 1.99029f,
+	0.00930f, 0.13137f, 0.25621f, 0.38045f, 0.50457f, 0.62860f, 0.75260f, 0.87655f, 1.00048f, 1.12435f, 1.24819f, 1.37201f, 1.49577f, 1.61949f, 1.74315f, 1.86679f, 1.99033f
+};
+static const float UNI_BH_DISC_LOGNORM[36] = {
+	-1.21578f, -0.59245f, 0.00327f, 0.51158f, 0.95678f, 1.35538f, 1.71896f, 2.05557f, 2.37314f, 2.67628f, 2.96889f, 3.25360f, 3.53253f, 3.80703f, 4.07831f, 4.34710f, 4.60275f, 4.84417f, 5.06801f, 5.27266f, 5.45867f, 5.62797f, 5.78303f, 5.92636f, 6.06023f, 6.18652f, 6.30680f, 6.42231f, 6.53404f, 6.64277f, 6.74914f, 6.85361f, 6.95659f, 7.05838f, 7.15921f, 7.25929f
+};
+
+/** The table's row position of a peak temperature (clamped to the grid). */
+UNI_FN float Uni_BhBeamRow(float InPeakK)
+{
+	return clamp((log(max(InPeakK, 1.0f)) - UNI_BH_BEAM_LNT0) / UNI_BH_BEAM_DLNT, 0.0f, (float)(UNI_BH_BEAM_NT - 1u));
+}
+
+/** The nucleus's light towards a direction at |cos i| to its disc's axis, over its mean over
+ *  directions (bilinear in the table). */
+UNI_FN float Uni_BhDiscBeam(float InPeakK, float InAbsCosI)
+{
+	const float Tr = Uni_BhBeamRow(InPeakK);
+	const uint T0 = min((uint)Tr, UNI_BH_BEAM_NT - 2u);
+	const float Ft = Tr - (float)T0;
+	const float Mr = saturate(InAbsCosI) * (float)(UNI_BH_BEAM_NM - 1u);
+	const uint M0 = min((uint)Mr, UNI_BH_BEAM_NM - 2u);
+	const float Fm = Mr - (float)M0;
+	const uint I0 = T0 * UNI_BH_BEAM_NM + M0;
+	const float A = UNI_BH_DISC_BEAM[I0] + (UNI_BH_DISC_BEAM[I0 + 1u] - UNI_BH_DISC_BEAM[I0]) * Fm;
+	const float B = UNI_BH_DISC_BEAM[I0 + UNI_BH_BEAM_NM] + (UNI_BH_DISC_BEAM[I0 + UNI_BH_BEAM_NM + 1u] - UNI_BH_DISC_BEAM[I0 + UNI_BH_BEAM_NM]) * Fm;
+	return A + (B - A) * Ft;
+}
+
+/** log10 of the disc's light averaged over directions at radiance scale 1 (linear in ln T). */
+UNI_FN float Uni_BhDiscLog10Norm(float InPeakK)
+{
+	const float Tr = Uni_BhBeamRow(InPeakK);
+	const uint T0 = min((uint)Tr, UNI_BH_BEAM_NT - 2u);
+	const float Ft = Tr - (float)T0;
+	return UNI_BH_DISC_LOGNORM[T0] + (UNI_BH_DISC_LOGNORM[T0 + 1u] - UNI_BH_DISC_LOGNORM[T0]) * Ft;
+}
+
+/** The nucleus's colour (brightest channel 1): its disc's light summed over its radii
+ *  (UNI_BH_COLOUR_TAPS, even in ln x from the innermost stable orbit to the outer radius, each
+ *  annulus x its opacity), unshifted: within 0.5% of the disc's colour averaged over every
+ *  direction with its shifts (1% where the peak is near the floor), so the sprite and the disc it
+ *  hands its light to agree. */
+UNI_FN float3 Uni_NucleusColour(FUniBlackHole InBh)
+{
+	const float Peak = Uni_BhDiscPeakK(InBh);
+	const float Outer = Uni_BhDiscOuterX(Peak);
+	const float LnSpan = log(Outer / UNI_BH_ISCO_X);
+	float3 Sum = float3(0.0f, 0.0f, 0.0f);
+	UNI_UNROLL
+	for (uint I = 0u; I < UNI_BH_COLOUR_TAPS; ++I)
+	{
+		const float X = UNI_BH_ISCO_X * exp(LnSpan * (((float)I + 0.5f) / (float)UNI_BH_COLOUR_TAPS));
+		Sum += Uni_BhDiscLight(Peak * Uni_BhDiscProfile(X)) * (Uni_BhDiscOpacity(X, Outer) * X * X);   // x dx = x^2 d(ln x)
+	}
+	const float M = max(Sum.x, max(Sum.y, Sum.z));
+	return M > 0.0f ? Sum / M : Uni_TemperatureColour(Peak);
+}
+
+/** The disc's axis: its host's disc normal (unit) tilted within UNI_BH_AXIS_TILT_COS (uniform over
+ *  the cap; BH.SPIN draws 0, 1). */
+UNI_FN float3 Uni_BhDiscAxis(uint InSeed, float3 InHostNormal)
+{
+	const float CosT = 1.0f - (1.0f - UNI_BH_AXIS_TILT_COS) * Uni_DrawUnit(InSeed, UNI_CH_BH_SPIN, 0u);
+	const float SinT = sqrt(max(1.0f - CosT * CosT, 0.0f));
+	const float Az = 6.2831853f * Uni_DrawUnit(InSeed, UNI_CH_BH_SPIN, 1u);
+	const float3 N = normalize(InHostNormal);
+	const float3 Ref = abs(N.z) < 0.9f ? float3(0.0f, 0.0f, 1.0f) : float3(1.0f, 0.0f, 0.0f);
+	const float3 E1 = normalize(cross(Ref, N));
+	const float3 E2 = cross(N, E1);
+	return normalize(N * CosT + (E1 * cos(Az) + E2 * sin(Az)) * SinT);
+}
+
+/** D-274 (owner 2026-11-17: "the brightness of the black hole up close is much too bright for me
+ *  to inspect the effect, it is masked by the bloom and flare"): the disc's light per pixel
+ *  (exposure units) softened above a knee: unchanged up to it, then Knee (1 + log10(L / Knee)),
+ *  its colour kept. Continuous and monotone (the slope drops to 1 / ln 10 at the knee): 10x the knee reads 2x, 1e8x
+ *  (an active nucleus's inner disc a few hundred R_s away) 9x, so the disc's structure (the
+ *  Doppler side, the lifted far side, the photon ring) survives under bloom. Render only; a knee
+ *  of 0 is physical. */
+static const float UNI_BH_DISC_KNEE = 2.0f;            // uu.Bh.DiscKnee's default (exposure units per pixel)
+
+UNI_FN float3 Uni_BhDiscSoften(float3 InRgb, float InKnee)
+{
+	if (!(InKnee > 0.0f)) { return InRgb; }
+	const float L = Uni_Luminance(InRgb);
+	if (!(L > InKnee)) { return InRgb; }
+	return InRgb * (InKnee * (1.0f + log10(L / InKnee)) / L);
+}
+
+// ------------------------------------------------------------------------------------------
+// D-273: lensing and the disc along a camera ray (units of R_s, the black hole at the origin)
+// ------------------------------------------------------------------------------------------
+
+static const float UNI_LENS_SPHERE_X = 200.0f;     // the integrated sphere's radius at least this, R_s (1.25 x the disc's outer radius when larger): beyond it the closed form's 2nd order (15 pi / 16 b^2) is under 1e-4 rad
+static const float UNI_LENS_STEP = 0.06f;          // an RK4 step is this x r (speed-normalised) within UNI_LENS_NEAR_X; x0.5 inside 3 R_s, where rays wind about the photon sphere
+static const float UNI_LENS_STEP_FAR = 0.15f;      // .. and this beyond it (nearly straight)
+static const float UNI_LENS_NEAR_X = 20.0f;
+static const uint UNI_LENS_MAX_STEPS = 400u;       // a ray still winding after this many is taken as fallen in (it is within ~1e-4 of the shadow's edge)
+static const uint UNI_LENS_MAX_CROSSINGS = 4u;     // disc crossings shaded (the 4th image is ~e^-3pi fainter)
+
+struct FUniLensDisc
+{
+	float3 Axis;        // unit, world axes
+	float OuterX;       // its outer radius, R_s (Uni_BhDiscOuterX)
+	float PeakK;        // its peak temperature (Uni_BhDiscPeakK)
+	float bDisc;        // 0: no disc (lensing alone)
+	float Pad0;
+	float Pad1;
+	// D-276: the volumetric disc (Thickness > 0; 0: D-273's thin disc) and its look.
+	float3 E1;          // a unit vector in its plane (the azimuth's zero; E2 = Axis x E1)
+	float Thickness;    // its Gaussian half-thickness over the radius, H = Thickness x rho (flared)
+	float Opacity;      // its optical depth through the plane at mean density
+	float Clouds;       // 0..1: smooth .. clumped (cloud gaps the sky shows through)
+	float Bands;        // the rings' brightness contrast (0: none)
+	float Heat;         // the clumps' temperature contrast (0: none)
+	float Spiral;       // the clouds' log-spiral winding (radians per e-fold of radius)
+	float OmegaIsco;    // the gas's angular speed at the innermost stable orbit, rad / s (art; Keplerian outwards)
+	float FlowTA;       // the two flow phases' times (s) ..
+	float FlowTB;
+	float FlowWA;       // .. and phase A's weight (B's 1 - it)
+	uint SeedA;         // the two phases' cloud seeds (a fresh cloud pattern each cycle)
+	uint SeedB;
+	uint MaxSamples;    // the most volume samples a ray takes (0: UNI_LENS_VOL_SAMPLES)
+	float Falloff;      // the light's fall with temperature: (Planck(gT) / Planck(peak))^Falloff x Planck(peak) (1: physical, the V band's; < 1: the cooler outer disc glows)
+	float Erosion;      // D-278: 0..1: the clouds' edges, the disc's top surface and rim eaten by a finer noise (0: D-276's)
+	float LookPad1;
+	float LookPad2;
+};
+
+struct FUniLensResult
+{
+	float3 Dir;         // where the ray came from: its direction at infinity (world axes; any when it fell in)
+	float Captured;     // 1: it fell in (the shadow)
+	float3 Disc;        // the disc's light along it (Uni_BhDiscLight units, each crossing x its opacity x what is in front)
+	float Transmit;     // the share of the scene behind still seen through the disc
+	float Steps;        // RK4 steps taken
+	float Deflection;   // angle between the ray's direction at the camera and Dir, rad
+	float ImpactB;      // the photon's impact parameter, R_s
+	float3 FirstPos;    // the first disc crossing (R_s; diagnostics) ..
+	float FirstX;       // .. its radius (0: none) ..
+	float FirstG;       // .. and its shift g
+	float Pad0;
+	float Pad1;
+	float Pad2;
+};
+
+// D-276: the volumetric disc's clouds (owner 2026-11-17 10:23: "disc clouds rather than a static disc
+// ... some form of noise ... potentially with like spiral distortion"; "rotation ... bands of
+// differing light intensity and fusion colors"; "volume ... that can be transited through"). Value
+// noise (an integer lattice hash: the same on the GPU and the CPU), fBm in the disc's co-rotating
+// cylinder (cos, sin of the azimuth winding as a log spiral; ln radius; height over the thickness),
+// so it has no seam. Differential rotation would wind any pattern into ever thinner threads: two
+// flow phases (Vlachos, "Water flow in Portal 2", 2010) each advect it for one cycle and restart
+// with a fresh seed, cross-faded (each phase's weight 0 at its restart).
+static const uint UNI_LENS_VOL_SAMPLES = 192u;     // the volume samples a ray takes at half a thickness apart (D-278 with erosion: mean 74, past it 2% of rays); past it one an RK4 step
+static const float UNI_BH_VOL_INNER = 2.6f;        // the volume's inner edge (R_s): the plunging gas thins from here to the ISCO
+static const float UNI_BH_CLOUD_FA = 2.5f;         // the clouds' frequency around the disc (cylinder radius in noise units)
+static const float UNI_BH_CLOUD_FR = 3.0f;         // .. along ln radius
+static const float UNI_BH_CLOUD_FZ = 0.5f;         // .. through its height (per thickness)
+static const float UNI_BH_BAND_RINGS = 7.0f;       // rings across the disc (even in ln radius)
+
+UNI_FN float Uni_BhHash(float3 InC, uint InSeed)
+{
+	const uint X = (uint)((int)InC.x), Y = (uint)((int)InC.y), Z = (uint)((int)InC.z);
+	const uint H = Uni_Avalanche((X * 73856093u) ^ (Y * 19349663u) ^ (Z * 83492791u) ^ (InSeed * 2654435761u));
+	return (float)(H & 0xFFFFFFu) * (1.0f / 16777216.0f);
+}
+
+/** Value noise in [0, 1] (quintic fade). */
+UNI_FN float Uni_BhNoise(float3 InP, uint InSeed)
+{
+	const float3 I = float3(floor(InP.x), floor(InP.y), floor(InP.z));
+	const float3 F = InP - I;
+	const float3 U = F * F * F * (F * (F * 6.0f - float3(15.0f, 15.0f, 15.0f)) + float3(10.0f, 10.0f, 10.0f));
+	const float A = lerp(Uni_BhHash(I, InSeed), Uni_BhHash(I + float3(1.0f, 0.0f, 0.0f), InSeed), U.x);
+	const float B = lerp(Uni_BhHash(I + float3(0.0f, 1.0f, 0.0f), InSeed), Uni_BhHash(I + float3(1.0f, 1.0f, 0.0f), InSeed), U.x);
+	const float C = lerp(Uni_BhHash(I + float3(0.0f, 0.0f, 1.0f), InSeed), Uni_BhHash(I + float3(1.0f, 0.0f, 1.0f), InSeed), U.x);
+	const float D = lerp(Uni_BhHash(I + float3(0.0f, 1.0f, 1.0f), InSeed), Uni_BhHash(I + float3(1.0f, 1.0f, 1.0f), InSeed), U.x);
+	return lerp(lerp(A, B, U.y), lerp(C, D, U.y), U.z);
+}
+
+/** 3 octaves of it (mean ~0.5). */
+UNI_FN float Uni_BhFbm(float3 InP, uint InSeed)
+{
+	return (Uni_BhNoise(InP, InSeed) * 0.5714f + Uni_BhNoise(InP * 2.03f + float3(17.1f, 9.3f, 3.7f), InSeed + 1u) * 0.2857f
+		+ Uni_BhNoise(InP * 4.11f + float3(5.3f, 31.7f, 11.1f), InSeed + 2u) * 0.1429f);
+}
+
+/** The clouds at a point (disc frame: Rho, the azimuth's cos / sin, Z), one flow phase. */
+UNI_FN float Uni_BhCloudPhase(float InLnR, float InCos, float InSin, float InZh, float InTurn, uint InSeed)
+{
+	const float C = cos(InTurn), S = sin(InTurn);
+	const float Cr = InCos * C + InSin * S, Sr = InSin * C - InCos * S;   // the azimuth turned back by InTurn
+	return Uni_BhFbm(float3(Cr * UNI_BH_CLOUD_FA, Sr * UNI_BH_CLOUD_FA, InLnR * UNI_BH_CLOUD_FR + InZh * UNI_BH_CLOUD_FZ), InSeed);
+}
+
+/** D-278: the clouds' erosion detail, one flow phase: 2 octaves at 5x the clouds' frequency (3x
+ *  through the height), moving with the gas (the same turn). */
+UNI_FN float Uni_BhDetailPhase(float InLnR, float InCos, float InSin, float InZh, float InTurn, uint InSeed)
+{
+	const float C = cos(InTurn), S = sin(InTurn);
+	const float Cr = InCos * C + InSin * S, Sr = InSin * C - InCos * S;
+	const float3 P = float3(Cr * (5.0f * UNI_BH_CLOUD_FA), Sr * (5.0f * UNI_BH_CLOUD_FA), InLnR * (5.0f * UNI_BH_CLOUD_FR) + InZh * (3.0f * UNI_BH_CLOUD_FZ));
+	return Uni_BhNoise(P, InSeed + 11u) * 0.6667f + Uni_BhNoise(P * 2.07f + float3(7.7f, 3.1f, 13.3f), InSeed + 12u) * 0.3333f;
+}
+
+/** The volumetric disc at a point (R_s, world axes about the hole): its absorption (per R_s) and
+ *  source (Uni_BhDiscLight units: the light it shows where optically thick), shifted by the gas's
+ *  motion for a photon of angular momentum InLambda about the axis. */
+UNI_FN void Uni_BhDiscSample(float3 InP, FUniLensDisc InDisc, float InLambda, UNI_OUT(float) OutAlpha, UNI_OUT(float3) OutSource)
+{
+	OutAlpha = 0.0f;
+	OutSource = float3(0.0f, 0.0f, 0.0f);
+	const float Z = dot(InP, InDisc.Axis);
+	const float3 Pp = InP - InDisc.Axis * Z;
+	const float Rho = length(Pp);
+	if (!(Rho > UNI_BH_VOL_INNER) || !(Rho < InDisc.OuterX)) { return; }
+	const float H = max(InDisc.Thickness * Rho, 1.0e-4f);
+	const float Zh0 = Z / H;
+	if (abs(Zh0) > 3.5f * (1.0f + 0.5f * InDisc.Erosion)) { return; }
+	const float3 E2 = cross(InDisc.Axis, InDisc.E1);
+	const float Cs = dot(Pp, InDisc.E1) / Rho, Sn = dot(Pp, E2) / Rho;
+	const float LnR = log(Rho * (1.0f / UNI_BH_ISCO_X));
+	// Its angular speed (Keplerian from the ISCO's), the turn each phase has advected it by, and the spiral.
+	const float Om = InDisc.OmegaIsco * pow(max(Rho * (1.0f / UNI_BH_ISCO_X), 0.1f), -1.5f);
+	const float Wind = InDisc.Spiral * LnR;
+	const float Na = Uni_BhCloudPhase(LnR, Cs, Sn, Zh0, Om * InDisc.FlowTA - Wind, InDisc.SeedA);
+	const float Nb = Uni_BhCloudPhase(LnR, Cs, Sn, Zh0, Om * InDisc.FlowTB - Wind, InDisc.SeedB);
+	float N = Na * InDisc.FlowWA + Nb * (1.0f - InDisc.FlowWA);
+	// D-278: erosion (the volumetric-cloud way, Schneider 2015): a finer noise eats the clouds' thin
+	// edges and leaves their cores; it also roughens the disc's top surface (the height scaled by
+	// it) and its outer rim. Off at Erosion 0 (D-276's disc exactly).
+	float Zh = Zh0;
+	float RhoEdge = Rho;
+	if (InDisc.Erosion > 0.0f)
+	{
+		// Its own, looser winding (a quarter of the clouds'): it cuts across their streaks.
+		const float Da = Uni_BhDetailPhase(LnR, Cs, Sn, Zh0, Om * InDisc.FlowTA - 0.25f * Wind, InDisc.SeedA);
+		const float Db = Uni_BhDetailPhase(LnR, Cs, Sn, Zh0, Om * InDisc.FlowTB - 0.25f * Wind, InDisc.SeedB);
+		const float Dn = Da * InDisc.FlowWA + Db * (1.0f - InDisc.FlowWA);
+		N = N - InDisc.Erosion * 0.4f * Dn * (1.0f - smoothstep(0.45f, 0.85f, N));
+		Zh = Zh0 / max(1.0f + InDisc.Erosion * 0.8f * (Dn - 0.5f) + InDisc.Erosion * 0.5f * (N - 0.5f), 0.3f);
+		RhoEdge = Rho * (1.0f + InDisc.Erosion * 0.25f * (Dn - 0.5f));
+	}
+	const float Clump = lerp(1.0f, 2.0f * smoothstep(0.40f, 0.66f, N), saturate(InDisc.Clouds));
+	const float Edge = Uni_BhDiscOpacity(max(RhoEdge, UNI_BH_ISCO_X), InDisc.OuterX) * smoothstep(UNI_BH_VOL_INNER, UNI_BH_ISCO_X + 0.2f, Rho);
+	OutAlpha = InDisc.Opacity * (0.39894f / H) * exp(-0.5f * Zh * Zh) * Clump * Edge;
+	// Its light: the thin disc's temperature, the clumps hotter (Heat), the rings (Bands), shifted by g.
+	const float Omega = sqrt(0.5f / (Rho * Rho * Rho));
+	const float G = sqrt(max(1.0f - 1.5f / Rho, 0.0f)) / max(1.0f - Omega * InLambda, 1.0e-3f);
+	const float T = InDisc.PeakK * Uni_BhDiscProfile(max(Rho, UNI_BH_ISCO_X + 1.0e-3f)) * (1.0f + InDisc.Heat * (2.0f * N - 1.0f));
+	const float Span = max(log(InDisc.OuterX * (1.0f / UNI_BH_ISCO_X)), 0.1f);
+	const float Band = max(1.0f + InDisc.Bands * sin(6.2831853f * UNI_BH_BAND_RINGS * LnR / Span + 3.0f * N), 0.0f);
+	const float Tg = G * max(T, 1.0f);
+	const float3 C = Uni_TemperatureColour(Tg);
+	const float Pk = max(Uni_BhPlanckV(InDisc.PeakK), 1.0e-30f);
+	const float Lv = InDisc.Falloff > 0.0f && InDisc.Falloff != 1.0f ? Pk * pow(max(Uni_BhPlanckV(Tg) / Pk, 1.0e-30f), InDisc.Falloff) : Uni_BhPlanckV(Tg);
+	OutSource = C * (Lv * Band / max(Uni_Luminance(C), 1.0e-3f));
+}
+
+/** The straight line's share of the deflection beyond a point at InSigma along it (from the
+ *  closest approach, signed) with impact InB: K(+inf) - K(InSigma) is what bends the line from
+ *  there on, K(InSigma) - K(-inf) up to there. K(sigma) = s (2 s^2 + 3) / (2 b (1 + s^2)^1.5),
+ *  s = sigma / b; +-1 / b at the ends (the whole line: 2 / b, the weak-field deflection). */
+UNI_FN float Uni_LensTailK(float InSigma, float InB)
+{
+	const float S = InSigma / InB;
+	if (abs(S) > 1.0f)
+	{
+		const float T2 = 1.0f / (S * S);   // (b / sigma)^2, no cancellation far away
+		return (S > 0.0f ? 1.0f : -1.0f) * (2.0f + 3.0f * T2) / (2.0f * InB * pow(1.0f + T2, 1.5f));
+	}
+	return S * (2.0f * S * S + 3.0f) / (2.0f * InB * pow(1.0f + S * S, 1.5f));
+}
+
+/** InDir turned by InAngle towards the black hole, in the plane of InPos and InDir. */
+UNI_FN float3 Uni_LensBend(float3 InDir, float3 InPos, float InAngle)
+{
+	const float3 C = InPos - InDir * dot(InPos, InDir);   // the line's closest point
+	const float B = length(C);
+	if (!(B > 1.0e-20f)) { return InDir; }
+	const float3 N = C * (-1.0f / B);
+	return normalize(InDir * cos(InAngle) + N * sin(InAngle));
+}
+
+/** The flat-coordinate acceleration whose orbits are the photon orbits (h2 = |x x v|^2). */
+UNI_FN float3 Uni_LensAccel(float3 InX, float InH2)
+{
+	const float R2 = dot(InX, InX);
+	const float InvR = rsqrt(R2);
+	const float InvR5 = InvR * InvR * InvR * InvR * InvR;
+	return InX * (-1.5f * InH2 * InvR5);
+}
+
+/** One camera ray: InCam the camera relative to the black hole (R_s, world axes), InDir the
+ *  direction it looks in (unit, as a static observer there measures it). */
+UNI_FN FUniLensResult Uni_LensTrace(float3 InCam, float3 InDir, FUniLensDisc InDisc, uint InMaxSteps)
+{
+	FUniLensResult Res;
+	Res.Dir = InDir;
+	Res.Captured = 0.0f;
+	Res.Disc = float3(0.0f, 0.0f, 0.0f);
+	Res.Transmit = 1.0f;
+	Res.Steps = 0.0f;
+	Res.Deflection = 0.0f;
+	Res.ImpactB = 0.0f;
+	Res.FirstPos = float3(0.0f, 0.0f, 0.0f);
+	Res.FirstX = 0.0f;
+	Res.FirstG = 0.0f;
+	Res.Pad0 = 0.0f;
+	Res.Pad1 = 0.0f;
+	Res.Pad2 = 0.0f;
+	const float Rc = length(InCam);
+	if (!(Rc > 1.0001f)) { Res.Captured = 1.0f; return Res; }   // at or inside the horizon: dark
+	// The static observer's direction -> the coordinate one: its radial part x sqrt(1 - 1/r).
+	const float3 Rhat = InCam * (1.0f / Rc);
+	const float Dr = dot(InDir, Rhat);
+	const float3 D0 = normalize(InDir + Rhat * (Dr * (sqrt(1.0f - 1.0f / Rc) - 1.0f)));
+	const float Sphere = max(UNI_LENS_SPHERE_X, 1.25f * InDisc.OuterX);
+
+	float3 X = InCam;
+	float3 V = D0;
+	if (Rc > Sphere)
+	{
+		// Outside the sphere: straight to it (or past it), bent in closed form.
+		const float Sig = dot(InCam, D0);                 // signed position along the line (closest approach 0)
+		const float B = length(InCam - D0 * Sig);
+		Res.ImpactB = B;
+		if (!(B < Sphere) || Sig >= 0.0f)
+		{
+			Res.Dir = Uni_LensBend(D0, InCam, 1.0f / max(B, 1.0e-20f) - Uni_LensTailK(Sig, B));
+			Res.Deflection = acos(clamp(dot(Res.Dir, InDir), -1.0f, 1.0f));
+			return Res;
+		}
+		const float SigIn = -sqrt(max(Sphere * Sphere - B * B, 0.0f));
+		V = Uni_LensBend(D0, InCam, Uni_LensTailK(SigIn, B) - Uni_LensTailK(Sig, B));
+		X = InCam + D0 * (SigIn - Sig);
+	}
+	// The photon's conserved quantities: h (the flat orbit's), its plane, its impact parameter b
+	// (1/b^2 = 1/(r sin psi)^2 - 1/r^3 in the coordinate angle psi: the orbit equation's first
+	// integral), and its angular momentum about the disc's axis per unit energy (the photon runs
+	// against the traced ray: lambda = -b (plane . axis)).
+	const float3 Hv = cross(X, V);
+	const float H2 = dot(Hv, Hv);
+	const float R0 = length(X);
+	const float HGeom = sqrt(H2);
+	const float BPhys = HGeom * rsqrt(max(1.0f - H2 / (R0 * R0 * R0), 1.0e-6f));
+	Res.ImpactB = BPhys;
+	const float Lambda = HGeom > 1.0e-20f ? -BPhys * dot(Hv, InDisc.Axis) / HGeom : 0.0f;
+	uint Crossings = 0u;
+	uint VolLeft = InDisc.MaxSamples > 0u ? InDisc.MaxSamples : UNI_LENS_VOL_SAMPLES;
+	float Steps = 0.0f;
+	bool bDone = false;
+	UNI_LOOP
+	for (uint I = 0u; I < InMaxSteps; ++I)
+	{
+		const float R = length(X);
+		if (R < 1.5f && dot(X, V) < 0.0f) { Res.Captured = 1.0f; bDone = true; break; }   // inside the photon sphere, inwards: falls in
+		if (R > Sphere && dot(X, V) > 0.0f)
+		{
+			const float3 Vn = normalize(V);
+			const float Sig = dot(X, Vn);
+			const float B = length(X - Vn * Sig);
+			Res.Dir = Uni_LensBend(Vn, X, 1.0f / max(B, 1.0e-20f) - Uni_LensTailK(Sig, B));
+			bDone = true;
+			break;
+		}
+		const float Speed = length(V);
+		const float K = R < UNI_BH_ISCO_X ? 0.5f * UNI_LENS_STEP : (R < UNI_LENS_NEAR_X ? UNI_LENS_STEP : UNI_LENS_STEP_FAR);
+		const float Dt = K * R / max(Speed, 1.0e-6f);
+		const float3 K1x = V;
+		const float3 K1v = Uni_LensAccel(X, H2);
+		const float3 K2x = V + K1v * (0.5f * Dt);
+		const float3 K2v = Uni_LensAccel(X + K1x * (0.5f * Dt), H2);
+		const float3 K3x = V + K2v * (0.5f * Dt);
+		const float3 K3v = Uni_LensAccel(X + K2x * (0.5f * Dt), H2);
+		const float3 K4x = V + K3v * Dt;
+		const float3 K4v = Uni_LensAccel(X + K3x * Dt, H2);
+		const float3 X1 = X + (K1x + K2x * 2.0f + K3x * 2.0f + K4x) * (Dt / 6.0f);
+		V = V + (K1v + K2v * 2.0f + K3v * 2.0f + K4v) * (Dt / 6.0f);
+		Steps += 1.0f;
+		// D-276: the volumetric disc: samples along this step's chord where it passes through the
+		// slab (front to back: dI = (S - I) alpha ds, the step's transmittance exact per sample).
+		if (InDisc.bDisc > 0.0f && InDisc.Thickness > 0.0f)
+		{
+			const float Z0 = dot(X, InDisc.Axis), Z1 = dot(X1, InDisc.Axis);
+			const float Rho0 = length(X - InDisc.Axis * Z0), Rho1 = length(X1 - InDisc.Axis * Z1);
+			const float ZMin = (Z0 > 0.0f) != (Z1 > 0.0f) ? 0.0f : min(abs(Z0), abs(Z1));
+			if (ZMin < 3.5f * InDisc.Thickness * max(Rho0, Rho1) && max(Rho0, Rho1) > UNI_BH_VOL_INNER && min(Rho0, Rho1) < InDisc.OuterX)
+			{
+				const float Seg = length(X1 - X);
+				const float Hloc = max(InDisc.Thickness * max(min(Rho0, Rho1), UNI_BH_ISCO_X), 1.0e-3f);
+				// Half a thickness apart, at most 24 a step; past the ray's budget one a step (no hard cut).
+				const uint Want = clamp((uint)ceil(Seg / (0.5f * Hloc)), 1u, 24u);
+				const uint Ns = VolLeft > 0u ? min(Want, VolLeft) : 1u;
+				VolLeft -= min(Ns, VolLeft);
+				Res.Pad0 += (float)Ns;   // samples taken (diagnostics)
+				const float Ds = Seg / (float)Ns;
+				for (uint Ks = 0u; Ks < Ns; ++Ks)
+				{
+					const float3 P = X + (X1 - X) * (((float)Ks + 0.5f) / (float)Ns);
+					float Al;
+					float3 Src;
+					Uni_BhDiscSample(P, InDisc, Lambda, Al, Src);
+					if (Al > 0.0f)
+					{
+						const float Tr = exp(-Al * Ds);
+						if (Res.FirstX == 0.0f) { Res.FirstPos = P; Res.FirstX = length(P); }
+						Res.Disc += Src * (Res.Transmit * (1.0f - Tr));
+						Res.Transmit *= Tr;
+					}
+				}
+				if (Res.Transmit < 1.0e-3f) { Res.Transmit = 0.0f; bDone = true; X = X1; break; }
+			}
+		}
+		// The disc's plane crossed: its light there (front to back), if the gas is there (D-273's thin disc).
+		const float S0 = dot(X, InDisc.Axis);
+		const float S1 = dot(X1, InDisc.Axis);
+		if (InDisc.bDisc > 0.0f && !(InDisc.Thickness > 0.0f) && (S0 > 0.0f) != (S1 > 0.0f) && Crossings < UNI_LENS_MAX_CROSSINGS)
+		{
+			const float3 Xc = X + (X1 - X) * (S0 / (S0 - S1));
+			const float Xr = length(Xc);
+			const float A = Uni_BhDiscOpacity(Xr, InDisc.OuterX);
+			if (A > 0.0f)
+			{
+				const float Omega = sqrt(0.5f / (Xr * Xr * Xr));   // Keplerian, about the axis (counter-clockwise)
+				const float G = sqrt(max(1.0f - 1.5f / Xr, 0.0f)) / max(1.0f - Omega * Lambda, 1.0e-3f);
+				if (Crossings == 0u) { Res.FirstPos = Xc; Res.FirstX = Xr; Res.FirstG = G; }
+				++Crossings;
+				Res.Disc += Uni_BhDiscLight(G * InDisc.PeakK * Uni_BhDiscProfile(Xr)) * (A * Res.Transmit);
+				Res.Transmit *= 1.0f - A;
+				if (Res.Transmit < 1.0e-3f) { Res.Transmit = 0.0f; bDone = true; X = X1; break; }
+			}
+		}
+		X = X1;
+	}
+	Res.Steps = Steps;
+	if (!bDone) { Res.Captured = 1.0f; }   // still winding at the photon sphere: on the shadow's edge
+	if (Res.Captured < 0.5f && Res.Transmit > 0.0f) { Res.Deflection = acos(clamp(dot(Res.Dir, InDir), -1.0f, 1.0f)); }
+	return Res;
+}
+
+/** The triangle wave of period 4: [-1, 1] to itself, mirrored back beyond. */
+UNI_FN float Uni_LensFold(float InX)
+{
+	const float A = InX - 1.0f;
+	return abs(A - 4.0f * floor(A * 0.25f) - 2.0f) - 1.0f;
+}
+
+/** A direction's place in the view (NDC, x right, y up), folded back into it by mirroring when it
+ *  is off screen or behind (the lens pass has only the screen; the strongly bent rays that leave
+ *  it are the thin rings about the shadow). InFold 0: unfolded (may be outside [-1, 1]). */
+UNI_FN float2 Uni_LensSkyNdc(float3 InDir, float3 InFwd, float3 InRight, float3 InUp, float2 InTanHalf, bool InFold)
+{
+	float Fz = dot(InDir, InFwd);
+	if (InFold && Fz < 1.0e-3f) { Fz = max(-Fz, 1.0e-3f); }   // behind: the mirror image through the eye's plane
+	const float Fs = max(Fz, 1.0e-6f);
+	float2 N = float2(dot(InDir, InRight) / (Fs * InTanHalf.x), dot(InDir, InUp) / (Fs * InTanHalf.y));
+	if (InFold)
+	{
+		N = float2(Uni_LensFold(N.x), Uni_LensFold(N.y));
+	}
+	return N;
+}
+
+#endif // UNI_COMPACT_USH

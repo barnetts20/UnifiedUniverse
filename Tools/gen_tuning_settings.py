@@ -65,6 +65,7 @@ CATEGORIES = [
     ("uu.VolumeFar", "March|Far Cache"),
     ("uu.VolumeDebug", "Debug"),
     ("uu.Volume.DustGain", "Galaxy|Balance"),
+    ("uu.Volume.DustCurve", "Galaxy|Balance"),
     ("uu.Volume", "March|Other"),
     ("uu.GalaxyTexture", "Textures"),
     ("uu.GalaxyTextures", "Textures"),
@@ -82,7 +83,9 @@ CATEGORIES = [
     ("uu.Cluster.", "Population|Clusters"),
     ("uu.Group.", "Population|Clusters"),
     ("uu.Sprite", "Sprites"),
+    ("uu.Bh.", "Compact Objects"),   # D-272
     ("uu.MotionWeb", "Web"),
+    ("uu.WebDust", "Web"),
     ("uu.SkyWeb", "Web"),
     ("uu.WebDebug", "Debug"),
     ("uu.Warp", "Travel"),
@@ -97,7 +100,7 @@ CATEGORIES = [
 # The page's order (the details panel keeps declaration order).
 CAT_ORDER = ["March|Paradigms", "March|Steps", "March|Sampling and Noise", "March|Temporal", "March|Resolution", "March|Galaxy Map",
              "March|Voxel Grid (nebulae)", "March|Far Cache", "March|Other", "Textures", "Galaxy|Shape and Noise", "Galaxy|Detail Layers", "Galaxy|Balance",
-             "Nebulae", "Population", "Population|Clusters", "Sprites", "Web", "Travel", "Lighting", "Background",
+             "Nebulae", "Population", "Population|Clusters", "Sprites", "Compact Objects", "Web", "Travel", "Lighting", "Background",
              "Streaming and Generation", "Debug"]
 REENABLE_PREFIX = ("uu.Cluster.", "uu.Group.", "uu.Star.", "uu.WebTex", "uu.WebSource", "uu.WebTexture", "uu.GalaxyTextures", "uu.GalaxyPalettes", "uu.GalaxyTexture.")
 

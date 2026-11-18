@@ -1,0 +1,237 @@
+// knots_d267.cpp.txt (archived exploration; were UNI_TEST(zz, knots) and UNI_TEST(zz, knotimg) at the end of tests/test_galaxymap.cpp; need #include <thread>): D-267, the knots in the detail layers. The Milky Way from the solar circle (toward the centre, along the disc, 300 pc above), D-266's layers and bubble with knot amplitudes 0 / 0.5 / 1 (also 32 steps, 2 texels): per configuration the 8-phase jittered march against its own fine reference. Result (mean over the views): without knots err 1.10% spread 1.231%; knots 0.5 1.14% / 1.261%; knots 1 1.24% / 1.326%; 32 steps 1.27% / 1.186% (x1.45 steps); 2 texels 1.48% / 1.663%; light within 0.7%, steps unchanged. Images (kn_<view>_<cfg>.ppm, 320x180, ~10 min each on two cores): toward the centre, the pink knots broken into clumps, with the tint at 1 some taking the galaxy's teal and pink nebula colours.
+// Run: univerify test --group zz.knots (UNI_KN="f0 l0 d0 k0 f1 l1 d1 k1 steps texels tint", UNI_SEG_VIEWS) / zz.knotimg (UNI_DET_OUT, UNI_DET_W, UNI_DET_VIEW).
+
+// ---- D-267 exploration (temporary; archived to experiments/ when done) ----
+namespace
+{
+	struct FKCfg { std::string Name; float F0, L0, D0, K0, F1, L1, D1, K1, Steps, Texels, Tint; };
+	void KnotSettings(FVolumeSettings& S, const FKCfg& C)
+	{
+		S.DetailFreq0 = C.F0; S.DetailLight0 = C.L0; S.DetailDust0 = C.D0; S.DetailKnot0 = C.K0;
+		S.DetailFreq1 = C.F1; S.DetailLight1 = C.L1; S.DetailDust1 = C.D1; S.DetailKnot1 = C.K1;
+		S.DetailSteps = C.Steps; S.DetailStepTexels = C.Texels; S.DetailFoot = 0.5f; S.DetailKnotTint = C.Tint;
+		S.DetailRange0 = 0.33f; S.DetailFade0 = 1.0f; S.DetailRange1 = 0.08f; S.DetailFade1 = 0.5f;
+	}
+	std::vector<FKCfg> KnotCfgs()
+	{
+		std::vector<FKCfg> C = {
+			{ "d266", 4, 0.5f, 0.5f, 0, 16, 0.5f, 0.5f, 0, 16, 4, 0 },
+			{ "k.5", 4, 0.5f, 0.5f, 0.5f, 16, 0.5f, 0.5f, 0.5f, 16, 4, 0 },
+			{ "k1", 4, 0.5f, 0.5f, 1, 16, 0.5f, 0.5f, 1, 16, 4, 0 },
+			{ "k1 s32", 4, 0.5f, 0.5f, 1, 16, 0.5f, 0.5f, 1, 32, 4, 0 },
+			{ "k1 tx2", 4, 0.5f, 0.5f, 1, 16, 0.5f, 0.5f, 1, 16, 2, 0 },
+		};
+		if (const char* E = std::getenv("UNI_KN"))
+		{
+			FKCfg X{ "custom", 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0 };
+			if (std::sscanf(E, "%f %f %f %f %f %f %f %f %f %f %f", &X.F0, &X.L0, &X.D0, &X.K0, &X.F1, &X.L1, &X.D1, &X.K1, &X.Steps, &X.Texels, &X.Tint) >= 10)
+			{
+				if (std::getenv("UNI_KN_ONLY")) { C.resize(1); }
+				C.push_back(X);
+			}
+		}
+		return C;
+	}
+}
+
+UNI_TEST(zz, knots)
+{
+	const FCacheTex& Tx = GalTex();
+	if (!Tx.bOk) { std::printf("    textures not loaded: %s\n", Tx.Err.c_str()); return; }
+	FGalBindAll Bind(Tx);
+	FUniverseDef D = UniScenes::Flythrough();
+	UniScenes::UseGalaxyTextures(D, Tx.T[0].Size);
+	UniScenes::UseGalaxyPalettes(D);
+	FUniverseModel M(D);
+	FRefGenerator G(M);
+	FVolumeBuilder VB(M, G);
+	struct FView { const char* Name; FVec3d Pos; FV3 Look; };
+	const FView Views[] = {
+		{ "toward the centre", { 8.0 * Units::Kpc, 1.0 * Units::Kpc, 20.0 * Units::Pc }, { -1.0, 0.05, 0.02 } },
+		{ "along the disc", { 8.0 * Units::Kpc, 1.0 * Units::Kpc, 20.0 * Units::Pc }, { 0.05, 1.0, 0.02 } },
+		{ "300 pc above, down 30 deg", { 8.0 * Units::Kpc, 1.0 * Units::Kpc, 300.0 * Units::Pc }, { -0.85, 0.1, -0.5 } },
+	};
+	const std::vector<FKCfg> Cfgs = KnotCfgs();
+	const int NC = int(Cfgs.size());
+	const char* OnlyEnv = std::getenv("UNI_SEG_VIEWS");
+	const int NV = OnlyEnv ? std::max(1, std::min(3, std::atoi(OnlyEnv))) : 3;
+	FGalaxyMap Map;
+	bool bBaked = false;
+	std::vector<double> SumErr(NC, 0.0), SumSpread(NC, 0.0), SumLight(NC, 0.0), SumSteps(NC, 0.0), SumP99(NC, 0.0);
+	for (int Vi = 0; Vi < NV; ++Vi)
+	{
+		const FView& Vw = Views[Vi];
+		const FCoord Cam = CamAt(Vw.Pos);
+		FRefPipeline P(G);
+		P.bVelocityLod = false;
+		P.Update(Cam, FVec3f{});
+		FCamera Cm; Cm.Coord = Cam; Cm.Width = 96; Cm.Height = 54; Cm.LookAlong(Vw.Look);
+		auto Scene = [&](const FKCfg& C, bool bRef) -> FVolumeScene
+		{
+			FVolumeSettings S;
+			S.StepFoot = bRef ? 0.0f : 0.5f; S.SegmentTaps = bRef ? 1u : 4u;
+			KnotSettings(S, C);
+			FVolumeScene Sc = VB.Build(P, Cam, FVec3f{}, Cm.View(), S).Subset(false);
+			const FCarrierGPU* Home = HomeCarrierOf(Sc);
+			if (Home && !bBaked) { Map.Bake(*Home, Sc.Params, 512u, 2); bBaked = true; }
+			if (Home) { PublishGalaxyMap(Sc.View, Sc.Home.Carrier, 512u); }
+			if (bRef) { Sc.View.MarchFlags |= 2u; Sc.View.MaxSteps = 65536u; }
+			return Sc;
+		};
+		{ FVolumeScene S0 = Scene(Cfgs[0], true); (void)S0; }
+		BindGalaxyMap(0u, &Map);
+		if (!bBaked) { std::printf("    %s: NO HOME\n", Vw.Name); BindGalaxyMap(0u, nullptr); continue; }
+		const FRun Ref0 = March(Scene(Cfgs[0], true), Cm);
+		double Ref0Mean = 0.0;
+		for (double L : Ref0.Lum) { Ref0Mean += L; }
+		Ref0Mean /= double(Ref0.Lum.size());
+		std::printf("    %s (reference d266: %.0f steps a ray)\n", Vw.Name, Ref0.Steps);
+		for (int C = 0; C < NC; ++C)
+		{
+			const FRun Ref = C == 0 ? Ref0 : March(Scene(Cfgs[C], true), Cm);
+			double RefMean = 0.0;
+			for (double L : Ref.Lum) { RefMean += L; }
+			RefMean /= double(Ref.Lum.size());
+			FVolumeScene Sc = Scene(Cfgs[C], false);
+			Sc.View.MarchFlags |= H::UNI_VOL_JITTER_FLAG;
+			const int Np = 8;
+			std::vector<double> S1(Ref.Lum.size(), 0.0), S2 = S1;
+			double St = 0.0;
+			for (int Ph = 0; Ph < Np; ++Ph)
+			{
+				Sc.View.JitterShift = float(Ph) * 0.61803398875f;
+				const FRun R = March(Sc, Cm);
+				St += R.Steps;
+				for (size_t I = 0; I < R.Lum.size(); ++I) { S1[I] += R.Lum[I]; S2[I] += R.Lum[I] * R.Lum[I]; }
+			}
+			double Sm = 0.0, Ss = 0.0, Err = 0.0;
+			std::vector<double> Rel;
+			for (size_t I = 0; I < S1.size(); ++I)
+			{
+				const double Mu = S1[I] / Np;
+				Sm += Mu;
+				const double Sd = std::sqrt(std::max(S2[I] / Np - Mu * Mu, 0.0));
+				Ss += Sd;
+				Err += std::abs(Mu - Ref.Lum[I]);
+				Rel.push_back(Sd / std::max(Mu, 1e-300));
+			}
+			std::sort(Rel.begin(), Rel.end());
+			const double P99 = Rel[Rel.size() * 99 / 100];
+			const double N = double(S1.size());
+			const double E = Err / std::max(RefMean * N, 1e-300), Spread = Ss / std::max(Sm, 1e-300);
+			const double Light = Sm / N / std::max(Ref0Mean, 1e-300) - 1.0, RefLight = RefMean / std::max(Ref0Mean, 1e-300) - 1.0;
+			SumErr[C] += E / NV; SumSpread[C] += Spread / NV; SumLight[C] += Light / NV; SumSteps[C] += St / Np / NV; SumP99[C] += P99 / NV;
+			std::printf("      %-10s err %5.2f%%  spread %6.3f%% (p99 a pixel %5.1f%%)  light %+6.2f%% (its ref %+6.2f%%)  steps %6.1f\n",
+				Cfgs[C].Name.c_str(), 100.0 * E, 100.0 * Spread, 100.0 * P99, 100.0 * Light, 100.0 * RefLight, St / Np);
+			std::fflush(stdout);
+		}
+		BindGalaxyMap(0u, nullptr);
+	}
+	std::printf("    mean over the views:\n");
+	for (int C = 0; C < NC; ++C)
+	{
+		std::printf("      %-10s err %5.2f%%  spread %6.3f%% (p99 %5.1f%%)  light %+6.2f%%  steps %6.1f (x%.2f)\n",
+			Cfgs[C].Name.c_str(), 100.0 * SumErr[C], 100.0 * SumSpread[C], 100.0 * SumP99[C], 100.0 * SumLight[C], SumSteps[C], SumSteps[C] / std::max(SumSteps[0], 1e-9));
+	}
+}
+
+UNI_TEST(zz, knotimg)
+{
+	const FCacheTex& Tx = GalTex();
+	if (!Tx.bOk) { std::printf("    textures not loaded: %s\n", Tx.Err.c_str()); return; }
+	FGalBindAll Bind(Tx);
+	FUniverseDef D = UniScenes::Flythrough();
+	UniScenes::UseGalaxyTextures(D, Tx.T[0].Size);
+	UniScenes::UseGalaxyPalettes(D);
+	FUniverseModel M(D);
+	FRefGenerator G(M);
+	FVolumeBuilder VB(M, G);
+	const std::string Dir = std::getenv("UNI_DET_OUT") ? std::getenv("UNI_DET_OUT") : "/tmp";
+	const int W = std::getenv("UNI_DET_W") ? std::atoi(std::getenv("UNI_DET_W")) : 320, Hh = W * 9 / 16;
+	struct FView { const char* Name; FVec3d Pos; FV3 Look; };
+	const FView Views[] = {
+		{ "centre", { 8.0 * Units::Kpc, 1.0 * Units::Kpc, 20.0 * Units::Pc }, { -1.0, 0.05, 0.02 } },
+		{ "along", { 8.0 * Units::Kpc, 1.0 * Units::Kpc, 20.0 * Units::Pc }, { 0.05, 1.0, 0.02 } },
+		{ "above300", { 8.0 * Units::Kpc, 1.0 * Units::Kpc, 300.0 * Units::Pc }, { -0.85, 0.1, -0.5 } },
+		{ "above1k", { 8.0 * Units::Kpc, 1.0 * Units::Kpc, 1000.0 * Units::Pc }, { -0.5, 0.1, -0.85 } },
+		{ "outside", { 8.0 * Units::Kpc, 1.0 * Units::Kpc, 30.0 * Units::Kpc }, { -0.25, -0.03, -1.0 } },
+	};
+	std::vector<FKCfg> Cfgs = {
+		{ "d266", 4, 0.5f, 0.5f, 0, 16, 0.5f, 0.5f, 0, 16, 4, 0 },
+		{ "k5t5", 4, 0.5f, 0.5f, 0.5f, 16, 0.5f, 0.5f, 0.5f, 16, 4, 0.5f },
+		{ "k1t1", 4, 0.5f, 0.5f, 1, 16, 0.5f, 0.5f, 1, 16, 4, 1.0f },
+	};
+	if (const char* E = std::getenv("UNI_KN"))
+	{
+		FKCfg X{ "custom", 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0 };
+		if (std::sscanf(E, "%f %f %f %f %f %f %f %f %f %f %f", &X.F0, &X.L0, &X.D0, &X.K0, &X.F1, &X.L1, &X.D1, &X.K1, &X.Steps, &X.Texels, &X.Tint) >= 10) { Cfgs.push_back(X); }
+	}
+	const char* OnlyV = std::getenv("UNI_DET_VIEW");
+	FGalaxyMap Map;
+	bool bBaked = false;
+	for (const FView& Vw : Views)
+	{
+		if (OnlyV && std::strcmp(OnlyV, Vw.Name) != 0) { continue; }
+		const FCoord Cam = CamAt(Vw.Pos);
+		FRefPipeline P(G);
+		P.bVelocityLod = false;
+		P.Update(Cam, FVec3f{});
+		FCamera Cm; Cm.Coord = Cam; Cm.Width = W; Cm.Height = Hh; Cm.LookAlong(Vw.Look);
+		double Scale = 0.0;
+		for (const FKCfg& C : Cfgs)
+		{
+			FVolumeSettings S;
+			S.StepFoot = 0.5f; S.SegmentTaps = 4u;
+			KnotSettings(S, C);
+			FVolumeScene Sc = VB.Build(P, Cam, FVec3f{}, Cm.View(), S).Subset(false);
+			const FCarrierGPU* Home = HomeCarrierOf(Sc);
+			const bool bHome = Home != nullptr;
+			if (bHome && !bBaked) { Map.Bake(*Home, Sc.Params, 512u, 2); bBaked = true; }
+			if (bHome) { PublishGalaxyMap(Sc.View, Sc.Home.Carrier, 512u); BindGalaxyMap(0u, &Map); }
+			Sc.View.MarchFlags |= H::UNI_VOL_JITTER_FLAG;
+			std::vector<double> Rgb(size_t(W) * Hh * 3, 0.0);
+			double Steps = 0.0;
+			const int Np = 8;
+			for (int Ph = 0; Ph < Np; ++Ph)
+			{
+				Sc.View.JitterShift = float(Ph) * 0.61803398875f;
+				const auto V = ToHlsl(Sc.View);
+				const auto Cb = Sc.CarrierBuf(); const auto Pb = Sc.ParamBuf(); const auto Lb = Sc.LutBuf();
+				std::vector<double> RowSteps(size_t(Hh), 0.0);
+				auto Rows = [&](int Y0, int Y1)
+				{
+					for (int Y = Y0; Y < Y1; ++Y)
+					{
+						for (int X = 0; X < W; ++X)
+						{
+							bool bS = false;
+							const H::FUniVolumeResult R = MarchPixel(Cb, Pb, Lb, V, Cm, W, Hh, X, Y, 3.0e38f, bS);
+							double* O = &Rgb[(size_t(Y) * W + X) * 3];
+							O[0] += R.Radiance.x / Np; O[1] += R.Radiance.y / Np; O[2] += R.Radiance.z / Np;
+							RowSteps[size_t(Y)] += R.Steps;
+						}
+					}
+				};
+				std::vector<std::thread> Th;
+				const int NT = 8;
+				for (int T = 0; T < NT; ++T) { Th.emplace_back(Rows, Hh * T / NT, Hh * (T + 1) / NT); }
+				for (auto& T : Th) { T.join(); }
+				for (double Sr : RowSteps) { Steps += Sr / (double(W) * Hh * Np); }
+			}
+			BindGalaxyMap(0u, nullptr);
+			if (Scale == 0.0)
+			{
+				std::vector<double> L(size_t(W) * Hh);
+				for (size_t I = 0; I < L.size(); ++I) { L[I] = 0.2126 * Rgb[I * 3] + 0.7152 * Rgb[I * 3 + 1] + 0.0722 * Rgb[I * 3 + 2]; }
+				std::nth_element(L.begin(), L.begin() + L.size() * 98 / 100, L.end());
+				Scale = 2.0 / std::max(L[L.size() * 98 / 100], 1e-30);
+			}
+			FImage Img(W, Hh);
+			for (size_t I = 0; I < Rgb.size(); ++I) { Img.Rgb[I] = float(Rgb[I] * Scale); }
+			const std::string Path = Dir + "/kn_" + Vw.Name + "_" + C.Name + ".ppm";
+			Img.WritePpm(Path);
+			std::printf("    %s %s: %.1f steps a ray -> %s\n", Vw.Name, C.Name.c_str(), Steps, Path.c_str());
+			std::fflush(stdout);
+		}
+	}
+}

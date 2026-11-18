@@ -1,0 +1,59 @@
+// webnodes_d270.cpp.txt (archived exploration; was UNI_TEST(zz, webnodes) at the end of tests/test_travellook.cpp; needs FBind from that file and a node weight MotionWebNodes in the volume view, built then reverted): B-033's filament / node weight for the motion web. Result (2026-11-16): channel means walls 0.377, filaments 0.415, nodes 0.094, uncollapsed 0.114; at threshold 3 the glow from node-dominated texels is 17.5% (weight 1), 14.6% (0.5), 12.7% (0.25), 10.3% (0); lit volume 8.3% -> 10.0%; the void camera's frame light 317.6 -> 319.8 and the images nearly identical. Not adopted: the blobs are the texture's 0.78 Mpc texels and the glow's log curve (saturate(0.5 log10 Fn)), not the nodes.
+
+// ---- D-270 exploration (temporary): the motion web's node weight ----
+UNI_TEST(zz, webnodes)
+{
+	FWebTexture T; std::string Err;
+	if (!FWebTexture::LoadDelivered("Data/Noise", "web_adhesion_density_mid", T, &Err)) { std::printf("    no web texture: %s\n", Err.c_str()); return; }
+	FBind Bind(T);
+	const H::float4 Mean = T.Mean();
+	std::printf("    channel means: walls %.4g filaments %.4g nodes %.4g uncollapsed %.4g\n", Mean.x, Mean.y, Mean.z, Mean.w);
+	const double Ws[] = { 1.0, 0.5, 0.25, 0.1, 0.0 };
+	// The glow's share from node-dominated texels (z > y), and the lit volume, per weight.
+	for (double Wn : Ws)
+	{
+		const double Inv = 1.0 / ((double(Mean.y) + Wn * double(Mean.z)) * 3.0);
+		double Lit = 0, Glow = 0, GlowN = 0; const int N = 400000;
+		for (int I = 0; I < N; ++I)
+		{
+			const double X = (I * 0.7548776662) - std::floor(I * 0.7548776662), Y = (I * 0.5698402910) - std::floor(I * 0.5698402910), Z = (I * 0.3053) - std::floor(I * 0.3053);
+			const H::float4 C = H::UniWebTexSample(H::float3(float(X), float(Y), float(Z)), 0.0f);
+			const double Fn = (double(C.y) + Wn * C.z) * Inv;
+			if (Fn > 1.0) { const double Xg = std::min(0.5 * std::log10(Fn), 1.0); Lit += 1; Glow += Xg; if (C.z > C.y) GlowN += Xg; }
+		}
+		std::printf("    nodes x%.2f: lit %.2f%% of the volume, glow from node-dominated texels %.1f%%\n", Wn, 100.0 * Lit / N, 100.0 * GlowN / std::max(Glow, 1e-30));
+	}
+	if (std::getenv("UNI_WN_NOIMG")) return;
+	const UniScenes::FClusterTuning Tun;
+	FUniverseDef Def = UniScenes::WebToGalaxy(Tun);
+	UniScenes::UseDeliveredWeb(Def, Tun, T.Size, Mean.z / (double(Mean.x) + Mean.y + Mean.z + Mean.w));
+	FUniverseModel M(Def); FRefGenerator G(M); FVolumeBuilder VB(M, G); FRefPipeline P(G); P.bVelocityLod = false;
+	const FCoord Cam = UniScenes::VoidCamera(); P.Update(Cam, FVec3f{});
+	const int W = std::getenv("UNI_WD_W") ? std::atoi(std::getenv("UNI_WD_W")) : 240, Hh = W * 9 / 16;
+	FCamera Cm; Cm.Coord = Cam; Cm.Width = W; Cm.Height = Hh; Cm.LookAlong({ 1.0, 0.3, 0.1 });
+	const double Mpc = Units::Mpc;
+	FWebTexture Gt[3];
+	for (int K = 0; K < 3; ++K) { std::string E; FWebTexture::LoadDelivered("Data/Noise", GalaxyTextureName(K), Gt[K], &E); BindGalaxyTexture(K, &Gt[K]); }
+	struct FUnbind { ~FUnbind() { for (int K = 0; K < 3; ++K) { BindGalaxyTexture(K, nullptr); } } } Unbind;
+	const std::string Dir = std::getenv("UNI_DET_OUT") ? std::getenv("UNI_DET_OUT") : "/tmp";
+	double Sc0 = 0.0;
+	for (double Wn : Ws)
+	{
+		FVolumeSettings S;
+		S.MotionWebDetailGain = 1.0f; S.MotionWebDetailCm = float(20.0 * Mpc); S.MotionWebStepCm = float(0.5 * Mpc); S.MotionWebRegionCm = float(200.0 * Mpc);
+		S.MotionWebGain = float(0.01 * 7.0e4 / Mpc); S.MotionWebNodes = float(Wn); S.MotionWebInvRef = float(1.0 / ((double(Mean.y) + Wn * double(Mean.z)) * 3.0));
+		S.MotionWebNearCm = float(4.0 * Mpc); S.MotionWebDepthCm = float(50.0 * Mpc);
+		FVolumeScene Sc = VB.Build(P, Cam, FVec3f{}, Cm.View(), S).Subset(true);
+		Sc.View.MarchFlags |= H::UNI_VOL_JITTER_FLAG;
+		const int Np = 4;
+		std::vector<double> Rgb(size_t(W) * Hh * 3, 0.0);
+		for (int Ph = 0; Ph < Np; ++Ph) { Sc.View.JitterShift = float(Ph) * 0.61803398875f; FImage Img(W, Hh); RenderVolume(Sc, Cm, Img); for (size_t I = 0; I < Rgb.size(); ++I) Rgb[I] += Img.Rgb[I] / Np; }
+		double Sum = 0.0; std::vector<double> L(size_t(W) * Hh);
+		for (size_t I = 0; I < L.size(); ++I) { L[I] = 0.2126 * Rgb[I * 3] + 0.7152 * Rgb[I * 3 + 1] + 0.0722 * Rgb[I * 3 + 2]; Sum += L[I]; }
+		if (Sc0 == 0.0) { std::vector<double> Q = L; std::nth_element(Q.begin(), Q.begin() + Q.size() * 98 / 100, Q.end()); Sc0 = 2.0 / std::max(Q[Q.size() * 98 / 100], 1e-30); }
+		FImage Img(W, Hh); for (size_t I = 0; I < Rgb.size(); ++I) Img.Rgb[I] = float(Rgb[I] * Sc0);
+		char Nm[64]; std::snprintf(Nm, sizeof(Nm), "/wn_%03d.ppm", int(Wn * 100 + 0.5));
+		Img.WritePpm(Dir + Nm);
+		std::printf("    nodes x%.2f: frame light %.4g -> %s%s\n", Wn, Sum, Dir.c_str(), Nm); std::fflush(stdout);
+	}
+}

@@ -115,14 +115,14 @@ float Pad0;
 float4 WarpVelBeta;      // D-190: the camera's motion (unit) and the warp optics' effective speed (0: none)
 float4 WarpDopplerKQ;    // D-190: Doppler colour strength, beaming exponent
 float4 ShiftVelAmount;   // D-230: the travel shift: the motion (unit), ln of the factor ahead (0: none)
-float ShiftK;            // D-230: its colour strength
+float4 ShiftKBoost;      // D-230: its colour strength; D-268: the boost's start (ln) and exponent
 
 /** D-190: the true direction behind an apparent one (a pixel's), and its Doppler colour shift. */
 float3 TrueDir(float3 InApparent) { return Uni_Aberrate(InApparent, WarpVelBeta.xyz, -WarpVelBeta.w); }
 float3 DopplerOf(float3 InRadiance, float3 InTrueDir)
 {
 	// D-230: the travel shift (uu.Shift), whatever the warp optics.
-	const float3 R = Uni_TravelShift(InRadiance, InTrueDir, ShiftVelAmount.xyz, ShiftVelAmount.w, ShiftK);
+	const float3 R = Uni_TravelShift(InRadiance, InTrueDir, ShiftVelAmount.xyz, ShiftVelAmount.w, ShiftKBoost.x, ShiftKBoost.y, ShiftKBoost.z);
 	if (WarpVelBeta.w == 0.0f) { return R; }
 	return Uni_DopplerTint(R, Uni_DopplerFactor(InTrueDir, WarpVelBeta.xyz, WarpVelBeta.w), WarpDopplerKQ.x, WarpDopplerKQ.y);
 }

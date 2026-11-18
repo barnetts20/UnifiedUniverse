@@ -53,6 +53,7 @@ Texture2DArray<float> VolumeSlices;  // luminance transmittance at UNI_VOL_SLICE
 uint bVolume;
 float SliceLnTLo;
 float SliceLnTHi;
+float SliceFarCm;                   // D-271: the slices' far segment's end (Uni_SlicePosT)
 float4 OutToMarch;                  // output pixel -> slice texel: m = p * xy + zw
 uint2 MarchSize;
 
@@ -192,15 +193,15 @@ float SceneDistance(float2 PixelPos, float CosToForward)
 }
 
 /** The dust's luminance transmittance at an output pixel to a true distance: the volume's slices,
- *  piecewise linear in ln t (Uni_SliceTransmittance); 1 without the volume. D-223: shared by the
- *  quad's pixels and the splat path's centres. */
+ *  piecewise linear in ln t, in t over the far segment (Uni_SliceTransmittance, D-271); 1 without
+ *  the volume. D-223: shared by the quad's pixels and the splat path's centres. */
 float SpriteTransmittance(float2 PixelPos, float TrueDistance)
 {
 	float T = 1.0f;
 	if (bVolume != 0u)
 	{
 		const int2 M = clamp(int2(PixelPos * OutToMarch.xy + OutToMarch.zw), int2(0, 0), int2(MarchSize) - 1);
-		const float X = (log(max(TrueDistance, 1.0f)) - SliceLnTLo) * (float)UNI_VOL_SLICES / max(SliceLnTHi - SliceLnTLo, 1.0e-3f);
+		const float X = Uni_SlicePosT(TrueDistance, SliceLnTLo, SliceLnTHi, SliceFarCm);   // D-271
 		if (X >= (float)UNI_VOL_SLICES) { T = VolumeSlices.Load(int4(M, UNI_VOL_SLICES - 1, 0)); }
 		else if (X > 0.0f)
 		{

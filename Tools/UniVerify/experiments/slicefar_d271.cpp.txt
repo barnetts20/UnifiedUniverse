@@ -1,0 +1,115 @@
+// zz_slicefar.cpp (experiment, not a check): how well the sprites' transmittance (the march's
+// slices) follows the web's dark dust (D-269) and the galaxies' dust beyond 100 kpc. The void
+// camera, the delivered web, the engine's web dust defaults; per ray the true luminance
+// transmittance T(d) (a march stopped at d) against the slices' reconstruction at d, for today's
+// slices (8 over 1 pc..100 kpc) and candidate far segments (n slices over 100 kpc..50 Mpc,
+// interpolated in ln t or in t).
+
+#include "../src/UniTest.h"
+#include "../src/UniVerifyCommon.h"
+#include "../src/UniRenderRef.h"
+#include "../src/UniVolumeRef.h"
+#include "../scenes/UniScenes.h"
+#include "UniWebTexture.h"
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <string>
+#include <vector>
+
+using namespace UniCore;
+using namespace UniRender;
+namespace H = UniHlsl;
+
+UNI_TEST(zz, slicefar)
+{
+	FWebTexture T;
+	std::string Err;
+	if (!FWebTexture::LoadDelivered("Data/Noise", "web_adhesion_density_mid", T, &Err)) { std::printf("no texture: %s\n", Err.c_str()); return; }
+	BindWebTexture(&T);
+	const UniScenes::FClusterTuning Tun;
+	FUniverseDef Def = UniScenes::WebToGalaxy(Tun);
+	const H::float4 Mean = T.Mean();
+	UniScenes::UseDeliveredWeb(Def, Tun, T.Size, Mean.z / (double(Mean.x) + Mean.y + Mean.z + Mean.w));
+	FUniverseModel M(Def);
+	FRefGenerator G(M);
+	FVolumeBuilder VB(M, G);
+	FRefPipeline P(G);
+	P.bVelocityLod = false;
+	const FCoord Cam = UniScenes::VoidCamera();
+	P.Update(Cam, FVec3f{});
+	FCamera Cm; Cm.Coord = Cam; Cm.Width = 48; Cm.Height = 27; Cm.LookAlong({ 1.0, 0.3, 0.1 });
+	const double Mpc = Units::Mpc;
+	FWebTexture Gt[3];
+	for (int K = 0; K < 3; ++K) { std::string E; FWebTexture::LoadDelivered("Data/Noise", GalaxyTextureName(K), Gt[K], &E); BindGalaxyTexture(K, &Gt[K]); }
+	FVolumeSettings S;
+	S.WebDustTauCm = float(3.0 / (100.0 * Mpc)); S.WebDustInvMean = float(1.0 / (double(Mean.y) + double(Mean.z)));
+	S.WebDustNearCm = float(2.0 * Mpc); S.WebDustDepthCm = float(50.0 * Mpc);
+	S.WebDustDetail = 1.0f; S.WebDustDetailCm = float(30.0 * Mpc); S.WebDustKnots = 0.3f;
+	S.WebDustPeak = 30.0f; S.WebDustTexN = float(Gt[2].Size); S.WebDustRedden = 0.5f;
+	const FVolumeScene Sc = VB.Build(P, Cam, FVec3f{}, Cm.View(), S);
+	const H::FUniVolumeView V = ToHlsl(Sc.View);
+	const auto Cb = Sc.CarrierBuf(); const auto Pb = Sc.ParamBuf(); const auto Lb = Sc.LutBuf();
+	const int Nd = 28;
+	std::vector<double> Dist(Nd);
+	for (int I = 0; I < Nd; ++I) { Dist[size_t(I)] = 0.1 * Mpc * std::pow(800.0, double(I) / (Nd - 1)); }   // 0.1 .. 80 Mpc
+	// Candidate boundaries: the far segment's n slices from 100 kpc to 50 Mpc.
+	const double Hi = 1.0e5 * Units::Pc, Far = 50.0 * Mpc;
+	struct FCand { int N; bool bLinT; double Pw; };   // Pw 0: log spacing; else d_k = Hi + (Far - Hi) (k / n)^Pw
+	const FCand Cands[] = { { 0, false, 0.0 }, { 4, true, 0.0 }, { 4, true, 1.0 }, { 4, true, 1.5 }, { 4, true, 2.0 }, { 6, true, 1.0 }, { 6, true, 1.5 }, { 8, true, 1.0 } };
+	const int Nc = int(sizeof(Cands) / sizeof(Cands[0]));
+	std::vector<double> ErrSum(size_t(Nc) * Nd, 0.0);
+	std::vector<double> TSum(Nd, 0.0), SliceSum(Nd, 0.0);
+	int Rays = 0;
+	for (int Y = 0; Y < Cm.Height; ++Y) for (int X = 0; X < Cm.Width; ++X)
+	{
+		const FV3 D = PixelDir(Cm, Cm.Width, Cm.Height, X + 0.5, Y + 0.5);
+		const H::float3 Dc(float(D.X), float(D.Y), float(D.Z));
+		H::FUniVolumeResult Full = H::Uni_VolumeMarch(Dc, 3.0e38f, Cb, Pb, Lb, V);
+		std::vector<double> Td(Nd);
+		for (int I = 0; I < Nd; ++I) { Td[size_t(I)] = H::Uni_Luminance(H::Uni_VolumeMarch(Dc, float(Dist[size_t(I)]), Cb, Pb, Lb, V).Transmittance); }
+		auto TAt = [&](double Dd)   // the true T at a boundary (a march to it)
+		{
+			return double(H::Uni_Luminance(H::Uni_VolumeMarch(Dc, float(Dd), Cb, Pb, Lb, V).Transmittance));
+		};
+		const double THi = TAt(Hi);
+		for (int Ci = 0; Ci < Nc; ++Ci)
+		{
+			const FCand& C = Cands[Ci];
+			std::vector<double> Bd, Bt;
+			Bd.push_back(Hi); Bt.push_back(THi);
+			for (int K = 1; K <= C.N; ++K) { const double Db = C.Pw > 0.0 ? Hi + (Far - Hi) * std::pow(double(K) / C.N, C.Pw) : Hi * std::pow(Far / Hi, double(K) / C.N); Bd.push_back(Db); Bt.push_back(TAt(Db)); }
+			for (int I = 0; I < Nd; ++I)
+			{
+				const double Dd = Dist[size_t(I)];
+				double R;
+				if (C.N == 0 || Dd <= Hi) { R = Dd <= Hi ? double(H::Uni_Luminance(H::Uni_SliceTransmittance(Full.SliceT, float(Dd), V))) : THi; }
+				else if (Dd >= Bd.back()) { R = Bt.back(); }
+				else
+				{
+					size_t K = 1; while (Bd[K] < Dd) { ++K; }
+					const double F = C.bLinT ? (Dd - Bd[K - 1]) / (Bd[K] - Bd[K - 1]) : std::log(Dd / Bd[K - 1]) / std::log(Bd[K] / Bd[K - 1]);
+					R = Bt[K - 1] + (Bt[K] - Bt[K - 1]) * F;
+				}
+				ErrSum[size_t(Ci) * Nd + I] += std::abs(R - Td[size_t(I)]);
+			}
+		}
+		for (int I = 0; I < Nd; ++I) { TSum[size_t(I)] += Td[size_t(I)]; SliceSum[size_t(I)] += Dist[size_t(I)] <= Hi ? Td[size_t(I)] : THi; }
+		++Rays;
+	}
+	std::printf("rays %d\n%8s %8s %8s", Rays, "d Mpc", "T true", "T now");
+	for (const FCand& C : Cands) { std::printf(" n%dp%.1f", C.N, C.Pw); }
+	std::printf("\n");
+	std::vector<double> Tot(Nc, 0.0);
+	for (int I = 0; I < Nd; ++I)
+	{
+		std::printf("%8.3f %8.4f %8.4f", Dist[size_t(I)] / Mpc, TSum[size_t(I)] / Rays, SliceSum[size_t(I)] / Rays);
+		for (int Ci = 0; Ci < Nc; ++Ci) { const double E = ErrSum[size_t(Ci) * Nd + I] / Rays; std::printf(" %6.4f", E); if (Dist[size_t(I)] >= 0.5 * Mpc && Dist[size_t(I)] <= 50 * Mpc) { Tot[size_t(Ci)] += E; } }
+		std::printf("\n");
+	}
+	std::printf("mean |dT| 0.5..50 Mpc:");
+	for (int Ci = 0; Ci < Nc; ++Ci) { std::printf(" n%dp%.1f %.4f", Cands[Ci].N, Cands[Ci].Pw, Tot[size_t(Ci)]); }
+	std::printf("\n");
+	for (int K = 0; K < 3; ++K) { BindGalaxyTexture(K, nullptr); }
+	BindWebTexture(nullptr);
+}

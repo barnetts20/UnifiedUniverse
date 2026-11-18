@@ -24,6 +24,7 @@
 #include "UniProfile.h"
 #include "UniWebTexture.h"
 #include "UniNebGrid.h"
+#include "UniCompact.h"   // D-272
 
 int main()
 {

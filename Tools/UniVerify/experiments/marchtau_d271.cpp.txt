@@ -1,0 +1,144 @@
+// zz_marchtau.cpp (experiment): which rays give T3.vol.march's tau error (0.0043 -> 0.0169 at D-256..D-262).
+#include "../src/UniTest.h"
+#include "../src/UniRenderRef.h"
+#include "../src/UniVerifyCommon.h"
+#include "../src/UniVolumeRef.h"
+#include "../scenes/UniScenes.h"
+#include "UniVolume.h"
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <vector>
+using namespace UniCore;
+using namespace UniRender;
+namespace H = UniHlsl;
+namespace {
+	FCoord Moved(const FCoord& C, const FV3& D) { FCoord R = C; FVec3f F; AddDisplacement(R, F, FVec3d{ D.X, D.Y, D.Z }); return R; }
+	H::float3 BruteForce(const FVolumeScene& Sc, H::float3 Dir, float TScene, double* OutTau = nullptr)
+	{
+		const auto Pb = Sc.ParamBuf();
+		const auto Lb = Sc.LutBuf();
+		const H::FUniVolumeView V = ToHlsl(Sc.View);
+		struct FI { H::FUniCarrier C; H::float3 Ld; double T0, T1; };
+		std::vector<FI> Act;
+		double TMin = 1e300, TMax = 0;
+		for (const FCarrierGPU& G : Sc.Carriers)
+		{
+			FI I; I.C = ToHlsl(G);
+			if (!(I.C.Weight > 0.0f)) { continue; }
+			I.Ld = H::Uni_CarrierLocalDir(I.C, Dir);
+			float A = 0, B = 0;
+			if (!H::Uni_CarrierInterval(I.C, I.Ld, TScene, A, B)) { continue; }
+			I.T0 = A; I.T1 = B;
+			TMin = std::min(TMin, I.T0); TMax = std::max(TMax, I.T1);
+			Act.push_back(I);
+		}
+		double Bv[3] = { 0, 0, 0 }, Tr[3] = { 1, 1, 1 };
+		if (Act.empty()) { if (OutTau) { *OutTau = 0; } return H::float3(0, 0, 0); }
+		double T = TMin;
+		const double Uniform = (TMax - TMin) / 4.0e5;
+		while (T < TMax)
+		{
+			double Next = TMax;
+			bool bAny = false;
+			for (const FI& I : Act) { if (T < I.T0) { Next = std::min(Next, I.T0); } else if (T < I.T1) { bAny = true; Next = std::min(Next, I.T1); } }
+			if (!bAny) { T = Next; continue; }
+			double S = std::min(std::max(0.002 * T, 1.0e14), Uniform);
+			S = std::max(std::min(S, Next - T), 1e-9 * T);
+			const double Tm = T + 0.5 * S;
+			double E[3] = { 0, 0, 0 }, Tau[3] = { 0, 0, 0 };
+			for (const FI& I : Act)
+			{
+				if (Tm < I.T0 || Tm >= I.T1) { continue; }
+				const H::FUniFieldParams Par = Pb[I.C.ParamIndex];
+				const H::float3 P = H::Uni_CarrierPoint(I.C, I.Ld, float(Tm));
+				const double Du = S * double(I.C.InvRadius);
+				const double Rho = H::Uni_FieldSample(I.C.FieldId, P, Par);
+				if (Rho > 0)
+				{
+					const H::float3 L = H::Uni_VolumeLut(Lb, I.C.LutIndex, float(Tm));
+					const double K = double(I.C.Amplitude) * double(I.C.Weight) * Rho * Du;
+					E[0] += L.x * K; E[1] += L.y * K; E[2] += L.z * K;
+				}
+				if (I.C.Flags & H::UNI_CARRIER_DUST)
+				{
+					const H::FUniFieldParams D = Pb[I.C.DustParamIndex];
+					const double Rd = H::Uni_FieldSample(I.C.FieldId, P, D);
+					const double Sig[3] = { V.DustSigmaRgb.x, V.DustSigmaRgb.y, V.DustSigmaRgb.z };
+					for (int K = 0; K < 3; ++K) { Tau[K] += Sig[K] * double(D.D.y) * Rd * Du; }
+				}
+			}
+			for (int K = 0; K < 3; ++K)
+			{
+				const double Ex = std::exp(-Tau[K]);
+				const double W = Tau[K] > 1e-9 ? (1 - Ex) / Tau[K] : 1.0;
+				Bv[K] += Tr[K] * E[K] * W;
+				Tr[K] *= Ex;
+			}
+			T += S;
+		}
+		for (const FI& I : Act)
+		{
+			if (!(I.C.Flags & H::UNI_CARRIER_TAIL) || I.T1 < double(I.C.TEnd) || TScene <= I.C.TEnd) { continue; }
+			const H::float3 Tl = H::Uni_VolumeLut(Lb, I.C.LutIndex + 1u, I.C.TEnd);
+			const double K = double(I.C.Amplitude) * double(I.C.Weight) * double(I.C.MeanDensity) * double(I.C.InvRadius);
+			Bv[0] += Tr[0] * Tl.x * K; Bv[1] += Tr[1] * Tl.y * K; Bv[2] += Tr[2] * Tl.z * K;
+		}
+		if (OutTau) { *OutTau = -std::log(std::max(Tr[1], 1e-300)); }
+		return H::float3(float(Bv[0]), float(Bv[1]), float(Bv[2]));
+	}
+
+}
+
+UNI_TEST(zz, marchtau)
+{
+	// Rays through the anchored galaxy from outside (face-on, edge-on) and inside (the solar
+	// camera, in-plane and out of plane), with dust: the adaptive march vs a brute-force march.
+	FUniverseModel M(UniScenes::GalaxyToStar());
+	FRefGenerator G(M);
+	FVolumeBuilder VB(M, G);
+	struct FCase { const char* Name; FV3 Offset; bool bSolar; FV3 Look; };
+	const double Kpc = Units::Kpc;
+	const FCase Cases[] = {
+		{ "face-on 60 kpc", { 0, 0, 60 * Kpc }, false, { 0, 0, -1 } },
+		{ "edge-on 60 kpc", { 60 * Kpc, 0, 1.0 * Kpc }, false, { -1, 0, -0.0167 } },
+		{ "inside, towards centre", { 0, 0, 0 }, true, { -1, -0.12, -0.02 } },
+		{ "inside, out of plane", { 0, 0, 0 }, true, { -0.3, 0.1, 1 } },
+	};
+	double Worst = 0.0, WorstTau = 0.0;
+	size_t Rays = 0, Trunc = 0, Compared = 0;
+	u64 StepSum = 0; u32 StepMax = 0;
+	std::string Detail;
+	for (const FCase& C : Cases)
+	{
+		FRefPipeline P(G);
+		const FCoord Cam = C.bSolar ? UniScenes::SolarCamera() : Moved(FCoord::Origin(), C.Offset);
+		P.Update(Cam, FVec3f{});
+		FCamera Cm; Cm.Coord = Cam; Cm.Width = 96; Cm.Height = 54; Cm.LookAlong(C.Look);
+		// The integrator against brute force, on the exact field: D-160's prefiltering averages
+		// a pixel's footprint on purpose (T2.vol.equivalence checks that it keeps the light).
+		FVolumeSettings Exact; Exact.bPrefilter = false;
+		const FVolumeScene Sc = VB.Build(P, Cam, FVec3f{}, Cm.View(), Exact);
+		const H::FUniVolumeView V = ToHlsl(Sc.View);
+		double CaseWorst = 0.0;
+		for (int Y = 0; Y < 9; ++Y) for (int X = 0; X < 16; ++X)
+		{
+			const FV3 D = PixelDir(Cm, 16, 9, X + 0.5, Y + 0.5);
+			const H::float3 Dir(float(D.X), float(D.Y), float(D.Z));
+			const H::FUniVolumeResult R = H::Uni_VolumeMarch(Dir, 3.0e38f, Sc.CarrierBuf(), Sc.ParamBuf(), Sc.LutBuf(), V);
+			++Rays; Trunc += R.Truncated; StepSum += R.Steps; StepMax = std::max(StepMax, R.Steps);
+			if (!R.Active) { continue; }
+			double Tau = 0;
+			const H::float3 Ref = BruteForce(Sc, Dir, 3.0e38f, &Tau);
+			if (!(Ref.y > 0.0f)) { continue; }
+			++Compared;
+			const double Err = std::fabs(double(R.Radiance.y) - double(Ref.y)) / double(Ref.y);
+			const double TauErr = std::fabs(-std::log(std::max(double(R.Transmittance.y), 1e-300)) - Tau);
+			// Fully opaque rays (tau > 7) stop early by design: compare emission only.
+			Worst = std::max(Worst, Err); CaseWorst = std::max(CaseWorst, Err);
+			if (Tau < 7.0) { WorstTau = std::max(WorstTau, TauErr); } if (TauErr > 0.004 && Tau < 7.0) { std::printf("%s px %d,%d tau ref %.4f march %.4f err %.4f steps %u T %.3e\n", C.Name, X, Y, Tau, -std::log(std::max(double(R.Transmittance.y), 1e-300)), TauErr, R.Steps, double(R.Transmittance.y)); }
+		}
+		Detail += Uni::Fmt("%s: worst %.3f%%; ", C.Name, CaseWorst * 100.0);
+	}
+		std::printf("worst tau %.4f emission %.4f\n", WorstTau, Worst);
+}

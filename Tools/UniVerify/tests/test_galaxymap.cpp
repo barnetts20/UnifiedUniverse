@@ -2,7 +2,8 @@
 // the camera's own galaxy marched from its baked 2D map against its field. (D-211's clipmap, which
 // this file first tested, was removed in D-213.) D-255: T2.vol.galaxy_map_stepfoot, the map read over
 // the march's step along the disc (uu.Volume.StepFoot). D-262: T2.vol.galaxy_segment. D-265:
-// T2.vol.galaxy_detail_layers, the camera's galaxy's detail layers and their step cap.
+// T2.vol.galaxy_detail_layers, the camera's galaxy's detail layers and their step cap. D-267:
+// T2.vol.galaxy_knot_layers, the knots in the detail layers and the knots' nebula tint.
 #include "../src/UniTest.h"
 #include "../src/UniVerifyCommon.h"
 #include "../src/UniRenderRef.h"
@@ -402,9 +403,11 @@ UNI_TEST(volume, galaxy_segment)
 	std::string Sum;
 	for (int C = 0; C < NC; ++C) { Sum += Uni::Fmt("%s%s err %.2f%% spread %.3f%% light %+.1f%% %.0f ms", Sum.empty() ? "" : ", ", Cfgs[C].Name, 100.0 * SumErr[C], 100.0 * SumSpread[C], 100.0 * SumLight[C], SumMs[C]); }
 	std::printf("    galaxy_segment mean: %s\n    %s\n", Sum.c_str(), Detail.c_str());
-	bPass = bPass && SumErr[2] < SumErr[1] && SumSpread[2] <= 1.5 * SumSpread[1] && SumSpread[2] <= SumSpread[0];
-	Uni::Check(2, "T2.vol.galaxy_segment", "D-262 paradigm C: the camera's galaxy's step read at up to SegmentTaps points along its run; from the solar circle along and across the disc and from 300 pc above, 8 jitter phases against a fine reference (an eighth of the steps, unjittered, StepFoot 0): SegmentTaps 4 at StepFoot 0.5 nearer the reference than D-255's one tap, its spread over the phases within 1.5x D-255's and no more than StepFoot 0's")
-		.Metric("err_d255", SumErr[1]).Metric("err_taps4", SumErr[2]).Metric("err_taps8", SumErr[3]).Metric("spread_d255", SumSpread[1]).Metric("spread_taps4", SumSpread[2]).Metric("spread_foot0", SumSpread[0])
+	// D-270 (B-034 closed): the step footprint keeps the light (the shaped textures are mean 1 at every
+	// mip, D-258/D-259; the taps, D-262): the defaults' light within 1% of the fine reference.
+	bPass = bPass && SumErr[2] < SumErr[1] && SumSpread[2] <= 1.5 * SumSpread[1] && SumSpread[2] <= SumSpread[0] && std::abs(SumLight[2]) <= 0.01;
+	Uni::Check(2, "T2.vol.galaxy_segment", "D-262 paradigm C: the camera's galaxy's step read at up to SegmentTaps points along its run; from the solar circle along and across the disc and from 300 pc above, 8 jitter phases against a fine reference (an eighth of the steps, unjittered, StepFoot 0): SegmentTaps 4 at StepFoot 0.5 nearer the reference than D-255's one tap, its spread over the phases within 1.5x D-255's and no more than StepFoot 0's, and its light within 1% of the reference (D-270)")
+		.Metric("light_taps4", SumLight[2]).Metric("err_d255", SumErr[1]).Metric("err_taps4", SumErr[2]).Metric("err_taps8", SumErr[3]).Metric("spread_d255", SumSpread[1]).Metric("spread_taps4", SumSpread[2]).Metric("spread_foot0", SumSpread[0])
 		.Pass(bPass, "mean: " + Sum + "; " + Detail);
 }
 
@@ -546,4 +549,192 @@ UNI_TEST(volume, galaxy_detail_layers)
 	Uni::Check(2, "T2.vol.galaxy_detail_layers", "D-265 detail layers (x4, x16; light and dust 0.5; 16 steps a layer at 4 texels): from the solar circle toward the centre and 300 pc above, 8 jitter phases against each configuration's fine reference: the light within 4% of the layers off, with the step cap the grain no more than the layers' without it, the error under 2.5%, the steps at most 2x; D-266: with the defaults' bubble (0.33 radii fading over all of it, 0.08 over its outer half), and outside it (18 kpc above the solar circle) the frame and steps exactly the layers off")
 		.Metric("light_on", Light[2]).Metric("spread_off", Spread[0]).Metric("spread_nocap", Spread[1]).Metric("spread_cap", Spread[2]).Metric("err_cap", Err[2]).Metric("steps_x", StepsX)
 		.Pass(bPass, Detail + Uni::Fmt("; steps x%.2f", StepsX));
+}
+
+
+UNI_TEST(volume, galaxy_knot_layers)
+{
+	// D-267 (owner 2026-11-16: the nebulae as part of the field, their fidelity from the detail
+	// layers): each detail layer's knot channel (galaxy_shape's G^8 over its mean) multiplies the
+	// knots' young light, and the knots' light leans toward the galaxy's nebula colours. Held:
+	// - the layer function: the knot amplitude leaves the light and dust multipliers bit for bit,
+	//   knots off give exactly 1, and the knot multiplier's mean over the Milky Way's disc slab is 1
+	//   within 3% (galaxy_shape's mean 1 at every mip; 20,000 points at two footprints);
+	// - the march (the engine's layers and bubble, knots 0.5 each): from the solar circle toward the
+	//   centre and 300 pc above, 8 jitter phases against each configuration's fine reference: the
+	//   light within 3% of the layers without knots, the grain (spread over the phases) at most 15%
+	//   over theirs, the error under 2.5%, the steps the same (the knots ride the light layers' steps);
+	// - the tint (1 against 0) keeps each sample's luminance exactly (the colour moves, its luminance
+	//   does not); a pixel's within 1% (the dust in front absorbs a pinker sample's light differently
+	//   from a whiter one's: 0.25% measured), and the colour changes.
+	const FCacheTex& Tx = GalTex();
+	if (!Tx.bOk) { Uni::Check(2, "T2.vol.galaxy_knot_layers", "D-267 knots in the detail layers").Pass(false, "textures not loaded: " + Tx.Err); return; }
+	FGalBindAll Bind(Tx);
+	FUniverseDef D = UniScenes::Flythrough();
+	UniScenes::UseGalaxyTextures(D, Tx.T[0].Size);
+	UniScenes::UseGalaxyPalettes(D);
+	FUniverseModel M(D);
+	FRefGenerator G(M);
+	FVolumeBuilder VB(M, G);
+	std::string Detail;
+	bool bPass = true;
+	auto Layers = [](FVolumeSettings& S, float Knots, float Tint, float Steps)
+	{
+		S.DetailFreq0 = 4.0f; S.DetailLight0 = 0.5f; S.DetailDust0 = 0.5f; S.DetailKnot0 = Knots;
+		S.DetailFreq1 = 16.0f; S.DetailLight1 = 0.5f; S.DetailDust1 = 0.5f; S.DetailKnot1 = Knots;
+		S.DetailRange0 = 0.33f; S.DetailFade0 = 1.0f; S.DetailRange1 = 0.08f; S.DetailFade1 = 0.5f;
+		S.DetailSteps = Steps; S.DetailStepTexels = 4.0f; S.DetailFoot = 0.5f; S.DetailKnotTint = Tint;
+	};
+	// The layer function over the Milky Way's slab.
+	{
+		const FCoord Cam = CamAt({ 8.0 * Units::Kpc, 1.0 * Units::Kpc, 20.0 * Units::Pc });
+		FRefPipeline P(G);
+		P.bVelocityLod = false;
+		P.Update(Cam, FVec3f{});
+		FCamera Cm; Cm.Coord = Cam; Cm.Width = 16; Cm.Height = 9; Cm.LookAlong({ -1.0, 0.05, 0.02 });
+		FVolumeSettings S;
+		FVolumeScene Sc = VB.Build(P, Cam, FVec3f{}, Cm.View(), S).Subset(false);
+		const FCarrierGPU* Home = HomeCarrierOf(Sc);
+		if (!Home) { bPass = false; Detail += "NO HOME"; }
+		else
+		{
+			H::FUniFieldParams Par;
+			std::memcpy(static_cast<void*>(&Par), &Sc.Params[Home->ParamIndex], sizeof(Par));
+			const H::FUniGalaxyConst K = H::Uni_GalaxyConstOf(Par);
+			const float Slab = H::Uni_GalaxyDiscSlab(Par);
+			bool bSame = true, bOne = true;
+			double Mean[2] = { 0.0, 0.0 };
+			const int N = 20000;
+			const float Foots[2] = { 2.0e-5f, 2.0e-4f };   // ~0.5 and ~5 pc of a 24 kpc radius: layer 1 sharp, then its mip ~3
+			for (int I = 0; I < N; ++I)
+			{
+				const double U = (I * 0.7548776662) - std::floor(I * 0.7548776662), V = (I * 0.5698402910) - std::floor(I * 0.5698402910), Wz = (I * 0.4142135624) - std::floor(I * 0.4142135624);
+				const double R = 0.15 + 0.7 * std::sqrt(U), Ph = 6.283185307 * V;
+				const H::float3 Pt(float(R * std::cos(Ph)), float(R * std::sin(Ph)), float((2.0 * Wz - 1.0) * 0.5 * Slab));
+				for (int Fi = 0; Fi < 2; ++Fi)
+				{
+					const H::float3 A = H::Uni_GalaxyDetailLayers(Pt, Par, K, Foots[Fi], H::float4(4.0f, 0.5f, 0.5f, 0.0f), H::float4(16.0f, 0.5f, 0.5f, 0.0f));
+					const H::float3 B = H::Uni_GalaxyDetailLayers(Pt, Par, K, Foots[Fi], H::float4(4.0f, 0.5f, 0.5f, 1.0f), H::float4(16.0f, 0.5f, 0.5f, 1.0f));
+					bSame = bSame && A.x == B.x && A.y == B.y;
+					bOne = bOne && A.z == 1.0f;
+					Mean[Fi] += double(B.z) / N;
+				}
+			}
+			const bool bMean = std::abs(Mean[0] - 1.0) < 0.03 && std::abs(Mean[1] - 1.0) < 0.03;
+			bPass = bPass && bSame && bOne && bMean;
+			Detail += Uni::Fmt("the layer function: light and dust unchanged by the knots %s, knots off exactly 1 %s, the knot multiplier's mean over the slab (both layers at 1) %.4f / %.4f at two footprints", bSame ? "yes" : "NO", bOne ? "yes" : "NO", Mean[0], Mean[1]);
+		}
+	}
+	struct FView { const char* Name; FVec3d Pos; FV3 Look; };
+	const FView Views[] = {
+		{ "toward the centre", { 8.0 * Units::Kpc, 1.0 * Units::Kpc, 20.0 * Units::Pc }, { -1.0, 0.05, 0.02 } },
+		{ "300 pc above, down 30 deg", { 8.0 * Units::Kpc, 1.0 * Units::Kpc, 300.0 * Units::Pc }, { -0.85, 0.1, -0.5 } },
+	};
+	FGalaxyMap Map;
+	bool bBaked = false;
+	double WorstLight = 0.0, WorstErr = 0.0, WorstSpreadX = 0.0, WorstLum = 0.0, Chroma = 0.0;
+	bool bSteps = true;
+	for (const FView& Vw : Views)
+	{
+		const FCoord Cam = CamAt(Vw.Pos);
+		FRefPipeline P(G);
+		P.bVelocityLod = false;
+		P.Update(Cam, FVec3f{});
+		FCamera Cm; Cm.Coord = Cam; Cm.Width = 96; Cm.Height = 54; Cm.LookAlong(Vw.Look);
+		auto Scene = [&](float Knots, float Tint, bool bRef) -> FVolumeScene
+		{
+			FVolumeSettings S;
+			S.StepFoot = bRef ? 0.0f : 0.5f; S.SegmentTaps = bRef ? 1u : 4u;
+			Layers(S, Knots, Tint, 16.0f);
+			FVolumeScene Sc = VB.Build(P, Cam, FVec3f{}, Cm.View(), S).Subset(false);
+			const FCarrierGPU* Home = HomeCarrierOf(Sc);
+			if (Home && !bBaked) { Map.Bake(*Home, Sc.Params, 512u, 2); bBaked = true; }
+			if (Home) { PublishGalaxyMap(Sc.View, Sc.Home.Carrier, 512u); }
+			if (bRef) { Sc.View.MarchFlags |= 2u; Sc.View.MaxSteps = 65536u; }
+			return Sc;
+		};
+		{ FVolumeScene S0 = Scene(0.0f, 0.0f, true); (void)S0; }
+		BindGalaxyMap(0u, &Map);
+		if (!bBaked) { bPass = false; Detail += Uni::Fmt("; %s: NO HOME", Vw.Name); BindGalaxyMap(0u, nullptr); continue; }
+		double Mean0 = 0.0, Spread0 = 0.0, Steps0 = 0.0;
+		std::string Vd;
+		for (int C = 0; C < 2; ++C)
+		{
+			const float Kn = C == 0 ? 0.0f : 0.5f;
+			const FRun Ref = March(Scene(Kn, 0.0f, true), Cm);
+			double RefMean = 0.0;
+			for (double L : Ref.Lum) { RefMean += L; }
+			RefMean /= double(Ref.Lum.size());
+			FVolumeScene Sc = Scene(Kn, 0.0f, false);
+			Sc.View.MarchFlags |= H::UNI_VOL_JITTER_FLAG;
+			const int Np = 8;
+			std::vector<double> S1(Ref.Lum.size(), 0.0), S2 = S1;
+			double St = 0.0;
+			for (int Ph = 0; Ph < Np; ++Ph)
+			{
+				Sc.View.JitterShift = float(Ph) * 0.61803398875f;
+				const FRun R = March(Sc, Cm);
+				St += R.Steps / Np;
+				for (size_t I = 0; I < R.Lum.size(); ++I) { S1[I] += R.Lum[I]; S2[I] += R.Lum[I] * R.Lum[I]; }
+			}
+			double Sm = 0.0, Ss = 0.0, Ea = 0.0;
+			for (size_t I = 0; I < S1.size(); ++I)
+			{
+				const double Mu = S1[I] / Np;
+				Sm += Mu;
+				Ss += std::sqrt(std::max(S2[I] / Np - Mu * Mu, 0.0));
+				Ea += std::abs(Mu - Ref.Lum[I]);
+			}
+			const double N = double(S1.size());
+			const double E = Ea / std::max(RefMean * N, 1e-300), Sp = Ss / std::max(Sm, 1e-300);
+			if (C == 0) { Mean0 = Sm / N; Spread0 = Sp; Steps0 = St; }
+			else
+			{
+				const double Li = Sm / N / std::max(Mean0, 1e-300) - 1.0;
+				WorstLight = std::abs(Li) > std::abs(WorstLight) ? Li : WorstLight;
+				WorstErr = std::max(WorstErr, E);
+				WorstSpreadX = std::max(WorstSpreadX, Sp / std::max(Spread0, 1e-300));
+				bSteps = bSteps && St == Steps0;
+				Vd += Uni::Fmt(", knots 0.5: err %.2f%% spread %.3f%% (x%.3f) light %+.2f%% steps %.1f", 100.0 * E, 100.0 * Sp, Sp / std::max(Spread0, 1e-300), 100.0 * Li, St);
+			}
+			if (C == 0) { Vd += Uni::Fmt("without knots: err %.2f%% spread %.3f%% steps %.1f", 100.0 * E, 100.0 * Sp, St); }
+		}
+		// The tint: per pixel luminance kept, colour changed; 0 bit for bit.
+		{
+			FCamera Cs = Cm; Cs.Width = 48; Cs.Height = 27;
+			std::vector<H::float3> Out[2];
+			const float Tints[2] = { 0.0f, 1.0f };
+			for (int K = 0; K < 2; ++K)
+			{
+				FVolumeSettings S;
+				S.StepFoot = 0.5f; S.SegmentTaps = 4u;
+				Layers(S, 0.5f, Tints[K], 16.0f);
+				FVolumeScene Sc = VB.Build(P, Cam, FVec3f{}, Cs.View(), S).Subset(false);
+				const FCarrierGPU* Home = HomeCarrierOf(Sc);
+				if (Home) { PublishGalaxyMap(Sc.View, Sc.Home.Carrier, 512u); }
+				const auto V = ToHlsl(Sc.View);
+				const auto Cb = Sc.CarrierBuf(); const auto Pb = Sc.ParamBuf(); const auto Lb = Sc.LutBuf();
+				for (int Y = 0; Y < Cs.Height; ++Y)
+				{
+					for (int X = 0; X < Cs.Width; ++X)
+					{
+						bool bS = false;
+						Out[K].push_back(MarchPixel(Cb, Pb, Lb, V, Cs, Cs.Width, Cs.Height, X, Y, 3.0e38f, bS).Radiance);
+					}
+				}
+			}
+			for (size_t I = 0; I < Out[0].size(); ++I)
+			{
+				const double L1 = H::Uni_Luminance(Out[0][I]), L2 = H::Uni_Luminance(Out[1][I]);
+				if (L1 > 0.0) { WorstLum = std::max(WorstLum, std::abs(L2 / L1 - 1.0)); Chroma += (std::abs(double(Out[1][I].x - Out[0][I].x)) + std::abs(double(Out[1][I].z - Out[0][I].z))) / L1 / double(Out[0].size()); }
+			}
+		}
+		BindGalaxyMap(0u, nullptr);
+		Detail += Uni::Fmt("; %s: %s", Vw.Name, Vd.c_str());
+	}
+	bPass = bPass && std::abs(WorstLight) <= 0.03 && WorstSpreadX <= 1.15 && WorstErr < 0.025 && bSteps && WorstLum < 1e-2 && Chroma > 1e-3;
+	Uni::Check(2, "T2.vol.galaxy_knot_layers", "D-267 knots in the detail layers (galaxy_shape's knot channel on the knots' young light) and the knots' nebula tint: the layer function's light and dust bit for bit, knots off exactly 1, the knot multiplier's mean 1 within 3% over the Milky Way's slab; with the engine's layers and bubble and knots 0.5, toward the centre and 300 pc above, 8 jitter phases against each configuration's fine reference: the light within 3% of the layers without knots, the grain at most x1.15 theirs, the error under 2.5%, the same steps; the tint keeps each pixel's luminance within 1% (each sample's exactly; the dust's reddening in front) and changes its colour")
+		.Metric("light", WorstLight).Metric("spread_x", WorstSpreadX).Metric("err", WorstErr).Metric("tint_lum", WorstLum).Metric("tint_chroma", Chroma)
+		.Pass(bPass, Detail + Uni::Fmt("; worst: light %+.2f%%, grain x%.3f, error %.2f%%, steps the same %s; the tint: luminance within %.1e, chroma moved %.3f of the luminance",
+			100.0 * WorstLight, WorstSpreadX, 100.0 * WorstErr, bSteps ? "yes" : "NO", WorstLum, Chroma));
 }

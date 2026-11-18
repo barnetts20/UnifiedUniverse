@@ -1,0 +1,58 @@
+// zz_foot_d270.cpp.txt (archived exploration; was tests/test_zz_foot.cpp, --group zz.foot): B-034's starlight over the step at range. Result (2026-11-16): light against the fine reference (an eighth of the steps, StepFoot 0, one tap), 4 jitter phases: 1 kpc above down 30 deg: foot 0 -0.19%, 0.5 one tap -0.52%, 0.5 taps 4 -0.11%, 1 taps 4 -0.08%, 2 taps 4 -0.67%; 3 kpc above down 45 deg: +0.03 / -0.02 / -0.08 / -0.08 / -0.37%; solar along the disc: -0.01 / -0.17 / -0.16 / -0.09 / -0.32%. D-255's -3.7% at 3 kpc predates D-258/D-259's shaped textures and D-262's taps: B-034's item closed (D-270).
+// exploration (B-034): the camera's galaxy's light over the step footprint at range.
+#include "../src/UniTest.h"
+#include "../src/UniVerifyCommon.h"
+#include "../src/UniRenderRef.h"
+#include "../src/UniVolumeRef.h"
+#include "../scenes/UniScenes.h"
+#include "UniGalaxyMap.h"
+#include "UniWebTexture.h"
+#include <algorithm>
+#include <cmath>
+#include <string>
+#include <vector>
+#include <cstdio>
+using namespace UniCore; using namespace UniRender; namespace H = UniHlsl;
+namespace {
+	struct FTx { FWebTexture T[3]; bool bOk = true; FTx() { for (int S = 0; S < 3; ++S) { std::string E; if (!FWebTexture::LoadDelivered("Data/Noise", GalaxyTextureName(S), T[S], &E)) bOk = false; } } };
+	FCoord CamAt(const FVec3d& P) { FCoord C = FCoord::Origin(); FVec3f F; AddDisplacement(C, F, P); return C; }
+	std::vector<double> MarchL(const FVolumeScene& Sc, const FCamera& Cm, double& Steps)
+	{
+		std::vector<double> L(size_t(Cm.Width) * Cm.Height); const auto V = ToHlsl(Sc.View); const auto Cb = Sc.CarrierBuf(); const auto Pb = Sc.ParamBuf(); const auto Lb = Sc.LutBuf(); Steps = 0;
+		for (int Y = 0; Y < Cm.Height; ++Y) for (int X = 0; X < Cm.Width; ++X) { bool bS = false; const auto R = MarchPixel(Cb, Pb, Lb, V, Cm, Cm.Width, Cm.Height, X, Y, 3.0e38f, bS); L[size_t(Y) * Cm.Width + X] = H::Uni_Luminance(R.Radiance); Steps += R.Steps; }
+		Steps /= double(L.size()); return L;
+	}
+}
+UNI_TEST(zz, foot)
+{
+	static FTx Tx; for (int I = 0; I < 3; ++I) BindGalaxyTexture(I, &Tx.T[I]);
+	FUniverseDef D = UniScenes::Flythrough(); UniScenes::UseGalaxyTextures(D, Tx.T[0].Size); UniScenes::UseGalaxyPalettes(D);
+	FUniverseModel M(D); FRefGenerator G(M); FVolumeBuilder VB(M, G);
+	struct FView { const char* Name; FVec3d Pos; FV3 Look; };
+	const FView Views[] = {
+		{ "1 kpc above, down 30", { 8.0 * Units::Kpc, 1.0 * Units::Kpc, 1.0 * Units::Kpc }, { -0.85, 0.1, -0.5 } },
+		{ "3 kpc above, down 45", { 8.0 * Units::Kpc, 1.0 * Units::Kpc, 3.0 * Units::Kpc }, { -0.7, 0.1, -0.7 } },
+		{ "solar along the disc", { 8.0 * Units::Kpc, 1.0 * Units::Kpc, 20.0 * Units::Pc }, { 0.05, 1.0, 0.02 } },
+	};
+	struct FCfg { const char* N; float Foot; u32 Taps; };
+	const FCfg Cf[] = { { "foot0 t1", 0, 1 }, { "foot.5 t1", 0.5f, 1 }, { "foot.5 t4", 0.5f, 4 }, { "foot1 t4", 1.0f, 4 }, { "foot2 t4", 2.0f, 4 } };
+	FGalaxyMap Map; bool bBaked = false;
+	for (const FView& Vw : Views)
+	{
+		const FCoord Cam = CamAt(Vw.Pos); FRefPipeline P(G); P.bVelocityLod = false; P.Update(Cam, FVec3f{});
+		FCamera Cm; Cm.Coord = Cam; Cm.Width = 80; Cm.Height = 45; Cm.LookAlong(Vw.Look);
+		auto Scene = [&](float Foot, u32 Taps) { FVolumeSettings S; S.StepFoot = Foot; S.SegmentTaps = Taps; FVolumeScene Sc = VB.Build(P, Cam, FVec3f{}, Cm.View(), S).Subset(false); const FCarrierGPU* Home = HomeCarrierOf(Sc); if (Home && !bBaked) { Map.Bake(*Home, Sc.Params, 512u, 2); bBaked = true; } if (Home) PublishGalaxyMap(Sc.View, Sc.Home.Carrier, 512u); return Sc; };
+		FVolumeScene Rs = Scene(0, 1); BindGalaxyMap(0u, &Map); Rs.View.MarchFlags |= 2u; Rs.View.MaxSteps = 16384u; double St;
+		const auto Ref = MarchL(Rs, Cm, St); double Sr = 0; for (double L : Ref) Sr += L;
+		std::printf("  %s (ref %.0f steps)\n", Vw.Name, St);
+		for (const FCfg& C : Cf)
+		{
+			FVolumeScene Sc = Scene(C.Foot, C.Taps); Sc.View.MarchFlags |= H::UNI_VOL_JITTER_FLAG; double Sa = 0, Sst = 0;
+			for (int Ph = 0; Ph < 4; ++Ph) { Sc.View.JitterShift = float(Ph) * 0.618034f; double S1; const auto L = MarchL(Sc, Cm, S1); for (double x : L) Sa += x / 4; Sst += S1 / 4; }
+			std::printf("    %-10s light %+.2f%%  steps %.1f\n", C.N, 100.0 * (Sa / Sr - 1.0), Sst); std::fflush(stdout);
+		}
+		BindGalaxyMap(0u, nullptr);
+	}
+	for (int I = 0; I < 3; ++I) BindGalaxyTexture(I, nullptr);
+	Uni::Check(3, "zz.foot", "B-034 exploration").Pass(true, "see output");
+}

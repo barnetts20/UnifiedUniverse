@@ -1,0 +1,114 @@
+// webdust_d269.cpp.txt (archived exploration; was UNI_TEST(zz, webdust) at the end of tests/test_travellook.cpp): D-269, the cosmic web's dark dust from the void camera with the delivered web (wd_<cfg>.ppm, 8 jitter phases averaged), with and without the motion web's glow. The texture's filament + node matter over its mean: median 0.05, p75 0.60, p90 2.5, p99 14, max 191 (held at 30: mean 0.77). Result: at a 10 Mpc pattern period the dark features were specks 10-50 Mpc away (a brownish haze); at 30 Mpc, optical depth 5 per 100 Mpc and pattern 1, dark filament threads cross the glow (frame light x0.43 with the motion web); prefiltering over the whole step instead of half removed the extra grain with the motion web (spread 2.48% -> 2.22%, without dust 2.26%).
+// Run: univerify test --group zz.webdust (UNI_DET_OUT, UNI_WD_W, UNI_WD_MPC, UNI_WD_RED, UNI_WD="tau detail knots web", UNI_WD_TAG).
+
+// ---- D-269 exploration (temporary; archived to experiments/ when done) ----
+UNI_TEST(zz, webdust)
+{
+	FWebTexture T;
+	std::string Err;
+	if (!FWebTexture::LoadDelivered("Data/Noise", "web_adhesion_density_mid", T, &Err)) { std::printf("    no web texture: %s\n", Err.c_str()); return; }
+	FBind Bind(T);
+	const UniScenes::FClusterTuning Tun;
+	FUniverseDef Def = UniScenes::WebToGalaxy(Tun);
+	const H::float4 Mean = T.Mean();
+	UniScenes::UseDeliveredWeb(Def, Tun, T.Size, Mean.z / (double(Mean.x) + Mean.y + Mean.z + Mean.w));
+	FUniverseModel M(Def);
+	FRefGenerator G(M);
+	FVolumeBuilder VB(M, G);
+	FRefPipeline P(G);
+	P.bVelocityLod = false;
+	const FCoord Cam = UniScenes::VoidCamera();
+	P.Update(Cam, FVec3f{});
+	const int W = std::getenv("UNI_WD_W") ? std::atoi(std::getenv("UNI_WD_W")) : 320, Hh = W * 9 / 16;
+	FCamera Cm; Cm.Coord = Cam; Cm.Width = W; Cm.Height = Hh; Cm.LookAlong({ 1.0, 0.3, 0.1 });
+	const double Mpc = Units::Mpc;
+	FWebTexture Gt[3];
+	for (int K = 0; K < 3; ++K) { std::string E; FWebTexture::LoadDelivered("Data/Noise", GalaxyTextureName(K), Gt[K], &E); BindGalaxyTexture(K, &Gt[K]); }
+	struct FUnbind { ~FUnbind() { for (int K = 0; K < 3; ++K) { BindGalaxyTexture(K, nullptr); } } } Unbind;
+	// The filament + node matter along rays: its share of the path over thresholds (the texture's stats).
+	{
+		std::vector<double> Fn;
+		const int N = T.Size;
+		for (int I = 0; I < 200000; ++I)
+		{
+			const double X = (I * 0.7548776662) - std::floor(I * 0.7548776662), Y = (I * 0.5698402910) - std::floor(I * 0.5698402910), Z = (I * 0.3053) - std::floor(I * 0.3053);
+			const H::float4 C = H::UniWebTexSample(H::float3(float(X), float(Y), float(Z)), 0.0f);
+			Fn.push_back((double(C.y) + C.z) / (double(Mean.y) + Mean.z));
+		}
+		std::sort(Fn.begin(), Fn.end());
+		auto Q = [&](double P) { return Fn[size_t(P * (Fn.size() - 1))]; };
+		double Held = 0.0; for (double F : Fn) { Held += F / (1.0 + F / 30.0); } Held /= double(Fn.size());
+		std::printf("    filament+node over its mean: median %.2f, p75 %.2f, p90 %.2f, p99 %.1f, max %.0f; held at 30: mean %.3f (texels %d)\n", Q(0.5), Q(0.75), Q(0.9), Q(0.99), Fn.back(), Held, N);
+	}
+	struct FCfg { const char* Name; double Tau, Detail, Knots, Web; };
+	const double DetMpc = std::getenv("UNI_WD_MPC") ? std::atof(std::getenv("UNI_WD_MPC")) : 10.0;
+	const double Redden = std::getenv("UNI_WD_RED") ? std::atof(std::getenv("UNI_WD_RED")) : 1.0;
+	std::vector<FCfg> Cfgs = {
+		{ "off", 0, 0, 0, 0 }, { "t0.5", 0.5, 0.8, 0.5, 0 }, { "t2", 2, 0.8, 0.5, 0 },
+		{ "web", 0, 0, 0, 0.006 }, { "web_t0.5", 0.5, 0.8, 0.5, 0.006 }, { "web_t2", 2, 0.8, 0.5, 0.006 }, { "web_t2_fil", 2, 0.8, 0.0, 0.006 }, { "web_t2_knots", 2, 0.8, 1.0, 0.006 }, { "web_t2_plain", 2, 0.0, 0.5, 0.006 },
+	};
+	if (const char* E = std::getenv("UNI_WD"))
+	{
+		static FCfg X{ "custom", 0, 0, 0, 0 };
+		if (std::sscanf(E, "%lf %lf %lf %lf", &X.Tau, &X.Detail, &X.Knots, &X.Web) == 4) { Cfgs = { FCfg{ "off", 0, 0, 0, 0 }, FCfg{ "web", 0, 0, 0, X.Web }, X }; }
+	}
+	const std::string Dir = std::getenv("UNI_DET_OUT") ? std::getenv("UNI_DET_OUT") : "/tmp";
+	double Scale = 0.0, ScaleW = 0.0, L0 = 0.0, LW = 0.0;
+	for (const FCfg& C : Cfgs)
+	{
+		FVolumeSettings S;
+		if (C.Web > 0.0)
+		{
+			S.MotionWebDetailGain = 1.0f; S.MotionWebDetailCm = float(20.0 * Mpc); S.MotionWebStepCm = float(0.5 * Mpc);
+			S.MotionWebGain = float(C.Web * 7.0e4 / Mpc); S.MotionWebInvRef = float(1.0 / ((double(Mean.y) + double(Mean.z)) * 3.0));
+			S.MotionWebNearCm = float(4.0 * Mpc); S.MotionWebDepthCm = float(50.0 * Mpc);
+		}
+		if (C.Tau > 0.0)
+		{
+			S.WebDustTauCm = float(C.Tau / (100.0 * Mpc)); S.WebDustInvMean = float(1.0 / (double(Mean.y) + double(Mean.z)));
+			S.WebDustNearCm = float(2.0 * Mpc); S.WebDustDepthCm = float(50.0 * Mpc);
+			S.WebDustDetail = float(C.Detail); S.WebDustDetailCm = float(DetMpc * Mpc); S.WebDustRedden = float(Redden); S.WebDustKnots = float(C.Knots); S.WebDustPeak = 30.0f; S.WebDustTexN = float(Gt[2].Size);
+		}
+		FVolumeScene Sc = VB.Build(P, Cam, FVec3f{}, Cm.View(), S).Subset(true);
+		Sc.View.MarchFlags |= H::UNI_VOL_JITTER_FLAG;
+		const int Np = 8;
+		std::vector<double> Rgb(size_t(W) * Hh * 3, 0.0), S2(size_t(W) * Hh, 0.0);
+		double Steps = 0.0;
+		for (int Ph = 0; Ph < Np; ++Ph)
+		{
+			Sc.View.JitterShift = float(Ph) * 0.61803398875f;
+			FImage Img(W, Hh);
+			const FVolumeStats St = RenderVolume(Sc, Cm, Img);
+			Steps += double(St.Steps) / std::max(double(St.Rays), 1.0) / Np;
+			for (size_t I = 0; I < size_t(W) * Hh; ++I)
+			{
+				for (int K = 0; K < 3; ++K) { Rgb[I * 3 + K] += Img.Rgb[I * 3 + K] / Np; }
+				const double L = 0.2126 * Img.Rgb[I * 3] + 0.7152 * Img.Rgb[I * 3 + 1] + 0.0722 * Img.Rgb[I * 3 + 2];
+				S2[I] += L * L / Np;
+			}
+		}
+		double Sum = 0.0, Spread = 0.0, Br = 0.0, Rr = 0.0;
+		for (size_t I = 0; I < size_t(W) * Hh; ++I)
+		{
+			const double L = 0.2126 * Rgb[I * 3] + 0.7152 * Rgb[I * 3 + 1] + 0.0722 * Rgb[I * 3 + 2];
+			Sum += L; Spread += std::sqrt(std::max(S2[I] - L * L, 0.0)); Br += Rgb[I * 3 + 2]; Rr += Rgb[I * 3];
+		}
+		const bool bWeb = C.Web > 0.0;
+		double& Sc0 = bWeb ? ScaleW : Scale;
+		double& Lr = bWeb ? LW : L0;
+		if (Lr == 0.0) { Lr = Sum; }
+		if (Sc0 == 0.0)
+		{
+			std::vector<double> L(size_t(W) * Hh);
+			for (size_t I = 0; I < L.size(); ++I) { L[I] = 0.2126 * Rgb[I * 3] + 0.7152 * Rgb[I * 3 + 1] + 0.0722 * Rgb[I * 3 + 2]; }
+			std::nth_element(L.begin(), L.begin() + L.size() * 98 / 100, L.end());
+			Sc0 = 2.0 / std::max(L[L.size() * 98 / 100], 1e-30);
+		}
+		FImage Img(W, Hh);
+		for (size_t I = 0; I < Rgb.size(); ++I) { Img.Rgb[I] = float(Rgb[I] * Sc0); }
+		const std::string Path = Dir + "/wd_" + C.Name + (std::getenv("UNI_WD_TAG") ? std::getenv("UNI_WD_TAG") : "") + ".ppm";
+		Img.WritePpm(Path);
+		std::printf("    %-13s light x%.4f of its no-dust frame, spread %.3f%%, blue/red %.4f, steps %.1f -> %s\n", C.Name, Sum / Lr, 100.0 * Spread / std::max(Sum, 1e-300), Br / std::max(Rr, 1e-300), Steps, Path.c_str());
+		std::fflush(stdout);
+	}
+}

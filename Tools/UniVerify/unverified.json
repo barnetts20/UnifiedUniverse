@@ -322,5 +322,49 @@
   {
     "id": "UE-90",
     "what": "D-266: the detail layers' bubble about the camera (uu.Galaxy.Detail.Range0/1, Fade0/1): the detail thinning smoothly with distance with no band, and from far above the disc the image and the volume pass's cost as with the layers off (REVIEW_TONIGHT section 91)."
+  },
+  {
+    "id": "UE-91",
+    "what": "D-267: knots in the detail layers (uu.Galaxy.Detail.Knots0/1) and the knots' nebula tint (KnotTint): the arms' knots in nebula colours, breaking into clumps near the camera with no pop or new grain, the brightness kept, the volume pass's cost as D-266's (REVIEW_TONIGHT section 92)."
+  },
+  {
+    "id": "UE-92",
+    "what": "D-268: the travel shift's own speed curve (in from 150 kpc/s, D-230's top at 2.2 Mpc/s, x7.4 at 8.9 Mpc/s), deeper hues and the blue side's boost past the old maximum, no flicker (REVIEW_TONIGHT section 93)."
+  },
+  {
+    "id": "UE-93",
+    "what": "D-269: the cosmic web's dark dust (uu.WebDust*): dark filaments and knots against the motion web and the background, galaxies behind dimmed and reddened, no swimming at speed, uu.WebDust 0 the old sky exactly, the background passes' cost (REVIEW_TONIGHT section 94)."
+  },
+  {
+    "id": "UE-94",
+    "what": "D-270: uu.Volume.DustCurve, D-132's reddening (0) toward Cardelli's R_V 3.1 curve (1): the dust lanes' and reddened starlight's colour at 0 and 1, brightness about the same; the default to pick in the tuning pass (REVIEW_TONIGHT section 95)."
+  },
+  {
+    "id": "UE-95",
+    "what": "D-271: the sprites' transmittance past 100 kpc (12 slices, 4 evenly to 50 Mpc) and slices recorded at their boundary: galaxy sprites behind the web's dark dust dim as the glow does (uu.WebDust 0 / 3), stars behind the Milky Way's lanes as before, no seam at the far cache's start, the volume and sprite passes' cost within noise (REVIEW_TONIGHT section 96)."
+  },
+  {
+    "id": "UE-96",
+    "what": "D-272: galaxies' nuclei (supermassive black holes' accretion light, uu.Bh.*): a few galaxies show a point core with glare at their centre, warm or blue-white; uu.Bh.ActiveFraction 1 and uu.Bh.NucleusGain 30 to find them; the galaxy's own sprite and volume unchanged; GetGalaxyBlackHole in Blueprint (REVIEW_TONIGHT section 97)."
+  },
+  {
+    "id": "UE-97",
+    "what": "D-273: black holes up close (uu.Bh.Lens*): the lens pass compiles and runs at a galaxy's centre (uu.Perf's lens line; Uni.Lens in ProfileGPU); the shadow, photon ring and Einstein ring over the bulge's stars; an active nucleus's disc resolving out of its point without a jump in light; a ship in front not lensed (REVIEW_TONIGHT section 98)."
+  },
+  {
+    "id": "UE-98",
+    "what": "D-274: the accretion disc up close softened (uu.Bh.DiscKnee 2): the disc readable under bloom (the Doppler side, the lifted far side, the photon ring); 0.5 dimmer, 0 physical (REVIEW_TONIGHT section 99)."
+  },
+  {
+    "id": "UE-99",
+    "what": "D-275: the player (or a ship) in front of a black hole is not copied into the lensed sky beside it (REVIEW_TONIGHT section 100)."
+  },
+  {
+    "id": "UE-100",
+    "what": "D-276: the accretion disc's look: readable brightness (uu.Bh.DiscBrightness), spiral clouds with gaps, rings and colours, rotating (uu.Bh.DiscPeriod), a volume the camera can fly through; the cost of Uni.Lens with the disc filling the view (REVIEW_TONIGHT section 101)."
+  },
+  {
+    "id": "UE-101",
+    "what": "D-279: no shells of the player's outline beside it near a black hole (the lens's fill behind the foreground); the cost of Uni.Lens.SkyMask / SkyMip (REVIEW_TONIGHT section 102)."
   }
 ]

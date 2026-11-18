@@ -162,7 +162,7 @@ namespace UniRender
 					if (bSuper) { ++S.Supersampled; }
 					if (Cube && TScene > Cube->StartCm) { R.Radiance = R.Radiance + R.Transmittance * Cube->Sample(Dc); }
 					// D-230: the travel shift, as MarchCS and the composite apply it (DopplerOf).
-					R.Radiance = H::Uni_TravelShift(R.Radiance, Dc, H::float3(float(Cam.ShiftVel.X), float(Cam.ShiftVel.Y), float(Cam.ShiftVel.Z)), float(Cam.ShiftAmount), float(Cam.ShiftK));
+					R.Radiance = H::Uni_TravelShift(R.Radiance, Dc, H::float3(float(Cam.ShiftVel.X), float(Cam.ShiftVel.Y), float(Cam.ShiftVel.Z)), float(Cam.ShiftAmount), float(Cam.ShiftK), float(Cam.ShiftBoostFrom), float(Cam.ShiftBoost));
 					const double Om = PixelSolidAngle(Cam, Img.W, Img.H, X + 0.5, Y + 0.5);
 					float* P = &Img.Rgb[(size_t(Y) * Img.W + X) * 3];
 					P[0] += float(R.Radiance.x * Om); P[1] += float(R.Radiance.y * Om); P[2] += float(R.Radiance.z * Om);
@@ -705,6 +705,11 @@ namespace UniRender
 			float Sh = -1.0f;
 			if (!bCurveHandoff) { const auto It = Share.find(Hash); Sh = It != Share.end() ? It->second : 0.0f; }
 			const H::FUniSprite S = H::Uni_ProjectObjectH(D[0], D[1], D[2], u32(K.Level), Fade, Ho, V, false, Sh);
+			if (V.NucleusArchetypeMask != 0u)   // D-272: a galaxy's nucleus, as the project pass appends it (never handed off)
+			{
+				const H::FUniSprite Sn = H::Uni_ProjectNucleusH(D[0], D[1], D[2], u32(K.Level), Fade, Ho, V);
+				if (Sn.Flags & H::UNI_SPRITE_VISIBLE) { Sprites.push_back(Sn); }
+			}
 			if (S.Flags & H::UNI_SPRITE_PROMOTE_CANDIDATE)
 			{
 				if (!((O.A[3] >> 16) & H::UNI_OBJ_FLAG_EXTENDED))
