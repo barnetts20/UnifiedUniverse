@@ -348,23 +348,43 @@
     "what": "D-272: galaxies' nuclei (supermassive black holes' accretion light, uu.Bh.*): a few galaxies show a point core with glare at their centre, warm or blue-white; uu.Bh.ActiveFraction 1 and uu.Bh.NucleusGain 30 to find them; the galaxy's own sprite and volume unchanged; GetGalaxyBlackHole in Blueprint (REVIEW_TONIGHT section 97)."
   },
   {
-    "id": "UE-97",
-    "what": "D-273: black holes up close (uu.Bh.Lens*): the lens pass compiles and runs at a galaxy's centre (uu.Perf's lens line; Uni.Lens in ProfileGPU); the shadow, photon ring and Einstein ring over the bulge's stars; an active nucleus's disc resolving out of its point without a jump in light; a ship in front not lensed (REVIEW_TONIGHT section 98)."
+    "id": "UE-104",
+    "what": "D-293: the start on the home planet (uu.AutoStart home): the home system, the planet's frame (its centre the origin), VoxelPlanets' planet actor from the UnifiedUniverseGame factory (uu.Planet.Class), the pawn held then released onto dry ground, the warm pool on leaving and returning (REVIEW_TONIGHT section 105)."
   },
   {
-    "id": "UE-98",
-    "what": "D-274: the accretion disc up close softened (uu.Bh.DiscKnee 2): the disc readable under bloom (the Doppler side, the lifted far side, the photon ring); 0.5 dimmer, 0 physical (REVIEW_TONIGHT section 99)."
+    "id": "UE-105",
+    "what": "D-294: the home planet's first look: CloudAtmosphere's tuned terrestrial archetype and look on a planet whose class has none (uu.Planet.AtmoArchetype / AtmoLook), the terrain's debug colours (uu.Planet.LandView 13), one directional light (the light rig stands down for the planet's atmosphere) (REVIEW_TONIGHT section 106)."
   },
   {
-    "id": "UE-99",
-    "what": "D-275: the player (or a ship) in front of a black hole is not copied into the lensed sky beside it (REVIEW_TONIGHT section 100)."
+    "id": "UE-106",
+    "what": "D-295: CloudAtmosphere stage RS1 (Sampling.StepFootprint, Sampling.StepTaps: the cloud march's noise over the step and taps along it) and the planets' atmospheres at their own scale (uu.Planet.AtmoThicknessKm, CloudLayerKm, CloudStepFootprint, CloudStepTaps; locked HeightScale / CloudThickness): less grain, a thin real-scale deck, the cost (REVIEW_TONIGHT section 107)."
   },
   {
-    "id": "UE-100",
-    "what": "D-276: the accretion disc's look: readable brightness (uu.Bh.DiscBrightness), spiral clouds with gaps, rings and colours, rotating (uu.Bh.DiscPeriod), a volume the camera can fly through; the cost of Uni.Lens with the disc filling the view (REVIEW_TONIGHT section 101)."
+    "id": "UE-107",
+    "what": "D-296: the stars behind a planet's sky: through CloudAtmosphere's clouds and air (CloudAtmosphere_GetViewOutput, uu.Sprite.Atmosphere), gone against its day sky (uu.Sprite.SkyFadeStart / End), the galaxy's glow hidden by day (uu.Planet.DaySkyHide, DaySkyHeightKm); the terrain's rivers view 19 (REVIEW_TONIGHT section 108)."
   },
   {
-    "id": "UE-101",
-    "what": "D-279: no shells of the player's outline beside it near a black hole (the lens's fill behind the foreground); the cost of Uni.Lens.SkyMask / SkyMip (REVIEW_TONIGHT section 102)."
+    "id": "UE-108",
+    "what": "D-297: no placeholder spheres for planets a body factory makes: the voxel planet from promotion (~50 radii) at its true place and size, the sprite until it is ready, live outside the planet's frame, parked when demoted (uu.Planet.MaxLive, uu.Planet.Placeholders) (REVIEW_TONIGHT section 109)."
+  },
+  {
+    "id": "UE-109",
+    "what": "D-298: a planet's actors (planet, terrain, ocean, gravity zone, atmosphere) tick in TG_PostUpdateWork, after the universe places the planet: its atmosphere stays on its terrain in Cruise (no hemisphere split) (uu.Planet.TickLate) (REVIEW_TONIGHT section 110)."
+  },
+  {
+    "id": "UE-110",
+    "what": "D-299: planets turn about +Z (uu.Planet.DayHours, a solar day, scaled by uu.TimeScale); in a planet's frame the world turns with it: the sun, stars and galaxy go round, the ground stays; no jump entering or leaving; the renderer's view in the universe's axes (REVIEW_TONIGHT section 111)."
+  },
+  {
+    "id": "UE-111",
+    "what": "D-301: the clouds' sim on the planet's clock (uu.Planet.WeatherClock; CloudAtmosphere RS3 SetTimeScale): a day's weather a planet day, scaled by uu.TimeScale; the atmosphere's own field spin off (REVIEW_TONIGHT section 112)."
+  },
+  {
+    "id": "UE-112",
+    "what": "D-302: far cloud as the mean of the cloud, no round blobs (CloudAtmosphere RS3 Sampling.NoisePrefilter; uu.Planet.CloudPrefilter; r.CloudAtmosphere.NoisePrefilterScale / MipShift) (REVIEW_TONIGHT section 113)."
+  },
+  {
+    "id": "UE-113",
+    "what": "D-303: the cloud shadow under a turning light and from orbit: the footprint's level of detail and the light's pivot (CloudAtmosphere RS4; r.CloudAtmosphere.March.Ablate 8192 / 16384 for A/B) (REVIEW_TONIGHT section 114)."
   }
 ]

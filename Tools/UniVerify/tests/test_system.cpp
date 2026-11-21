@@ -145,7 +145,17 @@ UNI_TEST(system, determinism)
 		const FSystem A = BuildSystem(Stars[I].O), B = BuildSystem(Stars[I].O);
 		++Systems;
 		bool Same = A.Planets.size() == B.Planets.size();
-		for (size_t K = 0; Same && K < A.Planets.size(); ++K) { Same = std::memcmp(&A.Planets[K], &B.Planets[K], sizeof(FPlanet)) == 0; }
+		// Field by field (D-281: FPlanet has padding, whose bytes are whatever the stack held: a memcmp
+		// compared them too, and failed once BuildSystem did more work between planets).
+		for (size_t K = 0; Same && K < A.Planets.size(); ++K)
+		{
+			const FPlanet& Pa = A.Planets[K];
+			const FPlanet& Pb = B.Planets[K];
+			Same = Pa.Seed == Pb.Seed && Pa.Index == Pb.Index && Pa.Type == Pb.Type && Pa.SemiMajorCm == Pb.SemiMajorCm && Pa.Ecc == Pb.Ecc && Pa.Inc == Pb.Inc
+				&& Pa.Node == Pb.Node && Pa.Peri == Pb.Peri && Pa.MeanAnomaly0 == Pb.MeanAnomaly0 && Pa.PeriodS == Pb.PeriodS && Pa.RadiusCm == Pb.RadiusCm
+				&& Pa.Albedo == Pb.Albedo && Pa.Tint[0] == Pb.Tint[0] && Pa.Tint[1] == Pb.Tint[1] && Pa.Tint[2] == Pb.Tint[2];
+		}
+		Same = Same && A.Bh.bValid == B.Bh.bValid && A.Bh.Seed == B.Bh.Seed && A.Bh.SemiMajorCm == B.Bh.SemiMajorCm && A.Bh.Phase0 == B.Bh.Phase0;   // D-281
 		Mismatch += Same ? 0 : 1;
 		Planets += A.Planets.size();
 		Empty += A.Planets.empty() ? 1 : 0;

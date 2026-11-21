@@ -155,15 +155,19 @@ namespace UniCore
 	/** The lens target of a black hole at RelCm from the camera (cm). Normalisation: its galaxy's
 	 *  record's nucleus (Mn, the isotropic magnitude; 99: none: lensing alone), through the core's
 	 *  table (Uni_BhDiscLog10Norm: the disc's light averaged over directions, lensing and all).
-	 *  ThetaPixel: rad per pixel. */
+	 *  ThetaPixel: rad per pixel. Style: D-280's look (nullptr: none): its extent (the disc drawn
+	 *  ExtentMul x its physical outer radius; the normalisation stays the physical disc's, exact at 1: the outer disc's V light is
+	 *  small, and the engine's brightness is exposure-relative, D-276). SizeScale: D-281's
+	 *  uu.Bh.StellarScale for a stellar black hole (lensing and disc drawn as if its R_s were this x;
+	 *  1: physical). */
 	inline FLensTarget LensTargetOf(const UniHlsl::FUniBlackHole& Bh, float Mn, const double RelCm[3], const float AxisWorld[3],
-		u32 NucleusSeed, double ThetaPixel, const FLensConfig& L)
+		u32 NucleusSeed, double ThetaPixel, const FLensConfig& L, const UniHlsl::FUniBhStyle* Style = nullptr, double SizeScale = 1.0)
 	{
 		FLensTarget T;
 		if (!L.bLens) { return T; }
 		// D-277: the lens's R_s is LensScale x the physical one; the disc keeps its physical outer
 		// radius (in the lens's units OuterX / LensScale) and starts at the lens's ISCO.
-		const double RsPhys = std::pow(10.0, double(UniHlsl::UNI_BH_LOG_RS_SUN_CM) + double(Bh.Log10Mass));
+		const double RsPhys = std::pow(10.0, double(UniHlsl::UNI_BH_LOG_RS_SUN_CM) + double(Bh.Log10Mass)) * std::max(SizeScale, 1.0);   // D-281: x SizeScale
 		const double Ks = std::max(double(L.LensScale), 1.0);
 		T.RsCm = RsPhys * Ks;
 		for (int A = 0; A < 3; ++A) { T.RelCm[A] = RelCm[A]; T.Axis[A] = AxisWorld[A]; }
@@ -172,7 +176,9 @@ namespace UniCore
 		const double Th = std::max(ThetaPixel, 1.0e-9);
 		const double Dx = T.DistanceCm / T.RsCm;   // the lens's R_s
 		T.PeakK = UniHlsl::Uni_BhDiscPeakK(Bh);
-		T.OuterX = std::max(float(double(UniHlsl::Uni_BhDiscOuterX(T.PeakK)) / Ks), UniHlsl::UNI_BH_ISCO_X + 1.0f);
+		// D-280: x its look's extent (1: the physical outer radius).
+		const double ExtentMul = Style ? double(std::max(Style->ExtentMul, 0.05f)) : 1.0;
+		T.OuterX = std::max(float(double(UniHlsl::Uni_BhDiscOuterX(T.PeakK)) * ExtentMul / Ks), UniHlsl::UNI_BH_ISCO_X + 1.0f);
 		T.RingPx = float(std::sqrt(2.0 / std::max(Dx, 1.0)) / Th);
 		T.DiscPx = float(std::atan(double(T.OuterX) / std::max(Dx, 1.0)) / Th);
 		T.bDisc = L.bDisc && Mn < UniHlsl::UNI_BH_NONE_MAG;
@@ -193,7 +199,7 @@ namespace UniCore
 			const float Md = UniHlsl::Uni_F16ToF32(UniHlsl::Uni_F32ToF16(Mn - 2.5f * std::log10(std::max(Beam, 1.0e-6f))));
 			T.PointAppMag = UniHlsl::Uni_ApparentMag(Md, float(T.DistanceCm));
 			T.PointPhysAngRad = float(std::exp2(double(std::log2(float(100.0 * RsPhys)))) / T.DistanceCm);   // the record's (physical) size
-			const UniHlsl::float3 C = UniHlsl::Uni_UnpackColour(UniHlsl::Uni_PackColour(UniHlsl::Uni_NucleusColour(Bh)));   // as the record carries it
+			const UniHlsl::float3 C = UniHlsl::Uni_UnpackColour(UniHlsl::Uni_PackColour(UniHlsl::Uni_NucleusColourP(Bh, Style ? Style->Palette : 0u, Style ? Style->PaletteMix : 0.0f)));   // as the record carries it (D-280: in its palette)
 			T.PointColour[0] = C.x; T.PointColour[1] = C.y; T.PointColour[2] = C.z;
 		}
 		// The region: the integrated sphere (and the disc) with a margin, and where the weak-field
@@ -224,6 +230,8 @@ namespace UniCore
 		float CycleOrbits = 1.0f;     // uu.Bh.DiscCycle: a flow phase lasts this many ISCO orbits
 		float Falloff = 0.35f;        // uu.Bh.DiscFalloff: the light's fall with temperature (1: physical)
 		u32 MaxSamples = UniHlsl::UNI_LENS_VOL_SAMPLES;
+		u32 Palette = 0u;             // D-280: its palette (0: the blackbody; StyledLook)
+		float PaletteMix = 0.0f;      // D-280: the palette's share of the colour
 	};
 
 	/** A unit vector in the disc's plane (the azimuth's zero). */
@@ -248,7 +256,8 @@ namespace UniCore
 		D.MaxSamples = L.MaxSamples;
 		D.Falloff = std::clamp(L.Falloff, 0.05f, 1.0f);
 		D.Erosion = std::clamp(L.Erosion, 0.0f, 1.0f);   // D-278
-		D.LookPad1 = D.LookPad2 = 0.0f;
+		D.Palette = float(std::min<u32>(L.Palette, UniHlsl::UNI_BH_PALETTES - 1u));   // D-280
+		D.PaletteMix = L.PaletteMix > 0.0f && L.Palette > 0u ? std::min(L.PaletteMix, 1.0f) : 0.0f;
 		const double Omega = L.PeriodS > 0.0f ? 6.283185307179586 / double(L.PeriodS) : 0.0;
 		D.OmegaIsco = float(Omega);
 		const double Cycle = L.PeriodS > 0.0f ? std::max(double(L.CycleOrbits), 0.05) * double(L.PeriodS) : 0.0;
@@ -284,5 +293,67 @@ namespace UniCore
 		const UniHlsl::float3 N = bFixedOrientation ? UniHlsl::float3(0.0f, 0.0f, 1.0f) : UniHlsl::Uni_DiscNormal(Seed);
 		const UniHlsl::float3 A = UniHlsl::Uni_BhDiscAxis(Seed, N);
 		Out[0] = A.x; Out[1] = A.y; Out[2] = A.z;
+	}
+	// ----------------------------------------------------------------------------------------
+	// D-280: each black hole's look (the core's Uni_BhStyleOf about the engine's tuned look)
+	// ----------------------------------------------------------------------------------------
+
+	/** The engine's look (the centre, uu.Bh.Disc*) for one black hole of style S: every setting x
+	 *  its multiplier (ApplyDiscLook clamps them), its palette. */
+	inline FDiscLook StyledLook(const FDiscLook& Centre, const UniHlsl::FUniBhStyle& S)
+	{
+		FDiscLook L = Centre;
+		L.Spiral *= S.SpiralMul;
+		L.Thickness *= S.ThicknessMul;
+		L.Opacity *= S.OpacityMul;
+		L.Clouds *= S.CloudsMul;
+		L.Bands *= S.BandsMul;
+		L.Heat *= S.HeatMul;
+		L.Erosion *= S.ErosionMul;
+		L.PeriodS *= S.PeriodMul;
+		L.Palette = S.Palette;
+		L.PaletteMix = S.PaletteMix;
+		return L;
+	}
+
+	/** The name of the galaxy emitters' arm winding range (D-256), the disc's spiral follows it. */
+	static constexpr const char* kArmsWindingRange = "Arms.Winding";
+
+	/** A galaxy's arms' winding over its emitter's range (0..1), as its field rolls it; -1 without
+	 *  arms (an early type, or no galaxy-field emitter with that range). */
+	inline float HostWinding01(const FArchetype& A, u32 Seed, bool bEarly)
+	{
+		if (bEarly) { return -1.0f; }
+		for (const FUniEmitter& E : A.Emitters)
+		{
+			if (E.FieldId != UniHlsl::UNI_FIELD_GALAXY) { continue; }
+			if (!(E.Exemplar.V[6] > 0.0f)) { return -1.0f; }   // no arms (a dwarf's exemplar)
+			for (const FParamRange& R : E.Ranges)
+			{
+				if (R.Name != kArmsWindingRange) { continue; }
+				const float V = UniHlsl::Uni_RollRange(Seed, ChannelIdUpper(R.Name), R.Min, R.Max, R.Bias, R.Quantize);
+				const float Span = R.Max - R.Min;
+				return std::fabs(Span) > 0.0f ? std::clamp((V - R.Min) / Span, 0.0f, 1.0f) : 0.5f;
+			}
+			return -1.0f;
+		}
+		return -1.0f;
+	}
+
+	/** The look settings (uu.Bh.DiscVariety, uu.Bh.DiscPalette). */
+	struct FStyleConfig
+	{
+		float Variety = 1.0f;
+		float PaletteMode = -1.0f;   // < 0 rolled; 0 the blackbody; n palette n for every black hole
+	};
+
+	/** A galaxy record's black hole's look (its host archetype for the arms' winding; nullptr: none). */
+	inline UniHlsl::FUniBhStyle GalaxyBhStyle(const FObjectGPU& O, const FArchetype* Host, const FStyleConfig& C, float Active = UniHlsl::UNI_BH_ACTIVE_SHARE)
+	{
+		const UniHlsl::FUniObject Ho = ToHlsl(O);
+		const bool bEarly = (UniHlsl::Uni_ObjectFlags(Ho) & UniHlsl::UNI_OBJ_FLAG_EARLY) != 0u;
+		const UniHlsl::FUniBlackHole B = UniHlsl::Uni_GalaxyBlackHole(Ho, Active);
+		const float W = Host ? HostWinding01(*Host, O.B[0], bEarly) : -1.0f;
+		return UniHlsl::Uni_BhStyleOf(O.B[0], B, bEarly, W, C.Variety, C.PaletteMode);
 	}
 }

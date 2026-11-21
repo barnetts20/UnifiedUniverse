@@ -226,7 +226,7 @@ Once the overarching look and feel is in a good state, short diversions for enti
 - **Nebulae:** emission and reflection nebulae and dark clouds in galaxies, as a field (no explicit entities: keep the cost flat). *Outside view done: D-234; the fly-into layer is B-034.*
 - **A galactic star-cluster layer:** clustering at the galaxy level baked as a density field modulating star placement and the glow, not as explicit cluster entities like the universe's (a dense entity layer spiked the cost before). *Done: globulars D-238, open clusters D-239 (UE-69, UE-70). Follow-ups in B-035.*
 - **Compact and exotic objects:** stellar and supermassive black holes, quasars, magnetars and the like. *Design proposal: Docs/COMPACT_OBJECTS.md (2026-11-16, D-270; the owner's answers 2026-11-17 in its §7). Phase A (supermassive black holes, galaxies' nuclei) built: D-272 (UE-96). Next: B (quasars as an active-galaxy archetype, optical jets), C (remnants), D (lensing and accretion discs, with the gravity ship).*
-- **The gravity ship:** a pass in the gravity project for a walkable, gravity-enabled ship that flies in real space and drives the speed/scale system at universe scale. It's the bridge from the debug traversal mode to gameplay traversal.
+- **The gravity ship:** a pass in the gravity project for a walkable, gravity-enabled ship that flies in real space and drives the speed/scale system at universe scale. It's the bridge from the debug traversal mode to gameplay traversal. *Design: Docs/SHIPS.md (B-045, 2026-11-19).*
 
 ## B-032: Far cache follow-ups (D-228)
 - A split distance that grows with speed: 4 kpc is 0.68x today's at 1 pc a frame instead of 0.92x at 2 kpc, but 0.46x at rest instead of 0.38x.
@@ -302,5 +302,37 @@ Inria report (Gérôme / Neyret 2026, hal-05713074; procedural star octree, Shad
 - **Several black holes at once.** One target per frame (the most visible). Two near holes (a binary, a satellite's) would need the trace to bend by each in turn.
 - **The camera's own shift deep in the well.** A static camera at r sees everything blueshifted by 1/sqrt(1 - 1/r) (5% at 10 R_s): not applied.
 - **Before TSR.** The pass runs after TSR (with the stars), so the disc's edge and the photon ring are not temporally antialiased: one ray a pixel. Supersampling near the shadow's edge, or moving the pass before TSR with the volume (D-246), would smooth them.
-- **Stellar black holes (phase C)** use the same pass: their mass source (an archetype) is all they need; the disc only in binaries.
+- **Stellar black holes (phase C)** use the same pass: their mass source (an archetype) is all they need; the disc only in binaries. *D-281: the binaries are built (a star's companion, in its system). Still open: isolated ones (no light: an archetype whose relevance is its lensing reach), the accretion stream from the star to the disc, an outburst's light seen from afar (capped at half its star's: the star's level is its own light's), the star orbiting the heavier hole.*
+- **The disc in time:** done (D-276: rotation, flow phases).
 
+
+## B-045: Ships, gravity and travel (2026-11-19; Docs/SHIPS.md)
+- **Status:** design only, at the owner's request ("our current effort should be focused on planning and gameplay design for the generic ship travel part ... rather than a direct implementation"). Nothing is built.
+- **The design:**
+  - The UE world is pinned to what the player stands in: the ship in space, the planet near it. The universe moves around them (needs a frame rotation in the renderer).
+  - One gravity field, with apparent gravity and damped interiors; GravPlugin zones.
+  - A kinematic ship.
+  - Newtonian flight with a flight computer at scale 1.
+  - Warp tiers gated by gravitational depth (atmosphere, star system, galaxy; black holes pull you out) under a stop-in-time speed rule.
+  - Scanning, a chart, route legs and map modes.
+  - Hardpoint modules after the framework.
+- **Owner's answers (2026-11-19 00:42), recorded as D-282..D-286:**
+  - frames as recommended;
+  - GravPlugin's two changes approved;
+  - depth gates with stop-in-time;
+  - the computer flies above tier 1;
+  - an omni ship first (every capability, a refuel button) as the prototype that real ships subset, with jump gates for small ships (§8).
+- **Build phases S0–S6 (§13)** wait for the owner.
+- **GravPlugin** (`Plugins/GravPlugin`) is read only so far; any change there needs the owner's approval (§3.5).
+- **Phase P1, planets as worlds (Docs/SHIPS_PLANETS.md; D-290..D-293):** built 2026-11-19 (D-293, UE-104): the home star and planet, planet properties, the planet's frame, body factories and the UnifiedUniverseGame module over VoxelPlanets, the warm pool, the home start. Still open in P1:
+  - the origin test at 1.3 and 1.8 Earth radii (D-291; needs a command to reach such a planet, e.g. `uu.GotoPlanet`);
+  - D-292 layers 3–4 (system-level build kits, a deeper disk cache: VoxelPlanets' side, after the owner's spawn timeline numbers) and navigation prefetch (after navigation);
+  - a hidden-build mode in the planet actor (owner's plugin) would let the acquire move out from 3 radii towards 60;
+  - gas giants as planet actors once a gas giant class is set up (`uu.Planet.GasGiantClass`); ice giants after the planet actor has a model.
+  - clouds at real scale (D-294, D-295, SHIPS_PLANETS.md §12): thin shells and step taps / footprint built (CloudAtmosphere stage RS1, UE-106); still open: a bubble of detail with frequency-scaled steps, shaped noise against strands, the bake's budget at thin shells if low-sun shadows suffer;
+  - terrain materials (procedural, per planet) to replace the debug view (`uu.Planet.LandView`).
+  - the day and the world's turn (D-299, UE-110): seeded spin periods, phases and tilts (SHIPS_PLANETS.md §6; a tilt makes the world's turn a full rotation, not a yaw), tidal locking for close planets;
+  - the owner's first look at the day/night/year build (2026-11-19), open items:
+    - cloud lighting flickers in fast flight and at high time scales: BUILT (D-303, CloudAtmosphere RS4, UE-113): the footprint's level of detail (from orbit, no camera-following inner levels) and the light's pivot (shadows follow the sun between rebakes). Left if seams remain: bake all levels together (one light and clock for the three);
+    - the player jitters while airborne (a jump): suspects the frame's tick order or the pawn's movement against the planet's frame; A/B asked (`uu.Planet.TickLate 0`, `uu.Planet.DayHours 0`, a level without the universe);
+    - built, needing the engine: the weather on the planet's clock (D-301, UE-111) and far cloud without round blobs (D-302, UE-112).

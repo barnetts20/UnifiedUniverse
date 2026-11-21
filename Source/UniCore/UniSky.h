@@ -9,6 +9,7 @@
 // Engine-agnostic; the engine runs it on a worker thread every second or so and blends.
 
 #include "UniVolume.h"
+#include "UniSpin.h"   // D-299
 
 #include <cmath>
 #include <vector>
@@ -53,8 +54,10 @@ namespace UniCore
 	 *  surfaces) as Sub x Sub rays over its area, each with its share of the texel as the
 	 *  prefilter footprint, and scale the radiance (exposure units per sr) by Scale: the engine
 	 *  passes the screen pixel's solid angle, so a texel holds what a screen pixel of that sky
-	 *  shows. One ray per texel at 16 a face puts a thin galactic band's light out by ~8%. */
-	inline FSkyCube BuildSkyCube(const FVolumeScene& Sc, int N, double Scale, int Sub = 2)
+	 *  shows. One ray per texel at 16 a face puts a thin galactic band's light out by ~8%.
+	 *  D-299: the cube is in the world's axes, which turn against the universe's by WorldYaw about
+	 *  +Z: each texel's direction is turned by it into the scene's. */
+	inline FSkyCube BuildSkyCube(const FVolumeScene& Sc, int N, double Scale, int Sub = 2, double WorldYaw = 0.0)
 	{
 		FSkyCube C;
 		C.N = N;
@@ -69,7 +72,7 @@ namespace UniCore
 			HV::float3 Acc(0, 0, 0);
 			for (int J = 0; J < Sub; ++J) for (int I = 0; I < Sub; ++I)
 			{
-				const FVec3d D = SkyTexelDir(F, X + (I + 0.5) / Sub, Y + (J + 0.5) / Sub, N);
+				const FVec3d D = RotateYaw(SkyTexelDir(F, X + (I + 0.5) / Sub, Y + (J + 0.5) / Sub, N), WorldYaw);
 				const HV::FUniVolumeResult R = HV::Uni_VolumeMarch(HV::float3(float(D.X), float(D.Y), float(D.Z)), 3.0e38f, Cb, Pb, Lb, V);
 				Acc += R.Radiance;
 				C.Steps += R.Steps;

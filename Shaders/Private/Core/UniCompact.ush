@@ -361,6 +361,266 @@ UNI_FN float3 Uni_BhDiscAxis(uint InSeed, float3 InHostNormal)
 	return normalize(N * CosT + (E1 * cos(Az) + E2 * sin(Az)) * SinT);
 }
 
+// ------------------------------------------------------------------------------------------
+// D-280 (owner 2026-11-17 22:35: "proceduralize the black hole within a range given the size of
+// its parent galaxy, give it some procedural color palettes, ranges of twists, accretion disc
+// amount based on the galaxy that hosts it"): each black hole's look, rolled from its seed (new
+// channel BH.LOOK) and what it is: its accretion rate (thin, dense, bright discs at a high one;
+// at a low one a puffy, optically thin torus, the hot flow of a slow accretor: Narayan & Yi 1995,
+// the glowing ring of the EHT's images), its host's type (an early type's disc smaller, its
+// palette warmer) and, for a disc galaxy, its arms' winding (the disc's spiral winds with it).
+// Its size follows its host already: its mass is its host bulge's (D-272), its R_s the lens's.
+// Multipliers about the engine's tuned look (uu.Bh.Disc*: the centre of every range), each raised
+// to the power Variety (uu.Bh.DiscVariety: 0 every black hole D-278's look exactly, 1 the full
+// spread). Render only: nothing generated reads it.
+// ------------------------------------------------------------------------------------------
+
+static const uint UNI_CH_BH_LOOK = 0x49FCE548u;        // ChannelId("BH.LOOK")       its look: draws 0 palette, 1 its mix, 2 thickness, 3 opacity, 4 clouds, 5 bands, 6 heat, 7 erosion, 8 spiral, 9 period, 10 brightness, 11 extent (D-280)
+static const uint UNI_BH_PALETTES = 8u;                // 0: the blackbody (physical colours); 1..7 art palettes
+static const float UNI_BH_PAL_SPAN_LN = 3.4011974f;    // a palette runs cool .. hot over a factor of this exp() in temperature below the disc's peak (30x: across the visible disc)
+static const float UNI_BH_PAL_WHITE = 0.5f;            // above the peak (the Doppler-boosted side) it whitens by up to this, over a factor of 2
+static const float UNI_BH_PAL_MIX_LO = 0.8f;           // a rolled palette's share of the colour (the rest the blackbody's): uniform over [lo, hi]
+static const float UNI_BH_PAL_MIX_HI = 1.0f;
+static const float UNI_BH_PAL_MIX_FORCED = 0.95f;     // uu.Bh.DiscPalette n > 0: every black hole palette n at this share
+static const float UNI_BH_THICK_LOG_EDD_LO = -4.3f;    // log10 lambda: a torus below this (the art's ADAF boundary; physically ~-2: lowered so ~1/4 of the accreting are tori, the rest thin discs) ..
+static const float UNI_BH_THICK_LOG_EDD_HI = -3.5f;    // .. a thin disc above this
+static const float UNI_BH_TORUS_THICKNESS = 5.0f;      // a torus's thickness x the centre's (0.025: H / R 0.125)
+static const float UNI_BH_TORUS_OPACITY = 0.3f;        // .. its optical depth x the centre's
+static const float UNI_BH_TORUS_CLOUDS = 0.6f;         // .. its clumping x the centre's (a hot flow is smoother)
+static const float UNI_BH_TORUS_EXTENT = 0.55f;        // .. its extent x the thin disc's
+static const float UNI_BH_EARLY_EXTENT = 0.75f;        // an early type's (gas-poor) disc x this extent
+
+// Palettes, cool (outer) .. mid .. hot (inner), linear RGB (any scale: the light's luminance is the
+// blackbody's; a palette sets only the chromaticity).
+static const float UNI_BH_PALETTE[72] = {
+	1.00f, 1.00f, 1.00f,   1.00f, 1.00f, 1.00f,   1.00f, 1.00f, 1.00f,   // 0 blackbody (unused)
+	0.60f, 0.13f, 0.02f,   1.00f, 0.50f, 0.12f,   1.00f, 0.88f, 0.62f,   // 1 gold (the film look)
+	0.10f, 0.10f, 0.55f,   0.30f, 0.55f, 1.00f,   0.85f, 0.93f, 1.00f,   // 2 quasar blue
+	0.45f, 0.03f, 0.02f,   1.00f, 0.22f, 0.04f,   1.00f, 0.68f, 0.30f,   // 3 ember
+	0.22f, 0.03f, 0.40f,   0.75f, 0.22f, 0.95f,   1.00f, 0.82f, 1.00f,   // 4 violet
+	0.02f, 0.18f, 0.28f,   0.12f, 0.70f, 0.78f,   0.80f, 1.00f, 0.96f,   // 5 teal
+	0.45f, 0.05f, 0.18f,   1.00f, 0.40f, 0.38f,   1.00f, 0.90f, 0.78f,   // 6 rose
+	0.80f, 0.15f, 0.03f,   1.00f, 0.60f, 0.35f,   0.30f, 0.55f, 1.00f,   // 7 ice and fire (orange outside, blue within)
+};
+// The palettes' weights at a low accretion rate and at a high one (lerped by it): warm palettes
+// favoured on slow accretors, blue and white ones on fast ones.
+static const float UNI_BH_PAL_W_COOL[8] = { 1.0f, 3.0f, 0.5f, 3.0f, 1.0f, 0.5f, 2.0f, 1.0f };
+static const float UNI_BH_PAL_W_HOT[8]  = { 1.0f, 2.0f, 3.0f, 0.5f, 1.0f, 2.0f, 1.0f, 2.5f };
+static const float UNI_BH_PAL_W_EARLY[8] = { 1.0f, 1.5f, 0.5f, 1.5f, 1.0f, 0.5f, 1.5f, 0.75f };   // x an early type's weights: warmer
+
+struct FUniBhStyle
+{
+	float SpiralMul;      // x uu.Bh.DiscSpiral
+	float ThicknessMul;   // x uu.Bh.DiscThickness
+	float OpacityMul;     // x uu.Bh.DiscOpacity
+	float CloudsMul;      // x uu.Bh.DiscClouds
+	float BandsMul;       // x uu.Bh.DiscBands
+	float HeatMul;        // x uu.Bh.DiscHeat
+	float ErosionMul;     // x uu.Bh.DiscErosion
+	float PeriodMul;      // x uu.Bh.DiscPeriod
+	float BrightnessMul;  // x uu.Bh.DiscBrightness
+	float ExtentMul;      // x the disc's outer radius (the lens target's)
+	float PaletteMix;     // the palette's share of the colour (0: the blackbody)
+	uint Palette;         // UNI_BH_PALETTES: 0 the blackbody
+};
+
+/** A palette's colour at InU (0 cool .. 1 hot). */
+UNI_FN float3 Uni_BhPaletteRgb(uint InPal, float InU)
+{
+	const uint B = min(InPal, UNI_BH_PALETTES - 1u) * 9u;
+	const float3 C0 = float3(UNI_BH_PALETTE[B], UNI_BH_PALETTE[B + 1u], UNI_BH_PALETTE[B + 2u]);
+	const float3 C1 = float3(UNI_BH_PALETTE[B + 3u], UNI_BH_PALETTE[B + 4u], UNI_BH_PALETTE[B + 5u]);
+	const float3 C2 = float3(UNI_BH_PALETTE[B + 6u], UNI_BH_PALETTE[B + 7u], UNI_BH_PALETTE[B + 8u]);
+	const float U = saturate(InU);
+	if (U < 0.5f) { return C0 + (C1 - C0) * (U * 2.0f); }
+	return C1 + (C2 - C1) * ((U - 0.5f) * 2.0f);
+}
+
+/** The disc's colour (any luminance: callers divide by it) for gas seen at InK, its disc's peak
+ *  InPeakK: the blackbody's (Uni_TemperatureColour, exactly, for palette 0 or mix 0), else that
+ *  mixed with the palette at the temperature's place below the peak (the outer, cooler gas towards
+ *  its cool end, the receding side redder, the approaching side whiter), each at luminance 1. */
+UNI_FN float3 Uni_BhDiscChroma(float InK, float InPeakK, uint InPal, float InMix)
+{
+	const float3 Bb = Uni_TemperatureColour(InK);
+	if (InPal == 0u || !(InMix > 0.0f)) { return Bb; }
+	const float Lr = log(max(InK, 1.0f) / max(InPeakK, 1.0f));
+	float3 P = Uni_BhPaletteRgb(InPal, 1.0f + Lr / UNI_BH_PAL_SPAN_LN);
+	const float Wt = UNI_BH_PAL_WHITE * saturate(Lr * 1.4426950f);   // ln -> log2: whitening over a factor of 2 above the peak
+	P = P + (float3(1.0f, 1.0f, 1.0f) - P) * Wt;
+	const float3 Bn = Bb * (1.0f / max(Uni_Luminance(Bb), 1.0e-3f));
+	const float3 Pn = P * (1.0f / max(Uni_Luminance(P), 1.0e-3f));
+	return Bn + (Pn - Bn) * saturate(InMix);
+}
+
+/** Uni_BhDiscLight in a palette: the same V weight, the palette's chromaticity (exactly
+ *  Uni_BhDiscLight for palette 0). */
+UNI_FN float3 Uni_BhDiscLightP(float InK, float InPeakK, uint InPal, float InMix)
+{
+	if (InPal == 0u || !(InMix > 0.0f)) { return Uni_BhDiscLight(InK); }
+	const float3 C = Uni_BhDiscChroma(InK, InPeakK, InPal, InMix);
+	return C * (Uni_BhPlanckV(InK) / max(Uni_Luminance(C), 1.0e-3f));
+}
+
+/** Uni_NucleusColour in a palette (the far sprite's colour is its disc's: the same taps through
+ *  the palette; exactly Uni_NucleusColour for palette 0). */
+UNI_FN float3 Uni_NucleusColourP(FUniBlackHole InBh, uint InPal, float InMix)
+{
+	if (InPal == 0u || !(InMix > 0.0f)) { return Uni_NucleusColour(InBh); }
+	const float Peak = Uni_BhDiscPeakK(InBh);
+	const float Outer = Uni_BhDiscOuterX(Peak);
+	const float LnSpan = log(Outer / UNI_BH_ISCO_X);
+	float3 Sum = float3(0.0f, 0.0f, 0.0f);
+	UNI_UNROLL
+	for (uint I = 0u; I < UNI_BH_COLOUR_TAPS; ++I)
+	{
+		const float X = UNI_BH_ISCO_X * exp(LnSpan * (((float)I + 0.5f) / (float)UNI_BH_COLOUR_TAPS));
+		Sum += Uni_BhDiscLightP(Peak * Uni_BhDiscProfile(X), Peak, InPal, InMix) * (Uni_BhDiscOpacity(X, Outer) * X * X);
+	}
+	const float M = max(Sum.x, max(Sum.y, Sum.z));
+	return M > 0.0f ? Sum / M : Uni_TemperatureColour(Peak);
+}
+
+/** The disc's mode from its accretion rate: 0 a torus (slow) .. 1 a thin disc (fast); an early
+ *  type's no different (its gas is scarcer: a smaller disc, Uni_BhStyleOf). */
+UNI_FN float Uni_BhThinShare(float InLog10Eddington)
+{
+	return smoothstep(UNI_BH_THICK_LOG_EDD_LO, UNI_BH_THICK_LOG_EDD_HI, InLog10Eddington);
+}
+
+/** Its palette (BH.LOOK draws 0, 1): InMode >= 0 forces palette InMode (0 the blackbody) at
+ *  UNI_BH_PAL_MIX_FORCED; otherwise rolled (weights lerped from cool to hot by the accretion
+ *  rate, an early type's x UNI_BH_PAL_W_EARLY: warmer), its mix x InVariety (0: the blackbody). */
+UNI_FN void Uni_BhPaletteOf(uint InSeed, FUniBlackHole InBh, bool InEarly, float InVariety, float InMode, UNI_OUT(uint) OutPal, UNI_OUT(float) OutMix)
+{
+	if (InMode >= 0.0f)
+	{
+		OutPal = min((uint)InMode, UNI_BH_PALETTES - 1u);
+		OutMix = OutPal == 0u ? 0.0f : UNI_BH_PAL_MIX_FORCED;
+		return;
+	}
+	OutPal = 0u;
+	OutMix = 0.0f;
+	if (!(InVariety > 0.0f)) { return; }
+	const float Hot = saturate((InBh.Log10Eddington + 4.0f) / 3.5f);
+	float Total = 0.0f;
+	UNI_UNROLL
+	for (uint I = 0u; I < UNI_BH_PALETTES; ++I) { Total += (UNI_BH_PAL_W_COOL[I] + (UNI_BH_PAL_W_HOT[I] - UNI_BH_PAL_W_COOL[I]) * Hot) * (InEarly ? UNI_BH_PAL_W_EARLY[I] : 1.0f); }
+	float Pick = Uni_DrawUnit(InSeed, UNI_CH_BH_LOOK, 0u) * Total;
+	uint Chosen = UNI_BH_PALETTES - 1u;   // the last if rounding leaves the draw past every weight
+	bool bChosen = false;
+	UNI_UNROLL
+	for (uint J = 0u; J < UNI_BH_PALETTES; ++J)
+	{
+		const float W = (UNI_BH_PAL_W_COOL[J] + (UNI_BH_PAL_W_HOT[J] - UNI_BH_PAL_W_COOL[J]) * Hot) * (InEarly ? UNI_BH_PAL_W_EARLY[J] : 1.0f);
+		if (!bChosen && Pick < W) { Chosen = J; bChosen = true; }
+		Pick -= W;
+	}
+	OutPal = Chosen;
+	OutMix = Chosen == 0u ? 0.0f : saturate(InVariety) * (UNI_BH_PAL_MIX_LO + (UNI_BH_PAL_MIX_HI - UNI_BH_PAL_MIX_LO) * Uni_DrawUnit(InSeed, UNI_CH_BH_LOOK, 1u));
+}
+
+/** A draw of BH.LOOK as a symmetric log factor: 2^(InOct (2 u - 1)). */
+UNI_FN float Uni_BhLookJitter(uint InSeed, uint InDraw, float InOct)
+{
+	return exp2(InOct * (2.0f * Uni_DrawUnit(InSeed, UNI_CH_BH_LOOK, InDraw) - 1.0f));
+}
+
+/** A black hole's look (D-280). InHostWinding: its host's arms' winding over its range (0..1; < 0:
+ *  no arms, an early type or a dwarf); InVariety: uu.Bh.DiscVariety (0: every multiplier 1 and
+ *  the blackbody); InPaletteMode: uu.Bh.DiscPalette (< 0 rolled). */
+UNI_FN FUniBhStyle Uni_BhStyleOf(uint InSeed, FUniBlackHole InBh, bool InEarly, float InHostWinding, float InVariety, float InPaletteMode)
+{
+	FUniBhStyle S;
+	const float V = saturate(InVariety);
+	const float Thin = Uni_BhThinShare(InBh.Log10Eddington);
+	// The raw multipliers (Variety 1), then each ^V.
+	const float Thick = (UNI_BH_TORUS_THICKNESS + (1.0f - UNI_BH_TORUS_THICKNESS) * Thin) * Uni_BhLookJitter(InSeed, 2u, 0.5f);
+	const float Opac = (UNI_BH_TORUS_OPACITY + (1.0f - UNI_BH_TORUS_OPACITY) * Thin) * Uni_BhLookJitter(InSeed, 3u, 0.4f);
+	const float Clouds = (UNI_BH_TORUS_CLOUDS + (1.0f - UNI_BH_TORUS_CLOUDS) * Thin) * (0.85f + 0.3f * Uni_DrawUnit(InSeed, UNI_CH_BH_LOOK, 4u));
+	const float Bands = Uni_BhLookJitter(InSeed, 5u, 1.0f);
+	const float Heat = Uni_BhLookJitter(InSeed, 6u, 0.8f);
+	const float Eros = 0.6f + 0.6f * Uni_DrawUnit(InSeed, UNI_CH_BH_LOOK, 7u);
+	// The spiral: a disc galaxy's hole winds with its arms (0.43x .. 2.3x over the arms' range, x a
+	// 0.76 .. 1.3 jitter); without arms, 0.6x .. 1.6x.
+	const float Spiral = InHostWinding >= 0.0f
+		? exp2(1.2f * (saturate(InHostWinding) - 0.5f)) * Uni_BhLookJitter(InSeed, 8u, 0.4f)
+		: Uni_BhLookJitter(InSeed, 8u, 0.7f);
+	// Heavier holes turn slower (physically their period goes as their mass; art: 2^0.35 a decade).
+	const float Period = clamp(exp2(0.35f * (InBh.Log10Mass - 7.0f)), 0.5f, 2.5f) * Uni_BhLookJitter(InSeed, 9u, 0.25f);
+	// Faster accretors brighter (art: 1 at 1e-3 of Eddington, 0.6 .. 1.6), jittered.
+	const float Bright = clamp(pow(10.0f, 0.25f * (InBh.Log10Eddington + 3.0f)), 0.6f, 1.6f) * Uni_BhLookJitter(InSeed, 10u, 0.3f);
+	const float Extent = (UNI_BH_TORUS_EXTENT + (1.0f - UNI_BH_TORUS_EXTENT) * Thin) * (InEarly ? UNI_BH_EARLY_EXTENT : 1.0f) * Uni_BhLookJitter(InSeed, 11u, 0.35f);
+	S.SpiralMul = pow(Spiral, V);
+	S.ThicknessMul = pow(Thick, V);
+	S.OpacityMul = pow(Opac, V);
+	S.CloudsMul = pow(Clouds, V);
+	S.BandsMul = pow(Bands, V);
+	S.HeatMul = pow(Heat, V);
+	S.ErosionMul = pow(Eros, V);
+	S.PeriodMul = pow(Period, V);
+	S.BrightnessMul = pow(Bright, V);
+	S.ExtentMul = pow(Extent, V);
+	uint Pal;
+	float Mix;
+	Uni_BhPaletteOf(InSeed, InBh, InEarly, V, InPaletteMode, Pal, Mix);
+	S.Palette = Pal;
+	S.PaletteMix = Mix;
+	return S;
+}
+
+// ------------------------------------------------------------------------------------------
+// D-281 (owner 2026-11-17 22:35: "We should be able to scatter some stellar mass black holes around
+// as well"): stellar black holes, as X-ray binaries: a star's companion (COMPACT_OBJECTS.md §2.3:
+// "X-ray binaries ... systems in the D-142 sense"), a property of the star's record alone (new
+// channel BH.STELLAR on its seed; the star and its planets unchanged), so they are where the stars
+// are, as many as uu.Bh.StellarFraction of them, and found when their star's system activates.
+// Mass 5 .. 25 M_sun (log, skewed low: median ~9; Ozel et al. 2010's ~8, the heavier merging ones
+// LIGO sees); accretion from the companion: in outburst (uu.Bh.StellarActive of them, 1e-2 .. 1 of
+// Eddington, log-uniform) or quiescent (1e-8 .. 1e-4). Everything else (its light, its disc, its
+// lensing, its look) is the same black hole core as a galaxy's.
+// ------------------------------------------------------------------------------------------
+
+static const uint UNI_CH_BH_STELLAR = 0x0222A2ECu;     // ChannelId("BH.STELLAR")    a star's black hole companion: draws 0 presence, 1 mass, 2 state, 3 rate, 4 separation, 5 inclination, 6 node, 7 phase (D-281)
+static const float UNI_BH_STELLAR_FRACTION = 1.0e-3f;   // uu.Bh.StellarFraction's default: the stars with one (art; real black-hole binaries are rarer)
+static const float UNI_BH_STELLAR_ACTIVE = 0.3f;        // uu.Bh.StellarActive's default: the share in outburst
+static const float UNI_BH_STELLAR_LOG_M_LO = 0.69897f;  // log10 5
+static const float UNI_BH_STELLAR_LOG_M_HI = 1.39794f;  // log10 25
+static const float UNI_BH_STELLAR_M_SKEW = 1.5f;        // log M = lo + (hi - lo) u^this
+static const float UNI_BH_XRB_ACTIVE_LO = -2.0f;        // log10 lambda in outburst ..
+static const float UNI_BH_XRB_ACTIVE_HI = 0.0f;
+static const float UNI_BH_XRB_QUIET_LO = -8.0f;         // .. and quiescent
+static const float UNI_BH_XRB_QUIET_HI = -4.0f;
+static const float UNI_BH_XRB_SEPARATION = 4.8f;        // the orbit's radius at least this x the companion's radius (it fills its Roche lobe: Eggleton's R_L / a ~ 0.21 at q ~ 0.1) ..
+static const float UNI_BH_XRB_SEPARATION_SPAN = 3.0f;   // .. up to this x that (log-uniform)
+static const float UNI_BH_STELLAR_SCALE = 30.0f;        // uu.Bh.StellarScale's default: a stellar black hole drawn (lensing and disc) as if this x larger (art; 1 physical: its disc ~3e4 km)
+
+/** Whether a star has a black hole companion (BH.STELLAR draw 0 < InFraction: raising the fraction
+ *  only adds). */
+UNI_FN bool Uni_StarHasBlackHole(uint InStarSeed, float InFraction)
+{
+	return Uni_DrawUnit(InStarSeed, UNI_CH_BH_STELLAR, 0u) < InFraction;
+}
+
+/** A star's black hole companion (draws 1..3): its mass and accretion rate. InActive: the share in
+ *  outburst. */
+UNI_FN FUniBlackHole Uni_StellarBlackHole(uint InStarSeed, float InActive)
+{
+	const float Um = Uni_DrawUnit(InStarSeed, UNI_CH_BH_STELLAR, 1u);
+	const float LogM = UNI_BH_STELLAR_LOG_M_LO + (UNI_BH_STELLAR_LOG_M_HI - UNI_BH_STELLAR_LOG_M_LO) * pow(Um, UNI_BH_STELLAR_M_SKEW);
+	const bool bActive = Uni_DrawUnit(InStarSeed, UNI_CH_BH_STELLAR, 2u) < saturate(InActive);
+	const float Ur = Uni_DrawUnit(InStarSeed, UNI_CH_BH_STELLAR, 3u);
+	const float LogE = bActive ? UNI_BH_XRB_ACTIVE_LO + (UNI_BH_XRB_ACTIVE_HI - UNI_BH_XRB_ACTIVE_LO) * Ur
+		: UNI_BH_XRB_QUIET_LO + (UNI_BH_XRB_QUIET_HI - UNI_BH_XRB_QUIET_LO) * Ur;
+	return Uni_BlackHoleOf(LogM, LogE);
+}
+
+/** Its disc's seed (its clouds and its look: BH.LOOK draws on it), distinct from its star's. */
+UNI_FN uint Uni_StellarBlackHoleSeed(uint InStarSeed)
+{
+	return Uni_SeedMix(InStarSeed, UNI_CH_BH_STELLAR);
+}
+
 /** D-274 (owner 2026-11-17: "the brightness of the black hole up close is much too bright for me
  *  to inspect the effect, it is masked by the bloom and flare"): the disc's light per pixel
  *  (exposure units) softened above a knee: unchanged up to it, then Knee (1 + log10(L / Knee)),
@@ -414,8 +674,8 @@ struct FUniLensDisc
 	uint MaxSamples;    // the most volume samples a ray takes (0: UNI_LENS_VOL_SAMPLES)
 	float Falloff;      // the light's fall with temperature: (Planck(gT) / Planck(peak))^Falloff x Planck(peak) (1: physical, the V band's; < 1: the cooler outer disc glows)
 	float Erosion;      // D-278: 0..1: the clouds' edges, the disc's top surface and rim eaten by a finer noise (0: D-276's)
-	float LookPad1;
-	float LookPad2;
+	float PaletteMix;   // D-280: the palette's share of the colour (0: the blackbody, D-273's colours exactly)
+	float Palette;      // D-280: its palette (UNI_BH_PALETTES; a whole number)
 };
 
 struct FUniLensResult
@@ -543,7 +803,7 @@ UNI_FN void Uni_BhDiscSample(float3 InP, FUniLensDisc InDisc, float InLambda, UN
 	const float Span = max(log(InDisc.OuterX * (1.0f / UNI_BH_ISCO_X)), 0.1f);
 	const float Band = max(1.0f + InDisc.Bands * sin(6.2831853f * UNI_BH_BAND_RINGS * LnR / Span + 3.0f * N), 0.0f);
 	const float Tg = G * max(T, 1.0f);
-	const float3 C = Uni_TemperatureColour(Tg);
+	const float3 C = Uni_BhDiscChroma(Tg, InDisc.PeakK, (uint)InDisc.Palette, InDisc.PaletteMix);   // D-280 (palette 0: Uni_TemperatureColour)
 	const float Pk = max(Uni_BhPlanckV(InDisc.PeakK), 1.0e-30f);
 	const float Lv = InDisc.Falloff > 0.0f && InDisc.Falloff != 1.0f ? Pk * pow(max(Uni_BhPlanckV(Tg) / Pk, 1.0e-30f), InDisc.Falloff) : Uni_BhPlanckV(Tg);
 	OutSource = C * (Lv * Band / max(Uni_Luminance(C), 1.0e-3f));
@@ -718,7 +978,7 @@ UNI_FN FUniLensResult Uni_LensTrace(float3 InCam, float3 InDir, FUniLensDisc InD
 				const float G = sqrt(max(1.0f - 1.5f / Xr, 0.0f)) / max(1.0f - Omega * Lambda, 1.0e-3f);
 				if (Crossings == 0u) { Res.FirstPos = Xc; Res.FirstX = Xr; Res.FirstG = G; }
 				++Crossings;
-				Res.Disc += Uni_BhDiscLight(G * InDisc.PeakK * Uni_BhDiscProfile(Xr)) * (A * Res.Transmit);
+				Res.Disc += Uni_BhDiscLightP(G * InDisc.PeakK * Uni_BhDiscProfile(Xr), InDisc.PeakK, (uint)InDisc.Palette, InDisc.PaletteMix) * (A * Res.Transmit);   // D-280
 				Res.Transmit *= 1.0f - A;
 				if (Res.Transmit < 1.0e-3f) { Res.Transmit = 0.0f; bDone = true; X = X1; break; }
 			}

@@ -3,7 +3,7 @@
 	"Version": 1,
 	"VersionName": "0.1-prototype",
 	"FriendlyName": "Unified Universe",
-	"Description": "One coordinate, one generator, one renderer: nested-octree scale levels over a 128-bit universal coordinate, GPU-resident generation and a radially compressed backdrop. Prototype; runs alongside UltraLargeScale for A/B and has no dependency on it.",
+	"Description": "One coordinate, one generator, one renderer: nested-octree scale levels over a 128-bit universal coordinate, GPU-resident generation and a radially compressed backdrop. Prototype; runs alongside UltraLargeScale for A/B. Only its game module (UnifiedUniverseGame: planets as VoxelPlanets worlds, D-293) depends on other plugins.",
 	"Category": "vxl",
 	"CreatedBy": "Sam Barnett",
 	"CreatedByURL": "",
@@ -31,9 +31,20 @@
 			"LoadingPhase": "Default"
 		},
 		{
+			"Name": "UnifiedUniverseGame",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		},
+		{
 			"Name": "UnifiedUniverseEditor",
 			"Type": "Editor",
 			"LoadingPhase": "Default"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "VoxelPlanets",
+			"Enabled": true
 		}
 	]
 }

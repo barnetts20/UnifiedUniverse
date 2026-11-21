@@ -455,6 +455,9 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Population|Clusters", meta = (DisplayName = "Group.Enable", UniCVar = "uu.Group.Enable", UniReenable, ToolTip = "D-174: galaxy groups from the web's node list (each places dwarfs; 0: none). Needs the node list. [re-enables the scene on change]"))
 	int32 U_Group_Enable = 0;
 
+	UPROPERTY(config, EditAnywhere, Category = "Sprites", meta = (DisplayName = "Sprite.Atmosphere", UniCVar = "uu.Sprite.Atmosphere", ToolTip = "D-296: sprites pass through a planet's atmosphere as the scene behind it does (its clouds and air: the transmittance it composited), and fade where its sky is bright (uu.Sprite.SkyFadeStart / End). 0: drawn over it, as before."))
+	int32 U_Sprite_Atmosphere = 0;
+
 	UPROPERTY(config, EditAnywhere, Category = "Sprites", meta = (DisplayName = "Sprite.CorePx", UniCVar = "uu.Sprite.CorePx", ToolTip = "Core size of an unresolved sprite (Gaussian sigma, pixels). Brightness no longer enlarges it (D-156)."))
 	float U_Sprite_CorePx = 0.0f;
 
@@ -475,6 +478,12 @@ public:
 
 	UPROPERTY(config, EditAnywhere, Category = "Sprites", meta = (DisplayName = "Sprite.Saturation", UniCVar = "uu.Sprite.Saturation", ToolTip = "Intensity (exposure units: 1 = a star at the exposure magnitude) where a sprite's core stops brightening. 0: physical (all light in the core, no halo; the engine's bloom does the glare)."))
 	float U_Sprite_Saturation = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Sprites", meta = (DisplayName = "Sprite.SkyFadeEnd", UniCVar = "uu.Sprite.SkyFadeEnd", ToolTip = "D-296: the sky brightness where the sprites are gone (a day sky)."))
+	float U_Sprite_SkyFadeEnd = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Sprites", meta = (DisplayName = "Sprite.SkyFadeStart", UniCVar = "uu.Sprite.SkyFadeStart", ToolTip = "D-296: the atmosphere's sky brightness (its in-scattered light at the pixel, pre-exposed scene colour: 1 is about white) where the sprites start to fade (a twilight sky)."))
+	float U_Sprite_SkyFadeStart = 0.0f;
 
 	UPROPERTY(config, EditAnywhere, Category = "Sprites", meta = (DisplayName = "Sprite.Splat", UniCVar = "uu.Sprite.Splat", ToolTip = "D-223: 1: plain point sprites (no halo, round, at the core size: nearly every star) are drawn by atomic adds into fixed-point buffers and one shared gather; the rest stay quads. 0: every sprite a quad (before D-223)."))
 	int32 U_Sprite_Splat = 0;
@@ -521,6 +530,9 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.DiscOpacity", UniCVar = "uu.Bh.DiscOpacity", ToolTip = "D-276: the disc's optical depth through its plane at mean density (lower: more of the sky shows through)."))
 	float U_Bh_DiscOpacity = 0.0f;
 
+	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.DiscPalette", UniCVar = "uu.Bh.DiscPalette", ToolTip = "D-280: the accretion discs' colours: -1 each black hole's rolled palette; 0 the blackbody (physical colours); 1..7 every black hole that palette (1 gold, 2 quasar blue, 3 ember, 4 violet, 5 teal, 6 rose, 7 ice and fire)."))
+	int32 U_Bh_DiscPalette = 0;
+
 	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.DiscPeriod", UniCVar = "uu.Bh.DiscPeriod", ToolTip = "D-276: seconds for one orbit of the disc's inner edge (outer gas slower, Keplerian). Art: physically hours to days. 0: still."))
 	float U_Bh_DiscPeriod = 0.0f;
 
@@ -535,6 +547,9 @@ public:
 
 	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.DiscToPx", UniCVar = "uu.Bh.DiscToPx", ToolTip = "D-273: .. to all of it at this (smoothstep between)."))
 	float U_Bh_DiscToPx = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.DiscVariety", UniCVar = "uu.Bh.DiscVariety", ToolTip = "D-280: how far each black hole's look strays from the uu.Bh.Disc* settings (its palette, spiral, thickness, opacity, clouds, bands, heat, erosion, period, brightness and extent, rolled from its seed, its accretion rate and its host): 0 every black hole the settings' look exactly (D-278), 1 the full spread."))
+	float U_Bh_DiscVariety = 0.0f;
 
 	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.DiscVolume", UniCVar = "uu.Bh.DiscVolume", ToolTip = "D-276: the disc is a volume (a flared slab of rotating clouds the camera can fly through). 0: D-273's thin, smooth disc."))
 	int32 U_Bh_DiscVolume = 0;
@@ -562,6 +577,99 @@ public:
 
 	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.NucleusGain", UniCVar = "uu.Bh.NucleusGain", ToolTip = "D-272: the nuclei's light x this (art; 1 physical), under the cap. Render only, live."))
 	float U_Bh_NucleusGain = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.StellarActive", UniCVar = "uu.Bh.StellarActive", ToolTip = "D-281: the share of stellar black holes in outburst (1e-2..1 of Eddington: bright, hot, thin discs); the rest quiescent (1e-8..1e-4: dim tori)."))
+	float U_Bh_StellarActive = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.StellarFraction", UniCVar = "uu.Bh.StellarFraction", ToolTip = "D-281: the share of stars with a stellar black hole companion (5..25 M_sun, an X-ray binary fed by the star), found when the star's system activates (art; raising it only adds). 0: none. Applies to systems activated from then on."))
+	float U_Bh_StellarFraction = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Compact Objects", meta = (DisplayName = "Bh.StellarScale", UniCVar = "uu.Bh.StellarScale", ToolTip = "D-281: a stellar black hole's lensing and disc drawn as if it were this x larger (art; render only): at 30 a 10 M_sun hole's disc is ~1 R_sun, resolved from a few AU. 1: physical (its disc ~3e4 km)."))
+	float U_Bh_StellarScale = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Planets", meta = (DisplayName = "Home.Timeout", UniCVar = "uu.Home.Timeout", ToolTip = "D-293: seconds the home start waits for the planet's ground, then for its collision, before giving up (logged as an error; the pawn stays held, uu.Fly moves it). Generous: a first run compiles the planet's shaders."))
+	float U_Home_Timeout = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Planets", meta = (DisplayName = "Home.WaitAltitudeM", UniCVar = "uu.Home.WaitAltitudeM", ToolTip = "D-293: metres above sea level the pawn waits, held, while the home planet builds."))
+	float U_Home_WaitAltitudeM = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Planets", meta = (DisplayName = "Planet.AtmoArchetype", UniCVar = "uu.Planet.AtmoArchetype", ToolTip = "D-294: the atmosphere archetype a terrestrial planet's atmosphere draws from when its class sets none (the planet's AtmosphereSet empty: else the atmosphere's class defaults, an untuned look). Empty: none."))
+	FString U_Planet_AtmoArchetype;
+
+	UPROPERTY(config, EditAnywhere, Category = "Planets", meta = (DisplayName = "Planet.AtmoLook", UniCVar = "uu.Planet.AtmoLook", ToolTip = "D-294: the look profile a terrestrial planet's atmosphere draws from when its class sets none. Empty: none."))
+	FString U_Planet_AtmoLook;
+
+	UPROPERTY(config, EditAnywhere, Category = "Planets", meta = (DisplayName = "Planet.AtmoThicknessKm", UniCVar = "uu.Planet.AtmoThicknessKm", ToolTip = "D-295: a rocky planet's atmosphere's depth at Earth's gravity and temperature, km (Earth's sky is about 60 km of it: CloudAtmosphere's scale heights are fractions of it); scaled by the planet's temperature over its gravity (a scale height's kT / mg), set as the atmosphere's HeightScale (its depth over the radius, at least 0.005) and locked against the seed. 0: the seed's own (CloudAtmosphere's 0.03-0.07 of the radius)."))
+	float U_Planet_AtmoThicknessKm = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Planets", meta = (DisplayName = "Planet.Class", UniCVar = "uu.Planet.Class", ToolTip = "D-293: the class of rocky planets' detailed actors (a path such as /Game/Planets/BP_Planet.BP_Planet_C; an APlanetActor subclass). Empty: APlanetActor itself (no materials or sets of its own: set this to the project's planet Blueprint). Applies to planets acquired after the change."))
+	FString U_Planet_Class;
+
+	UPROPERTY(config, EditAnywhere, Category = "Planets", meta = (DisplayName = "Planet.CloudLayerKm", UniCVar = "uu.Planet.CloudLayerKm", ToolTip = "D-295: a rocky planet's weather layer at Earth's gravity and temperature, km (Earth's troposphere ~12 km), scaled as uu.Planet.AtmoThicknessKm; set as the atmosphere's CloudThickness (its share of the atmosphere) and locked. 0: the seed's own."))
+	float U_Planet_CloudLayerKm = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Planets", meta = (DisplayName = "Planet.CloudPrefilter", UniCVar = "uu.Planet.CloudPrefilter", ToolTip = "D-302: the planets' atmospheres' Sampling.NoisePrefilter (CloudAtmosphere stage RS3: the structure noise's spread its mips average away, so far cloud is the mean of the cloud, not round blobs cut from the mean noise; 0 off). Set when an atmosphere is made; r.CloudAtmosphere.NoisePrefilterScale scales it live. -1: the atmosphere's own."))
+	float U_Planet_CloudPrefilter = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Planets", meta = (DisplayName = "Planet.CloudStepFootprint", UniCVar = "uu.Planet.CloudStepFootprint", ToolTip = "D-295: the planets' atmospheres' Sampling.StepFootprint (CloudAtmosphere stage RS1: the cloud noise read over this many step lengths at least; 0 the pixel's width alone). -1: the atmosphere's own."))
+	float U_Planet_CloudStepFootprint = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Planets", meta = (DisplayName = "Planet.CloudStepTaps", UniCVar = "uu.Planet.CloudStepTaps", ToolTip = "D-295: the planets' atmospheres' Sampling.StepTaps (CloudAtmosphere stage RS1: noise reads along each cloud step, averaged; 1 one read). 0: the atmosphere's own."))
+	int32 U_Planet_CloudStepTaps = 0;
+
+	UPROPERTY(config, EditAnywhere, Category = "Planets", meta = (DisplayName = "Planet.DayHours", UniCVar = "uu.Planet.DayHours", ToolTip = "D-299: the planets' solar day, hours of universe time (uu.TimeScale 1: real hours; it scales with the clock as the orbits do): every planet turns about the universe's +Z once in 1 / (1 / day + 1 / year), so its sun comes back once a day and the year shows in the day's drift. The world turns with the planet whose frame it is in (the ground stays put, the sky goes round). 0: no spin (planets keep their turn at the epoch)."))
+	float U_Planet_DayHours = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Planets", meta = (DisplayName = "Planet.DaySkyHeightKm", UniCVar = "uu.Planet.DaySkyHeightKm", ToolTip = "D-296: the height above the planet's surface by which its day sky no longer hides the backdrop (from a fifth of it up)."))
+	float U_Planet_DaySkyHeightKm = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Planets", meta = (DisplayName = "Planet.DaySkyHide", UniCVar = "uu.Planet.DaySkyHide", ToolTip = "D-296: how much of the backdrop (the galaxy's glow and the stars) a planet's day sky hides, at noon near the ground: its light x (1 - this x the daylight). The sprites also fade by the atmosphere's own sky brightness per pixel (uu.Sprite.SkyFadeStart / End); this is the glow's, which is drawn before the atmosphere. 0: none."))
+	float U_Planet_DaySkyHide = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Planets", meta = (DisplayName = "Planet.Frame", UniCVar = "uu.Planet.Frame", ToolTip = "D-293: near a planet (Local mode) the world is its frame: its centre the origin, the planet still, the universe moving round it. 0: never (the planet moves along its orbit through the world, as before)."))
+	int32 U_Planet_Frame = 0;
+
+	UPROPERTY(config, EditAnywhere, Category = "Planets", meta = (DisplayName = "Planet.FrameExit", UniCVar = "uu.Planet.FrameExit", ToolTip = "D-293: the frame is left at this many times its radius (hysteresis)."))
+	float U_Planet_FrameExit = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Planets", meta = (DisplayName = "Planet.FrameRadii", UniCVar = "uu.Planet.FrameRadii", ToolTip = "D-293: the planet's frame holds within this many of its radii of its centre (entered there, left at uu.Planet.FrameExit x it)."))
+	float U_Planet_FrameRadii = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Planets", meta = (DisplayName = "Planet.GasGiantAtmoArchetype", UniCVar = "uu.Planet.GasGiantAtmoArchetype", ToolTip = "D-294: the atmosphere archetype a gas giant's atmosphere draws from when its class sets none. Empty: none."))
+	FString U_Planet_GasGiantAtmoArchetype;
+
+	UPROPERTY(config, EditAnywhere, Category = "Planets", meta = (DisplayName = "Planet.GasGiantAtmoLook", UniCVar = "uu.Planet.GasGiantAtmoLook", ToolTip = "D-294: the look profile a gas giant's atmosphere draws from when its class sets none. Empty: none."))
+	FString U_Planet_GasGiantAtmoLook;
+
+	UPROPERTY(config, EditAnywhere, Category = "Planets", meta = (DisplayName = "Planet.GasGiantClass", UniCVar = "uu.Planet.GasGiantClass", ToolTip = "D-293: the class of gas giants' detailed actors (an APlanetActor subclass set up as a gas giant). Empty: none (gas giants keep their placeholder spheres). Ice giants always keep theirs (D-290)."))
+	FString U_Planet_GasGiantClass;
+
+	UPROPERTY(config, EditAnywhere, Category = "Planets", meta = (DisplayName = "Planet.LandView", UniCVar = "uu.Planet.LandView", ToolTip = "D-294: the terrain's debug colours while planets have no materials of their own: voxel.Debug.LandView set to this when a planet is made (D-296: 19, the rivers' channels and valleys over the elevation's colours; 14 the landforms; 13 needs a bake with drainage, which a disk-cached bake lacks). -1: leave voxel.Debug.LandView alone. A value typed or set in an ini wins."))
+	int32 U_Planet_LandView = 0;
+
+	UPROPERTY(config, EditAnywhere, Category = "Planets", meta = (DisplayName = "Planet.MaxG", UniCVar = "uu.Planet.MaxG", ToolTip = "D-293: play's upper limit on a planet's surface gravity, in g."))
+	float U_Planet_MaxG = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Planets", meta = (DisplayName = "Planet.MaxLive", UniCVar = "uu.Planet.MaxLive", ToolTip = "D-297: planets with a live detailed body at once (the frame planet first, then the nearest promoted ones); the rest keep their sprites until they are among the nearest. Each holds GBs of GPU memory."))
+	int32 U_Planet_MaxLive = 0;
+
+	UPROPERTY(config, EditAnywhere, Category = "Planets", meta = (DisplayName = "Planet.MinG", UniCVar = "uu.Planet.MinG", ToolTip = "D-293: play's lower limit on a planet's surface gravity, in g (applies to planets acquired after the change)."))
+	float U_Planet_MinG = 0.0f;
+
+	UPROPERTY(config, EditAnywhere, Category = "Planets", meta = (DisplayName = "Planet.Placeholders", UniCVar = "uu.Planet.Placeholders", ToolTip = "D-297: 1: promoted planets a body factory makes get the old placeholder sphere as well (A/B); 0: never (their sprite stands in until the detailed body is ready). Planets no factory makes (ice giants; gas giants without uu.Planet.GasGiantClass) and stars always get theirs. Applies to planets promoted after the change."))
+	int32 U_Planet_Placeholders = 0;
+
+	UPROPERTY(config, EditAnywhere, Category = "Planets", meta = (DisplayName = "Planet.Pool", UniCVar = "uu.Planet.Pool", ToolTip = "D-292: planets' detailed actors kept parked (dormant) after their frame is left, for an instant return; beyond this many the oldest is released. Each holds GBs of GPU memory."))
+	int32 U_Planet_Pool = 0;
+
+	UPROPERTY(config, EditAnywhere, Category = "Planets", meta = (DisplayName = "Planet.Surface", UniCVar = "uu.Planet.Surface", ToolTip = "D-293: rocky planets' surface generator: 1 the terrestrial generator (plates, landforms, the bake; D-290), 0 the noise surface (no bake: faster, plainer)."))
+	int32 U_Planet_Surface = 0;
+
+	UPROPERTY(config, EditAnywhere, Category = "Planets", meta = (DisplayName = "Planet.TickLate", UniCVar = "uu.Planet.TickLate", ToolTip = "D-298: a planet's actors (the planet, its terrain, ocean, gravity zone and atmosphere, and their components) tick in TG_PostUpdateWork, after the universe has placed the planet this frame (the universe ticks after the actor tick groups up to TG_PostPhysics). Else an atmosphere or ocean that reads the planet's place in its tick draws it a frame behind the terrain: in Cruise, where the planet moves past the pinned pawn, the atmosphere's shell is off the terrain by a frame's travel and half the planet shows the terrain through it. 0: TG_PrePhysics (UE's default), for comparison."))
+	int32 U_Planet_TickLate = 0;
+
+	UPROPERTY(config, EditAnywhere, Category = "Planets", meta = (DisplayName = "Planet.WeatherClock", UniCVar = "uu.Planet.WeatherClock", ToolTip = "D-301: the clouds' clock (CloudAtmosphere's sim). 1: the planet's own: the sim's day (one turn of the planet its Coriolis assumes) is the planet's solar day (uu.Planet.DayHours) on the universe clock, so the weather runs with the day and uu.TimeScale (a day a minute: a day's weather a minute; at 1, real time: slow); 0: the atmosphere's own speed (its SimSpeed) times uu.TimeScale; -1: the atmosphere's own, untouched. The planets turn themselves (D-299), so their atmospheres' own spin of the cloud field (SpinRatio) is set to 0 while they do."))
+	int32 U_Planet_WeatherClock = 0;
 
 	UPROPERTY(config, EditAnywhere, Category = "Web", meta = (DisplayName = "MotionWeb", UniCVar = "uu.MotionWeb", ToolTip = "D-230: the motion web: while travelling, the cosmic web's filaments and nodes glow faintly so the structure shows motion (render only). Strength at full travel: a galaxy disc's surface brightness per Mpc of web (0.01: a few-Mpc filament at a few % of a disc). 0: off."))
 	float U_MotionWeb = 0.0f;
@@ -692,7 +800,7 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Travel", meta = (DisplayName = "Warp.StreakMax", UniCVar = "uu.Warp.StreakMax", ToolTip = "D-187: longest warp streak, pixels."))
 	float U_Warp_StreakMax = 0.0f;
 
-	UPROPERTY(config, EditAnywhere, Category = "Lighting", meta = (DisplayName = "LightRig", UniCVar = "uu.LightRig", ToolTip = "M3 placeholder: a movable directional light from the nearest active star, so promoted planets are lit (0 off)."))
+	UPROPERTY(config, EditAnywhere, Category = "Lighting", meta = (DisplayName = "LightRig", UniCVar = "uu.LightRig", ToolTip = "M3 placeholder: a movable directional light from the nearest active star, so promoted planets are lit (0 off). D-294: off while the planet whose frame the world is has its detailed body live and ready (its atmosphere lights the scene)."))
 	int32 U_LightRig = 0;
 
 	UPROPERTY(config, EditAnywhere, Category = "Lighting", meta = (DisplayName = "LightRigLux", UniCVar = "uu.LightRigLux", ToolTip = "Intensity of the light rig, lux."))

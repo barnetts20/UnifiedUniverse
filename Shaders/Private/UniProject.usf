@@ -62,6 +62,7 @@ uint WriteSpriteSource;                          // D-193: 1 on a frame with a p
 uint NucleusArchetypeMask;                       // D-272: archetypes whose objects have a nucleus (0: none)
 float4 NucleusParams;                            // D-272: (accreting share, cap x the host, gain, D-273: the lensed nucleus's share handed to its disc)
 uint NucleusHandSeed;                            // D-273: that nucleus's galaxy seed
+float4 NucleusStyle;                             // D-280: (uu.Bh.DiscVariety, uu.Bh.DiscPalette): the nuclei's colours their discs' palettes
 StructuredBuffer<uint4> InHandoffs;              // D-196: (cell index, slot, carrier share bits, 0), sorted by (cell index, slot)
 uint NumHandoffs;
 uint SplatMode;                                  // D-223: 1: sort the sprites into the splat and quad lists
@@ -176,8 +177,8 @@ void MainCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
 	V.NucleusGain = NucleusParams.z;
 	V.NucleusHandSeed = NucleusHandSeed;             // D-273
 	V.NucleusHandShare = NucleusParams.w;
-	V.NucleusPad0 = 0.0f;
-	V.NucleusPad1 = 0.0f;
+	V.NucleusVariety = NucleusStyle.x;               // D-280
+	V.NucleusPalette = NucleusStyle.y;
 
 	// D-187: at warp a new cell's objects streak in from ahead (the sprite pass stretches their
 	// tails by their arrival). D-203: their fade-in is the cell's own (bits 8..15: the level's fade

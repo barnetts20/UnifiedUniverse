@@ -12,7 +12,8 @@
 // GetKnownObject. Resolve and persistence are absent (M4).
 //
 // Console (any level, PIE or standalone):
-//   uu.Enable [galaxy|web|flythrough]   start a universe at its demo camera
+//   uu.Enable [galaxy|web|flythrough|home]  start a universe at its demo camera (D-293: home
+//                                       starts on foot on the home planet)
 //   uu.Flythrough [seconds]             3 Gpc -> 1 m from a bright star (default 60 s)
 //   uu.Fly [cm/s]                       toggle free flight: steer with the view, WASD/QE to
 //                                       move, mouse wheel doubles / halves the speed
@@ -54,6 +55,8 @@
 //   uu.Query <radius pc> [archetype]    log the resident objects within a radius of the camera
 //   uu.Nearest <archetype>              log the nearest resident object of an archetype
 //   uu.Events [archetype ...|off]       log resident / evicted events for archetypes (counts per second)
+//   uu.Planets                          log the planet's frame, planets' detailed bodies and the
+//                                       home start (D-293; uu.Planet.*, uu.Home.*)
 //   uu.Disable
 
 #include "CoreMinimal.h"
@@ -76,6 +79,9 @@
 #include "UniMotes.h"
 #include "UniQuery.h"   // D-193
 #include "UniApiTypes.h"
+#include "UniBodyFactory.h"   // D-293
+#include "UniPlanetProps.h"   // D-293
+#include "UniSpin.h"          // D-299
 #include "UniSubsystem.generated.h"
 
 class UTextureCube;
@@ -194,6 +200,28 @@ public:
 	/** Resolve the nearest star (within 100 pc) whose system has a gas giant, and jump into it
 	 *  in free flight, facing the star. */
 	bool GoToSystem(bool bToPlanet = false);
+	/** D-281: jump to the nearest stellar black hole (a star's companion), 3 disc radii out (uu.GotoStellarBlackHole). */
+	bool GoToStellarBlackHole();
+
+	// ---- Planets as worlds (D-293, SHIPS_PLANETS.md) ----------------------------------------
+	/** A game module's body factory (made per enabled universe). Call from the module's startup;
+	 *  unregister at shutdown. */
+	static void RegisterBodyFactoryClass(TSubclassOf<UUniBodyFactory> FactoryClass);
+	static void UnregisterBodyFactoryClass(TSubclassOf<UUniBodyFactory> FactoryClass);
+
+	/** Whether the world is a planet's frame now (its centre the origin, D-291), and which. */
+	UFUNCTION(BlueprintPure, Category = "Universe|Planet")
+	bool IsInPlanetFrame() const { return BodyFrame.bActive; }
+	UFUNCTION(BlueprintPure, Category = "Universe|Planet")
+	FUniBodyDesc GetFramePlanet() const { return BodyFrame.Desc; }
+	/** The frame planet's detailed actor (null without one, or before it is acquired). */
+	UFUNCTION(BlueprintPure, Category = "Universe|Planet")
+	AActor* GetFramePlanetActor() const;
+	/** The start on the home planet (uu.AutoStart home): done once the pawn stands on the ground. */
+	UFUNCTION(BlueprintPure, Category = "Universe|Planet")
+	bool IsHomeStartDone() const { return StartPhase == EStartPhase::None || StartPhase == EStartPhase::Done; }
+	/** uu.Planets: the frame, the detailed bodies, the start. */
+	void LogPlanets() const;
 
 	/** M3 (D-146): actors placed by the parallax rule register here and are placed every frame
 	 *  right after the universal camera moves. */
@@ -350,9 +378,13 @@ private:
 	uint32 SystemArchetypeMask = 0;
 	uint32 DiscArchetypeMask = 0;   // D-183: archetypes emitting through the galaxy field (inclined sprites)
 	UniCore::FNucleusConfig NucleusConfig() const;   // D-272: uu.Bh.* (the nuclei and the black hole lookup)
+	UniCore::FStyleConfig StyleConfig() const;       // D-280: uu.Bh.DiscVariety, uu.Bh.DiscPalette
+	UniCore::FStellarBhConfig StellarBhConfig() const;   // D-281: uu.Bh.Stellar*
 	/** D-273: the black hole the lens pass draws this frame (of the camera's galaxies, the most visible), into F. */
 	void UpdateLensTarget(struct FUniFrameData& F, const UniCore::FVolumeScene& Sc, const UniCore::FCoord& Cam);
 	UniCore::FLensTarget LensLast;   // D-273: the last one (uu.Perf)
+	UniHlsl::FUniBhStyle LensStyleLast{};   // D-280: its look
+	bool LensStellarLast = false;           // D-281: a stellar black hole's
 	uint32 FixedDiscSeeds[4] = { 0, 0, 0, 0 };   // D-183: seeds of fixed-orientation anchors (up to four)
 	double UniverseTime = 0.0;
 	double TimeScale = 1.0;
@@ -375,6 +407,82 @@ private:
 	void UpdateParallax(const FVector& ViewLoc);
 	void UpdateLightRig();
 	void ClearPromotion();
+
+	// D-293: the planet's frame, planets' detailed actors and the home start (UniSubsystemPlanets.cpp)
+	struct FPlanetFrame
+	{
+		bool bActive = false;
+		uint32 StarSeed = 0;
+		int32 Ordinal = -1;
+		double RadiusCm = 0.0;
+		double FrameRadiusCm = 0.0;
+		FUniBodyDesc Desc;
+	};
+	FPlanetFrame BodyFrame;
+	struct FDetailedBody
+	{
+		TWeakObjectPtr<AActor> Actor;
+		TWeakObjectPtr<UUniBodyFactory> Factory;
+		FUniBodyDesc Desc;
+		bool bParked = false;
+		bool bReady = false;
+		double ParkedAt = 0.0;
+	};
+	TMap<uint32, FDetailedBody> DetailedBodies;
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UUniBodyFactory>> BodyFactories;
+	static TArray<TSubclassOf<UUniBodyFactory>>& BodyFactoryClasses();
+	enum class EStartPhase : uint8 { None, WaitPawn, WaitGround, WaitCollision, Done };
+	EStartPhase StartPhase = EStartPhase::None;
+	double StartPhaseSince = 0.0;
+	FVector StartUp = FVector::UpVector;          // the spawn point's up (planet frame)
+	FVector StartSpawn = FVector::ZeroVector;     // where the pawn waits (world)
+	std::vector<UniCore::FVec3d> StartCandidates;
+	bool bPawnHeld = false;
+	/** D-296: the backdrop's (the volume's and the sprites') share under the frame planet's day
+	 *  sky: 1 in space or at night, down to 1 - uu.Planet.DaySkyHide at noon near the ground. */
+	float BackdropDayScale = 1.0f;
+	/** D-297: whether a live, ready detailed body with air lights the scene (the light rig stands down). */
+	bool bDetailedLit = false;
+	/** D-297: per promoted planet, whether a body factory makes it (no placeholder sphere then). */
+	struct FPromotedBodyLink { bool bSupported = false; };
+	TMap<uint32, FPromotedBodyLink> PromotedLinks;
+	bool BodyDescOf(uint32 StarSeed, uint32 PlanetSeed, FUniBodyDesc& OutDesc) const;
+	bool HasDetailedBody(uint32 PlanetSeed) const;
+	/** D-297: whether a promoted body gets the placeholder sphere (stars and planets no factory makes). */
+	bool WantsPlaceholder(const UniCore::FPromotedBody& B);
+	/** D-297: the promoted planets whose sprite an actor replaces (a placeholder, or a ready detailed body). */
+	std::set<UniCore::u32> SpriteCulledIds() const;
+	/** The planet's centre at universe time t, exact (false: its system is not active). */
+	bool PlanetCentreOf(uint32 StarSeed, int32 Ordinal, double TimeS, UniCore::FCoord& OutCentre, UniCore::FVec3f& OutFrac, const UniCore::FActiveSystem** OutSystem = nullptr) const;
+	FUniBodyDesc DescOf(const UniCore::FActiveSystem& A, int32 Ordinal) const;
+	/** Enter, follow or leave a planet's frame (Local mode). Moves the world (and InOutViewLoc) on
+	 *  entering; on leaving, the origin stays where the planet's centre last was. */
+	void UpdateBodyFrame(FVector& InOutViewLoc);
+	void LeaveBodyFrame(const TCHAR* Why);
+	/** Move everything in the UE world the universe does not place by Shift (D-149's re-centre,
+	 *  D-293's frame changes): the pawn, Simulated parallax actors, and OnLocalRecentre's listeners. */
+	void ShiftWorld(const FVector& Shift, FVector& InOutViewLoc);
+	/** Local mode's camera: anchor + its fraction + the view (D-293), the view turned into the
+	 *  universe's axes (D-299). */
+	UniCore::FCoord LocalCamera(const FVector& ViewLoc, UniCore::FVec3f& OutFrac) const;
+	/** D-299: the world's turn against the universe's axes (UniSpin.h: universal = yaw(world)): it
+	 *  follows the spin of the planet whose frame the world is in, and holds outside one. Every
+	 *  mapping between the world and the universe goes through these. */
+	UniCore::FWorldTurn WorldTurn;
+	UniCore::FVec3d ToUniversalAxes(const FVector& World) const { return WorldTurn.ToUniversal(UniCore::FVec3d{ World.X, World.Y, World.Z }); }
+	FVector ToWorldAxes(const UniCore::FVec3d& Universal) const { const UniCore::FVec3d W = WorldTurn.ToWorld(Universal); return FVector(W.X, W.Y, W.Z); }
+	/** A direction in the universe's axes as a world rotation (the controller's, facing it). */
+	FRotator WorldRotationOf(const FVector& UniversalDir) const { return ToWorldAxes(UniCore::FVec3d{ UniversalDir.X, UniversalDir.Y, UniversalDir.Z }).Rotation(); }
+	/** D-299: a planet's turn about +Z now (uu.Planet.DayHours; 0 hours: none). */
+	double PlanetSpinNow(const UniCore::FActiveSystem& A, int32 Ordinal) const;
+	void UpdateDetailedBodies(const FVector& ViewLoc);
+	void ReleaseDetailedBodies();
+	UUniBodyFactory* FactoryFor(const FUniBodyDesc& Desc) const;
+	/** The home start (SHIPS_PLANETS.md §7): set up at uu.Enable home, run every tick until done. */
+	void BeginHomeStart();
+	void UpdateHomeStart(const FVector& ViewLoc);
+	void HoldPawn(bool bHold);
 
 	// D-186: the sky light from the backdrop. A small cube marched on a worker thread from a copy
 	// of the frame's volume scene every uu.SkyLightInterval seconds, uploaded as a transient
@@ -399,6 +507,9 @@ private:
 
 	FUniCoord Camera;
 	FUniCoord LocalAnchor;
+	/** D-293: the world origin's sub-centimetre part (the planet's exact centre in its frame;
+	 *  zero otherwise): world p is the universal point LocalAnchor + LocalAnchorFrac + p. */
+	FVector3f LocalAnchorFrac = FVector3f::ZeroVector;
 	FVector3f CameraFraction = FVector3f::ZeroVector;
 	FVector Velocity = FVector::ZeroVector;
 	EUniMotionMode MotionMode = EUniMotionMode::Local;

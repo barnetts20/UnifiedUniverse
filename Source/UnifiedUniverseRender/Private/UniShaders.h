@@ -282,6 +282,7 @@ public:
 		SHADER_PARAMETER(uint32, NucleusArchetypeMask)   // D-272
 		SHADER_PARAMETER(FVector4f, NucleusParams)       // D-272: accreting share, cap, gain; D-273: w the lensed nucleus's share handed to its disc
 		SHADER_PARAMETER(uint32, NucleusHandSeed)        // D-273
+		SHADER_PARAMETER(FVector4f, NucleusStyle)        // D-280: variety, palette mode
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint4>, InHandoffs)   // D-196
 		SHADER_PARAMETER(uint32, NumHandoffs)
 		SHADER_PARAMETER(uint32, SplatMode)                                       // D-223
@@ -806,6 +807,12 @@ BEGIN_SHADER_PARAMETER_STRUCT(FUniSpriteParameters, )
 	SHADER_PARAMETER(float, SliceFarCm)   // D-271
 	SHADER_PARAMETER(FVector4f, OutToMarch)
 	SHADER_PARAMETER(FUintVector2, MarchSize)
+	SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float4>, AtmoColor)   // D-296
+	SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float2>, AtmoTint)
+	SHADER_PARAMETER(uint32, bAtmo)
+	SHADER_PARAMETER(FVector4f, OutToAtmo)
+	SHADER_PARAMETER(FUintVector2, AtmoSize)
+	SHADER_PARAMETER(FVector4f, AtmoSkyFade)
 	SHADER_PARAMETER(uint32, bQuadIndex)                                    // D-223: instance i draws InQuadIndex[i]
 	SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InQuadIndex)
 END_SHADER_PARAMETER_STRUCT()
@@ -867,6 +874,12 @@ public:
 		SHADER_PARAMETER(float, SliceFarCm)   // D-271
 		SHADER_PARAMETER(FVector4f, OutToMarch)
 		SHADER_PARAMETER(FUintVector2, MarchSize)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float4>, AtmoColor)   // D-296
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float2>, AtmoTint)
+		SHADER_PARAMETER(uint32, bAtmo)
+		SHADER_PARAMETER(FVector4f, OutToAtmo)
+		SHADER_PARAMETER(FUintVector2, AtmoSize)
+		SHADER_PARAMETER(FVector4f, AtmoSkyFade)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P) { return UniShadersEnabled() && IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5); }
@@ -996,7 +1009,7 @@ BEGIN_SHADER_PARAMETER_STRUCT(FUniLensParameters, )
 	SHADER_PARAMETER(float, DiscScale)
 	SHADER_PARAMETER(float, DiscKnee)        // D-274
 	SHADER_PARAMETER(FVector3f, DiscE1)      // D-276
-	SHADER_PARAMETER(float, LensPad5)
+	SHADER_PARAMETER(float, DiscPaletteMix)  // D-280
 	SHADER_PARAMETER(FVector4f, DiscVol0)
 	SHADER_PARAMETER(FVector4f, DiscVol1)
 	SHADER_PARAMETER(FVector4f, DiscFlow)

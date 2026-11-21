@@ -1,6 +1,6 @@
 # Compact and exotic objects: design proposal
 
-Status: the third item of B-031's roadmap after nebulae (D-234 on) and star clusters (D-238, D-239). Proposed 2026-11-16; the owner answered §6 on 2026-11-17 (§7). Phase A (supermassive black holes and galaxies' nuclei) is built: D-272. Phase D's lensing and accretion disc are built ahead of B and C at the owner's word (2026-11-17 08:11): D-273 (§8).
+Status: the third item of B-031's roadmap after nebulae (D-234 on) and star clusters (D-238, D-239). Proposed 2026-11-16; the owner answered §6 on 2026-11-17 (§7). Phase A (supermassive black holes and galaxies' nuclei) is built: D-272. Phase D's lensing and accretion disc are built ahead of B and C at the owner's word (2026-11-17 08:11): D-273 (§8). Each hole's own look and stellar black holes in binaries: D-280, D-281 (§9).
 
 ## 1. What is out there, and how much of it
 
@@ -164,3 +164,10 @@ Owner, 2026-11-17 08:11: "Gravitational sensing ans accretion discs, there are q
 - **The look (D-276, D-277):** brightness relative to the exposure (uu.Bh.DiscBrightness 1); a volumetric disc in the same trace (a flared slab H = 0.025 rho of value-noise clouds in co-rotating log-spiral coordinates, wound 4 radians per e-fold, with gaps, rings and hot knots), Keplerian rotation (the ISCO's orbit 8 s, art) with two flow phases re-forming the clouds each orbit; the hole lenses as if 2x heavier (uu.Bh.LensScale 2: shadow and lensing 2x against the disc). A camera can fly through the disc; a kill zone is a gameplay choice, not a cost one.
 - **D-278:** spiral 12, the hole 4x (uu.Bh.LensScale), erosion detail (uu.Bh.DiscErosion 0.8: torn cloud edges, a ragged surface and rim).
 
+## 9. Each black hole's look (D-280) and stellar black holes (D-281)
+
+Owner, 2026-11-17 22:35: "proceduralize the black hole within a range given the size of its parent galaxy, give it some procedural color palettes, ranges of twists, accretion disc amount based on the galaxy that hosts it. We should be able to scatter some stellar mass black holes around as well."
+
+- **The look (D-280):** Uni_BhStyleOf (channel BH.LOOK): multipliers about the engine's uu.Bh.Disc* (the centre), ^uu.Bh.DiscVariety. Thin, dense, brighter discs on fast accretors; puffy, optically thin tori on slow ones (the art's boundary 10^-4.3..10^-3.5 of Eddington: ~22% of accreting holes); an early type's disc smaller and its palette warmer; a disc galaxy's spiral following its arms' winding; bands, heat, erosion, period (with the mass), brightness (with the rate) and extent jittered. Size from the host: its mass (D-272).
+- **Palettes:** blackbody, gold, quasar blue, ember, violet, teal, rose, ice and fire (three stops placed by temperature against the peak, luminance kept); the nucleus sprite in the same palette (the hand-off's colour within 0.007). uu.Bh.DiscPalette.
+- **Stellar black holes (D-281):** X-ray binaries as §2.3 proposed: a star's companion (channel BH.STELLAR; uu.Bh.StellarFraction 1e-3 of stars), 5..25 M_sun, in outburst (uu.Bh.StellarActive 0.3) or quiescent, on a close circular orbit; found when the star's system activates; its light a dynamic record (capped at half its star's, faded in); the lens pass at uu.Bh.StellarScale (30, art); uu.GotoStellarBlackHole. Isolated ones (lensing only) are still to come (B-044).

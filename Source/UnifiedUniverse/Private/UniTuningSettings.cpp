@@ -5,6 +5,7 @@
 
 #include "HAL/FileManager.h"
 #include "HAL/IConsoleManager.h"
+#include "Misc/ConfigCacheIni.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "UniSubsystem.h"
@@ -143,6 +144,7 @@ namespace
 		{ TEXT("U_Cluster_RadiusScale"), TEXT("uu.Cluster.RadiusScale"), true, TEXT("Population|Clusters") },
 		{ TEXT("U_Group_Dwarfs"), TEXT("uu.Group.Dwarfs"), true, TEXT("Population|Clusters") },
 		{ TEXT("U_Group_Enable"), TEXT("uu.Group.Enable"), true, TEXT("Population|Clusters") },
+		{ TEXT("U_Sprite_Atmosphere"), TEXT("uu.Sprite.Atmosphere"), false, TEXT("Sprites") },
 		{ TEXT("U_Sprite_CorePx"), TEXT("uu.Sprite.CorePx"), false, TEXT("Sprites") },
 		{ TEXT("U_Sprite_Floor"), TEXT("uu.Sprite.Floor"), false, TEXT("Sprites") },
 		{ TEXT("U_Sprite_HaloChroma"), TEXT("uu.Sprite.HaloChroma"), false, TEXT("Sprites") },
@@ -150,6 +152,8 @@ namespace
 		{ TEXT("U_Sprite_HaloGrowth"), TEXT("uu.Sprite.HaloGrowth"), false, TEXT("Sprites") },
 		{ TEXT("U_Sprite_HaloMax"), TEXT("uu.Sprite.HaloMax"), false, TEXT("Sprites") },
 		{ TEXT("U_Sprite_Saturation"), TEXT("uu.Sprite.Saturation"), false, TEXT("Sprites") },
+		{ TEXT("U_Sprite_SkyFadeEnd"), TEXT("uu.Sprite.SkyFadeEnd"), false, TEXT("Sprites") },
+		{ TEXT("U_Sprite_SkyFadeStart"), TEXT("uu.Sprite.SkyFadeStart"), false, TEXT("Sprites") },
 		{ TEXT("U_Sprite_Splat"), TEXT("uu.Sprite.Splat"), false, TEXT("Sprites") },
 		{ TEXT("U_SpriteEllipses"), TEXT("uu.SpriteEllipses"), false, TEXT("Sprites") },
 		{ TEXT("U_SpriteExtent"), TEXT("uu.SpriteExtent"), false, TEXT("Sprites") },
@@ -165,11 +169,13 @@ namespace
 		{ TEXT("U_Bh_DiscHeat"), TEXT("uu.Bh.DiscHeat"), false, TEXT("Compact Objects") },
 		{ TEXT("U_Bh_DiscKnee"), TEXT("uu.Bh.DiscKnee"), false, TEXT("Compact Objects") },
 		{ TEXT("U_Bh_DiscOpacity"), TEXT("uu.Bh.DiscOpacity"), false, TEXT("Compact Objects") },
+		{ TEXT("U_Bh_DiscPalette"), TEXT("uu.Bh.DiscPalette"), false, TEXT("Compact Objects") },
 		{ TEXT("U_Bh_DiscPeriod"), TEXT("uu.Bh.DiscPeriod"), false, TEXT("Compact Objects") },
 		{ TEXT("U_Bh_DiscSamples"), TEXT("uu.Bh.DiscSamples"), false, TEXT("Compact Objects") },
 		{ TEXT("U_Bh_DiscSpiral"), TEXT("uu.Bh.DiscSpiral"), false, TEXT("Compact Objects") },
 		{ TEXT("U_Bh_DiscThickness"), TEXT("uu.Bh.DiscThickness"), false, TEXT("Compact Objects") },
 		{ TEXT("U_Bh_DiscToPx"), TEXT("uu.Bh.DiscToPx"), false, TEXT("Compact Objects") },
+		{ TEXT("U_Bh_DiscVariety"), TEXT("uu.Bh.DiscVariety"), false, TEXT("Compact Objects") },
 		{ TEXT("U_Bh_DiscVolume"), TEXT("uu.Bh.DiscVolume"), false, TEXT("Compact Objects") },
 		{ TEXT("U_Bh_Lens"), TEXT("uu.Bh.Lens"), false, TEXT("Compact Objects") },
 		{ TEXT("U_Bh_LensBendMinPx"), TEXT("uu.Bh.LensBendMinPx"), false, TEXT("Compact Objects") },
@@ -179,6 +185,37 @@ namespace
 		{ TEXT("U_Bh_Nucleus"), TEXT("uu.Bh.Nucleus"), false, TEXT("Compact Objects") },
 		{ TEXT("U_Bh_NucleusCap"), TEXT("uu.Bh.NucleusCap"), false, TEXT("Compact Objects") },
 		{ TEXT("U_Bh_NucleusGain"), TEXT("uu.Bh.NucleusGain"), false, TEXT("Compact Objects") },
+		{ TEXT("U_Bh_StellarActive"), TEXT("uu.Bh.StellarActive"), false, TEXT("Compact Objects") },
+		{ TEXT("U_Bh_StellarFraction"), TEXT("uu.Bh.StellarFraction"), false, TEXT("Compact Objects") },
+		{ TEXT("U_Bh_StellarScale"), TEXT("uu.Bh.StellarScale"), false, TEXT("Compact Objects") },
+		{ TEXT("U_Home_Timeout"), TEXT("uu.Home.Timeout"), false, TEXT("Planets") },
+		{ TEXT("U_Home_WaitAltitudeM"), TEXT("uu.Home.WaitAltitudeM"), false, TEXT("Planets") },
+		{ TEXT("U_Planet_AtmoArchetype"), TEXT("uu.Planet.AtmoArchetype"), false, TEXT("Planets") },
+		{ TEXT("U_Planet_AtmoLook"), TEXT("uu.Planet.AtmoLook"), false, TEXT("Planets") },
+		{ TEXT("U_Planet_AtmoThicknessKm"), TEXT("uu.Planet.AtmoThicknessKm"), false, TEXT("Planets") },
+		{ TEXT("U_Planet_Class"), TEXT("uu.Planet.Class"), false, TEXT("Planets") },
+		{ TEXT("U_Planet_CloudLayerKm"), TEXT("uu.Planet.CloudLayerKm"), false, TEXT("Planets") },
+		{ TEXT("U_Planet_CloudPrefilter"), TEXT("uu.Planet.CloudPrefilter"), false, TEXT("Planets") },
+		{ TEXT("U_Planet_CloudStepFootprint"), TEXT("uu.Planet.CloudStepFootprint"), false, TEXT("Planets") },
+		{ TEXT("U_Planet_CloudStepTaps"), TEXT("uu.Planet.CloudStepTaps"), false, TEXT("Planets") },
+		{ TEXT("U_Planet_DayHours"), TEXT("uu.Planet.DayHours"), false, TEXT("Planets") },
+		{ TEXT("U_Planet_DaySkyHeightKm"), TEXT("uu.Planet.DaySkyHeightKm"), false, TEXT("Planets") },
+		{ TEXT("U_Planet_DaySkyHide"), TEXT("uu.Planet.DaySkyHide"), false, TEXT("Planets") },
+		{ TEXT("U_Planet_Frame"), TEXT("uu.Planet.Frame"), false, TEXT("Planets") },
+		{ TEXT("U_Planet_FrameExit"), TEXT("uu.Planet.FrameExit"), false, TEXT("Planets") },
+		{ TEXT("U_Planet_FrameRadii"), TEXT("uu.Planet.FrameRadii"), false, TEXT("Planets") },
+		{ TEXT("U_Planet_GasGiantAtmoArchetype"), TEXT("uu.Planet.GasGiantAtmoArchetype"), false, TEXT("Planets") },
+		{ TEXT("U_Planet_GasGiantAtmoLook"), TEXT("uu.Planet.GasGiantAtmoLook"), false, TEXT("Planets") },
+		{ TEXT("U_Planet_GasGiantClass"), TEXT("uu.Planet.GasGiantClass"), false, TEXT("Planets") },
+		{ TEXT("U_Planet_LandView"), TEXT("uu.Planet.LandView"), false, TEXT("Planets") },
+		{ TEXT("U_Planet_MaxG"), TEXT("uu.Planet.MaxG"), false, TEXT("Planets") },
+		{ TEXT("U_Planet_MaxLive"), TEXT("uu.Planet.MaxLive"), false, TEXT("Planets") },
+		{ TEXT("U_Planet_MinG"), TEXT("uu.Planet.MinG"), false, TEXT("Planets") },
+		{ TEXT("U_Planet_Placeholders"), TEXT("uu.Planet.Placeholders"), false, TEXT("Planets") },
+		{ TEXT("U_Planet_Pool"), TEXT("uu.Planet.Pool"), false, TEXT("Planets") },
+		{ TEXT("U_Planet_Surface"), TEXT("uu.Planet.Surface"), false, TEXT("Planets") },
+		{ TEXT("U_Planet_TickLate"), TEXT("uu.Planet.TickLate"), false, TEXT("Planets") },
+		{ TEXT("U_Planet_WeatherClock"), TEXT("uu.Planet.WeatherClock"), false, TEXT("Planets") },
 		{ TEXT("U_MotionWeb"), TEXT("uu.MotionWeb"), false, TEXT("Web") },
 		{ TEXT("U_MotionWeb_Depth"), TEXT("uu.MotionWeb.Depth"), false, TEXT("Web") },
 		{ TEXT("U_MotionWeb_Detail"), TEXT("uu.MotionWeb.Detail"), false, TEXT("Web") },
@@ -287,6 +324,14 @@ namespace
 #endif
 	}
 
+	/** A console variable's value into its property. */
+	void UniTuningImport(const FProperty* P, void* Container, const IConsoleVariable* V)
+	{
+		if (const FFloatProperty* F = CastField<FFloatProperty>(P)) { F->SetPropertyValue_InContainer(Container, V->GetFloat()); }
+		else if (const FIntProperty* I = CastField<FIntProperty>(P)) { I->SetPropertyValue_InContainer(Container, V->GetInt()); }
+		else if (const FStrProperty* S = CastField<FStrProperty>(P)) { S->SetPropertyValue_InContainer(Container, V->GetString()); }
+	}
+
 	bool UniTuningSame(const FProperty* P, const void* Container, const IConsoleVariable* V)
 	{
 		if (const FFloatProperty* F = CastField<FFloatProperty>(P)) { return F->GetPropertyValue_InContainer(Container) == V->GetFloat(); }
@@ -307,13 +352,10 @@ void UUniTuningSettings::ImportAll()
 {
 	for (const FUniTuningEntry& E : GUniTuningTable)
 	{
-		FProperty* P = FindFProperty<FProperty>(GetClass(), E.Property);
+		const FProperty* P = FindFProperty<FProperty>(GetClass(), E.Property);
 		const IConsoleVariable* V = IConsoleManager::Get().FindConsoleVariable(E.CVar);
 		if (!P || !V) { continue; }
-		void* Container = this;
-		if (FFloatProperty* F = CastField<FFloatProperty>(P)) { F->SetPropertyValue_InContainer(Container, V->GetFloat()); }
-		else if (FIntProperty* I = CastField<FIntProperty>(P)) { I->SetPropertyValue_InContainer(Container, V->GetInt()); }
-		else if (FStrProperty* S = CastField<FStrProperty>(P)) { S->SetPropertyValue_InContainer(Container, V->GetString()); }
+		UniTuningImport(P, this, V);
 	}
 }
 
@@ -365,12 +407,28 @@ void UUniTuningSettings::ResetFilteredToDefaults()
 
 void UUniTuningSettings::ApplyAll() const
 {
+	// D-293: a variable registered after the page was built (a module loaded later, as
+	// UnifiedUniverseGame's) never reached its property: the property holds the type's zero, not a
+	// saved value. Unless the page saved one for it, its own value goes into the property instead.
+	TSet<FString> Known;
+	for (const TPair<FString, FString>& KV : UniTuningDefaults()) { Known.Add(KV.Key); }
 	CaptureDefaults();   // D-264: a variable registered after the page was built
+	const FString Section = GetClass()->GetPathName();
 	for (const FUniTuningEntry& E : GUniTuningTable)
 	{
 		const FProperty* P = FindFProperty<FProperty>(GetClass(), E.Property);
 		IConsoleVariable* V = IConsoleManager::Get().FindConsoleVariable(E.CVar);
-		if (!P || !V || UniTuningSame(P, this, V)) { continue; }
+		if (!P || !V) { continue; }
+		if (!Known.Contains(E.CVar))
+		{
+			FString Saved;
+			if (!GConfig || !GConfig->GetString(*Section, *P->GetName(), Saved, GGameIni))
+			{
+				UniTuningImport(P, const_cast<UUniTuningSettings*>(this), V);
+				continue;
+			}
+		}
+		if (UniTuningSame(P, this, V)) { continue; }
 		FString Str;
 		if (UniTuningValue(P, this, Str)) { V->Set(*Str, ECVF_SetByProjectSetting); }
 	}

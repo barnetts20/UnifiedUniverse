@@ -2665,3 +2665,313 @@ Not verified: the engine side (UE-101).
 Reroll impact: none (render only).
 Status: built; offline check; engine test UE-101.
 
+D-280 — Each black hole its own look: palettes, twists and disc amount from its host
+Owner, 2026-11-17 22:35: "we can probably proceduralize the black hole within a range given the size of its parent galaxy, give it some procedural color palettes, ranges of twists, accretion disc amount based on the galaxy that hosts it".
+- **Size from the host:** already so. A galaxy's black hole's mass is its host bulge's (D-272: 0.0014 x the bulge, 0.3 dex), so its R_s, its shadow and its lensing scale with its galaxy (1e5..1e9 M_sun over the galaxy function); nothing new.
+- **The look (Uni_BhStyleOf, UniCompact.ush; new channel BH.LOOK on the galaxy's seed, draws 0..11):** multipliers of the engine's tuned look (uu.Bh.Disc*: every range's centre), each raised to uu.Bh.DiscVariety (1; 0 = D-278's look exactly for every hole):
+  - **Disc amount by accretion rate:** a thin, dense disc on a fast accretor; on a slow one a puffy, optically thin torus (the hot flow below ~1e-2 of Eddington: Narayan & Yi 1995; the EHT's glowing rings). The art's boundary is lowered to 10^-4.3..10^-3.5 so ~22% of accreting holes are tori (with the physical -2, 95% would be). Torus: thickness x5, optical depth x0.3, clumping x0.6, extent x0.55; jitters thickness 2^+-0.5, opacity 2^+-0.4.
+  - **Host type:** an early type's (gas-poor) disc x0.75 in extent and its palette weights warmer (x UNI_BH_PAL_W_EARLY).
+  - **Twist:** a disc galaxy's hole winds with its arms (its Arms.Winding over the range: 2^(1.2 (w - 0.5)), Spearman 0.84 over 10^4 records), jittered 2^+-0.4; without arms 2^+-0.7: spirals 6..24 about the centre's 12.
+  - **Others:** bands 2^+-1, heat 2^+-0.8, erosion 0.6..1.2, period with the mass (2^(0.35 (log M - 7)), 0.5..2.5: heavier turns slower), brightness with the accretion rate (10^(0.25 (log lambda + 3)), 0.6..1.6; the art mode only), extent 2^+-0.35.
+- **Palettes (7 + the blackbody):** gold, quasar blue, ember, violet, teal, rose, ice and fire: three stops (cool outer .. hot inner) placed by the gas's temperature against the disc's peak over a factor of 30 (the Doppler-boosted side whitening above the peak), mixed with the blackbody at 0.8..1.0; the light's luminance stays the blackbody's (a palette sets chromaticity only, 3e-7). Weights lerped by the accretion rate (warm palettes on slow accretors, blue and white on fast ones: 35% of fast accretors' palettes blue or white, 14% of quiet ones'; warm on 77% of early types, 64% of late; at 10^4 records: blackbody 8%, gold 25%, blue 5%, ember 25%, violet 8%, teal 4%, rose 16%, ice and fire 8%). uu.Bh.DiscPalette: -1 rolled, 0 blackbody, 1..7 every hole that palette (at 0.95).
+- **One colour far to near:** the nucleus sprite's colour is its disc's palette (Uni_NucleusColourP, the project pass, FUniView's pads now NucleusVariety / NucleusPalette, new usf parameter NucleusStyle): the disc's colour over directions within 0.0069 chromaticity of the sprite's in every palette.
+- **Plumbing:** the game thread rolls the style (UpdateLensTarget; the host archetype's ranges) into FLensFrame.DiscStyle0..2; the renderer multiplies the CVars (UniCore::StyledLook) and the art brightness; the lens target's extent (LensTargetOf's Style); FUniLensDisc.LookPad1/2 -> PaletteMix / Palette; UniLens.usf's LensPad5 -> DiscPaletteMix, DiscSeeds.w its palette. uu.Stats logs the look.
+- **Cost:** at the look's extremes (the thickest torus, the densest thin disc) 27 volume samples a ray on average, p99 135, 0.14% past the budget.
+- **Check:** T1.bh.style (new), T1.lens.palette (new; still render/still_bh_styles: eight holes as their galaxies roll them). Seed channel BH.LOOK in T1.seed.channels.
+Not verified: the engine side (UE-102).
+Reroll impact: none (render only; a new channel).
+Status: built; offline checks; engine test UE-102.
+
+D-281 — Stellar black holes: X-ray binaries in star systems
+Owner, 2026-11-17 22:35: "We should be able to scatter some stellar mass black holes around as well."
+- **Where (COMPACT_OBJECTS §2.3's X-ray binaries as systems):** a star's companion, a property of the star's record alone (new channel BH.STELLAR on its seed: draw 0 < uu.Bh.StellarFraction, 1e-3 by default: raising it only adds), so they are where the stars are and turn up when the star's system activates (D-142). The star and its planets are unchanged.
+- **What:** 5..25 M_sun (log, skewed low: median 8.8); uu.Bh.StellarActive (0.3) in outburst (1e-2..1 of Eddington: hot thin discs), the rest quiescent (1e-8..1e-4: tori, by D-280's look); a circular orbit about the star at 4.8..14.4 star radii (the star fills its Roche lobe: Eggleton's R_L / a ~ 0.21 at q ~ 0.1), Kepler's period, a random plane; the disc's axis its normal. The same black hole core, look (seeded by its own seed) and lens pass as a galaxy's.
+- **Its light:** one more dynamic record of the system (archetype UNI_ARCH_DYNAMIC_BH 0xFFF1, like a planet's cell): its disc's V light by the nucleus rule (at most uu.Bh.NucleusCap x its star's: the star's level is its own light's) x the beam towards the camera, faded in across the activation shell (0 at the activation radius, whole inside 0.6 of it: render only, no pop), its palette's colour. While the lens pass draws it, the record is flagged PROMOTED (its sprite held back) and the pass draws the point, as for a nucleus.
+- **Size (uu.Bh.StellarScale 30, render only):** physically a 10 M_sun hole's disc is ~3e4 km, resolved only within ~0.1 AU; at 30 its lensing and disc are drawn as if 30x larger (a disc ~1 R_sun, resolved from a few AU, the Einstein ring a pixel at 20 AU). LensTargetOf's SizeScale.
+- **Finding one:** `uu.GotoStellarBlackHole`: the nearest resident star with one (the reference generator's content, within 1 kpc), the camera 3 disc radii out, 20 degrees above the disc, free flight at a fifth of a disc radius a second.
+- **Not yet:** isolated stellar black holes (no light: an archetype whose relevance is its lensing reach, COMPACT_OBJECTS §2.3); the accretion stream from the star; the light from afar (an outburst can outshine its star, capped here at 0.5 of it); the stars in the system orbiting the heavier hole (the star stays at its record's position).
+- **Check:** T1.bh.stellar (new; still render/still_bh_stellar). Seed channel BH.STELLAR in T1.seed.channels. T2.system.determinism compares planets field by field (its memcmp read FPlanet's padding bytes, stack leftovers, and failed 109 of 20000 once BuildSystem did more work; the planets are the same: 61119, every set distinct as before).
+Not verified: the engine side (UE-103).
+Reroll impact: none (a new channel; systems gain a companion, their planets unchanged).
+Status: built; offline checks; engine test UE-103.
+
+D-282 — Ships: the UE world follows what the player stands in (SHIPS.md §2)
+Owner, 2026-11-19 00:42: "we go with your suggestion" (SHIPS.md question 1).
+- **The rule:** the UE world is bound to one reference frame at a time, and the rest of the universe is placed around it:
+  - **Ship frame** (aboard, or on EVA near it, in open space): the ship sits at the origin, unrotated, for good.
+  - **Body frame** (within a planet's frame radius: low orbit, atmosphere, surface): the planet's centre at the origin, turning with its spin once spin exists.
+  - **Inertial frame** (on foot far from both): today's Local anchor.
+- **What it fixes:**
+  - A ship's interior and a planet's surface never move in the UE world, so the player is not flung and props behave.
+  - The voxel planet is never moved under the player; it is moved only while far away, as today.
+- **What it costs:**
+  - a rotation between universe axes and UE world axes in every render pass, and in placement, the light rig and the sky light;
+  - frame switches: one rigid transform of every non-universe actor, velocities rotated, with hysteresis.
+- **The remaining moving-base case** (a ship flying inside a Body frame) uses framed character movement and stows props.
+- **Single-player** (one universal camera).
+Reroll impact: none (design).
+Status: design (Docs/SHIPS.md); not built (phase S0).
+
+D-283 — GravPlugin: two approved changes, and only those
+Owner, 2026-11-19 00:42: "yes" (SHIPS.md question 2).
+- **The changes:**
+  - export `AGravityController` (`GRAVPLUGIN_API`), so Unified Universe's frame-aware controller can derive from it;
+  - an additive-field hook: apparent gravity, the true field minus the frame's acceleration, for actors outside every zone (EVA).
+- **Everything else is used as it is:** zones, priorities and `ExcludeTags` (a ship's interior zone excludes the ship).
+- Any other change to GravPlugin, which lives outside this plugin, needs the owner's approval first (CLAUDE.md rule 1's spirit).
+Reroll impact: none.
+Status: approved; not built (phase S0).
+
+D-284 — Warp travel gated by gravitational depth, at stop-in-time speeds (SHIPS.md §6)
+Owner, 2026-11-19 00:19: speeds need a logic ("exit the atmosphere to enter interplanetary cruise, exit the star system for interstellar, exit the galaxy for intergalactic ... if you fly too close to a black hole it pulls you out of warp"); 00:42: "yes" (question 3).
+- **Depth:** an object's depth is r_g / r (r_g = GM/c^2). A drive of tier n works only where every gating object's depth is under its tolerance D_n. An object's well for tier n is r_g / D_n, with a floor at a safe multiple of its size.
+- **Tolerances and gates:**
+
+| Tier | D_n | Gates |
+| --- | --- | --- |
+| 1 | 1e-7 | atmospheres (matter); a minimum altitude over airless bodies; stars (the Sun 0.1 AU); compact objects |
+| 2 | 1e-10 | stars (the Sun ~100 AU; matches the systems' activation radii); compact objects (10 M_sun: 1,000 AU; a 4e6 M_sun nucleus: ~2 kpc) |
+| 3 | 1e-6 | galaxies (dynamical mass; Milky Way ~50 kpc; floor 1.5 radii) and their nuclei |
+
+- **Black holes interdict without a special rule:** a nucleus's tier-1 well is ~2 pc, a stellar hole's ~1 AU.
+- **Clusters and groups gate no tier.**
+- **Speed:** never faster than the drive can stop. v <= min(Vcap, L / tau), with L the distance to the nearest well edge ahead, the drop point or a corridor obstacle, and tau 3 s an e-fold.
+- **Defaults:** caps 3,000 c, 1 kpc/s and 100 Mpc/s. Ramps at most x4.5 a second.
+- **Events:** engage, step-down, drop (to the frame of rest's velocity) and pull-out.
+Reroll impact: none.
+Status: design; not built (phase S3).
+
+D-285 — Above tier 1 the flight computer flies
+Owner, 2026-11-19 00:42: "Computer to start, we can consider a manual override later" (question 4).
+- **Tier 0:** the pilot flies, with flight assist.
+- **Tier 1:** the pilot steers and sets the throttle; the governor enforces stop-in-time.
+- **Tiers 2 and 3:** the pilot picks a destination (a charted object, a region, or a bearing and distance), approves the plot, and may abort or nudge the heading; the computer flies.
+- **Later:** a manual override (free cruise, with the governor still on).
+Reroll impact: none.
+Status: design; not built (phase S3).
+
+D-286 — The omni ship: ships as capability sets; resources by function; gates for small ships (SHIPS.md §8)
+Owner, 2026-11-19 00:42: function over fuel names; the first ship is "basically a composite of all ship capabilities", with a refuel button. Real ships have a subset and real refuelling; it is "the prototype for the ship systems we plan to use to build different ships from". Example: only specialised, very large ships fly intergalactic, and smaller ships rely on something like jump gates.
+- **Capabilities, not ship types:** every system reads capabilities only. The capabilities are:
+  - hull;
+  - artificial gravity;
+  - thrust;
+  - flight computer features;
+  - a drive for tier 1, 2 or 3;
+  - gate transit;
+  - scanner;
+  - power and cooling;
+  - tanks;
+  - docking bay;
+  - reserved: shields, armour, cloak, weapons, cargo.
+- **The omni ship** has them all at full grade, with a Refuel button (`uu.Ship.Refuel`) and a capability panel (`uu.Ship.Cap`) that switches or grades any capability live, so it can act as any future class.
+- **Resources** are channels: capacity, amount, a consumption law (per impulse, per second, per distance, per e-fold) and refill sources (later). Names are data.
+- **Real ships:** frames, hardpoints and modules assemble capability sets. A tier-3 drive exists only in a large size class.
+- **Jump gates** lend their drive for one leg (continuous by default; instant as an option) and are edges in the route planner. Carriers ferry docked ships.
+Reroll impact: none (gates, when procedural, take new seed channels).
+Status: design; the omni ship is phase S1, classes and gates phase S5.
+
+D-287 — Seamless boarding: no load, no teleport; the frame is the outermost moving thing you are in or near (SHIPS.md §2.1)
+Owner, 2026-11-19 08:51: "seamless entry exit of the ship, no load screen or teleporting - you walk or float on board through a hatch/door".
+- **D-282's frame rule, refined:** the frame is the outermost moving thing the player is in or near.
+  - Within a planet's frame radius: the planet, aboard or not.
+  - In open space: the ship, or the carrier a docked ship sits in.
+  - A ship's frame radius (10 hull lengths, at least 1 km) covers EVA.
+  - So landed boarding, airlock EVA and walking from a hangar into a docked shuttle change no frame.
+- **The interior is part of the ship actor:** no level streaming and no load.
+- **Hatches and airlocks get transition zones** (a priority between outside and inside) that blend the gravity's magnitude and direction over about 1 m. The character rights itself over about 0.5 s.
+- **Leaving the interior volume hands over the ship's velocity** (physics: you coast beside it, or fall with it).
+- **Frame changes stay invisible:** velocities are rotated with the transform, and the renderer's previous-frame view is moved by it (a history reset is the fallback). Today's 1,000 km re-centre lacks the latter: a possible one-frame smear, to be fixed with the frame work.
+- **No warp with a hatch open or the player outside.**
+Reroll impact: none.
+Status: design; not built (phases S0, S1, S2).
+
+D-288 — Scanning and exploration: the owner's answers (SHIPS_EXPLORATION.md §9)
+Owner, 2026-11-19 11:53.
+1. **Starting knowledge:** the chart starts empty except the start system, surveyed.
+2. **Distances:** distance is an estimate that closes by parallax as the ship moves. The governor uses the interval's near end.
+3. **Bands:** need more design. The four bands (optical, X-ray, gravity, infrared / radio) are the working set until follow-up piece 1b.
+4. **Names:** a procedural naming scheme for objects is to be designed (follow-up piece 1c), with renaming.
+5. **Pings:** a ping is a signature: a hook for the weapons era.
+Reroll impact: none.
+Status: design; not built (phase S4).
+
+D-289 — Ship framework scope: single-player, multiplayer kept possible; voxel planets, spin, atmospheres, persistence (SHIPS.md §2.2, pieces 8 and 9)
+Owner, 2026-11-19 11:53.
+- **Single-player now.** Multiplayer is not a requirement, but the owner is curious what it would take (SHIPS.md §2.2: per-place physics islands on the server, each client pinning its own frame, the deterministic universe generated per client with only deltas and dynamic state replicated).
+- **Four design rules, adopted now so that multiplayer stays possible:**
+  1. Authoritative state in universal or container-local coordinates, never UE world coordinates.
+  2. Fixed-step, deterministic ship simulation in UniCore.
+  3. Frame code written in terms of an island.
+  4. No new assumption of "the first player controller".
+- **The planet is the owner's voxel planet** (`APlanetActor`, already tied to GravPlugin through `APlanetGravityZone`); it enters through promotion (design piece 8).
+- **Planets spin:** needed (piece 8). Spin is a new seeded property, so no existing content rerolls.
+- **Atmospheres come from the planet actors**, and they gate tier 1 (D-284).
+- **The ship persists as a universe object while the player is away**, like a promoted body (piece 9).
+- **Save and load** need their own design (piece 9).
+Reroll impact: none now; planet spin, when built, adds a seed channel.
+Status: design.
+
+D-290 — Planets and the start: the owner's answers (SHIPS_PLANETS.md §11)
+Owner, 2026-11-19 12:15.
+1. **Real scale:** the voxel planets handle it, so planets keep the universe's radii.
+2. **The origin on a planet:** needs more design. SHIPS_PLANETS.md §5.1 sets out two candidates and an engine test that decides between them, run first in phase P1:
+   - A: the planet's centre at the origin; the planet never moves.
+   - B: the origin near the player, re-centred along the surface; the planet moves only at re-centres.
+3. **Generator:** Terrestrial for rocky planets.
+4. **Home system:** an authored home star with a fixed seed, pinned offline so its system has an Earth-like planet in the habitable zone.
+5. **Giants:** gas giants become planet actors with the gas giant atmosphere model (`EPlanetAtmosphereType::GasGiant`). Ice giants keep the placeholder sphere until the planet actor has a model for them.
+6. **Dependency:** a Unified Universe game module may depend on VoxelPlanets, and through it on UltraLargeScale (`IPooledActor`, `IStarLit`). The universe's core modules stay free of both, through a body actor factory interface.
+Reroll impact: none now. The planet properties take new seed channels when built (surface seed, atmosphere, spin).
+Status: design; phase P1 (the start), ahead of SHIPS.md S0.
+
+D-291 — On a planet, the planet's centre is the world origin (SHIPS_PLANETS.md §5.1)
+Owner, 2026-11-19 12:20 and 12:24: planets of about 5,000 km radius ran without issues with the planet at the world origin; larger sizes need testing.
+- **Candidate A is the default.** In a planet's frame, the UE origin is the planet's centre and the planet actor never moves while you are near it.
+- **The home planet** is pinned at 0.8–1.0 Earth radii, about the proven size.
+- **Larger planets:** the engine test runs at 1.3 and 1.8 Earth radii. Where A fails, the fallback is B (the origin re-centred along the surface, moving the planet only at re-centres). Failures confined to materials are fixed in the materials first.
+- **A cap on the rocky radius roll** is the last resort: a content change, decided after the test.
+Reroll impact: none.
+Status: design; phase P1.
+
+D-292 — Planet spawn: hidden by lead time, then cached at the system level (SHIPS_PLANETS.md §3.1)
+Owner, 2026-11-19 12:41: planet spawn as fast and seamless as possible. Today it takes 1–2 s; much of that could be cached at the system level.
+- **Layers 1 and 2** (Unified Universe only; built in phase P1):
+  - the voxel planet is acquired at ~60 radii, behind the placeholder, and cross-fades in only when ready;
+  - a plotted course prefetches its destination planet;
+  - a warm pool keeps left planets dormant, not released, so returning is instant.
+- **Layers 3 and 4** (VoxelPlanets changes, the owner's or owner-approved):
+  - system-level build kits: a planet's deterministic heavy data, prepared on a worker when its system activates, and handed to the actor on acquire;
+  - more stages cached on disk.
+  - Their order follows the spawn timeline's measured stages. Remaining synchronous work is time-sliced under ~2 ms a frame.
+- **Unified Universe owns the orchestration:** what to prepare when, priorities, cancellation, the memory budget.
+Reroll impact: none.
+Status: design; layers 1–2 in P1, layers 3–4 after the owner's timeline numbers.
+
+D-293 — Phase P1 built: planets as worlds, the planet's frame, the home start (SHIPS_PLANETS.md §9)
+Owner, 2026-11-19 13:05: "yea can you re-request access and we can start" (after D-290..D-292).
+- **The home star** (UniHome.h): an authored anchor at the solar camera (the "home" scene is the flythrough universe plus it), Sun-like, seed 35: the first seed whose system has a rocky planet of 0.8–1.0 Earth radii, insolation 0.7–1.4, eccentricity ≤ 0.1, a terrestrial atmosphere and seas, and no black hole companion. Its home planet is the second (5,142 km, 0.913 AU, 0.81 g). The anchor's record is the generator's (`AnchorRecord`, now shared by generation and the home start: T1.home.system checks they are identical).
+- **Planet properties** (UniPlanetProps.h): surface seed on the new channel PLANET_SURFACE; atmosphere none (< 0.5 Earth radii), terrestrial (Teq 200–350 K) or air alone, gas giant for giants; seas with a terrestrial atmosphere at Teq 235–320 K; gravity from radius and the type's density (rock 5.5, gas 1.3, ice 1.6 g/cm³), clamped to play's limits (`uu.Planet.MinG` / `MaxG`, 0.3–2 g).
+- **The planet's frame** (D-291's candidate A): within `uu.Planet.FrameRadii` (3) radii in Local mode, the world origin is the planet's exact centre (whole centimetres plus a sub-centimetre fraction carried in `LocalAnchorFrac`), followed every frame; entering shifts the world so no universal point moves; left at 1.2× (`uu.Planet.FrameExit`), in Cruise, or when its system deactivates. No 1,000 km re-centre inside a frame. Translation only (spin with S0).
+- **Body factories** (UniBodyFactory.h): the universe asks a registered factory for a planet's detailed actor; only the new game module UnifiedUniverseGame depends on VoxelPlanets (D-290). Its factory spawns `APlanetActor` (or `uu.Planet.Class`; gas giants only with `uu.Planet.GasGiantClass`; ice giants never) at its true radius at the origin, sets generator, seeds, ocean, atmosphere type and gravity before the first tick, pushes the star's position each frame (IStarLit) and sets the gravity zone's strength.
+- **Deviation from D-292's layer 1:** the voxel planet is acquired on entering the frame (3 radii), not at ~60 radii: the planet actor has no hidden-build mode (dormancy stops its tick, and with it the build), and a live planet holds 3.3–3.6 GB of GPU memory. The placeholder covers the build and hides once the factory says the planet is ready. Navigation prefetch waits for navigation. The warm pool is built (`uu.Planet.Pool` 1: parked with `OnReturnToPool`, woken with `OnAcquired`).
+- **The home start** (`uu.AutoStart home` / `uu.Enable home`): the home system activated on the CPU at once, the world in the home planet's frame from the first frame, the pawn held 3 km above the first spawn candidate (day side, within 40° of the equator) until the planet's density answers, then the spawn point picked by `PickHomeSpawn` (dry, 2–2,500 m, level within 15 m over 100 m), then held until a line trace finds collision there, then released onto it. Timeout `uu.Home.Timeout` (300 s), after which the pawn stays held (free flight frees it). The spawn height is the ground's own radius from the factory (sea level need not be the planet's radius). Tuning variables registered after the page is built (another module's) take their own values unless the page saved one.
+Reroll impact: none for existing objects. New channels PLANET_SURFACE and HOME_SPAWN. The "home" scene adds one anchor; every other scene is unchanged. Changing HomeStarSeed rerolls the start.
+Status: built; offline checks pass (T1.home.system, T1.planet.properties, T1.frame.moving_anchor, T1.home.spawn); the engine test is UE-104 (REVIEW_TONIGHT §105).
+
+D-294 — The home planet's first look: tuned atmosphere sets, the terrain's debug colours, one directional light; the clouds at real scale need CloudAtmosphere
+Owner, 2026-11-19 14:17 (first good run, a screenshot from orbit): "loaded and dropped in on the surface - good starting point"; "start the default terrain debug view in the color + flow... 13"; "our clouds were way too strand like and the cloud layer was too thick leading to grain/aliasing"; "see if any of the lessons we learned in the galaxy march implementation apply here as well".
+Found (the run's log and CloudAtmosphere's docs, read only):
+- **The planet ran on the atmosphere's class defaults.** With `uu.Planet.Class` empty the bare `APlanetActor` has no `AtmosphereSet` ("Set offers Terrestrial nothing"), so the seeded atmosphere generated nothing and kept its class defaults. *Corrected 14:55 (D-295): the actor's constructor sets the terrestrial `HeightScale` to 0.05 and `CloudThickness` to 0.3 (stage A2), not the struct's 0.2 / 0.5: a 257 km atmosphere and a 77 km cloud layer here; its other look settings were the class's, untuned.*
+- **The atmosphere's heights are fractions of the planet's radius.** Its thickness is `HeightScale` × radius: 0.05 × 5,142 km is a 257 km atmosphere, 0.3 of it cloud (77 km). CloudAtmosphere's harness keeps `HeightScale` ≥ 0.05 ("thinner shells lengthen grazing chords the bake doesn't shorten"; the shadow map loses precision below ~0.005), so at real scale its thinnest validated atmosphere here is 257 km, and its cloud layer (`CloudThickness` ~0.8 of it) is about 18–36× Earth's weather layer (~12 km, 0.002 radii) at `HeightScale` 0.05–0.1. A real-scale cloud layer is outside the core's validated range: a CloudAtmosphere change, the owner's plugin and frozen core.
+- **The cloud march's detail footprint is the pixel's alone** (`PixelFootprint = distance × pixel angle`, AtmosphereMarch.ush), not the step's: the grain mechanism D-251 measured in the galaxy (detail sampled at one jittered point of a long step).
+Built:
+- **Tuned sets by default** (UnifiedUniverseGame): a planet whose class has no atmosphere set for a model gets CloudAtmosphere's own archetype and look (`uu.Planet.AtmoArchetype` / `AtmoLook`, `uu.Planet.GasGiantAtmoArchetype` / `GasGiantAtmoLook`; the `/CloudAtmosphere/NoiseRecipes/` assets; empty: none). A class's own set wins.
+- **The terrain's debug colours** (`uu.Planet.LandView` 13: elevation with lakes and rivers over it) set into `voxel.Debug.LandView` when a planet is made, by code, so a typed or ini value wins; -1 leaves it alone. The view's legend shows on screen while it is on (VoxelPlanets').
+- **One directional light:** the light rig (`uu.LightRig`) stands down while the frame planet's detailed body is live and ready; its atmosphere's sun light (aimed by IStarLit) lights the scene. The screenshot's "competing for forward shading" warning was the two.
+Proposed, for the owner (not built; CloudAtmosphere changes need the owner's approval): the galaxy march's lessons that carry over (Docs/SHIPS_PLANETS.md §12).
+Reroll impact: none (render and content defaults only).
+Status: built; engine test UE-105.
+
+D-295 — The galaxy march's lessons in CloudAtmosphere (stage RS1), and each planet's atmosphere at its own scale
+Owner, 2026-11-19 14:24: "Yes we can apply our lessons learned at this point to cloudatmosphere" (SHIPS_PLANETS.md §12). Approval to change CloudAtmosphere (the owner's plugin).
+- **CloudAtmosphere, stage RS1** (its STAGE_RS1_NOTES.md; delivered to `Plugins/CloudAtmosphere`, the owner commits):
+  - `Sampling.StepFootprint` (class default 0): a cloud sample's noise mips follow max(the pixel's width, this × its step's length), so detail finer than a step reads as its mean (D-265's "the fade is the step's").
+  - `Sampling.StepTaps` (class default 1): a coarse cloud step reads the field at this many points along its run, stratified at its jitter, and averages the density (the material and the rest density-weighted); the light, the air and the depth stay one read; entry substeps one read (D-262's paradigm C).
+  - Defaults keep the march bit for bit as it was (the core's own rule: class defaults stay). The bake is untouched.
+- **The universe's planets** (UnifiedUniverseGame), once per planet's atmosphere actor, before its first generation where it can (else one regeneration, which restarts its sim):
+  - `Sampling.StepFootprint` 0.5 and `StepTaps` 4 (`uu.Planet.CloudStepFootprint`, `uu.Planet.CloudStepTaps`).
+  - A real-scale shell, locked against the seed (the seeded actor's `Locks`): the atmosphere's depth `uu.Planet.AtmoThicknessKm` (60 km at Earth's gravity and temperature; CloudAtmosphere's scale heights are fractions of it, ~9 km for Rayleigh) × (Teq / 255 K) / (g / g_Earth), a scale height's kT / mg, as `Planet.HeightScale` (at least 0.005); the weather layer `uu.Planet.CloudLayerKm` (12 km) on the same scale as `Shape.CloudThickness`. The home planet: 78 km (HeightScale 0.0152), a 15.6 km weather layer (CloudThickness 0.2).
+- **Not done:** a bubble of detail with frequency-scaled steps (D-266) in the cloud march; shaped coverage noise against strands (D-258); `WarpStretch` stays the seed's.
+- **Below CloudAtmosphere's harness floor** (`HeightScale` ≥ 0.03–0.05, for the bake's grazing chords): the risk is softer, coarser shadows at low sun (its budgeted steps ~2× longer in thickness units at 0.015 than at 0.05); `ATMO_BAKE_MAX_STEPS` is the handle. Above the shadow map's precision floor (0.005).
+Not verified: no offline check reaches CloudAtmosphere's shaders; the engine test is UE-106.
+Reroll impact: none (render-side; the planet's look settings, not its seeds).
+Status: built; engine test UE-106.
+
+D-296 — The backdrop behind a planet's sky: sprites through the atmosphere, the day sky hides the glow; the terrain's rivers view
+Owner, 2026-11-19 14:42 (a screenshot from the ground): "stars are too visible on the day side of the planet"; "stars and sky are visible through the clouds where the clouds should be opaque"; "the terrain debug color mode i suggested was incorrect... there was one that traces drainage and has the green/brown/tan colors".
+Found: the sprites (stars) are drawn after motion blur, past the upscaler (D-124: sub-pixel points under TSR shimmer), so after CloudAtmosphere's composite (BeforeDOF): over its clouds and its day sky. The volume's glow is drawn before it (BeforeDOF, priority 100 above CloudAtmosphere's 0: the engine sorts extensions by descending priority), so its clouds cover it, but at the backdrop's exposure the glow outshines the composite's day sky. View 13 needs a bake with drainage, which a disk-cached bake lacks (its legend: "magenta: the bake has no drainage").
+Built:
+- **CloudAtmosphere stage RS2** (STAGE_RS1_NOTES.md): `CloudAtmosphere_GetViewOutput` hands later passes in the same graph its resolved output for the view (in-scatter, transmittance, its rect).
+- **The sprites through the atmosphere** (UniSprite.usf `SpriteTransmittance`, both the quads and the splat path): times its transmittance at the pixel (luminance-weighted), and a fade where its own sky (its in-scatter, pre-exposed) is bright: `uu.Sprite.SkyFadeStart` 0.01 to `uu.Sprite.SkyFadeEnd` 0.1; `uu.Sprite.Atmosphere` (1). UnifiedUniverseRender reads it through `FUniRenderer::SetAtmosphereQuery`, which UnifiedUniverseGame sets: the core modules still depend on no other plugin.
+- **The day sky hides the glow** (and the sprites, before the per-pixel fade): the frame's `BackdropScale` = 1 − `uu.Planet.DaySkyHide` (1) × daylight × lowness: daylight from the star's elevation at the eye (−6° to +6°), lowness from the eye's height (full below a fifth of `uu.Planet.DaySkyHeightKm`, 40, none above it); only in the frame of a planet with air.
+- **The terrain's debug view** `uu.Planet.LandView` 19: the rivers' channels and valleys over the elevation's colours (14, the landforms, the alternative).
+Not verified: the order of the two plugins' passes and the shared graph in the engine; the fade's thresholds (scene-colour units); UE-107.
+Reroll impact: none (render only).
+Status: built; engine test UE-107.
+
+D-297 — No placeholder spheres for planets a factory makes: the detailed body from promotion, at its true place
+Owner, 2026-11-19 15:00: "once i fly a decent height above the planet the planet actor either dissapears or is enveloped by the old placeholder. the old placeholder can be disposed of now, we should be spawning seeded planets instead". (Also: the missing backdrop of 14:53 was the ejected editor camera, which the universe never draws in: D-124's game views only.)
+Found: the detailed body lived only inside the planet's frame (3 radii, left at 3.6), then was parked and the placeholder (`AUniBodyActor`, parallax-placed) took over; inside the frame the placeholder hid only once the body was ready.
+- **The ladder is now sprite → detailed body.** A promoted planet (D-119: within 10,000 km of its surface or 0.02 rad across, about 50 radii) that a body factory makes gets its detailed body, never a placeholder; its sprite stands in until the body is ready (`SpriteCulledIds`: a promoted planet's sprite is culled only once its placeholder exists or its detailed body is live and ready). Stars, and planets no factory makes (ice giants; gas giants without `uu.Planet.GasGiantClass`), keep the placeholder. `uu.Planet.Placeholders` 1 restores the placeholder beside the body (A/B; it hides once the body is ready).
+- **Placement:** the frame planet at the origin, exactly (D-291); any other at its true place about the camera (view + its centre − the camera, whole cm and fractions apart) and its true size, moved every frame and never scaled (its geometry is its radius), as UltraLargeScale's parallax proxy carried the planet actor. No parallax compression for detailed bodies: promotion keeps them within ~50 radii (2.6e10 cm for the home planet; a gas giant ~4e11 cm), inside UE's large-world range.
+- **How many:** `uu.Planet.MaxLive` (1): the frame planet first, then the nearest promoted; the rest keep their sprites. Demoted or beyond MaxLive: parked (the warm pool, `uu.Planet.Pool` 1). This is D-292's layer 1 as designed (acquired at ~50 radii, building behind the sprite), replacing D-293's acquire-at-the-frame.
+- **The light rig** stands down while any live, ready detailed body with air lights the scene.
+Not verified: moving a planet actor and its children every frame outside the frame (its cost, its collision); a planet seen building from afar; UE-108.
+Reroll impact: none.
+Status: built; engine test UE-108.
+
+D-298 — A planet's actors tick after the universe places it
+Owner, 2026-11-19 16:38 and 16:41 (screenshots in Cruise at 4,100 km/s): "something weird going on with the atmosphere raymarch when the player is in motion": strafing right, one half of the planet shows its terrain through the air and the other an overcast; strafing left the halves swap; moving towards the planet both halves go wrong.
+Found: `UUniSubsystem` is an `FTickableGameObject`, ticked by `UWorld::Tick` after the actor tick groups up to TG_PostPhysics (LevelTick.cpp: TickObjects, then UpdateCameraManager, then TG_PostUpdateWork). D-297 places the planet there. CloudAtmosphere's `APlanetAtmosphereActor` reads its centre in its own tick (`UpdateAtmosphere`: `GetActorLocation`, handed to the march by `SetFrame_GameThread`), and VoxelPlanets' ocean reads its frame there too, both in TG_PrePhysics: a frame before the planet moves. The terrain's mesh follows its actor at the end of the frame. In Cruise the planet moves past the pinned pawn by the frame's travel (68 km at 4,100 km/s and 60 fps), so the atmosphere's shell stood that far off the terrain, along the motion: on the side it moved towards the shell covers the terrain deeper (overcast), on the other the terrain stands through it. A sideways move splits the planet along the great circle across the motion; a move towards it puts the terrain through the shell on every side.
+- **Fix:** the factory puts the planet actor and every actor attached to it (terrain, ocean, gravity zone, atmosphere), with their ticking components, in TG_PostUpdateWork, checked each frame in `UpdateBody` (parts made later join). They read this frame's place and this frame's camera; nothing of theirs runs before physics that needs to. `uu.Planet.TickLate` (1); 0 puts them in TG_PrePhysics (UE's default) to compare.
+- No change to CloudAtmosphere or VoxelPlanets.
+Not verified: the engine's view (UE-109); anything in those actors that relied on running before physics (none found: no tick prerequisites in either plugin).
+Reroll impact: none.
+Status: built; engine test UE-109.
+
+D-299 — Planets turn: a day at the set length, the world turning with the planet it is in
+Owner, 2026-11-19 16:47: "now that we have our frame working on the planet, we should add a rotation about its local z axis, at timescale 1 it should correspond with one earth day, and it should scale with timescale like orbit does"; 16:48: "that will give us a true day night year cycle".
+This is SHIPS_PLANETS.md §6 (spin) in a first cut, ahead of S0, with the frame's turn kept to a yaw.
+- **The spin:** every planet turns about the universe's +Z axis (its actor's local Z) on the universe clock, so `uu.TimeScale` scales it as it scales the orbits. `uu.Planet.DayHours` (24) is the solar day: the planet turns once in 1 / (1 / day + 1 / year) (UniSpin.h `PlanetSpinPeriodS`), so its sun comes back once a day and the year shows (the home planet: 86,129.7 s a turn, a 318.6-day year of 318.64 days). The axis is +Z for every planet for now; the obliquity is the orbit's inclination (0-4 degrees), so the seasons are faint. Phase 0 at the epoch. Seeded periods, phases and tilts (§6) come later on their own seed channels (no seed channel is taken now: reroll impact none).
+- **The frame turns with the planet** (UniSpin.h `FWorldTurn`): the world and the universe differ by a yaw about +Z, universal = yaw(world). In a planet's frame the yaw follows its spin (offset fixed on entry), so the planet stands still in the world (its actor's turn constant: the ground, the pawn and physics never move) and the sun, the stars and the galaxy go round. Out of a frame the yaw holds: entering or leaving never turns anything in the world, and the sky never jumps. A new start (`uu.Enable`) resets it.
+- **Everything that maps the world to the universe goes through it:** the Local camera (`LocalCamera`), the anchors (free flight off, teleports, the 1,000 km re-centre, now with the anchor's fraction when turned), Cruise's step (`Velocity` is in the world's axes), the frame's entry shift, detailed bodies' places and turns (spin less the world's yaw), the star's position for the planet and the day-sky fade, placeholders (`UUniParallaxComponent::ApplyPlacement*` take the yaw), the light rig, the streamer's view direction, the API's view, the controller's facing on jumps, the sky light's cube (marched in the world's axes), and the renderer (`FUniFrameData::WorldYaw`: every view basis the universe's passes use, and their histories, turned into the universe's axes; the sprites' matrix turned back).
+- **Not changed:** CloudAtmosphere and VoxelPlanets (the planet actor already takes a turn: the atmosphere aims its light relative to the planet, its field in the planet's frame); the pawn's physics (no centrifugal or Coriolis force: 0.3% of g at Earth's equator).
+Checks: T1.frame.spin (UniSpin.h: the day over an orbit to 1e-9, each day within the equation of time, a circular orbit's to 3e-14 rad; the clock steady to 1e10 s; no yaw jump on entry, exit or change; the frame planet's turn constant; a world point a planet point to 5.5e-7 cm; round trips 1.7e-7 cm; the sun opposite at half a day). The renderer's turn and the placements: UE-110.
+Not verified: the engine's view (UE-110); CloudAtmosphere's shadow bakes under a sun that moves (they re-bake as the light turns: cost at large time scales); the sky light lags its cube's refresh at large time scales.
+Reroll impact: none (no seed channel; orbits and content unchanged).
+Status: built; engine test UE-110.
+
+D-300 — The gate in parts: the tests split across background jobs
+Owner, 2026-11-19 17:08 (choosing between re-running the gate as one job and splitting it): "2".
+Found: the gate's test step takes about two hours here, the limit of one background job in this environment; gate288 (D-293 to D-297) was stopped at that limit with no result, after test builds for D-299 ran beside it.
+- **`univerify test --part K/N`** runs only part K of N of the registered tests, dealt by weight (`--weights FILE`: "group.name seconds" lines, the last full run's times): the heaviest first, each to the lightest part so far, ties to the lower part (equal weights: registration order, so round robin). `--times FILE` writes each test's seconds. Deterministic for one binary and one weights file, so every part deals the same hands.
+- **`verify_all.py --part K/N`** builds with g++ and runs that part into `Verification/work/parts/` (results, times, log, and a meta file: the binary's md5, the weights' md5, the tests run); **`verify_all.py --parts N`** runs everything else and takes the tests' results from the parts. It adds the check `T1.harness.parts`, which fails unless every part ran on this very binary (md5) with the same weights and together they ran every registered test exactly once; the parts' plain unit expectations are summed into one `unit.expectations`. The report's Run line names the split and the parts' seconds. A passing split run writes the weights for the next (`work/test_times.txt`); a single full run does too.
+- The single run is unchanged and still the default; the checks themselves are untouched.
+Reroll impact: none (tooling).
+Status: built; the first split gate (gate289) checks it (`T1.harness.parts`).
+
+D-301 — The weather on the planet's clock
+Owner, 2026-11-19 17:26: "time scale needs to apply to cloud speed factors as well... if i turn up time scale to have 1 day per minute, we would expect the clouds to move on a similar timescale as well but they are currently unaffected".
+Found: CloudAtmosphere's sim runs at its config's SimSpeed (sim time per world second; 0.0025 by default: the sim's own day, 4 pi / PlanetaryVorticity, in about 3.5 minutes) whatever the universe's clock, and it turns the cloud field about the planet by that day (`Planet.SpinRatio` 1), since its planets never turned. With D-299 the planet turns itself, so the clouds turned twice and at the wrong rate.
+- **CloudAtmosphere stage RS3** (owner-approved changes to that plugin, delivered uncommitted): `UFlowSimSubsystem::SetTimeScale`, a run-time multiplier on SimSpeed for every use of it (steps per frame, logs, a kept field's spin), so the config asset is never written.
+- **The factory sets it each frame** from the universe's clock (`UUniBodyFactory::SetClock`: `uu.TimeScale` and the solar day): `uu.Planet.WeatherClock` 1 (default): the sim's day is the planet's solar day on the universe clock (time scale = sim day / (SimSpeed x day) x uu.TimeScale): a day a minute gives a day's weather a minute; at 1, real time (slow, as weather is). 0: the atmosphere's own speed times uu.TimeScale. -1: untouched.
+- **The atmosphere's own spin off** while the planets turn: `Planet.SpinRatio` 0 on both models, locked (its field's frame is the planet actor's, which turns: D-299).
+Not verified: UE-111 (the clouds' pace against the day; the sim's cost at large time scales: it warns when a frame needs more steps than it takes, then runs slower than asked).
+Reroll impact: none (the lock fixes a rolled value the seed drew; render and motion only).
+Status: built; engine test UE-111.
+
+D-302 — Far cloud as the mean of the cloud (the round blobs)
+Owner, 2026-11-19 17:26 (screenshot: the planet from far, its cloud a white sheet with round grey holes): "cloud layer from far away becomes consumed by artifacting. i dont think this was occurring before we applied the galaxy lessons learned to the cloud atmosphere".
+Found: CloudAtmosphere reads its noise at the mip the footprint asks, then cuts it by coverage and erosion. Past the volume's finer octaves (far views; the shadow map's outer levels) only the smooth base octave is left, and the cut makes round blobs: the threshold of the mean noise, not the mean of the thresholded noise (CloudAtmosphere's own PITFALL note at `TR_NoiseLod`). The step footprint (RS1, D-295) brings that mip nearer, so it shows sooner since then; from far, the pixel alone reaches it.
+- **CloudAtmosphere stage RS3, `Sampling.NoisePrefilter`:** the octaves the mip took out are integrated back as a spread about the read noise, NoisePrefilter x 2^(Lod - the coarsest mip) (an fBm's removed spread doubles each mip), by three-point Gauss-Hermite through the whole density chain (the read noise and +- sqrt(3) spreads, weights 4/6, 1/6, 1/6), the step's profile mean included. Skipped below a spread of 0.01 (near views pay nothing); otherwise two more evaluations of the density's closed form a structure read, no extra fetches. Shared by the march and the bake. Class default 0 (as before, bit for bit).
+- **`uu.Planet.CloudPrefilter`** (0.2) sets it on the planets' atmospheres when made; `r.CloudAtmosphere.NoisePrefilterScale` (1) and `r.CloudAtmosphere.NoisePrefilterMipShift` (0) tune it live.
+Also asked (not changed, owner A/B first): the shadows' flicker in motion and at large time scales (each shadow level is rebaked every 12 frames; a sun turning faster than 2 degrees between bakes drops the bake's history, so each lands as a step); the pawn's jitter in the air (to tell D-298's tick order or D-299's turn from the gravity controller's own).
+Not verified: UE-112.
+Reroll impact: none (render only).
+Status: built; engine test UE-112.
+
+D-303 — The cloud shadow under a turning light and from far away
+Owner, 2026-11-19 21:59 (screenshots from 2-3 radii at time scale 0): "there is definitely an issue with the shadowmaps it flickers around in chunks while i transit around it in flight mode and has the issue with sunrise/sunset and fast speed scales".
+Found (CloudAtmosphere's cloud shadow map, read and baked in its shaders):
+- From far away: its two inner levels follow the camera's projection along the light, snapped to their texels and rebaked a few frames apart as the camera moves. From orbit that projection lands anywhere on the disc (at the limb from the terminator side), so a sharper patch (and level 2's detail grain) sat in the view and hopped at each rebake, though level 0 alone is finer than a pixel there.
+- Under a turning light (D-299's day, faster with the time scale): each level is read in the light it was baked with, refreshed about every 12 frames, the levels a few frames apart, so each held its shadows where an older sun put them and stepped them on at each rebake. At low sun a ground shadow lies tens of kilometres from its cloud and moves that far over a small turn: sunrise, sunset and a fast clock showed it most.
+- **CloudAtmosphere stage RS4 (shaders only; the bake and its schedule unchanged):**
+  - the footprint's level of detail: a finer level fades in only where the level outside it has a texel of 1 to 2 pixel footprints or more (by distance alone, so it does not move with the windows); from orbit only level 0 is read, and a level with no share is not fetched; geometry's shadow uses the march's reader, so the ground takes the same levels;
+  - the light's pivot: a point below the deck's middle is read at LocalPos + (L - L_baked) d, d the distance along the current light to the deck's middle (whole under the lowest base, easing to 0 at the middle; none on the gas giant's deep deck), so the baked light's ray crosses the deck where the current one does and the shadows move with the sun between bakes.
+  - A/B: `r.CloudAtmosphere.March.Ablate 8192` (no level of detail), `16384` (no pivot).
+- Left: the cloud's own motion between bakes and the bake's history (reprojected without the pivot, at a small weight); a coherent bake of all levels together if seams between levels remain.
+- **Amendment (owner's first test, 2026-11-20 08:49: a ground shadow that "flickers in then immediately disappears on a frequent interval while flying around or the speed scale is high"): a bake a frame late, from D-298.** CloudAtmosphere's subsystem sends the frame's shadow bakes in its Tick (a tickable, after the actor tick groups to TG_PostPhysics). Since D-298 the planet's atmosphere ticks in TG_PostUpdateWork, after it: its request waited for the next frame, while the atmosphere had already recorded the new bake's camera and light and packed the march with them, so each finished level (every few frames) was read for one frame at its new camera and light over its old texels. RS4 adds a drain after every actor's tick (`UFlowSimSubsystem::OnPostActorTick`, on `FWorldDelegates::OnWorldPostActorTick`, before the frame renders and after the sim's step), so a request goes out in its own frame from any tick group. D-298's order stays (the atmosphere still reads the planet where it is this frame).
+Not verified: UE-113.
+Reroll impact: none (render only).
+Status: built; engine test UE-113.

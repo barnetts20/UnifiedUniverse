@@ -3,6 +3,7 @@
 
 #include "UnifiedUniverseModule.h"
 #include "UniDemoScenes.h"
+#include "UniHome.h"   // D-293: the home scene (UniSubsystemPlanets.cpp may land in another unity file)
 #include "UniRenderer.h"
 #include "UniRenderHooks.h"
 #include "UniStreamer.h"
@@ -236,6 +237,13 @@ static TAutoConsoleVariable<float> CVarUniBhDiscFromPx(TEXT("uu.Bh.DiscFromPx"),
 static TAutoConsoleVariable<float> CVarUniBhDiscToPx(TEXT("uu.Bh.DiscToPx"), 6.0f, TEXT("D-273: .. to all of it at this (smoothstep between)."));
 static TAutoConsoleVariable<float> CVarUniBhLensBendMinPx(TEXT("uu.Bh.LensBendMinPx"), 0.1f, TEXT("D-273: the lens pass's region reaches where the deflection is this many pixels (pixels beyond it are copied)."));
 static TAutoConsoleVariable<float> CVarUniBhLensScale(TEXT("uu.Bh.LensScale"), 4.0f, TEXT("D-277: the black hole lenses as if this x heavier (art): its shadow, photon ring and lensing this x larger against its disc, which keeps its physical size (its inner edge out at the heavier hole's innermost stable orbit). 1: physical. D-278: 4 (was 2)."));
+// D-280: each black hole's look, rolled about the uu.Bh.Disc* settings (render only).
+static TAutoConsoleVariable<float> CVarUniBhDiscVariety(TEXT("uu.Bh.DiscVariety"), 1.0f, TEXT("D-280: how far each black hole's look strays from the uu.Bh.Disc* settings (its palette, spiral, thickness, opacity, clouds, bands, heat, erosion, period, brightness and extent, rolled from its seed, its accretion rate and its host): 0 every black hole the settings' look exactly (D-278), 1 the full spread."));
+static TAutoConsoleVariable<int32> CVarUniBhDiscPalette(TEXT("uu.Bh.DiscPalette"), -1, TEXT("D-280: the accretion discs' colours: -1 each black hole's rolled palette; 0 the blackbody (physical colours); 1..7 every black hole that palette (1 gold, 2 quasar blue, 3 ember, 4 violet, 5 teal, 6 rose, 7 ice and fire)."));
+// D-281: stellar black holes (X-ray binaries: a star's companion).
+static TAutoConsoleVariable<float> CVarUniBhStellarFraction(TEXT("uu.Bh.StellarFraction"), UniHlsl::UNI_BH_STELLAR_FRACTION, TEXT("D-281: the share of stars with a stellar black hole companion (5..25 M_sun, an X-ray binary fed by the star), found when the star's system activates (art; raising it only adds). 0: none. Applies to systems activated from then on."));
+static TAutoConsoleVariable<float> CVarUniBhStellarActive(TEXT("uu.Bh.StellarActive"), UniHlsl::UNI_BH_STELLAR_ACTIVE, TEXT("D-281: the share of stellar black holes in outburst (1e-2..1 of Eddington: bright, hot, thin discs); the rest quiescent (1e-8..1e-4: dim tori)."));
+static TAutoConsoleVariable<float> CVarUniBhStellarScale(TEXT("uu.Bh.StellarScale"), UniHlsl::UNI_BH_STELLAR_SCALE, TEXT("D-281: a stellar black hole's lensing and disc drawn as if it were this x larger (art; render only): at 30 a 10 M_sun hole's disc is ~1 R_sun, resolved from a few AU. 1: physical (its disc ~3e4 km)."));
 static TAutoConsoleVariable<int32> CVarUniBhLensMaxSteps(TEXT("uu.Bh.LensMaxSteps"), 400, TEXT("D-273: the most RK4 steps a ray takes; a ray still winding at the photon sphere after them is taken as fallen in (16..2000)."));
 static TAutoConsoleVariable<int32> CVarUniGalaxyPalettes(TEXT("uu.GalaxyPalettes"), 1, TEXT("D-182: every galaxy its own colour palette (bulge, disc, arms, knots), which its stars and glow take (chroma only: brightness unchanged). 0: physical colours. Applies at uu.Enable; rerolls star and galaxy colours only."));
 static TAutoConsoleVariable<int32> CVarUniGalaxyTextures(TEXT("uu.GalaxyTextures"), 1, TEXT("D-179: galaxies read the noise project's galaxy textures (warp_fine, warp_large, galaxy_detail in Plugins/UnifiedUniverse/Data/Noise): texture warps of discs, arms and bulges, disc noise and star-forming knots. 0: off. Applies at uu.Enable; rerolls galaxies' stars."));
@@ -300,7 +308,7 @@ void UUniSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 }
 
 // D-216: start-up without console commands.
-static TAutoConsoleVariable<FString> CVarUniAutoStart(TEXT("uu.AutoStart"), TEXT("flythrough"), TEXT("D-216: the scene enabled when play begins (galaxy, web or flythrough, as uu.Enable); none: wait for uu.Enable. Set in DefaultEngine.ini [ConsoleVariables] to change it."));
+static TAutoConsoleVariable<FString> CVarUniAutoStart(TEXT("uu.AutoStart"), TEXT("flythrough"), TEXT("D-216: the scene enabled when play begins (galaxy, web, flythrough or home, as uu.Enable; D-293: home starts on foot on the home planet); none: wait for uu.Enable. Set in DefaultEngine.ini [ConsoleVariables] to change it."));
 static TAutoConsoleVariable<int32> CVarUniAutoFly(TEXT("uu.AutoFly"), 1, TEXT("D-216: with uu.AutoStart, begin in free flight (as uu.Fly) once the player's pawn exists. 0: Local mode."));
 
 void UUniSubsystem::OnWorldBeginPlay(UWorld& InWorld)
@@ -310,7 +318,7 @@ void UUniSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 	if (Scene.IsEmpty() || Scene.Equals(TEXT("none"), ESearchCase::IgnoreCase)) { return; }
 	EnableUniverse(Scene);
 	// The pawn is usually possessed after the world's begin play: free flight waits for it (Tick).
-	bAutoFlyPending = bEnabled && CVarUniAutoFly.GetValueOnGameThread() != 0;
+	bAutoFlyPending = bEnabled && CVarUniAutoFly.GetValueOnGameThread() != 0 && SceneName != TEXT("home");   // D-293: home starts on foot
 }
 
 void UUniSubsystem::Deinitialize()
@@ -338,11 +346,14 @@ void UUniSubsystem::EnableUniverse(const FString& Scene)
 		return;
 	}
 	SceneName = Scene.IsEmpty() ? TEXT("galaxy") : Scene.ToLower();
+	WorldTurn.Reset();   // D-299: a new start: the world's axes are the universe's
 	++NebGridEpoch;   // D-252: the textures may have changed: the nebula grid rebakes
 	ClusterTuning = UniClusterCVars::Read();
 	Warp.Current = 0.0;
 	bCameraJumped = true;
-	UniCore::FUniverseDef Def = SceneName == TEXT("web") ? UniScenes::WebToGalaxy(ClusterTuning) : (SceneName == TEXT("flythrough") ? UniScenes::Flythrough(ClusterTuning) : UniScenes::GalaxyToStar());
+	// D-293: "home" is the flythrough universe plus the home star (UniHome.h).
+	UniCore::FUniverseDef Def = SceneName == TEXT("web") ? UniScenes::WebToGalaxy(ClusterTuning)
+		: (SceneName == TEXT("flythrough") ? UniScenes::Flythrough(ClusterTuning) : (SceneName == TEXT("home") ? UniScenes::Home(ClusterTuning) : UniScenes::GalaxyToStar()));
 	SetupWebTexture(Def);   // D-164: before the model, which bakes the definition's parameters
 	SetupGalaxyTextures(Def);   // D-179: likewise
 	if (CVarUniGalaxyPalettes.GetValueOnGameThread() != 0) { UniScenes::UseGalaxyPalettes(Def); }   // D-182
@@ -428,9 +439,17 @@ void UUniSubsystem::EnableUniverse(const FString& Scene)
 	const UniCore::FCoord Start = SceneName == TEXT("web") ? UniScenes::VoidCamera() : UniScenes::SolarCamera();
 	Camera = FUniCoord::Make(Start);
 	LocalAnchor = FUniCoord::Make(Start);   // Local mode: camera = anchor + the pawn's view location
+	LocalAnchorFrac = FVector3f::ZeroVector;
 	CameraFraction = FVector3f::ZeroVector;
 	MotionMode = EUniMotionMode::Local;
 	bEnabled = true;
+	// D-293: planets' detailed actors from the game modules' factories; the home start.
+	BodyFactories.Reset();
+	for (const TSubclassOf<UUniBodyFactory>& Fc : BodyFactoryClasses())
+	{
+		if (Fc) { BodyFactories.Add(NewObject<UUniBodyFactory>(this, Fc)); }
+	}
+	if (SceneName == TEXT("home")) { BeginHomeStart(); }
 	UniRenderHooks::EnsureRegistered();
 	UniRenderHooks::SetActive(true);
 	UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: enabled scene '%s' at %s"), *SceneName, *Camera.ToHexString());
@@ -447,7 +466,13 @@ void UUniSubsystem::DisableUniverse()
 	Off.bEnabled = false;
 	FUniRenderer::Get().SetFrame_GameThread(MoveTemp(Off));
 	VolumeBuilder.Reset();
+	ReleaseDetailedBodies();   // D-293: before the placeholders (they may be hidden for them)
 	ClearPromotion();
+	BodyFrame = FPlanetFrame();
+	WorldTurn.Reset();   // D-299
+	if (bPawnHeld) { HoldPawn(false); }
+	StartPhase = EStartPhase::None;
+	BodyFactories.Reset();
 	ClearSkyLight();   // D-186: waits for its worker (it reads the CPU textures unbound below)
 	Systems.Reset();
 	FrameCellTables.Reset();
@@ -693,8 +718,10 @@ void UUniSubsystem::Teleport(const FUniCoord& Coord)
 	UniCore::FCoord A = Coord.ToCore();
 	UniCore::FVec3f F{};
 	const FVector ViewLoc = GetViewLocation();
-	UniCore::AddDisplacement(A, F, UniCore::FVec3d{ -ViewLoc.X, -ViewLoc.Y, -ViewLoc.Z });
+	UniCore::AddDisplacement(A, F, ToUniversalAxes(-ViewLoc));   // D-299
 	LocalAnchor = FUniCoord::Make(A);
+	LocalAnchorFrac = FVector3f::ZeroVector;   // D-293
+	if (BodyFrame.bActive) { LeaveBodyFrame(TEXT("teleport")); }
 }
 
 void UUniSubsystem::SetVelocity(const FVector& CmPerSecond)
@@ -724,6 +751,7 @@ FVector UUniSubsystem::GetViewLocation(FRotator* OutRotation) const
 
 void UUniSubsystem::SetFreeFly(bool bOn, double CmPerSecond)
 {
+	if (bOn && bPawnHeld) { HoldPawn(false); }   // D-293: free flight takes over a pawn the home start holds
 	if (CmPerSecond > 0.0) { SetFlySpeed(CmPerSecond); }
 	if (bOn == bFreeFly) { return; }
 	bFreeFly = bOn;
@@ -743,8 +771,9 @@ void UUniSubsystem::SetFreeFly(bool bOn, double CmPerSecond)
 		UniCore::FCoord A = Camera.ToCore();
 		UniCore::FVec3f F{};
 		const FVector ViewLoc = GetViewLocation();
-		UniCore::AddDisplacement(A, F, UniCore::FVec3d{ -ViewLoc.X, -ViewLoc.Y, -ViewLoc.Z });
+		UniCore::AddDisplacement(A, F, ToUniversalAxes(-ViewLoc));   // D-299
 		LocalAnchor = FUniCoord::Make(A);
+		LocalAnchorFrac = FVector3f::ZeroVector;   // D-293
 		CameraFraction = FVector3f::ZeroVector;
 		UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: free flight off (Local mode)"));
 	}
@@ -807,7 +836,7 @@ void UUniSubsystem::StartFlythrough(float Seconds)
 	// Face the target.
 	if (APlayerController* PC = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr)
 	{
-		PC->SetControlRotation((-FlyDirection).Rotation());
+		PC->SetControlRotation(WorldRotationOf(-FlyDirection));   // D-299
 	}
 	UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: flythrough to a star of M = %.2f over %.0f s"), Best, FlyDuration);
 }
@@ -831,15 +860,18 @@ void UUniSubsystem::Tick(float DeltaTime)
 	{
 	FPerfTimer TickTimer(PerfMs[PerfTick]);
 	++FrameCounter;
+	// B-002: orbits are on rails at this clock. D-293: advanced first, so a planet's frame (its
+	// centre this frame), its drawn record and its promoted body agree on the time.
+	UniverseTime += double(DeltaTime) * TimeScale;
 	FRotator ViewRot;
 	FVector ViewLoc = GetViewLocation(&ViewRot);   // updated below if the pawn is moved or re-centred this frame
 	// Local mode computes camera = anchor + view location, so on entering Local the anchor is the
 	// camera MINUS the view location (else the camera jumps by the pawn offset).
-	auto AnchorFor = [&ViewLoc](const FUniCoord& Cam)
+	auto AnchorFor = [this, &ViewLoc](const FUniCoord& Cam)
 	{
 		UniCore::FCoord A = Cam.ToCore();
 		UniCore::FVec3f F{};
-		UniCore::AddDisplacement(A, F, UniCore::FVec3d{ -ViewLoc.X, -ViewLoc.Y, -ViewLoc.Z });
+		UniCore::AddDisplacement(A, F, ToUniversalAxes(-ViewLoc));   // D-299: in the universe's axes
 		return FUniCoord::Make(A);
 	};
 
@@ -884,18 +916,20 @@ void UUniSubsystem::Tick(float DeltaTime)
 		const bool bLocal = Pawn && (MotionMode == EUniMotionMode::Local ? FlySpeed < kCruiseOn : FlySpeed < kCruiseOff);
 		if (bLocal)
 		{
-			if (MotionMode != EUniMotionMode::Local) { LocalAnchor = AnchorFor(Camera); MotionMode = EUniMotionMode::Local; }
+			if (MotionMode != EUniMotionMode::Local) { LocalAnchor = AnchorFor(Camera); LocalAnchorFrac = FVector3f::ZeroVector; MotionMode = EUniMotionMode::Local; }
 			Pawn->SetActorLocation(Pawn->GetActorLocation() + Step, false, nullptr, ETeleportType::None);
 			ViewLoc += Step;
-			RecentreLocalIfNeeded(ViewLoc);
+			UpdateBodyFrame(ViewLoc);   // D-293: a planet's frame (no re-centre in it: the planet stays put)
+			if (!BodyFrame.bActive) { RecentreLocalIfNeeded(ViewLoc); }
 			UniCore::FVec3f F{};
-			C = UniCore::LocalToUniversal(LocalAnchor.ToCore(), UniCore::FVec3d{ ViewLoc.X, ViewLoc.Y, ViewLoc.Z }, F);
+			C = LocalCamera(ViewLoc, F);
 			Frac = F;
 		}
 		else
 		{
+			if (BodyFrame.bActive) { LeaveBodyFrame(TEXT("cruise")); }
 			MotionMode = EUniMotionMode::Cruise;
-			UniCore::AddDisplacement(C, Frac, UniCore::FVec3d{ Step.X, Step.Y, Step.Z });
+			UniCore::AddDisplacement(C, Frac, ToUniversalAxes(Step));   // D-299: the view's step in the universe's axes
 		}
 		DrawHud(Velocity.Size());
 	}
@@ -905,20 +939,26 @@ void UUniSubsystem::Tick(float DeltaTime)
 		const double Speed = Velocity.Size();
 		// A latched uu.Cruise stays in Cruise at any non-zero speed (the D-008 threshold would
 		// otherwise ignore every speed below 1e8 cm/s).
-		if (MotionMode == EUniMotionMode::Local && (Speed > kCruiseOn || (bCruiseLatched && Speed > 0.0))) { MotionMode = EUniMotionMode::Cruise; }
-		else if (MotionMode == EUniMotionMode::Cruise && Speed < kCruiseOff && !(bCruiseLatched && Speed > 0.0)) { MotionMode = EUniMotionMode::Local; LocalAnchor = AnchorFor(Camera); }
+		if (MotionMode == EUniMotionMode::Local && (Speed > kCruiseOn || (bCruiseLatched && Speed > 0.0)))
+		{
+			MotionMode = EUniMotionMode::Cruise;
+			if (BodyFrame.bActive) { LeaveBodyFrame(TEXT("cruise")); }
+		}
+		else if (MotionMode == EUniMotionMode::Cruise && Speed < kCruiseOff && !(bCruiseLatched && Speed > 0.0)) { MotionMode = EUniMotionMode::Local; LocalAnchor = AnchorFor(Camera); LocalAnchorFrac = FVector3f::ZeroVector; }
 		if (bCruiseLatched) { DrawHud(Speed); }
 		if (MotionMode == EUniMotionMode::Cruise)
 		{
-			const FVector Step = Velocity * double(DeltaTime);
-			UniCore::AddDisplacement(C, Frac, UniCore::FVec3d{ Step.X, Step.Y, Step.Z });
+			const FVector Step = Velocity * double(DeltaTime);   // D-299: Velocity is in the world's axes
+			UniCore::AddDisplacement(C, Frac, ToUniversalAxes(Step));
 		}
 		else
 		{
-			// Local: camera = local anchor + view location (the pawn moves normally).
-			RecentreLocalIfNeeded(ViewLoc);
+			// Local: camera = local anchor + view location (the pawn moves normally). D-293: in a
+			// planet's frame the anchor is the planet's exact centre this frame and nothing re-centres.
+			UpdateBodyFrame(ViewLoc);
+			if (!BodyFrame.bActive) { RecentreLocalIfNeeded(ViewLoc); }
 			UniCore::FVec3f F{};
-			C = UniCore::LocalToUniversal(LocalAnchor.ToCore(), UniCore::FVec3d{ ViewLoc.X, ViewLoc.Y, ViewLoc.Z }, F);
+			C = LocalCamera(ViewLoc, F);
 			Frac = F;
 		}
 	}
@@ -977,8 +1017,7 @@ void UUniSubsystem::Tick(float DeltaTime)
 		Streamer->FrameCandidateCap = UniCore::u64(Cap);
 		Streamer->GenChunkCap = Cap > 0 ? uint32(Cap) / UniHlsl::UNI_GEN_CHUNK + 8192u : 65536u;
 		Streamer->bViewPriority = CVarUniGenViewPriority.GetValueOnGameThread() != 0;
-		const FVector Fw = ViewRot.Vector();
-		Streamer->ViewDir = UniCore::FVec3d{ Fw.X, Fw.Y, Fw.Z };
+		Streamer->ViewDir = ToUniversalAxes(ViewRot.Vector());   // D-299
 		float FovDeg = 90.0f;
 		if (UWorld* World = GetWorld()) { if (APlayerController* PC = World->GetFirstPlayerController()) { if (PC->PlayerCameraManager) { FovDeg = PC->PlayerCameraManager->GetFOVAngle(); } } }
 		// The diagonal's half angle (aspect up to ~2:1), plus 10 degrees for turning.
@@ -1007,7 +1046,6 @@ void UUniSubsystem::Tick(float DeltaTime)
 		const double Reject = 0.5 * FMath::Min(double(UniHlsl::UNI_VOL_HANDOFF_PX) * ThetaPx, double(UniHlsl::UNI_THETA_PROMOTE));
 		Streamer->WakeTheta = FMath::Max(0.5 * Reject, 1.0e-6);
 	}
-	UniverseTime += double(DeltaTime) * TimeScale;   // B-002: orbits are on rails at this clock
 	{
 		TRACE_CPUPROFILER_EVENT_SCOPE(Uni_StreamerUpdate);
 		FPerfTimer T(PerfMs[PerfStreamer]);
@@ -1017,7 +1055,7 @@ void UUniSubsystem::Tick(float DeltaTime)
 	{ TRACE_CPUPROFILER_EVENT_SCOPE(Uni_Api); ProcessApiReadbacks(); UpdateApiEvents(ViewRot); }
 	// M3: bodies close enough become actors, and every parallax-placed actor follows the camera
 	// that just moved (same frame, same camera: no lag against the backdrop at any speed).
-	{ TRACE_CPUPROFILER_EVENT_SCOPE(Uni_Promotion); FPerfTimer T(PerfMs[PerfPromotion]); UpdatePromotion(); }
+	{ TRACE_CPUPROFILER_EVENT_SCOPE(Uni_Promotion); FPerfTimer T(PerfMs[PerfPromotion]); UpdatePromotion(); UpdateDetailedBodies(ViewLoc); UpdateHomeStart(ViewLoc); }
 	{ TRACE_CPUPROFILER_EVENT_SCOPE(Uni_Parallax); FPerfTimer T(PerfMs[PerfParallax]); UpdateParallax(ViewLoc); }
 	{ TRACE_CPUPROFILER_EVENT_SCOPE(Uni_LightRig); FPerfTimer T(PerfMs[PerfLightRig]); UpdateLightRig(); UpdateSkyLight(); }
 	{ TRACE_CPUPROFILER_EVENT_SCOPE(Uni_PushFrame); FPerfTimer T(PerfMs[PerfPushFrame]); PushFrame(); }
@@ -1209,6 +1247,7 @@ void UUniSubsystem::PushFrame()
 		TRACE_CPUPROFILER_EVENT_SCOPE(Uni_Systems);
 		FPerfTimer SysTimer(PerfMs[PerfSystems]);
 		const UniCore::FCoord Cam = Camera.ToCore();
+		Systems->BhConfig = StellarBhConfig();   // D-281
 		TArray<FUniActivation> Acts;
 		FUniRenderer::Get().DrainActivations_GameThread(Acts);
 		for (const FUniActivation& A : Acts)
@@ -1225,7 +1264,7 @@ void UUniSubsystem::PushFrame()
 		Systems->Update(Cam);
 		std::vector<UniCore::FCellGPU> SysCells;
 		std::vector<UniCore::FObjectGPU> SysRecords;
-		const std::set<UniCore::u32> Culled = Promoter.CulledSpriteIds();   // promoted planets: their actor draws them (D-147)
+		const std::set<UniCore::u32> Culled = SpriteCulledIds();   // promoted planets: their actor draws them (D-147; D-297: once it is ready)
 		Systems->Build(Cam, UniverseTime, FUniRenderer::DynamicPoolBase(), FUniRenderer::DynamicPoolSlots(), SysCells, SysRecords, &Culled, &Table.Bodies);
 		F.Cells.Append(SysCells.data(), int32(SysCells.size()));
 		F.DynamicRecords.Append(SysRecords.data(), int32(SysRecords.size()));
@@ -1280,9 +1319,15 @@ void UUniSubsystem::PushFrame()
 	F.DiscArchetypeMask = CVarUniSpriteEllipses.GetValueOnGameThread() != 0 ? DiscArchetypeMask : 0u;   // D-183 (render-only: live)
 	F.NucleusArchetypeMask = CVarUniBhNucleus.GetValueOnGameThread() != 0 ? DiscArchetypeMask : 0u;   // D-272: every galaxy archetype
 	F.NucleusParams = FVector4f(NucleusConfig().Active, NucleusConfig().Cap, NucleusConfig().Gain, 0.0f);
+	{
+		const UniCore::FStyleConfig Stc = StyleConfig();   // D-280: the nuclei's colours are their discs' palettes
+		F.NucleusStyle = FVector4f(Stc.Variety, Stc.PaletteMode, 0.0f, 0.0f);
+	}
 	for (int32 K = 0; K < 4; ++K) { F.FixedDiscSeeds[K] = FixedDiscSeeds[K]; }
 	F.DeltaMag = EffectiveDeltaMag;   // D-154: owner sensitivity + travel boost
 	F.ExposureBias = ExposureBias + TravelExposureMag;   // D-205
+	F.BackdropScale = BackdropDayScale;                  // D-296
+	F.WorldYaw = WorldTurn.Yaw;                          // D-299
 	F.bEnabled = true;
 	F.FrameNumber = FrameCounter;
 	if (bVolume && VolumeBuilder)
@@ -1671,8 +1716,9 @@ bool UUniSubsystem::BuildApiView(const FRotator& ViewRot, UniHlsl::FUniView& V, 
 			if (PC->PlayerCameraManager) { FovDeg = PC->PlayerCameraManager->GetFOVAngle(); }
 		}
 	}
+	// D-299: the view's basis in the universe's axes.
 	const FRotationMatrix R(ViewRot);
-	const FVector Fw = R.GetUnitAxis(EAxis::X), Rt = R.GetUnitAxis(EAxis::Y), Up = R.GetUnitAxis(EAxis::Z);
+	const UniCore::FVec3d Fw = ToUniversalAxes(R.GetUnitAxis(EAxis::X)), Rt = ToUniversalAxes(R.GetUnitAxis(EAxis::Y)), Up = ToUniversalAxes(R.GetUnitAxis(EAxis::Z));
 	V.Forward = UniHlsl::float3(float(Fw.X), float(Fw.Y), float(Fw.Z));
 	V.Right = UniHlsl::float3(float(Rt.X), float(Rt.Y), float(Rt.Z));
 	V.Up = UniHlsl::float3(float(Up.X), float(Up.Y), float(Up.Z));
@@ -1989,6 +2035,25 @@ bool UUniSubsystem::GetKnownObject(const FUniObjectId& Id, FUniObjectInfo& OutOb
 	return true;
 }
 
+UniCore::FStellarBhConfig UUniSubsystem::StellarBhConfig() const
+{
+	UniCore::FStellarBhConfig C;
+	C.Fraction = FMath::Clamp(CVarUniBhStellarFraction.GetValueOnGameThread(), 0.0f, 1.0f);
+	C.Active = FMath::Clamp(CVarUniBhStellarActive.GetValueOnGameThread(), 0.0f, 1.0f);
+	C.SizeScale = FMath::Clamp(CVarUniBhStellarScale.GetValueOnGameThread(), 1.0f, 1.0e4f);
+	C.Light = NucleusConfig();
+	C.Style = StyleConfig();
+	return C;
+}
+
+UniCore::FStyleConfig UUniSubsystem::StyleConfig() const
+{
+	UniCore::FStyleConfig C;
+	C.Variety = FMath::Clamp(CVarUniBhDiscVariety.GetValueOnGameThread(), 0.0f, 1.0f);
+	C.PaletteMode = float(FMath::Clamp(CVarUniBhDiscPalette.GetValueOnGameThread(), -1, int32(UniHlsl::UNI_BH_PALETTES) - 1));
+	return C;
+}
+
 UniCore::FNucleusConfig UUniSubsystem::NucleusConfig() const
 {
 	UniCore::FNucleusConfig C;
@@ -2020,10 +2085,12 @@ void UUniSubsystem::UpdateLensTarget(FUniFrameData& F, const UniCore::FVolumeSce
 	Lc.LensScale = FMath::Clamp(CVarUniBhLensScale.GetValueOnGameThread(), 1.0f, 10.0f);   // D-277
 	const double ThetaPixel = double(FMath::Max(FUniRenderer::Get().Stats.ThetaPixelLastFrame.load(), 1.0e-6f));
 	const UniCore::FNucleusConfig Nc = NucleusConfig();
+	const UniCore::FStyleConfig Stc = StyleConfig();   // D-280
 	TArray<UniCore::FObjectId, TInlineAllocator<16>> Cands;
 	if (Sc.Home.Carrier >= 0) { Cands.Add(Sc.Home.Parent); }
 	for (const UniCore::FCarrierHandoff& Hd : Sc.Handoffs) { Cands.AddUnique(Hd.Parent); }
 	UniCore::FLensTarget Best;
+	UniHlsl::FUniBhStyle BestStyle{};
 	for (const UniCore::FObjectId& Id : Cands)
 	{
 		const UniCore::FObjectGPU* O = Streamer->FindObject(Id);
@@ -2040,11 +2107,37 @@ void UUniSubsystem::UpdateLensTarget(FUniFrameData& F, const UniCore::FVolumeSce
 		for (int32 K = 0; K < 4; ++K) { bFixed |= Seed != 0u && FixedDiscSeeds[K] == Seed; }
 		float Axis[3];
 		UniCore::GalaxyDiscAxis(Seed, bFixed, Axis);
-		const UniCore::FLensTarget T = UniCore::LensTargetOf(Bh, Mn, RelCm, Axis, Seed, ThetaPixel, Lc);
-		if (T.bActive && (!Best.bActive || T.Score > Best.Score)) { Best = T; }
+		// D-280: its look (its host archetype's arms for the spiral).
+		const UniHlsl::FUniBhStyle Sty = UniCore::GalaxyBhStyle(*O, Model ? &Model->Definition().Arch(Arch) : nullptr, Stc, Nc.Active);
+		const UniCore::FLensTarget T = UniCore::LensTargetOf(Bh, Mn, RelCm, Axis, Seed, ThetaPixel, Lc, &Sty);
+		if (T.bActive && (!Best.bActive || T.Score > Best.Score)) { Best = T; BestStyle = Sty; }
 	}
+	// D-281: the stellar black holes of the active star systems.
+	bool bBestStellar = false;
+	if (Systems)
+	{
+		const UniCore::FStellarBhConfig Sbc = StellarBhConfig();
+		for (const auto& KV : Systems->ActiveSystems())
+		{
+			const UniCore::FActiveSystem& Act = KV.second;
+			const UniCore::FStellarBh& Sb = Act.Sys.Bh;
+			if (!Sb.bValid) { continue; }
+			UniCore::FCoord Bc = Act.Star;
+			UniCore::FVec3f BcFrac{};
+			UniCore::AddDisplacement(Bc, BcFrac, UniCore::StellarBhOffset(Sb, UniverseTime));
+			const UniCore::FVec3d Rel = UniCore::ToDouble(UniCore::Sub(Bc, Cam));
+			const double RelCm[3] = { Rel.X - double(CameraFraction.X), Rel.Y - double(CameraFraction.Y), Rel.Z - double(CameraFraction.Z) };
+			const double Dist = FMath::Sqrt(RelCm[0] * RelCm[0] + RelCm[1] * RelCm[1] + RelCm[2] * RelCm[2]);
+			const UniCore::FStellarBhLight Lt = UniCore::StellarBhLightOf(Sb, Act.Sys.StarAbsMag, Act.Sys.ActivationCm, Dist, Sbc);
+			const float Mn = CVarUniBhNucleus.GetValueOnGameThread() != 0 ? Lt.AbsMagIso : UniHlsl::UNI_BH_NONE_MAG;
+			const UniCore::FLensTarget T = UniCore::LensTargetOf(Sb.Core, Mn, RelCm, Sb.Normal, Sb.Seed, ThetaPixel, Lc, &Lt.Style, double(Sbc.SizeScale));
+			if (T.bActive && (!Best.bActive || T.Score > Best.Score)) { Best = T; BestStyle = Lt.Style; bBestStellar = true; }
+		}
+	}
+	LensStellarLast = bBestStellar;
 	if (!Best.bActive || !(Best.DistanceCm > 0.0)) { return; }
 	LensLast = Best;
+	LensStyleLast = BestStyle;
 	FUniFrameData::FLensFrame& L = F.Lens;
 	L.bActive = true;
 	L.CamRs = FVector3f(float(-Best.RelCm[0] / Best.RsCm), float(-Best.RelCm[1] / Best.RsCm), float(-Best.RelCm[2] / Best.RsCm));
@@ -2063,11 +2156,23 @@ void UUniSubsystem::UpdateLensTarget(FUniFrameData& F, const UniCore::FVolumeSce
 	L.PointAppMag = Best.PointAppMag;
 	L.PointPhysAngRad = Best.PointPhysAngRad;
 	L.PointColour = FVector3f(Best.PointColour[0], Best.PointColour[1], Best.PointColour[2]);
-	if (Best.PointAppMag < UniHlsl::UNI_BH_NONE_MAG)
+	// D-280: its look about the uu.Bh.Disc* settings (the renderer applies it to them).
+	L.DiscStyle0 = FVector4f(BestStyle.SpiralMul, BestStyle.ThicknessMul, BestStyle.OpacityMul, BestStyle.CloudsMul);
+	L.DiscStyle1 = FVector4f(BestStyle.BandsMul, BestStyle.HeatMul, BestStyle.ErosionMul, BestStyle.PeriodMul);
+	L.DiscStyle2 = FVector4f(BestStyle.BrightnessMul, BestStyle.PaletteMix, float(BestStyle.Palette), BestStyle.ExtentMul);
+	if (Best.PointAppMag < UniHlsl::UNI_BH_NONE_MAG && !bBestStellar)
 	{
 		// The pass draws this nucleus (its point x (1 - share), its disc x share): the sprite is held back.
 		F.NucleusParams.W = 1.0f;
 		F.NucleusHandSeed = Best.NucleusSeed;
+	}
+	if (bBestStellar)
+	{
+		// D-281: likewise its companion record's sprite (the pass draws its point and disc).
+		for (UniCore::FObjectGPU& R : F.DynamicRecords)
+		{
+			if (R.B[0] == Best.NucleusSeed && (R.A[3] & 0xFFFFu) == UniHlsl::UNI_ARCH_DYNAMIC_BH) { R.A[3] |= UniHlsl::UNI_OBJ_FLAG_PROMOTED << 16; }
+		}
 	}
 }
 
@@ -2127,6 +2232,12 @@ void UUniSubsystem::LogStats() const
 		UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: black hole lens: %.4g R_s away (R_s %.3g cm), Einstein ring %.1f px, disc %s (outer %.0f R_s = %.1f px, peak %.0f K, %.0f%% of the nucleus's light), region %.3g rad, pass %s"),
 			LensLast.DistanceCm / LensLast.RsCm, LensLast.RsCm, double(LensLast.RingPx), LensLast.bDisc ? TEXT("on") : TEXT("off"), double(LensLast.OuterX), double(LensLast.DiscPx), double(LensLast.PeakK),
 			100.0 * double(LensLast.DiscShare), double(LensLast.RegionRad), R.LensPassesLastFrame.load() ? TEXT("ran") : TEXT("did not run"));
+		if (LensStellarLast) { UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: black hole lens: a stellar black hole (an X-ray binary's; uu.Bh.StellarScale x%.0f)"), double(StellarBhConfig().SizeScale)); }
+		static const TCHAR* PaletteNames[UniHlsl::UNI_BH_PALETTES] = { TEXT("blackbody"), TEXT("gold"), TEXT("quasar blue"), TEXT("ember"), TEXT("violet"), TEXT("teal"), TEXT("rose"), TEXT("ice and fire") };
+		const UniHlsl::FUniBhStyle& Sl = LensStyleLast;   // D-280
+		UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: black hole look (x the uu.Bh.Disc* settings): palette %s (%.0f%%), spiral x%.2f, thickness x%.2f, opacity x%.2f, clouds x%.2f, bands x%.2f, heat x%.2f, erosion x%.2f, period x%.2f, brightness x%.2f, extent x%.2f"),
+			PaletteNames[FMath::Min(Sl.Palette, UniHlsl::UNI_BH_PALETTES - 1u)], 100.0 * double(Sl.PaletteMix), double(Sl.SpiralMul), double(Sl.ThicknessMul), double(Sl.OpacityMul), double(Sl.CloudsMul),
+			double(Sl.BandsMul), double(Sl.HeatMul), double(Sl.ErosionMul), double(Sl.PeriodMul), double(Sl.BrightnessMul), double(Sl.ExtentMul));
 	}
 	else { UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: black hole lens: none (no galaxy's black hole near enough%s)"), bVolume ? TEXT("") : TEXT("; the volume is off")); }
 	// Per level, coarse first (D-137/D-139): how full each window is, how wide, and whether
@@ -2147,7 +2258,7 @@ void UUniSubsystem::LogStats() const
 // ---------------------------------------------------------------------------------------------
 
 static TAutoConsoleVariable<int32> CVarUniLightRig(
-TEXT("uu.LightRig"), 1, TEXT("M3 placeholder: a movable directional light from the nearest active star, so promoted planets are lit (0 off)."));
+TEXT("uu.LightRig"), 1, TEXT("M3 placeholder: a movable directional light from the nearest active star, so promoted planets are lit (0 off). D-294: off while the planet whose frame the world is has its detailed body live and ready (its atmosphere lights the scene)."));
 static TAutoConsoleVariable<float> CVarUniLightRigLux(TEXT("uu.LightRigLux"), 10.0f, TEXT("Intensity of the light rig, lux."));
 
 void UUniSubsystem::RegisterParallax(UUniParallaxComponent* C)
@@ -2167,6 +2278,7 @@ void UUniSubsystem::ClearPromotion()
 	const bool bLive = World && !World->bIsTearingDown;
 	for (auto& KV : Bodies) { if (AUniBodyActor* B = KV.Value.Get(); B && bLive) { B->Destroy(); } }
 	Bodies.Reset();
+	PromotedLinks.Reset();   // D-297
 	Promoter.Clear();
 	if (ADirectionalLight* L = LightRig.Get(); L && bLive) { L->Destroy(); }
 	LightRig.Reset();
@@ -2192,10 +2304,31 @@ void UUniSubsystem::RecentreLocalIfNeeded(FVector& InOutViewLoc)
 	const FVector PawnLoc = Pawn->GetActorLocation();
 	const UniCore::FVec3d S = UniCore::RecentreShift(UniCore::FVec3d{ PawnLoc.X, PawnLoc.Y, PawnLoc.Z });
 	UniCore::FCoord A = LocalAnchor.ToCore();
-	UniCore::ShiftAnchor(A, S);
+	if (WorldTurn.Yaw == 0.0)
+	{
+		UniCore::ShiftAnchor(A, S);
+	}
+	else
+	{
+		// D-299: the world turned against the universe: the shift in the universe's axes is not
+		// whole centimetres; the anchor's fraction takes the rest.
+		UniCore::FVec3f Fr{ LocalAnchorFrac.X, LocalAnchorFrac.Y, LocalAnchorFrac.Z };
+		UniCore::AddDisplacement(A, Fr, ToUniversalAxes(FVector(S.X, S.Y, S.Z)));
+		LocalAnchorFrac = FVector3f(Fr.X, Fr.Y, Fr.Z);
+	}
 	LocalAnchor = FUniCoord::Make(A);
-	const FVector Shift(-S.X, -S.Y, -S.Z);
-	Pawn->SetActorLocation(PawnLoc + Shift, false, nullptr, ETeleportType::TeleportPhysics);
+	ShiftWorld(FVector(-S.X, -S.Y, -S.Z), InOutViewLoc);
+	++Recentres;
+	UE_LOG(LogUnifiedUniverse, Verbose, TEXT("UnifiedUniverse: Local frame re-centred by %s (re-centre %llu)"), *FVector(-S.X, -S.Y, -S.Z).ToString(), Recentres);
+}
+
+void UUniSubsystem::ShiftWorld(const FVector& Shift, FVector& InOutViewLoc)
+{
+	APlayerController* PC = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr;
+	if (APawn* Pawn = PC ? PC->GetPawn() : nullptr)
+	{
+		Pawn->SetActorLocation(Pawn->GetActorLocation() + Shift, false, nullptr, ETeleportType::TeleportPhysics);
+	}
 	InOutViewLoc += Shift;
 	for (const TWeakObjectPtr<UUniParallaxComponent>& W : ParallaxComponents)
 	{
@@ -2204,9 +2337,7 @@ void UUniSubsystem::RecentreLocalIfNeeded(FVector& InOutViewLoc)
 	}
 	OnLocalRecentre.Broadcast(Shift);
 	// The camera cache is what this frame renders from: refresh it, or the view lags the shift by a frame.
-	if (PC->PlayerCameraManager) { PC->PlayerCameraManager->UpdateCamera(0.0f); }
-	++Recentres;
-	UE_LOG(LogUnifiedUniverse, Verbose, TEXT("UnifiedUniverse: Local frame re-centred by %s (re-centre %llu)"), *Shift.ToString(), Recentres);
+	if (PC && PC->PlayerCameraManager) { PC->PlayerCameraManager->UpdateCamera(0.0f); }
 }
 
 void UUniSubsystem::UpdatePromotion()
@@ -2234,7 +2365,12 @@ void UUniSubsystem::UpdatePromotion()
 		for (const FUniObjectInfo& I : Demoted) { OnBodyDemoted.Broadcast(I); }
 		for (const FUniObjectInfo& I : Promoted) { OnBodyPromoted.Broadcast(I); }
 	}
-	// Demoted: destroy (pooling comes with real body actors).
+	// Demoted: destroy (pooling comes with real body actors). D-297: and forget whether a factory
+	// makes them.
+	for (auto It = PromotedLinks.CreateIterator(); It; ++It)
+	{
+		if (P.count(It.Key()) == 0) { It.RemoveCurrent(); }
+	}
 	for (auto It = Bodies.CreateIterator(); It; ++It)
 	{
 		if (P.count(It.Key()) == 0 || !It.Value().IsValid())
@@ -2247,6 +2383,9 @@ void UUniSubsystem::UpdatePromotion()
 	for (const auto& KV : P)
 	{
 		const UniCore::FPromotedBody& Body = KV.second;
+		// D-297: a planet a body factory makes gets its detailed body (UpdateDetailedBodies), not a
+		// placeholder sphere.
+		if (!WantsPlaceholder(Body)) { continue; }
 		TWeakObjectPtr<AUniBodyActor>* Found = Bodies.Find(KV.first);
 		AUniBodyActor* Actor = Found ? Found->Get() : nullptr;
 		if (!Actor)
@@ -2271,15 +2410,19 @@ void UUniSubsystem::UpdateParallax(const FVector& ViewLoc)
 	{
 		UUniParallaxComponent* C = ParallaxComponents[I].Get();
 		if (!C) { ParallaxComponents.RemoveAtSwap(I); continue; }
-		if (MotionMode == EUniMotionMode::Local) { C->ApplyPlacementLocal(ViewLoc, Camera, CameraFraction, LocalAnchor); }
-		else { C->ApplyPlacement(ViewLoc, Camera, CameraFraction); }
+		if (MotionMode == EUniMotionMode::Local) { C->ApplyPlacementLocal(ViewLoc, Camera, CameraFraction, LocalAnchor, LocalAnchorFrac, WorldTurn.Yaw); }
+		else { C->ApplyPlacement(ViewLoc, Camera, CameraFraction, WorldTurn.Yaw); }
 	}
 }
 
 void UUniSubsystem::UpdateLightRig()
 {
 	UWorld* World = GetWorld();
-	const bool bWant = CVarUniLightRig.GetValueOnGameThread() != 0 && Systems && !Systems->ActiveSystems().empty() && World;
+	// D-294: a planet's detailed body that is live and ready lights the scene itself (its
+	// atmosphere's sun light, aimed by IStarLit): a second directional light would compete with it
+	// for the atmosphere and forward shading.
+	const bool bBodyLit = bDetailedLit;   // D-297: any live, ready detailed body with air
+	const bool bWant = CVarUniLightRig.GetValueOnGameThread() != 0 && Systems && !Systems->ActiveSystems().empty() && World && !bBodyLit;
 	if (!bWant)
 	{
 		if (ADirectionalLight* L = LightRig.Get()) { L->Destroy(); }
@@ -2307,7 +2450,7 @@ void UUniSubsystem::UpdateLightRig()
 		LightRig = L;
 	}
 	const UniCore::FVec3d D = UniCore::ToDouble(UniCore::Sub(Cam, Near->Star));
-	const FVector Dir = FVector(D.X, D.Y, D.Z).GetSafeNormal();
+	const FVector Dir = ToWorldAxes(D).GetSafeNormal();   // D-299: the world's axes
 	L->SetActorRotation(Dir.Rotation());
 	if (ULightComponent* C = L->GetLightComponent())
 	{
@@ -2340,7 +2483,8 @@ void UUniSubsystem::StartSkyJob(const UniCore::FVolumeScene& Sc)
 	const double ThetaPx = double(FUniRenderer::Get().Stats.ThetaPixelLastFrame.load());
 	const double Scale = ThetaPx * ThetaPx;
 	TSharedPtr<UniCore::FVolumeScene, ESPMode::ThreadSafe> Copy = MakeShared<UniCore::FVolumeScene, ESPMode::ThreadSafe>(Sc);
-	SkyJob = Async(EAsyncExecution::ThreadPool, [Copy, N, Scale]() { return UniCore::BuildSkyCube(*Copy, N, Scale); });
+	const double Yaw = WorldTurn.Yaw;   // D-299: the cube in the world's axes (the sky light samples it so)
+	SkyJob = Async(EAsyncExecution::ThreadPool, [Copy, N, Scale, Yaw]() { return UniCore::BuildSkyCube(*Copy, N, Scale, 2, Yaw); });
 	bSkyJob = true;
 }
 
@@ -2506,7 +2650,7 @@ bool UUniSubsystem::GoToHost(UniCore::u32 Arch, double BrighterThan, const TCHAR
 	SetFreeFly(true, 0.2 * BestInfl);
 	SetFlySpeed(0.2 * BestInfl);
 	SetCamera(FUniCoord::Make(To));
-	if (APlayerController* PC = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr) { PC->SetControlRotation(FVector(-Dir.X, -Dir.Y, -Dir.Z).Rotation()); }
+	if (APlayerController* PC = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr) { PC->SetControlRotation(WorldRotationOf(FVector(-Dir.X, -Dir.Y, -Dir.Z))); }
 	// Members: a cluster's from its emitter (its fainter members) plus its authored bright ones
 	// (D-177); a group's dwarfs from its light (D-174: its magnitude is their light), now drawn
 	// from the node matter around it.
@@ -2557,6 +2701,61 @@ void UUniSubsystem::LogSystems() const
 	}
 }
 
+bool UUniSubsystem::GoToStellarBlackHole()
+{
+	// D-281: as GoToSystem: the nearest resident star (the reference generator's content) with a
+	// black hole companion, then 3 disc radii from the hole, 20 degrees above its disc, facing it.
+	if (!bEnabled || !Generator) { return false; }
+	const UniCore::FCoord Here = Camera.ToCore();
+	UniCore::FRefPipeline Resolve(*Generator);
+	Resolve.bVelocityLod = false;
+	Resolve.Update(Here, UniCore::FVec3f{});
+	const UniCore::FStellarBhConfig Sbc = StellarBhConfig();
+	double Best = 1000.0 * UniCore::Units::Pc;
+	UniCore::FCoord Star;
+	UniCore::FSystem Sys;
+	bool bFound = false;
+	size_t Stars = 0;
+	Resolve.ForEachResident([&](const UniCore::FCellKey& K, const UniCore::FObjectGPU& O, float, UniCore::u64)
+	{
+		const UniCore::u32 Arch = O.A[3] & 0xFFFFu;
+		if (Arch >= 32u || ((SystemArchetypeMask >> Arch) & 1u) == 0u || ((O.A[3] >> 16) & UniHlsl::UNI_OBJ_FLAG_DELTA_HIDDEN)) { return; }
+		++Stars;
+		if (!UniHlsl::Uni_StarHasBlackHole(O.B[0], Sbc.Fraction)) { return; }
+		const UniCore::u32 Off[3] = { O.A[0], O.A[1], O.A[2] };
+		const UniCore::FCoord C = UniCore::ObjectCoord(K, Off);
+		const double D = UniCore::Length(UniCore::ToDouble(UniCore::Sub(C, Here)));
+		if (D >= Best) { return; }
+		Best = D; Star = C; Sys = UniCore::BuildSystem(O, Sbc); bFound = true;
+	});
+	if (!bFound || !Sys.Bh.bValid)
+	{
+		UE_LOG(LogUnifiedUniverse, Warning, TEXT("UnifiedUniverse: no stellar black hole among the %llu resident stars within 1 kpc (uu.Bh.StellarFraction %.4g; raise it, or go where the stars are dense)."), uint64(Stars), double(Sbc.Fraction));
+		return false;
+	}
+	const UniCore::FStellarBh& Sb = Sys.Bh;
+	const UniHlsl::FUniBhStyle Sty = UniHlsl::Uni_BhStyleOf(Sb.Seed, Sb.Core, false, -1.0f, Sbc.Style.Variety, Sbc.Style.PaletteMode);
+	const double Rs = std::pow(10.0, double(UniHlsl::UNI_BH_LOG_RS_SUN_CM) + double(Sb.Core.Log10Mass)) * double(Sbc.SizeScale);
+	const double Outer = double(UniHlsl::Uni_BhDiscOuterX(UniHlsl::Uni_BhDiscPeakK(Sb.Core))) * double(FMath::Max(Sty.ExtentMul, 0.05f)) * Rs;
+	const UniCore::FVec3d Off = UniCore::StellarBhOffset(Sb, UniverseTime);
+	const FVector N(Sb.Normal[0], Sb.Normal[1], Sb.Normal[2]);
+	const FVector Along = FVector(Sb.E1[0], Sb.E1[1], Sb.E1[2]);
+	const FVector Out = (Along * FMath::Cos(FMath::DegreesToRadians(20.0)) + N * FMath::Sin(FMath::DegreesToRadians(20.0))).GetSafeNormal();
+	const double R = 3.0 * Outer;
+	UniCore::FCoord To = Star;
+	UniCore::FVec3f Frac{};
+	UniCore::AddDisplacement(To, Frac, UniCore::FVec3d{ Off.X + Out.X * R, Off.Y + Out.Y * R, Off.Z + Out.Z * R });
+	SetFreeFly(true, 0.2 * Outer);
+	SetFlySpeed(0.2 * Outer);   // a fifth of a disc radius a second
+	SetCamera(FUniCoord::Make(To));
+	if (APlayerController* PC = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr) { PC->SetControlRotation(WorldRotationOf(-Out)); }
+	UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: jumped to a stellar black hole of %.1f M_sun (%s, 1e%.1f of Eddington) beside a star of M = %.2f %s away; its disc %s across (x%.0f, uu.Bh.StellarScale), now %s from it. Its orbit about the star: %s, %.2f h."),
+		FMath::Pow(10.0, double(Sb.Core.Log10Mass)), Sb.Core.Log10Eddington > -3.0f ? TEXT("in outburst") : TEXT("quiescent"), double(Sb.Core.Log10Eddington), Sys.StarAbsMag,
+		UTF8_TO_TCHAR(UniCore::FormatDistance(Best).c_str()), UTF8_TO_TCHAR(UniCore::FormatDistance(2.0 * Outer).c_str()), double(Sbc.SizeScale), UTF8_TO_TCHAR(UniCore::FormatDistance(R).c_str()),
+		UTF8_TO_TCHAR(UniCore::FormatDistance(Sb.SemiMajorCm).c_str()), Sb.PeriodS / 3600.0);
+	return true;
+}
+
 bool UUniSubsystem::GoToSystem(bool bToPlanet)
 {
 	if (!bEnabled || !Generator) { return false; }
@@ -2605,7 +2804,7 @@ bool UUniSubsystem::GoToSystem(bool bToPlanet)
 		SetFreeFly(true, 2.0 * Giant->RadiusCm);
 		SetFlySpeed(2.0 * Giant->RadiusCm);   // 2 radii per second
 		SetCamera(FUniCoord::Make(To));
-		if (APlayerController* PC = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr) { PC->SetControlRotation((-Out).Rotation()); }
+		if (APlayerController* PC = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr) { PC->SetControlRotation(WorldRotationOf(-Out)); }
 		UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: jumped to 30 radii from a gas giant (R = %.1f R_earth, a = %.2f AU) of a star %s away. Fly in (W) to promote it to an actor; uu.Systems lists it."),
 			Giant->RadiusCm / UniCore::SysConst::EarthRadius, Giant->SemiMajorCm / UniCore::Units::Au, UTF8_TO_TCHAR(UniCore::FormatDistance(Best).c_str()));
 		return true;
@@ -2621,7 +2820,7 @@ bool UUniSubsystem::GoToSystem(bool bToPlanet)
 	SetCamera(FUniCoord::Make(To));
 	if (APlayerController* PC = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr)
 	{
-		PC->SetControlRotation(FVector(-0.25, 0.9, -0.7).GetSafeNormal().Rotation());
+		PC->SetControlRotation(WorldRotationOf(FVector(-0.25, 0.9, -0.7).GetSafeNormal()));
 	}
 	UE_LOG(LogUnifiedUniverse, Log, TEXT("UnifiedUniverse: jumped into the system of a star of M = %.2f, %s away (%d planets, widest orbit %s). It activates once its cell is drawn; uu.Systems lists it."),
 		Sys.StarAbsMag, UTF8_TO_TCHAR(UniCore::FormatDistance(Best).c_str()), int32(Sys.Planets.size()), UTF8_TO_TCHAR(UniCore::FormatDistance(Sys.SpanCm).c_str()));
@@ -2640,7 +2839,7 @@ namespace
 		return UUniSubsystem::FindForConsole();
 	}
 
-	FAutoConsoleCommandWithWorldAndArgs CmdEnable(TEXT("uu.Enable"), TEXT("uu.Enable [galaxy|web|flythrough]"),
+	FAutoConsoleCommandWithWorldAndArgs CmdEnable(TEXT("uu.Enable"), TEXT("uu.Enable [galaxy|web|flythrough|home]"),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
 		{
 			if (UUniSubsystem* S = Sub(World)) { S->EnableUniverse(Args.Num() ? Args[0] : FString()); }
@@ -2807,6 +3006,12 @@ namespace
 		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
 		{
 			if (UUniSubsystem* S = Sub(World)) { S->GoToSystem(Args.Num() > 0 && Args[0].Equals(TEXT("planet"), ESearchCase::IgnoreCase)); }
+		}));
+
+	FAutoConsoleCommandWithWorldAndArgs CmdGotoStellarBh(TEXT("uu.GotoStellarBlackHole"), TEXT("uu.GotoStellarBlackHole: jump to the nearest stellar black hole (a star's companion, D-281), 3 disc radii out, above its disc (free flight)."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>&, UWorld* World)
+		{
+			if (UUniSubsystem* S = Sub(World)) { S->GoToStellarBlackHole(); }
 		}));
 
 	FAutoConsoleCommandWithWorldAndArgs CmdStats(TEXT("uu.Stats"), TEXT("Log streaming and render statistics."),

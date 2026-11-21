@@ -17,6 +17,7 @@ static const float UNI_SYSTEM_RADIUS_MIN_AU = 30.0f;
 static const float UNI_SYSTEM_RADIUS_MAX_AU = 1.0e4f;  // 0.05 pc
 static const float UNI_SYSTEM_HYSTERESIS = 1.25f;      // deactivate (CPU, exact) beyond 1.25 x the radius
 static const uint UNI_ARCH_DYNAMIC_PLANET = 0xFFF0u;   // archetype id written into planet records
+static const uint UNI_ARCH_DYNAMIC_BH = 0xFFF1u;       // D-281: .. and into a stellar black hole companion's (its disc's light)
 
 /** sqrt(L / L_sun) from the V-band absolute magnitude (no bolometric correction in v1). */
 UNI_FN float Uni_SqrtLumSun(float InAbsMag)

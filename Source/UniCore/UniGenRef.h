@@ -155,6 +155,27 @@ namespace UniCore
 	/** Surface brightness: the shared core (UniPlacement.ush), so GPU and CPU agree. */
 	inline float SurfaceBrightness(float AbsMag, float RadiusLog2) { return UniHlsl::Uni_SurfaceBrightness(AbsMag, RadiusLog2); }
 
+	/** An anchor's record in its cell K (its level's cell holding A.Coord): the exact offset in the
+	 *  cell, the anchor flags, its archetype's colour (with the palette tint, D-182). One function for
+	 *  generation (FRefGenerator) and for whoever needs the record without generating the cell
+	 *  (D-293: the home system's activation on the CPU). */
+	inline FObjectGPU AnchorRecord(const FUniverseDef& D, const FAnchor& A, const FCellKey& K)
+	{
+		const FCoord O = CellOrigin(K);
+		u32 Off[3];
+		for (int Ax = 0; Ax < 3; ++Ax)
+		{
+			const FU128 Rel = Sub(A.Coord.Axis(Ax), O.Axis(Ax));   // 0 .. 2^L - 1
+			Off[Ax] = K.Level >= 32 ? u32(Shr(Rel, K.Level - 32).L[3]) : u32(Shl(Rel, 32 - K.Level).L[3]);
+		}
+		const FArchetype& AA = D.Arch(A.ArchetypeId);
+		const u32 Flags = H::UNI_OBJ_FLAG_ANCHOR | (AA.Visibility == EUniVisibility::Extended ? H::UNI_OBJ_FLAG_EXTENDED : 0u) | (AA.Emitters.empty() ? 0u : H::UNI_OBJ_FLAG_HAS_CONTRIBUTOR);
+		const float SB = AA.Visibility == EUniVisibility::Extended ? SurfaceBrightness(A.AbsMag, A.RadiusLog2) : 0.0f;
+		H::float3 Rgb = H::Uni_TemperatureColour(std::pow(10.0f, AA.ColourModel[0]));
+		if (AA.bPalette) { Rgb = H::Uni_TintRecordColour(Rgb, H::Uni_GalaxyFarTint(H::Uni_GalaxyPalette(H::Uni_PaletteSeed(A.Seed)))); }   // D-182
+		return FromHlsl(H::Uni_MakeObject(H::uint3(Off[0], Off[1], Off[2]), A.ArchetypeId, Flags, A.Seed, A.RadiusLog2, A.AbsMag, SB, Rgb));
+	}
+
 	// ======================================================================================
 	// Reference generator
 	// ======================================================================================
@@ -808,20 +829,7 @@ namespace UniCore
 			for (size_t I = 0; I < D.Anchors.size(); ++I)
 			{
 				if (!(AnchorCells[I] == K)) { continue; }
-				const FAnchor& A = D.Anchors[I];
-				const FCoord O = CellOrigin(K);
-				u32 Off[3];
-				for (int Ax = 0; Ax < 3; ++Ax)
-				{
-					const FU128 Rel = Sub(A.Coord.Axis(Ax), O.Axis(Ax));   // 0 .. 2^L - 1
-					Off[Ax] = K.Level >= 32 ? u32(Shr(Rel, K.Level - 32).L[3]) : u32(Shl(Rel, 32 - K.Level).L[3]);
-				}
-				const FArchetype& AA = D.Arch(A.ArchetypeId);
-				const u32 Flags = H::UNI_OBJ_FLAG_ANCHOR | (AA.Visibility == EUniVisibility::Extended ? H::UNI_OBJ_FLAG_EXTENDED : 0u) | (AA.Emitters.empty() ? 0u : H::UNI_OBJ_FLAG_HAS_CONTRIBUTOR);
-				const float SB = AA.Visibility == EUniVisibility::Extended ? SurfaceBrightness(A.AbsMag, A.RadiusLog2) : 0.0f;
-				H::float3 Rgb = H::Uni_TemperatureColour(std::pow(10.0f, AA.ColourModel[0]));
-				if (AA.bPalette) { Rgb = H::Uni_TintRecordColour(Rgb, H::Uni_GalaxyFarTint(H::Uni_GalaxyPalette(H::Uni_PaletteSeed(A.Seed)))); }   // D-182
-				Out.Objects.push_back(FromHlsl(H::Uni_MakeObject(H::uint3(Off[0], Off[1], Off[2]), A.ArchetypeId, Flags, A.Seed, A.RadiusLog2, A.AbsMag, SB, Rgb)));
+				Out.Objects.push_back(AnchorRecord(D, D.Anchors[I], K));
 				Out.Indices.push_back(kFirstAnchorIndex + u32(I));
 				Out.ObjectContributor.push_back(0u);
 			}

@@ -74,12 +74,13 @@ public:
 	void SetCoord(const FUniCoord& InCoord) { Coord = InCoord; }
 
 	/** Called by UUniSubsystem every frame: place the owner. ViewLocation is the camera's UE
-	 *  world location this frame; CameraCoord and CameraFraction its universal coordinate. */
-	void ApplyPlacement(const FVector& ViewLocation, const FUniCoord& CameraCoord, const FVector3f& CameraFraction);
+	 *  world location this frame; CameraCoord and CameraFraction its universal coordinate;
+	 *  WorldYaw the world's turn against the universe's axes about +Z (D-299, UniSpin.h). */
+	void ApplyPlacement(const FVector& ViewLocation, const FUniCoord& CameraCoord, const FVector3f& CameraFraction, double WorldYaw = 0.0);
 
 	/** Local mode (D-149): LocalAnchor is the universal coordinate of the UE world origin. A
 	 *  Simulated owner in real space is left where physics put it and Coord follows it. */
-	void ApplyPlacementLocal(const FVector& ViewLocation, const FUniCoord& CameraCoord, const FVector3f& CameraFraction, const FUniCoord& LocalAnchor);
+	void ApplyPlacementLocal(const FVector& ViewLocation, const FUniCoord& CameraCoord, const FVector3f& CameraFraction, const FUniCoord& LocalAnchor, const FVector3f& LocalAnchorFrac = FVector3f::ZeroVector, double WorldYaw = 0.0);
 
 protected:
 	virtual void BeginPlay() override;

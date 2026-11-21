@@ -243,11 +243,12 @@ namespace UniRender
 	 *  at radiance scale 1 (Uni_BhDiscLight units x sr x R_s^2): every ray of a log-polar grid
 	 *  about the black hole (Nr radii from 0.4 R_s to 1.3 x the outer radius, Nps azimuths)
 	 *  traced, lensing and shifts and all, each x its solid angle. */
-	inline void DiscFarLight(float PeakK, double Mu, double Dx, int Nr, int Nps, double OutRgb[3])
+	inline void DiscFarLight(float PeakK, double Mu, double Dx, int Nr, int Nps, double OutRgb[3], UniHlsl::uint Palette = 0u, float PaletteMix = 0.0f)
 	{
 		namespace H = UniHlsl;
 		H::FUniLensDisc D{};
 		D.Axis = H::float3(0.0f, 0.0f, 1.0f); D.PeakK = PeakK; D.OuterX = H::Uni_BhDiscOuterX(PeakK); D.bDisc = 1.0f;
+		D.Palette = float(Palette); D.PaletteMix = PaletteMix;   // D-280
 		const double S = std::sqrt(std::max(1.0 - Mu * Mu, 0.0));
 		const FV3 Fw{ -S, 0.0, -Mu };
 		const FV3 E1 = Norm(Cross(Fw, std::fabs(Mu) > 0.999 ? FV3{ 1.0, 0.0, 0.0 } : FV3{ 0.0, 0.0, 1.0 })), E2 = Cross(E1, Fw);

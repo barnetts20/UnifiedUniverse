@@ -57,6 +57,14 @@ float SliceFarCm;                   // D-271: the slices' far segment's end (Uni
 float4 OutToMarch;                  // output pixel -> slice texel: m = p * xy + zw
 uint2 MarchSize;
 
+// D-296: a planet's atmosphere over the scene (CloudAtmosphere's composite, read after the upscaler).
+Texture2D<float4> AtmoColor;        // rgb its in-scattered light (unexposed), a the green transmittance
+Texture2D<float2> AtmoTint;         // r the red transmittance, g the blue
+uint bAtmo;                         // 0: none (1 x 1 stand-ins bound)
+float4 OutToAtmo;                   // output pixel -> atmosphere texel: a = p * xy + zw
+uint2 AtmoSize;
+float4 AtmoSkyFade;                 // x, y: the sky's brightness (pre-exposed) where sprites start / finish fading; z the view's pre-exposure
+
 uint bQuadIndex;                    // D-223: 1: instance i draws sprite InQuadIndex[i] (the splat path has the rest)
 StructuredBuffer<uint> InQuadIndex;
 
@@ -210,6 +218,19 @@ float SpriteTransmittance(float2 PixelPos, float TrueDistance)
 			const float Hi = VolumeSlices.Load(int4(M, I, 0));
 			T = Lo + (Hi - Lo) * (X - (float)I);
 		}
+	}
+	// D-296: behind a planet's atmosphere, as the scene behind it is: its transmittance (the
+	// clouds' and the air's, luminance-weighted), and a fade where its own sky is bright (a star
+	// is lost against a day sky, which the composite's arithmetic alone does not do at the
+	// backdrop's exposure).
+	if (bAtmo != 0u)
+	{
+		const int2 A = clamp(int2(PixelPos * OutToAtmo.xy + OutToAtmo.zw), int2(0, 0), int2(AtmoSize) - 1);
+		const float4 C = AtmoColor.Load(int3(A, 0));
+		const float2 Tn = AtmoTint.Load(int3(A, 0));
+		const float Through = saturate(Uni_Luminance(float3(Tn.x, C.a, Tn.y)));
+		const float Sky = Uni_Luminance(C.rgb) * AtmoSkyFade.z;
+		T *= Through * (1.0f - smoothstep(AtmoSkyFade.x, AtmoSkyFade.y, Sky));
 	}
 	return T;
 }

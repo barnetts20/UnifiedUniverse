@@ -100,8 +100,8 @@ struct FUniView
 	// D-273: the nucleus whose black hole the lens pass draws hands this share of its light to the disc.
 	uint NucleusHandSeed;      // its galaxy's seed (record B.x)
 	float NucleusHandShare;    // 0: none handed (every nucleus a whole sprite)
-	float NucleusPad0;
-	float NucleusPad1;
+	float NucleusVariety;      // D-280: uu.Bh.DiscVariety (0: the blackbody: its colour D-273's)
+	float NucleusPalette;      // D-280: uu.Bh.DiscPalette (< 0: each its rolled palette)
 };
 
 struct FUniSprite
@@ -443,7 +443,11 @@ UNI_FN FUniSprite Uni_ProjectNucleusC(FUniCellRel InCell, float InLevelFade, FUn
 	// The point: the accretion disc's light region, ~100 Schwarzschild radii (never resolved here).
 	FUniObject N;
 	N.A = uint4(InObj.A.x, InObj.A.y, InObj.A.z, Arch | ((Uni_ObjectFlags(InObj) & UNI_OBJ_FLAG_DELTA_HIDDEN) << 16u));
-	N.B = uint4(InObj.B.x, asuint(log2(100.0f * Uni_BhSchwarzschildCm(Bh.Log10Mass))), Uni_F32ToF16(Mn) | (Uni_F32ToF16(Mn) << 16u), Uni_PackColour(Uni_NucleusColour(Bh)));
+	// D-280: its colour its disc's palette (BH.LOOK; the blackbody at variety 0).
+	uint Pal;
+	float PalMix;
+	Uni_BhPaletteOf(InObj.B.x, Bh, (Uni_ObjectFlags(InObj) & UNI_OBJ_FLAG_EARLY) != 0u, InView.NucleusVariety, InView.NucleusPalette, Pal, PalMix);
+	N.B = uint4(InObj.B.x, asuint(log2(100.0f * Uni_BhSchwarzschildCm(Bh.Log10Mass))), Uni_F32ToF16(Mn) | (Uni_F32ToF16(Mn) << 16u), Uni_PackColour(Uni_NucleusColourP(Bh, Pal, PalMix)));
 	S = Uni_ProjectObjectC(InCell, InLevelFade, N, InView, false, 0.0f);
 	S.Flags = S.Flags & ~UNI_SPRITE_PROMOTE_CANDIDATE;
 	return S;

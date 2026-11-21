@@ -20,6 +20,8 @@ SOURCES = [
     "Source/UnifiedUniverse/Private/UniSubsystem.cpp",
     "Source/UnifiedUniverseRender/Private/UniShaders.cpp",
     "Source/UnifiedUniverseRender/Private/UniRenderer.cpp",
+    "Source/UnifiedUniverse/Private/UniSubsystemPlanets.cpp",          # D-293
+    "Source/UnifiedUniverseGame/Private/UniVoxelPlanetFactory.cpp",    # D-293 (bound by name: absent without the game module)
 ]
 HEADER = "Source/UnifiedUniverse/Public/UniTuningSettings.h"
 CPP = "Source/UnifiedUniverse/Private/UniTuningSettings.cpp"
@@ -84,6 +86,8 @@ CATEGORIES = [
     ("uu.Group.", "Population|Clusters"),
     ("uu.Sprite", "Sprites"),
     ("uu.Bh.", "Compact Objects"),   # D-272
+    ("uu.Planet.", "Planets"),       # D-293
+    ("uu.Home.", "Planets"),
     ("uu.MotionWeb", "Web"),
     ("uu.WebDust", "Web"),
     ("uu.SkyWeb", "Web"),
@@ -100,7 +104,7 @@ CATEGORIES = [
 # The page's order (the details panel keeps declaration order).
 CAT_ORDER = ["March|Paradigms", "March|Steps", "March|Sampling and Noise", "March|Temporal", "March|Resolution", "March|Galaxy Map",
              "March|Voxel Grid (nebulae)", "March|Far Cache", "March|Other", "Textures", "Galaxy|Shape and Noise", "Galaxy|Detail Layers", "Galaxy|Balance",
-             "Nebulae", "Population", "Population|Clusters", "Sprites", "Compact Objects", "Web", "Travel", "Lighting", "Background",
+             "Nebulae", "Population", "Population|Clusters", "Sprites", "Compact Objects", "Planets", "Web", "Travel", "Lighting", "Background",
              "Streaming and Generation", "Debug"]
 REENABLE_PREFIX = ("uu.Cluster.", "uu.Group.", "uu.Star.", "uu.WebTex", "uu.WebSource", "uu.WebTexture", "uu.GalaxyTextures", "uu.GalaxyPalettes", "uu.GalaxyTexture.")
 
@@ -237,6 +241,7 @@ public:
 
 #include "HAL/FileManager.h"
 #include "HAL/IConsoleManager.h"
+#include "Misc/ConfigCacheIni.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "UniSubsystem.h"
@@ -284,6 +289,14 @@ namespace
 #endif
 	}
 
+	/** A console variable's value into its property. */
+	void UniTuningImport(const FProperty* P, void* Container, const IConsoleVariable* V)
+	{
+		if (const FFloatProperty* F = CastField<FFloatProperty>(P)) { F->SetPropertyValue_InContainer(Container, V->GetFloat()); }
+		else if (const FIntProperty* I = CastField<FIntProperty>(P)) { I->SetPropertyValue_InContainer(Container, V->GetInt()); }
+		else if (const FStrProperty* S = CastField<FStrProperty>(P)) { S->SetPropertyValue_InContainer(Container, V->GetString()); }
+	}
+
 	bool UniTuningSame(const FProperty* P, const void* Container, const IConsoleVariable* V)
 	{
 		if (const FFloatProperty* F = CastField<FFloatProperty>(P)) { return F->GetPropertyValue_InContainer(Container) == V->GetFloat(); }
@@ -304,13 +317,10 @@ void UUniTuningSettings::ImportAll()
 {
 	for (const FUniTuningEntry& E : GUniTuningTable)
 	{
-		FProperty* P = FindFProperty<FProperty>(GetClass(), E.Property);
+		const FProperty* P = FindFProperty<FProperty>(GetClass(), E.Property);
 		const IConsoleVariable* V = IConsoleManager::Get().FindConsoleVariable(E.CVar);
 		if (!P || !V) { continue; }
-		void* Container = this;
-		if (FFloatProperty* F = CastField<FFloatProperty>(P)) { F->SetPropertyValue_InContainer(Container, V->GetFloat()); }
-		else if (FIntProperty* I = CastField<FIntProperty>(P)) { I->SetPropertyValue_InContainer(Container, V->GetInt()); }
-		else if (FStrProperty* S = CastField<FStrProperty>(P)) { S->SetPropertyValue_InContainer(Container, V->GetString()); }
+		UniTuningImport(P, this, V);
 	}
 }
 
@@ -362,12 +372,28 @@ void UUniTuningSettings::ResetFilteredToDefaults()
 
 void UUniTuningSettings::ApplyAll() const
 {
+	// D-293: a variable registered after the page was built (a module loaded later, as
+	// UnifiedUniverseGame's) never reached its property: the property holds the type's zero, not a
+	// saved value. Unless the page saved one for it, its own value goes into the property instead.
+	TSet<FString> Known;
+	for (const TPair<FString, FString>& KV : UniTuningDefaults()) { Known.Add(KV.Key); }
 	CaptureDefaults();   // D-264: a variable registered after the page was built
+	const FString Section = GetClass()->GetPathName();
 	for (const FUniTuningEntry& E : GUniTuningTable)
 	{
 		const FProperty* P = FindFProperty<FProperty>(GetClass(), E.Property);
 		IConsoleVariable* V = IConsoleManager::Get().FindConsoleVariable(E.CVar);
-		if (!P || !V || UniTuningSame(P, this, V)) { continue; }
+		if (!P || !V) { continue; }
+		if (!Known.Contains(E.CVar))
+		{
+			FString Saved;
+			if (!GConfig || !GConfig->GetString(*Section, *P->GetName(), Saved, GGameIni))
+			{
+				UniTuningImport(P, const_cast<UUniTuningSettings*>(this), V);
+				continue;
+			}
+		}
+		if (UniTuningSame(P, this, V)) { continue; }
 		FString Str;
 		if (UniTuningValue(P, this, Str)) { V->Set(*Str, ECVF_SetByProjectSetting); }
 	}

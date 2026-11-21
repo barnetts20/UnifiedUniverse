@@ -22,10 +22,19 @@
 //
 // Not in v1 (owner): binaries and multiple stars. When they come they belong at the system
 // level, so one galaxy-level sprite stands in for the system and resolves into its stars.
+//
+// D-281: the one companion so far: a stellar black hole (an X-ray binary; UniCompact.ush's
+// Uni_StarHasBlackHole / Uni_StellarBlackHole, channel BH.STELLAR on the star's seed), on a
+// circular orbit about the star (the star stays at its record's position: art, the black hole is
+// the heavier), close enough that the star feeds its disc. Its light (the disc's, capped at
+// uu.Bh.NucleusCap x the star's and faded in across the activation shell, so it never pops) is one
+// more dynamic record; the lens pass draws its lensing and disc up close (UUniSubsystem::
+// UpdateLensTarget). The planets are unchanged.
 
 #include "UniGenRef.h"
 #include "UniScaleLadder.h"
 #include "UniSeed.h"
+#include "UniCompact.h"   // D-281
 
 #include <algorithm>
 #include <cmath>
@@ -66,6 +75,30 @@ namespace UniCore
 		float Tint[3] = { 1.0f, 1.0f, 1.0f };
 	};
 
+	/** D-281: the stellar black holes' settings (uu.Bh.Stellar*; the look's and the nuclei's). */
+	struct FStellarBhConfig
+	{
+		float Fraction = UniHlsl::UNI_BH_STELLAR_FRACTION;   // uu.Bh.StellarFraction (0: none)
+		float Active = UniHlsl::UNI_BH_STELLAR_ACTIVE;       // uu.Bh.StellarActive
+		float SizeScale = UniHlsl::UNI_BH_STELLAR_SCALE;     // uu.Bh.StellarScale (render only)
+		FNucleusConfig Light;                                // the cap and gain of its light (uu.Bh.NucleusCap / NucleusGain)
+		FStyleConfig Style;                                  // its look (uu.Bh.DiscVariety / DiscPalette)
+	};
+
+	/** D-281: a star's black hole companion. */
+	struct FStellarBh
+	{
+		bool bValid = false;
+		u32 Seed = 0;                                // its own (its disc's clouds and look)
+		UniHlsl::FUniBlackHole Core{};
+		double SemiMajorCm = 0.0;                    // its circular orbit about the star
+		double PeriodS = 0.0;
+		double Phase0 = 0.0;                         // at t = 0
+		double E1[3] = { 1.0, 0.0, 0.0 };            // the orbit's plane (E1, E2) ..
+		double E2[3] = { 0.0, 1.0, 0.0 };
+		float Normal[3] = { 0.0f, 0.0f, 1.0f };      // .. and its normal: the disc's axis
+	};
+
 	struct FSystem
 	{
 		u32 StarSeed = 0;
@@ -76,6 +109,7 @@ namespace UniCore
 		double ActivationCm = 0.0;
 		double SpanCm = 0.0;                         // max a (1 + e): the farthest any planet gets
 		std::vector<FPlanet> Planets;
+		FStellarBh Bh;                               // D-281
 	};
 
 	namespace SystemDetail
@@ -86,8 +120,61 @@ namespace UniCore
 		}
 	}
 
-	/** The system of a star, from its record. Pure and deterministic. */
-	inline FSystem BuildSystem(const FObjectGPU& Star)
+	/** D-281: a star's black hole companion (the star's seed, radius and mass). */
+	inline FStellarBh StellarCompanionOf(u32 StarSeed, double StarRadiusCm, double StarMassSun, const FStellarBhConfig& C)
+	{
+		namespace HS = UniHlsl;
+		FStellarBh B;
+		if (!HS::Uni_StarHasBlackHole(StarSeed, C.Fraction)) { return B; }
+		B.bValid = true;
+		B.Seed = HS::Uni_StellarBlackHoleSeed(StarSeed);
+		B.Core = HS::Uni_StellarBlackHole(StarSeed, C.Active);
+		const double Us = double(HS::Uni_DrawUnit(StarSeed, HS::UNI_CH_BH_STELLAR, 4u));
+		B.SemiMajorCm = double(HS::UNI_BH_XRB_SEPARATION) * std::max(StarRadiusCm, 1.0e9) * std::pow(double(HS::UNI_BH_XRB_SEPARATION_SPAN), Us);
+		const double GM = SysConst::GMSun * (std::pow(10.0, double(B.Core.Log10Mass)) + StarMassSun);
+		B.PeriodS = SysConst::TwoPi * std::sqrt(B.SemiMajorCm * B.SemiMajorCm * B.SemiMajorCm / GM);
+		// Its orbit's plane: a normal uniform over the sphere, a node and a phase.
+		const double CosI = 1.0 - 2.0 * double(HS::Uni_DrawUnit(StarSeed, HS::UNI_CH_BH_STELLAR, 5u));
+		const double SinI = std::sqrt(std::max(1.0 - CosI * CosI, 0.0));
+		const double Node = SysConst::TwoPi * double(HS::Uni_DrawUnit(StarSeed, HS::UNI_CH_BH_STELLAR, 6u));
+		B.Phase0 = SysConst::TwoPi * double(HS::Uni_DrawUnit(StarSeed, HS::UNI_CH_BH_STELLAR, 7u));
+		const double N[3] = { SinI * std::sin(Node), -SinI * std::cos(Node), CosI };
+		const double E1[3] = { std::cos(Node), std::sin(Node), 0.0 };   // the ascending node: in the plane, perpendicular to N
+		const double E2[3] = { N[1] * E1[2] - N[2] * E1[1], N[2] * E1[0] - N[0] * E1[2], N[0] * E1[1] - N[1] * E1[0] };
+		for (int A = 0; A < 3; ++A) { B.E1[A] = E1[A]; B.E2[A] = E2[A]; B.Normal[A] = float(N[A]); }
+		return B;
+	}
+
+	/** D-281: the black hole relative to its star at time t (cm). */
+	inline FVec3d StellarBhOffset(const FStellarBh& B, double TimeS)
+	{
+		const double Ph = B.PeriodS > 0.0 ? std::fmod(TimeS, B.PeriodS) / B.PeriodS : 0.0;
+		const double Th = B.Phase0 + SysConst::TwoPi * Ph;
+		const double C = std::cos(Th) * B.SemiMajorCm, S = std::sin(Th) * B.SemiMajorCm;
+		return FVec3d{ B.E1[0] * C + B.E2[0] * S, B.E1[1] * C + B.E2[1] * S, B.E1[2] * C + B.E2[2] * S };
+	}
+
+	/** D-281: its light as the camera sees it: the isotropic V magnitude of its disc (the nucleus
+	 *  rule: at most Light.Cap x its star's, x Light.Gain; 99 none) faded in across its star's
+	 *  activation shell (0 at the activation radius, whole at 0.6 of it: a render-only fade, so it
+	 *  never pops in), and its palette. */
+	struct FStellarBhLight { float AbsMagIso = UniHlsl::UNI_BH_NONE_MAG; float Fade = 0.0f; UniHlsl::FUniBhStyle Style{}; };
+	inline FStellarBhLight StellarBhLightOf(const FStellarBh& B, float StarAbsMag, double ActivationCm, double DistanceCm, const FStellarBhConfig& C)
+	{
+		namespace HS = UniHlsl;
+		FStellarBhLight L;
+		L.Style = HS::Uni_BhStyleOf(B.Seed, B.Core, false, -1.0f, C.Style.Variety, C.Style.PaletteMode);
+		const float Mn = HS::Uni_NucleusAbsMag(B.Core, StarAbsMag, C.Light.Cap, C.Light.Gain);
+		const double U = std::clamp((ActivationCm - DistanceCm) / std::max(0.4 * ActivationCm, 1.0), 0.0, 1.0);
+		L.Fade = float(U * U * (3.0 - 2.0 * U));
+		if (!(Mn < HS::UNI_BH_NONE_MAG) || !(L.Fade > 1.0e-4f)) { return L; }
+		L.AbsMagIso = Mn - 2.5f * std::log10(L.Fade);
+		return L;
+	}
+
+	/** The system of a star, from its record. Pure and deterministic. D-281: and its black hole
+	 *  companion, if it has one (Bh: the settings; the planets are the same either way). */
+	inline FSystem BuildSystem(const FObjectGPU& Star, const FStellarBhConfig& Bh = FStellarBhConfig{})
 	{
 		using namespace SystemDetail;
 		namespace HS = UniHlsl;
@@ -161,6 +248,7 @@ namespace UniCore
 			S.SpanCm = std::max(S.SpanCm, A * (1.0 + P.Ecc));
 			S.Planets.push_back(P);
 		}
+		S.Bh = StellarCompanionOf(S.StarSeed, S.StarRadiusCm, S.MassSun, Bh);   // D-281
 		return S;
 	}
 
@@ -261,6 +349,7 @@ namespace UniCore
 	public:
 		size_t MaxActive = 16;
 		size_t Activations = 0, Deactivations = 0, Rejected = 0;
+		FStellarBhConfig BhConfig;   // D-281: systems built from now on (and the black holes' light, every frame)
 
 		/** A star inside its activation radius, as the project pass saw it. Duplicates are
 		 *  ignored (keyed by the star's seed); reports already outside the hysteresis radius
@@ -273,7 +362,7 @@ namespace UniCore
 			const u32 Off[3] = { Star.A[0], Star.A[1], Star.A[2] };
 			FActiveSystem A;
 			A.Star = ObjectCoord(Cell, Off);
-			A.Sys = BuildSystem(Star);
+			A.Sys = BuildSystem(Star, BhConfig);
 			const double D = Length(ToDouble(Sub(A.Star, Camera)));
 			if (D > double(UniHlsl::UNI_SYSTEM_HYSTERESIS) * A.Sys.ActivationCm) { ++Rejected; return; }
 			A.ActivatedFrame = Frame;
@@ -329,7 +418,68 @@ namespace UniCore
 					if (OutRefs) { OutRefs->push_back(FPlanetCellRef{ A.Sys.StarSeed, A.StarId, A.bStarIdKnown, Ordinal, P.Seed, K }); }
 					++Ordinal;
 				}
+				// D-281: its black hole's light: one more record (named by no one: not a planet).
+				if (A.Sys.Bh.bValid && OutRecords.size() < Capacity)
+				{
+					FCoord Bc = A.Star;
+					FVec3f Frac{};
+					AddDisplacement(Bc, Frac, StellarBhOffset(A.Sys.Bh, TimeS));
+					const FCellKey K = CellOf(Bc, UNI_PLANET_CELL_LEVEL);
+					OutCells.push_back(DynamicCell(K, Camera, PoolBase + u32(OutRecords.size())));
+					OutRecords.push_back(StellarBhRecord(A, Bc, K, Camera));
+					if (OutRefs) { OutRefs->push_back(FPlanetCellRef{ A.Sys.StarSeed, A.StarId, false, -1, A.Sys.Bh.Seed, K }); }
+				}
 			}
+		}
+
+		/** A dynamic cell (one record at PoolStart), its origin relative to the camera exact. */
+		static FCellGPU DynamicCell(const FCellKey& K, const FCoord& Camera, u32 PoolStart)
+		{
+			FCellGPU G{};
+			const FDelta D = Sub(CellOrigin(K), Camera);
+			for (int Ax = 0; Ax < 3; ++Ax)
+			{
+				const FU128 T = D.TwosComplement(Ax);
+				uint32_t* Dst = Ax == 0 ? G.DeltaX : (Ax == 1 ? G.DeltaY : G.DeltaZ);
+				for (int N = 0; N < 4; ++N) { Dst[N] = T.L[N]; }
+			}
+			G.Level = u32(UNI_PLANET_CELL_LEVEL);
+			G.PoolStart = PoolStart;
+			G.PoolCount = 1u;
+			G.Flags = (255u << 8) | (255u << 16);   // fully faded in, settled (as a planet's)
+			return G;
+		}
+
+		/** D-281: a black hole companion's record: its disc's light towards the camera (the nucleus
+		 *  rule and fade, x its beam by the angle to its orbit's normal, as the lens pass's point),
+		 *  its palette's colour, a point of 100 R_s x uu.Bh.StellarScale. Hidden (DELTA_HIDDEN) when
+		 *  it has no light. */
+		FObjectGPU StellarBhRecord(const FActiveSystem& A, const FCoord& Bc, const FCellKey& K, const FCoord& Camera) const
+		{
+			namespace HS = UniHlsl;
+			const FStellarBh& B = A.Sys.Bh;
+			const FCoord O = CellOrigin(K);
+			u32 Qa[3] = { 0, 0, 0 };
+			for (int Ax = 0; Ax < 3; ++Ax)
+			{
+				const FU128 M = Shr(UniCore::Sub(Bc.Axis(Ax), O.Axis(Ax)), UNI_PLANET_CELL_LEVEL - 32);
+				Qa[Ax] = (M.L[0] | M.L[1] | M.L[2]) != 0u ? 0xFFFFFFFFu : M.L[3];
+			}
+			const FVec3d ToBh = ToDouble(Sub(Bc, Camera));
+			const double D = Length(ToBh);
+			const FStellarBhLight L = StellarBhLightOf(B, A.Sys.StarAbsMag, A.Sys.ActivationCm, D, BhConfig);
+			const float RL2 = float(std::log2(100.0 * std::pow(10.0, double(HS::UNI_BH_LOG_RS_SUN_CM) + double(B.Core.Log10Mass)) * double(std::max(BhConfig.SizeScale, 1.0f))));
+			u32 Flags = 0u;
+			float M = SysConst::MaxEffMag;
+			if (L.AbsMagIso < HS::UNI_BH_NONE_MAG && D > 0.0)
+			{
+				const double Mu = std::fabs(double(B.Normal[0]) * ToBh.X + double(B.Normal[1]) * ToBh.Y + double(B.Normal[2]) * ToBh.Z) / D;
+				M = L.AbsMagIso - 2.5f * std::log10(std::max(HS::Uni_BhDiscBeam(HS::Uni_BhDiscPeakK(B.Core), float(Mu)), 1.0e-6f));
+			}
+			if (!(M < SysConst::MaxEffMag)) { M = SysConst::MaxEffMag; Flags |= HS::UNI_OBJ_FLAG_DELTA_HIDDEN; }
+			const HS::float3 Rgb = HS::Uni_NucleusColourP(B.Core, L.Style.Palette, L.Style.PaletteMix);
+			const float SB = HS::Uni_SurfaceBrightness(M, RL2);
+			return FromHlsl(HS::Uni_MakeObject(HS::uint3(Qa[0], Qa[1], Qa[2]), HS::UNI_ARCH_DYNAMIC_BH, Flags, B.Seed, RL2, M, SB, Rgb));
 		}
 
 		/** One planet's record: exact offset in its own cell, effective absolute magnitude. */

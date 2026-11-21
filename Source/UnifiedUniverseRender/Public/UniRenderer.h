@@ -42,6 +42,8 @@ struct FUniFrameData
 	float DeltaMag = 0.0f;
 	float ExposureBias = 0.0f;     // magnitudes added to m_exposure (brighter < 0)
 	float SceneColourScale = 1.0f; // exposure units -> scene colour (lesson #36), tuned in UE
+	float BackdropScale = 1.0f;    // D-296: the backdrop's light under a planet's daytime sky (1: all of it)
+	double WorldYaw = 0.0;         // D-299: the world's turn against the universe's axes about +Z (UniSpin.h: universal = yaw(world)), radians
 	bool bEnabled = false;
 	uint64 FrameNumber = 0;
 	// D-184: the camera's move since the previous frame (cm, now minus then), for the volume's
@@ -132,6 +134,7 @@ struct FUniFrameData
 	uint32 NucleusArchetypeMask = 0;
 	FVector4f NucleusParams = FVector4f(0.4f, 0.5f, 1.0f, 0.0f);   // D-273: w the lensed nucleus's share handed to its disc
 	uint32 NucleusHandSeed = 0;                                     // D-273: that nucleus's galaxy seed
+	FVector4f NucleusStyle = FVector4f(1.0f, -1.0f, 0.0f, 0.0f);    // D-280: (uu.Bh.DiscVariety, uu.Bh.DiscPalette): the nuclei's colours their discs' palettes
 
 	// D-273: the near field of one black hole (UniLens.usf; UniCore::LensTargetOf): lensing and its
 	// accretion disc, drawn after the backdrop while bActive.
@@ -156,6 +159,10 @@ struct FUniFrameData
 		float PointAppMag = 99.0f;                    // 99: none
 		float PointPhysAngRad = 0.0f;
 		FVector3f PointColour = FVector3f(1.0f, 1.0f, 1.0f);
+		// D-280: its look, multipliers of the uu.Bh.Disc* settings (UniHlsl::FUniBhStyle).
+		FVector4f DiscStyle0 = FVector4f(1.0f, 1.0f, 1.0f, 1.0f);   // spiral, thickness, opacity, clouds
+		FVector4f DiscStyle1 = FVector4f(1.0f, 1.0f, 1.0f, 1.0f);   // bands, heat, erosion, period
+		FVector4f DiscStyle2 = FVector4f(1.0f, 0.0f, 0.0f, 1.0f);   // brightness, palette mix, palette, extent (applied already: DiscOuterX)
 	};
 	FLensFrame Lens;
 
@@ -268,6 +275,15 @@ public:
 
 	/** False when uu.Shaders=0 (nothing compiled): every pass is skipped. */
 	static bool ShadersEnabled();
+
+	/** D-296: what a planet's atmosphere left over the scene this frame, for the sprites drawn
+	 *  after the upscaler (render thread, the same graph): Color rgb its in-scattered light
+	 *  (unexposed), a the green transmittance; Tint r the red's, g the blue's; texel (0, 0) at
+	 *  Rect.Min (the internal resolution). A game module that knows the atmosphere plugin sets it
+	 *  (UnifiedUniverseGame: CloudAtmosphere), so this module depends on none. Unset: none. */
+	using FAtmosphereQuery = TFunction<bool(const FRDGBuilder&, const FSceneView&, FRDGTextureRef&, FRDGTextureRef&, FIntRect&)>;
+	/** Game thread (a module's startup; an empty function at its shutdown). */
+	static void SetAtmosphereQuery(FAtmosphereQuery Query);
 
 	/** TEST ONLY (UnifiedUniverse.Render.GpuParity): copies the first Num pool records to the CPU,
 	 *  blocking the calling (game) thread for up to TimeoutSeconds. Never call at runtime
